@@ -205,6 +205,15 @@ fn infer_from_samples(
         reason.push_str(&format!(" (most cited: {most_common})"));
     }
 
+    // `samples` is a fresh `HashMap` every poll cycle with a randomized
+    // per-process hash seed, so its iteration order is not stable across
+    // cycles even for identical input. Sorting here makes the serialized
+    // `affected_stops` array deterministic, which `normalize_for_diff`
+    // (queries.rs) relies on to avoid writing spurious `line_status_history`
+    // rows when nothing has actually changed.
+    let mut affected_stops: Vec<String> = samples.keys().cloned().collect();
+    affected_stops.sort();
+
     Some(LineStatus {
         severity,
         reason: reason.clone(),
@@ -212,7 +221,7 @@ fn infer_from_samples(
         disruption: Some(Disruption {
             category: "RealTime".to_string(),
             description: reason,
-            affected_stops: samples.keys().cloned().collect(),
+            affected_stops,
             affected_routes: vec![],
             source: Some("ldbws-sampling".to_string()),
         }),
@@ -276,7 +285,13 @@ fn most_common<'a>(items: &[&'a str]) -> Option<&'a str> {
     for item in items {
         *counts.entry(item).or_insert(0) += 1;
     }
-    counts.into_iter().max_by_key(|(_, count)| *count).map(|(item, _)| item)
+    // `counts` iterates in a randomized, per-process order, so on a tie
+    // `max_by_key` over `count` alone would pick a different "most cited"
+    // reason on different poll cycles for identical input. Breaking ties
+    // alphabetically by the reason string itself makes the result
+    // deterministic (same input -> same output every time), which is what
+    // `normalize_for_diff` needs to avoid spurious history rows.
+    counts.into_iter().max_by_key(|(reason, count)| (*count, *reason)).map(|(item, _)| item)
 }
 
 #[cfg(test)]
@@ -420,7 +435,7 @@ mod tests {
             to_date: None,
             is_now: false,
         };
-        let chosen = validity_for_output(&[future.clone()]);
+        let chosen = validity_for_output(std::slice::from_ref(&future));
         assert_eq!(chosen.from_date, future.from_date);
     }
 
@@ -512,6 +527,51 @@ mod tests {
         let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
         assert_eq!(status.severity, Severity::SevereDelays);
         assert_eq!(status.data_quality, DataQuality::LdbwsInferred);
+    }
+
+    #[test]
+    fn most_common_breaks_ties_deterministically() {
+        // "b" and "a" tie at 2 occurrences each; without a deterministic
+        // tie-break this could flip between "a" and "b" across runs
+        // depending on HashMap iteration order. Alphabetical tie-break
+        // always picks "b" (max_by_key: highest count, then lexicographic
+        // reason) for this input, and repeated calls must agree.
+        let items = ["a", "b", "b", "a"];
+        let first = most_common(&items);
+        for _ in 0..10 {
+            assert_eq!(most_common(&items), first, "most_common must be deterministic across calls");
+        }
+        assert_eq!(first, Some("b"));
+    }
+
+    #[test]
+    fn infer_from_samples_affected_stops_are_sorted_and_deterministic() {
+        // swr-alton.toml: sample_stations = ["AHT", "FRM", "AON"]. Insert
+        // samples in an order that would NOT be alphabetical if it leaked
+        // through raw HashMap iteration, to prove the output is sorted
+        // rather than incidentally ordered.
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let severe = vec![
+            departure("AON", 10, false),
+            departure("AON", 12, false),
+            departure("AON", 8, false),
+            departure("AON", 0, false),
+        ];
+        let mut samples = HashMap::new();
+        samples.insert(
+            "FRM".to_string(),
+            StationSample { crs: "FRM".to_string(), polled_at: Utc::now(), departures: severe.clone() },
+        );
+        samples.insert(
+            "AHT".to_string(),
+            StationSample { crs: "AHT".to_string(), polled_at: Utc::now(), departures: severe },
+        );
+
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let stops = status.disruption.expect("severe delays should produce a disruption").affected_stops;
+        assert_eq!(stops, vec!["AHT".to_string(), "FRM".to_string()], "affected_stops must be sorted alphabetically");
     }
 
     #[test]

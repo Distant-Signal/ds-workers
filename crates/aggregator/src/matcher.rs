@@ -16,7 +16,12 @@ pub enum MatchScope {
     OperatorOnly,
 }
 
+// `segments`/`operators`/`keywords` are faithful ports of the Python
+// prototype's `evidence` dict (`src/matcher.py`) and are intentionally kept
+// as API surface for future consumers (e.g. richer disruption messages,
+// debugging) even though only `.stations` is read today.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Evidence {
     pub stations: Vec<String>,
     pub segments: Vec<String>,

@@ -35,6 +35,11 @@ impl SegmentRegistry {
     }
 
     /// Every line ID that includes this segment, in load order.
+    ///
+    /// Ported public API surface from the Python `SegmentRegistry`
+    /// (`src/segments.py`); currently exercised only by unit tests, not by
+    /// the `bin` target that clippy's dead-code lint checks against.
+    #[allow(dead_code)]
     pub fn lines_for_segment(&self, segment: &str) -> Vec<String> {
         self.segment_lines.get(segment).cloned().unwrap_or_default()
     }
@@ -49,6 +54,10 @@ impl SegmentRegistry {
         matches!(self.segment_lines.get(segment), Some(users) if users == &[line_id.to_string()])
     }
 
+    /// Ported public API surface from the Python `SegmentRegistry`
+    /// (`src/segments.py`); currently exercised only by unit tests, not by
+    /// the `bin` target that clippy's dead-code lint checks against.
+    #[allow(dead_code)]
     pub fn segment_at(&self, line_id: &str, crs: &str) -> Option<&str> {
         self.station_segments
             .get(&(line_id.to_string(), crs.to_string()))
