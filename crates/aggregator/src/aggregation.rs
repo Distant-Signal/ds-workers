@@ -1,0 +1,534 @@
+//! Combine Knowledgebase incidents and LDBWS samples into one status
+//! report per line. Ported from `src/aggregator.py`, adapted for the real
+//! `common::IncidentMessage` shape (see module-level notes below).
+//!
+//! Two adaptations from the Python prototype, both because the real
+//! `IncidentMessage` (built against confirmed RDM facts) differs from
+//! what the prototype assumed:
+//! 1. No `severity_hint` field exists — `priority: i32`'s meaning is an
+//!    unresolved RDM gap, so severity classification uses keyword text
+//!    only, dropping the Python version's `severity_hint == "major"`/
+//!    `"minor"` branches.
+//! 2. `IncidentMessage.validity` is a `Vec<ValidityPeriod>`, not a single
+//!    optional pair — `validity_for_output` below picks one period for the
+//!    (still-singular) `LineStatus.validity` field.
+
+use std::collections::HashMap;
+
+use chrono::Utc;
+use common::{
+    AffectedRoute, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition, LineStatus,
+    LineStatusReport, Severity, StationDeparture, StationSample, ValidityPeriod, thresholds_for,
+};
+
+use crate::matcher::{Match, MatchScope, lines_affected_by};
+use crate::segments::SegmentRegistry;
+
+pub fn aggregate(
+    lines: &HashMap<String, LineDefinition>,
+    incidents: &[IncidentMessage],
+    samples: &HashMap<String, StationSample>,
+    registry: &SegmentRegistry,
+    defaults: &Defaults,
+) -> HashMap<String, LineStatusReport> {
+    let mut reports: HashMap<String, LineStatusReport> = lines
+        .values()
+        .map(|line| {
+            (
+                line.id.clone(),
+                LineStatusReport {
+                    id: line.id.clone(),
+                    name: line.name.clone(),
+                    mode_name: line.mode.clone(),
+                    operators: line.operators.clone(),
+                    statuses: vec![],
+                },
+            )
+        })
+        .collect();
+
+    // Layer 1: incidents.
+    for incident in incidents {
+        for m in lines_affected_by(incident, lines, registry) {
+            let status = status_from_incident(&m, incident);
+            reports.get_mut(&m.line.id).unwrap().statuses.push(status);
+        }
+    }
+
+    // Layer 2: inference for lines with no incidents.
+    for line in lines.values() {
+        let report = reports.get_mut(&line.id).unwrap();
+        if !report.statuses.is_empty() {
+            continue;
+        }
+        let inferred = infer_from_samples(line, samples, defaults);
+        report.statuses.push(inferred.unwrap_or_else(good_service));
+    }
+
+    reports
+}
+
+// --- Incident path ---
+
+fn status_from_incident(m: &Match, incident: &IncidentMessage) -> LineStatus {
+    let base_severity = severity_from_incident(incident);
+    let severity = demote_for_scope(base_severity, m.scope);
+
+    let affected_stations = m.evidence.stations.clone();
+    let affected_routes = routes_from_stations(m.line, &affected_stations);
+
+    let mut reason = incident.summary.clone();
+    match m.scope {
+        MatchScope::SharedSegment => reason.push_str(" (shared trunk — also affects other lines)"),
+        MatchScope::OperatorOnly => reason.push_str(" (operator-wide report)"),
+        _ => {}
+    }
+
+    let disruption = Disruption {
+        category: if incident.is_planned { "PlannedWork" } else { "RealTime" }.to_string(),
+        description: if incident.description.is_empty() { incident.summary.clone() } else { incident.description.clone() },
+        affected_stops: affected_stations,
+        affected_routes,
+        source: Some(format!("knowledgebase-incident-{}", incident.incident_id)),
+    };
+
+    LineStatus {
+        severity,
+        reason,
+        validity: validity_for_output(&incident.validity),
+        disruption: Some(disruption),
+        data_quality: if incident.is_planned { DataQuality::Planned } else { DataQuality::Knowledgebase },
+    }
+}
+
+/// Picks one `ValidityPeriod` for `LineStatus.validity` from an incident's
+/// (possibly empty, possibly multi-entry) `validity` vec. See module docs
+/// for why this exists — the real schema allows repeated validity periods,
+/// the output type doesn't.
+fn validity_for_output(periods: &[ValidityPeriod]) -> ValidityPeriod {
+    if periods.is_empty() {
+        return ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true };
+    }
+    let now = Utc::now();
+    periods
+        .iter()
+        .find(|p| p.from_date <= now && p.to_date.map(|to| to > now).unwrap_or(true))
+        .cloned()
+        .unwrap_or_else(|| periods[0].clone())
+}
+
+fn severity_from_incident(incident: &IncidentMessage) -> Severity {
+    if incident.is_planned {
+        return Severity::PlannedClosure;
+    }
+
+    let text = format!("{} {}", incident.summary, incident.description).to_lowercase();
+    if text.contains("suspended") || text.contains("no service") {
+        return Severity::Suspended;
+    }
+    if text.contains("rail replacement") || text.contains("replacement bus") {
+        return Severity::BusService;
+    }
+    if text.contains("lines blocked") || text.contains("all lines blocked") {
+        return Severity::PartSuspended;
+    }
+    if text.contains("severe delays") || text.contains("major disruption") {
+        return Severity::SevereDelays;
+    }
+    if text.contains("diverted") {
+        return Severity::Diverted;
+    }
+    Severity::MinorDelays
+}
+
+/// Weaker evidence -> milder reported status. Lower severity numbers are
+/// more disruptive, so capping "at Minor Delays or milder" means picking
+/// whichever of (severity, floor) sorts later (higher number = milder).
+fn demote_for_scope(severity: Severity, scope: MatchScope) -> Severity {
+    match scope {
+        MatchScope::ExclusiveSegment | MatchScope::StationHit | MatchScope::SharedSegment => severity,
+        MatchScope::KeywordOnly => severity.max(Severity::SevereDelays),
+        MatchScope::OperatorOnly => severity.max(Severity::MinorDelays),
+    }
+}
+
+fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<AffectedRoute> {
+    if stations.len() < 2 {
+        return vec![];
+    }
+    let line_order: Vec<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
+    let mut in_order: Vec<&String> = stations.iter().collect();
+    in_order.sort_by_key(|c| line_order.iter().position(|o| *o == c.as_str()).unwrap_or(999));
+    vec![AffectedRoute { from_crs: in_order[0].clone(), to_crs: in_order[in_order.len() - 1].clone() }]
+}
+
+// --- Inference path ---
+
+fn infer_from_samples(
+    line: &LineDefinition,
+    samples: &HashMap<String, StationSample>,
+    defaults: &Defaults,
+) -> Option<LineStatus> {
+    let thresholds = thresholds_for(defaults, &line.severity_overrides);
+
+    let relevant: Vec<&StationDeparture> = line
+        .sample_stations
+        .iter()
+        .filter_map(|crs| samples.get(crs))
+        .flat_map(|sample| sample.departures.iter())
+        .filter(|dep| belongs_to_line(dep, line))
+        .collect();
+
+    if (relevant.len() as i64) < thresholds.min_sample_size {
+        return None;
+    }
+
+    let total = relevant.len();
+    let cancelled = relevant.iter().filter(|d| d.is_cancelled).count();
+    let delayed = relevant
+        .iter()
+        .filter(|d| !d.is_cancelled && d.delay_minutes as i64 >= thresholds.delay_threshold_minutes)
+        .count();
+    let cancel_rate = cancelled as f64 / total as f64;
+    let delay_rate = delayed as f64 / total as f64;
+
+    let (severity, mut reason) = classify(cancel_rate, delay_rate, &thresholds, total, cancelled, delayed);
+    if severity == Severity::GoodService {
+        return Some(good_service());
+    }
+
+    let reasons: Vec<&str> = relevant
+        .iter()
+        .filter_map(|d| d.delay_reason.as_deref().or(d.cancel_reason.as_deref()))
+        .collect();
+    if let Some(most_common) = most_common(&reasons) {
+        reason.push_str(&format!(" (most cited: {most_common})"));
+    }
+
+    Some(LineStatus {
+        severity,
+        reason: reason.clone(),
+        validity: ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+        disruption: Some(Disruption {
+            category: "RealTime".to_string(),
+            description: reason,
+            affected_stops: samples.keys().cloned().collect(),
+            affected_routes: vec![],
+            source: Some("ldbws-sampling".to_string()),
+        }),
+        data_quality: DataQuality::LdbwsInferred,
+    })
+}
+
+/// Operator filter is mandatory; destination-CRS/headcode-prefix filters
+/// are optional narrowing, used at shared-trunk sample stations.
+fn belongs_to_line(dep: &StationDeparture, line: &LineDefinition) -> bool {
+    if !line.operators.contains(&dep.operator) {
+        return false;
+    }
+    if !line.destination_crs_filter.is_empty() && !line.destination_crs_filter.contains(&dep.destination_crs) {
+        return false;
+    }
+    if !line.headcode_prefixes.is_empty() {
+        let Some(headcode) = &dep.headcode else { return false };
+        if !line.headcode_prefixes.iter().any(|p| headcode.starts_with(p.as_str())) {
+            return false;
+        }
+    }
+    true
+}
+
+fn classify(
+    cancel_rate: f64,
+    delay_rate: f64,
+    thresholds: &Defaults,
+    total: usize,
+    cancelled: usize,
+    delayed: usize,
+) -> (Severity, String) {
+    if cancel_rate >= thresholds.part_suspended_pct {
+        return (Severity::PartSuspended, format!("{cancelled} of {total} sampled services cancelled."));
+    }
+    if cancel_rate >= thresholds.reduced_service_pct {
+        return (Severity::ReducedService, format!("{cancelled} of {total} sampled services cancelled."));
+    }
+    if delay_rate >= thresholds.severe_delays_pct {
+        return (Severity::SevereDelays, format!("{delayed} of {total} sampled services delayed."));
+    }
+    if delay_rate >= thresholds.minor_delays_pct {
+        return (Severity::MinorDelays, format!("{delayed} of {total} sampled services delayed."));
+    }
+    (Severity::GoodService, "Good Service".to_string())
+}
+
+fn good_service() -> LineStatus {
+    LineStatus {
+        severity: Severity::GoodService,
+        reason: "Good Service".to_string(),
+        validity: ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+        disruption: None,
+        data_quality: DataQuality::LdbwsInferred,
+    }
+}
+
+fn most_common<'a>(items: &[&'a str]) -> Option<&'a str> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for item in items {
+        *counts.entry(item).or_insert(0) += 1;
+    }
+    counts.into_iter().max_by_key(|(_, count)| *count).map(|(item, _)| item)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn load_all_lines() -> HashMap<String, LineDefinition> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
+        LineDefinition::from_dir(&dir)
+            .expect("lines/ directory should parse")
+            .into_iter()
+            .map(|l| (l.id.clone(), l))
+            .collect()
+    }
+
+    fn incident(id: &str, summary: &str, description: &str, operators: &[&str], affected_stations: &[&str]) -> IncidentMessage {
+        IncidentMessage {
+            incident_id: id.to_string(),
+            summary: summary.to_string(),
+            description: description.to_string(),
+            operators: operators.iter().map(|s| s.to_string()).collect(),
+            affected_stations: affected_stations.iter().map(|s| s.to_string()).collect(),
+            priority: 0,
+            validity: vec![],
+            is_planned: false,
+            is_cleared: false,
+        }
+    }
+
+    fn aggregate_with_defaults(
+        lines: &HashMap<String, LineDefinition>,
+        incidents: &[IncidentMessage],
+    ) -> HashMap<String, LineStatusReport> {
+        let registry = SegmentRegistry::new(lines);
+        let defaults = Defaults::default();
+        aggregate(lines, incidents, &HashMap::new(), &registry, &defaults)
+    }
+
+    #[test]
+    fn aggregator_propagates_severity_through_shared_trunk() {
+        // Description text already contains "severe delays", which the
+        // keyword classifier alone resolves to SevereDelays — the Python
+        // original's `severity_hint="major"` was redundant with this text,
+        // not load-bearing, so dropping it changes nothing about the result.
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-3",
+            "Signal failure at Woking",
+            "Severe delays expected on SWR services.",
+            &["SW"],
+            &["WOK"],
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
+            let worst = reports[line_id].worst_severity();
+            assert!(
+                (worst as i32) <= (Severity::SevereDelays as i32),
+                "{line_id} should have severe-or-worse severity, got {worst:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregator_isolates_exclusive_incident() {
+        // "minor delays" appears twice in the summary+description text, so
+        // the keyword classifier alone reaches MinorDelays — the Python
+        // original's `severity_hint="minor"` was likewise redundant here.
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-4",
+            "Minor delays on Alton line",
+            "A power supply problem at Alton is causing minor delays.",
+            &["SW"],
+            &["AON"],
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        assert_eq!(reports["swr-alton"].worst_severity(), Severity::MinorDelays);
+        assert_eq!(reports["swr-south-west-main"].worst_severity(), Severity::GoodService);
+        assert_eq!(reports["swr-portsmouth-direct"].worst_severity(), Severity::GoodService);
+    }
+
+    #[test]
+    fn operator_only_match_is_demoted_to_minor() {
+        let lines = load_all_lines();
+        let inc = incident(
+            "OP-1",
+            "SWR services suspended",
+            "No service on SWR following an earlier incident.",
+            &["SW"],
+            &[], // no stations -> operator-only
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
+            assert_eq!(
+                reports[line_id].worst_severity(),
+                Severity::MinorDelays,
+                "{line_id} should be capped at Minor Delays"
+            );
+        }
+    }
+
+    #[test]
+    fn no_incident_no_samples_yields_good_service() {
+        let lines = load_all_lines();
+        let reports = aggregate_with_defaults(&lines, &[]);
+        for report in reports.values() {
+            assert_eq!(report.worst_severity(), Severity::GoodService);
+        }
+    }
+
+    #[test]
+    fn validity_for_output_uses_now_when_no_periods_given() {
+        let period = validity_for_output(&[]);
+        assert!(period.is_now);
+        assert!(period.to_date.is_none());
+    }
+
+    #[test]
+    fn validity_for_output_picks_the_currently_active_period() {
+        let now = Utc::now();
+        let expired = ValidityPeriod {
+            from_date: now - chrono::Duration::days(2),
+            to_date: Some(now - chrono::Duration::days(1)),
+            is_now: false,
+        };
+        let active = ValidityPeriod {
+            from_date: now - chrono::Duration::hours(1),
+            to_date: None,
+            is_now: true,
+        };
+        let chosen = validity_for_output(&[expired.clone(), active.clone()]);
+        assert_eq!(chosen.from_date, active.from_date);
+    }
+
+    #[test]
+    fn validity_for_output_falls_back_to_first_when_none_are_active() {
+        let now = Utc::now();
+        let future = ValidityPeriod {
+            from_date: now + chrono::Duration::days(1),
+            to_date: None,
+            is_now: false,
+        };
+        let chosen = validity_for_output(&[future.clone()]);
+        assert_eq!(chosen.from_date, future.from_date);
+    }
+
+    // --- Inference-path tests ---
+    //
+    // The Python test suite (tests/test_matcher.py) never exercises
+    // `_infer_from_samples`/`_belongs_to_line`/`_classify` at all — every
+    // existing Python test is incident-path or matcher-only. There is no
+    // Python original to port here, so these are new tests covering
+    // logic that was faithfully ported but never had test coverage
+    // upstream. Found and added during this plan's self-review.
+
+    fn departure(destination_crs: &str, delay_minutes: i32, is_cancelled: bool) -> StationDeparture {
+        StationDeparture {
+            service_id: "svc".to_string(),
+            operator: "SW".to_string(),
+            destination_crs: destination_crs.to_string(),
+            scheduled: "10:00".to_string(),
+            estimated: "10:00".to_string(),
+            is_cancelled,
+            delay_minutes,
+            cancel_reason: if is_cancelled { Some("fault".to_string()) } else { None },
+            delay_reason: if !is_cancelled && delay_minutes > 0 { Some("signal failure".to_string()) } else { None },
+            headcode: None,
+        }
+    }
+
+    #[test]
+    fn belongs_to_line_filters_by_operator() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let matching = departure("AON", 0, false);
+        let wrong_operator = StationDeparture { operator: "XX".to_string(), ..matching.clone() };
+        assert!(belongs_to_line(&matching, alton));
+        assert!(!belongs_to_line(&wrong_operator, alton));
+    }
+
+    #[test]
+    fn belongs_to_line_filters_by_destination_crs() {
+        // swr-alton.toml: destination_crs_filter = ["AON", "BTL", "FRM", "AHT"]
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let matching = departure("AON", 0, false);
+        let wrong_destination = StationDeparture { destination_crs: "WOK".to_string(), ..matching.clone() };
+        assert!(belongs_to_line(&matching, alton));
+        assert!(!belongs_to_line(&wrong_destination, alton));
+    }
+
+    #[test]
+    fn infer_from_samples_returns_none_below_min_sample_size() {
+        // swr-alton.toml: sample_stations = ["AHT", "FRM", "AON"]
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                // Only 2 relevant departures, below the default min_sample_size of 3.
+                departures: vec![departure("AON", 0, false), departure("AON", 0, false)],
+            },
+        );
+        assert!(infer_from_samples(alton, &samples, &defaults).is_none());
+    }
+
+    #[test]
+    fn infer_from_samples_classifies_severe_delays() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        // 4 departures, 3 delayed >= 5 minutes -> 75% delay rate, above the
+        // default severe_delays_pct of 0.50.
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    departure("AON", 10, false),
+                    departure("AON", 12, false),
+                    departure("AON", 8, false),
+                    departure("AON", 0, false),
+                ],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        assert_eq!(status.severity, Severity::SevereDelays);
+        assert_eq!(status.data_quality, DataQuality::LdbwsInferred);
+    }
+
+    #[test]
+    fn infer_from_samples_returns_good_service_when_below_thresholds() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should still classify (Good Service)");
+        assert_eq!(status.severity, Severity::GoodService);
+    }
+}
