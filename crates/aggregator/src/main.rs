@@ -2,7 +2,9 @@
 //! incidents + LDBWS samples and writes it to `line_status`/
 //! `line_status_history`. See
 //! `docs/superpowers/specs/2026-07-06-aggregator-read-api-design.md` for
-//! the full design.
+//! the original design, and
+//! `docs/superpowers/specs/2026-07-09-custom-lines-and-blended-stats-design.md`
+//! for the custom-lines addition.
 
 mod aggregation;
 mod config;
@@ -33,11 +35,10 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
 
-    let lines: HashMap<String, LineDefinition> =
+    let static_lines: HashMap<String, LineDefinition> =
         config.lines.iter().map(|l| (l.id.clone(), l.clone())).collect();
-    tracing::info!(count = lines.len(), "loaded line catalogue");
+    tracing::info!(count = static_lines.len(), "loaded static line catalogue");
 
-    let registry = SegmentRegistry::new(&lines);
     let defaults = Defaults::default();
 
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         interval.tick().await;
 
-        if let Err(err) = run_cycle(&pool, &lines, &registry, &defaults, config.history_retention_days).await {
+        if let Err(err) = run_cycle(&pool, &static_lines, &defaults, config.history_retention_days).await {
             tracing::error!(error = ?err, "aggregation cycle failed; will retry next interval");
         }
     }
@@ -53,24 +54,31 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_cycle(
     pool: &sqlx::PgPool,
-    lines: &HashMap<String, LineDefinition>,
-    registry: &SegmentRegistry,
+    static_lines: &HashMap<String, LineDefinition>,
     defaults: &Defaults,
     retention_days: i64,
 ) -> anyhow::Result<()> {
+    let custom_lines = queries::load_custom_lines(pool).await?;
+    let lines = aggregation::merge_custom_lines(static_lines, custom_lines);
+    let registry = SegmentRegistry::new(&lines);
+
     let incidents = queries::load_incidents(pool).await?;
     let samples = queries::load_station_samples(pool).await?;
 
-    let reports = aggregation::aggregate(lines, &incidents, &samples, registry, defaults);
+    let reports = aggregation::aggregate(&lines, &incidents, &samples, &registry, defaults);
 
     for report in reports.values() {
         queries::write_line_status(pool, report).await?;
     }
 
+    let current_line_ids: Vec<String> = lines.keys().cloned().collect();
+    let removed = queries::prune_removed_lines(pool, &current_line_ids).await?;
+
     let pruned = queries::prune_history(pool, retention_days).await?;
     tracing::info!(
         lines = reports.len(),
         incidents = incidents.len(),
+        removed_lines = removed,
         pruned_history_rows = pruned,
         "aggregation cycle complete"
     );

@@ -17,12 +17,30 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use common::{
-    AffectedRoute, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition, LineStatus,
-    LineStatusReport, Severity, StationDeparture, StationSample, ValidityPeriod, thresholds_for,
+    AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition,
+    LineStatus, LineStatusReport, SampleStats, Severity, StationDeparture, StationSample,
+    ValidityPeriod, thresholds_for,
 };
 
 use crate::matcher::{Match, MatchScope, lines_affected_by};
 use crate::segments::SegmentRegistry;
+
+/// Merges DB-stored custom lines into the static catalogue, converting
+/// each into a `LineDefinition` (see `common::CustomLine`'s `From` impl) so
+/// the rest of the pipeline — matcher, segment registry, LDBWS inference —
+/// treats them identically to catalogue lines. Re-run every poll cycle
+/// (`main.rs`) since custom lines can be created or deleted at any time,
+/// unlike the static catalogue which is fixed at process startup.
+pub fn merge_custom_lines(
+    static_lines: &HashMap<String, LineDefinition>,
+    custom_lines: Vec<CustomLine>,
+) -> HashMap<String, LineDefinition> {
+    let mut merged = static_lines.clone();
+    for custom in custom_lines {
+        merged.insert(custom.id.clone(), custom.into());
+    }
+    merged
+}
 
 pub fn aggregate(
     lines: &HashMap<String, LineDefinition>,
@@ -55,14 +73,23 @@ pub fn aggregate(
         }
     }
 
-    // Layer 2: inference for lines with no incidents.
+    // Layer 2: sample-derived stats. Always computed for every line. Used
+    // as the status itself when a line has no incident-derived status
+    // (unchanged behavior); attached as supplementary `sample_stats` on top
+    // of the incident-derived status(es) otherwise, never overriding their
+    // severity — incident-reported severity stays authoritative.
     for line in lines.values() {
         let report = reports.get_mut(&line.id).unwrap();
-        if !report.statuses.is_empty() {
+        if report.statuses.is_empty() {
+            let inferred = infer_from_samples(line, samples, defaults);
+            report.statuses.push(inferred.unwrap_or_else(good_service));
             continue;
         }
-        let inferred = infer_from_samples(line, samples, defaults);
-        report.statuses.push(inferred.unwrap_or_else(good_service));
+        if let Some(stats) = compute_sample_stats(line, samples, defaults) {
+            for status in &mut report.statuses {
+                status.sample_stats = Some(stats.clone());
+            }
+        }
     }
 
     reports
@@ -98,6 +125,7 @@ fn status_from_incident(m: &Match, incident: &IncidentMessage) -> LineStatus {
         validity: validity_for_output(&incident.validity),
         disruption: Some(disruption),
         data_quality: if incident.is_planned { DataQuality::Planned } else { DataQuality::Knowledgebase },
+        sample_stats: None,
     }
 }
 
@@ -164,11 +192,17 @@ fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<Affec
 
 // --- Inference path ---
 
-fn infer_from_samples(
+/// Raw sample-derived numbers for a line: how many recently-sampled
+/// departures were delayed/cancelled, and by how much on average. Computed
+/// independently of whether the line also has an incident-derived status —
+/// `aggregate()` attaches the result to a line's status either way.
+/// `avg_delay_minutes` is averaged over non-cancelled ("running") sampled
+/// departures only.
+fn compute_sample_stats(
     line: &LineDefinition,
     samples: &HashMap<String, StationSample>,
     defaults: &Defaults,
-) -> Option<LineStatus> {
+) -> Option<SampleStats> {
     let thresholds = thresholds_for(defaults, &line.severity_overrides);
 
     let relevant: Vec<&StationDeparture> = line
@@ -189,14 +223,46 @@ fn infer_from_samples(
         .iter()
         .filter(|d| !d.is_cancelled && d.delay_minutes as i64 >= thresholds.delay_threshold_minutes)
         .count();
-    let cancel_rate = cancelled as f64 / total as f64;
-    let delay_rate = delayed as f64 / total as f64;
+    let running: Vec<&&StationDeparture> = relevant.iter().filter(|d| !d.is_cancelled).collect();
+    let avg_delay_minutes = if running.is_empty() {
+        0.0
+    } else {
+        running.iter().map(|d| d.delay_minutes as f64).sum::<f64>() / running.len() as f64
+    };
 
-    let (severity, mut reason) = classify(cancel_rate, delay_rate, &thresholds, total, cancelled, delayed);
+    Some(SampleStats { total, delayed, cancelled, avg_delay_minutes })
+}
+
+fn infer_from_samples(
+    line: &LineDefinition,
+    samples: &HashMap<String, StationSample>,
+    defaults: &Defaults,
+) -> Option<LineStatus> {
+    let stats = compute_sample_stats(line, samples, defaults)?;
+    let thresholds = thresholds_for(defaults, &line.severity_overrides);
+
+    let cancel_rate = stats.cancelled as f64 / stats.total as f64;
+    let delay_rate = stats.delayed as f64 / stats.total as f64;
+
+    let (severity, mut reason) =
+        classify(cancel_rate, delay_rate, &thresholds, stats.total, stats.cancelled, stats.delayed);
     if severity == Severity::GoodService {
-        return Some(good_service());
+        let mut status = good_service();
+        status.sample_stats = Some(stats);
+        return Some(status);
     }
 
+    // `compute_sample_stats` only returns aggregate counts, not the raw
+    // departures, so the "most cited reason" text below re-derives its own
+    // small filtered view. Cheap: a handful of departures per line per
+    // cycle, and keeps `compute_sample_stats` focused on just the numbers.
+    let relevant: Vec<&StationDeparture> = line
+        .sample_stations
+        .iter()
+        .filter_map(|crs| samples.get(crs))
+        .flat_map(|sample| sample.departures.iter())
+        .filter(|dep| belongs_to_line(dep, line))
+        .collect();
     let reasons: Vec<&str> = relevant
         .iter()
         .filter_map(|d| d.delay_reason.as_deref().or(d.cancel_reason.as_deref()))
@@ -226,6 +292,7 @@ fn infer_from_samples(
             source: Some("ldbws-sampling".to_string()),
         }),
         data_quality: DataQuality::LdbwsInferred,
+        sample_stats: Some(stats),
     })
 }
 
@@ -277,6 +344,7 @@ fn good_service() -> LineStatus {
         validity: ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
         disruption: None,
         data_quality: DataQuality::LdbwsInferred,
+        sample_stats: None,
     }
 }
 
@@ -590,5 +658,69 @@ mod tests {
         );
         let status = infer_from_samples(alton, &samples, &defaults).expect("should still classify (Good Service)");
         assert_eq!(status.severity, Severity::GoodService);
+    }
+
+    #[test]
+    fn sample_stats_are_attached_alongside_an_active_incident_without_changing_severity() {
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-5",
+            "Minor delays on Alton line",
+            "A points failure at Alton is causing minor delays.",
+            &["SW"],
+            &["AON"],
+        );
+        let registry = SegmentRegistry::new(&lines);
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        // 4 departures, 3 delayed >= 5 minutes -> would classify as SevereDelays
+        // on its own (75% delay rate, above the 50% severe_delays_pct default),
+        // but the incident's MinorDelays severity must still win.
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    departure("AON", 10, false),
+                    departure("AON", 12, false),
+                    departure("AON", 8, false),
+                    departure("AON", 0, false),
+                ],
+            },
+        );
+        let reports = aggregate(&lines, &[inc], &samples, &registry, &defaults);
+        let alton = &reports["swr-alton"];
+        assert_eq!(
+            alton.worst_severity(),
+            Severity::MinorDelays,
+            "incident severity must stay authoritative"
+        );
+        let stats = alton.statuses[0]
+            .sample_stats
+            .as_ref()
+            .expect("sample stats should be attached even though an incident is active");
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.delayed, 3);
+        assert_eq!(stats.cancelled, 0);
+    }
+
+    #[test]
+    fn merge_custom_lines_adds_custom_without_touching_static() {
+        let lines = load_all_lines();
+        let static_count = lines.len();
+        let custom = vec![CustomLine {
+            id: "custom-my-commute".to_string(),
+            name: "My Commute".to_string(),
+            operators: vec!["SW".to_string()],
+            stations: vec!["WOK".to_string(), "AON".to_string()],
+            headcode_prefixes: vec![],
+            destination_crs_filter: vec![],
+        }];
+        let merged = merge_custom_lines(&lines, custom);
+        assert_eq!(merged.len(), static_count + 1);
+        assert!(merged.contains_key("swr-alton"));
+        assert_eq!(merged["custom-my-commute"].name, "My Commute");
+        assert_eq!(merged["custom-my-commute"].category, "custom");
     }
 }

@@ -55,6 +55,42 @@ pub async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, Stati
         .collect()
 }
 
+pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>> {
+    let rows = sqlx::query(
+        "SELECT id, name, operators, stations, headcode_prefixes, destination_crs_filter \
+         FROM custom_lines",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(common::CustomLine {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                operators: row.try_get("operators")?,
+                stations: row.try_get("stations")?,
+                headcode_prefixes: row.try_get("headcode_prefixes")?,
+                destination_crs_filter: row.try_get("destination_crs_filter")?,
+            })
+        })
+        .collect()
+}
+
+/// Deletes `line_status` rows for any `line_id` not in `current_line_ids`.
+/// Called every cycle with the freshly-merged static+custom line set, so a
+/// deleted custom line's last-known status is removed on the next cycle
+/// rather than lingering forever (custom lines are the only way a line can
+/// disappear between cycles — the static catalogue is fixed for the
+/// process's lifetime).
+pub async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM line_status WHERE NOT (line_id = ANY($1))")
+        .bind(current_line_ids)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Fetches the currently-stored `statuses` JSON for one line, if any row
 /// exists yet.
 async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_json::Value>> {
@@ -65,24 +101,34 @@ async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_
     Ok(row.map(|r| r.try_get("statuses")).transpose()?)
 }
 
-/// Strips the one volatile field (`validity.from_date`) that `aggregation::
-/// aggregate`'s no-incident/no-inference fallback paths (`good_service()`,
-/// the LDBWS-inferred branch of `infer_from_samples`, and
-/// `validity_for_output`'s empty-periods case) stamp with a fresh
-/// `Utc::now()` on every call, even when nothing about the line's status
-/// has actually changed. Without this, a byte-for-byte comparison of the
-/// full `statuses` JSON would see a "change" on every single poll cycle for
-/// any line not currently matched to an incident with real validity data —
-/// which is the common case — defeating the point of only recording
-/// history on real changes. Incident-driven statuses are unaffected: their
-/// `from_date` comes from the incident's own stored `validity_periods` and
-/// stays stable across cycles as long as the incident data doesn't change.
+/// Strips volatile fields that `aggregation::aggregate` recomputes fresh on
+/// every cycle even when nothing about the line's status has actually
+/// changed, so that a byte-for-byte comparison of the resulting `statuses`
+/// JSON reflects only meaningful changes:
+///
+/// - `validity.from_date`: the no-incident/no-inference fallback paths
+///   (`good_service()`, the LDBWS-inferred branch of `infer_from_samples`,
+///   and `validity_for_output`'s empty-periods case) stamp this with a
+///   fresh `Utc::now()` on every call. Incident-driven statuses are
+///   unaffected: their `from_date` comes from the incident's own stored
+///   `validity_periods` and stays stable across cycles as long as the
+///   incident data doesn't change.
+/// - `sample_stats`: recomputed from live LDBWS samples every poll cycle,
+///   so its counts and `avg_delay_minutes` roll over every cycle even when
+///   the line's actual status is unchanged.
+///
+/// Without stripping both, a "change" would be seen on every single poll
+/// cycle for most lines, defeating the point of only recording history on
+/// real changes.
 fn normalize_for_diff(statuses: &serde_json::Value) -> serde_json::Value {
     let mut statuses = statuses.clone();
     if let Some(entries) = statuses.as_array_mut() {
         for entry in entries {
             if let Some(validity) = entry.get_mut("validity").and_then(|v| v.as_object_mut()) {
                 validity.remove("from_date");
+            }
+            if let Some(obj) = entry.as_object_mut() {
+                obj.remove("sample_stats");
             }
         }
     }
@@ -142,4 +188,77 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_for_diff_ignores_sample_stats_changes() {
+        let a = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live",
+                "sample_stats": {
+                    "total": 10,
+                    "delayed": 2,
+                    "cancelled": 0,
+                    "avg_delay_minutes": 1.5
+                }
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:01:00Z"},
+                "data_quality": "live",
+                "sample_stats": {
+                    "total": 11,
+                    "delayed": 5,
+                    "cancelled": 1,
+                    "avg_delay_minutes": 4.2
+                }
+            }
+        ]);
+
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_for_diff_still_detects_real_changes() {
+        let a = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live",
+                "sample_stats": {
+                    "total": 10,
+                    "delayed": 2,
+                    "cancelled": 0,
+                    "avg_delay_minutes": 1.5
+                }
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "minor-delays",
+                "reason": "Minor delays",
+                "validity": {"from_date": "2026-07-09T10:01:00Z"},
+                "data_quality": "live",
+                "sample_stats": {
+                    "total": 10,
+                    "delayed": 2,
+                    "cancelled": 0,
+                    "avg_delay_minutes": 1.5
+                }
+            }
+        ]);
+
+        assert_ne!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
 }
