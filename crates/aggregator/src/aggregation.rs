@@ -226,7 +226,7 @@ fn compute_sample_stats(
     let line_stations: HashSet<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
     let skipped = relevant
         .iter()
-        .filter(|d| d.skipped_stations.iter().any(|crs| line_stations.contains(crs.as_str())))
+        .filter(|d| !d.is_cancelled && d.skipped_stations.iter().any(|crs| line_stations.contains(crs.as_str())))
         .count();
     let running: Vec<&&StationDeparture> = relevant.iter().filter(|d| !d.is_cancelled).collect();
     let avg_delay_minutes = if running.is_empty() {
@@ -709,6 +709,39 @@ mod tests {
         let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
         assert_eq!(status.severity, Severity::GoodService);
         assert_eq!(status.sample_stats.expect("stats").skipped, 0);
+    }
+
+    #[test]
+    fn infer_from_samples_excludes_cancelled_departures_from_skip_count() {
+        // Darwin commonly marks the downstream subsequentCallingPoints of a
+        // wholesale-cancelled service as isCancelled: true too, so a fully
+        // cancelled service can still carry a non-empty skipped_stations
+        // list. That must count towards `cancelled` only, never `skipped` —
+        // skip detection is meant to be an independent signal from
+        // cancellation, not a shadow of it.
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let cancelled_with_skips =
+            StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("AON", 0, true) };
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    cancelled_with_skips,
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                ],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let stats = status.sample_stats.expect("stats");
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.cancelled, 1);
     }
 
     #[test]
