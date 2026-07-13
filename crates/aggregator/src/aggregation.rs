@@ -368,10 +368,7 @@ fn classify(
             ),
         ),
         (Some(d), Some(s)) if d < s => (d, format!("{delayed} of {total} sampled services delayed.")),
-        (Some(_), Some(_)) => (
-            skip_severity.expect("skip_severity is Some in this arm"),
-            format!("{skipped} of {total} sampled services skipping a scheduled stop."),
-        ),
+        (Some(_), Some(s)) => (s, format!("{skipped} of {total} sampled services skipping a scheduled stop.")),
         (Some(d), None) => (d, format!("{delayed} of {total} sampled services delayed.")),
         (None, Some(s)) => (s, format!("{skipped} of {total} sampled services skipping a scheduled stop.")),
         (None, None) => (Severity::GoodService, "Good Service".to_string()),
@@ -723,6 +720,18 @@ mod tests {
         let (severity, reason) = classify(0.0, 0.25, 0.75, &Defaults::default(), 4, 0, 1, 3);
         assert_eq!(severity, Severity::SevereDelays);
         assert!(reason.contains("skipping"), "reason was: {reason}");
+    }
+
+    #[test]
+    fn classify_prefers_delay_when_more_severe_than_skip() {
+        // delay_rate (75%, >= severe_delays_pct 0.50) is more severe than
+        // skip_rate (30%, >= minor_delays_skip_pct 0.25 but < severe_delays_skip_pct
+        // 0.50) -> the overall severity must be the delay candidate's
+        // SevereDelays, not the skip candidate's MinorDelays.
+        let (severity, reason) = classify(0.0, 0.75, 0.30, &Defaults::default(), 4, 0, 3, 1);
+        assert_eq!(severity, Severity::SevereDelays);
+        assert!(reason.contains("delayed"), "reason was: {reason}");
+        assert!(!reason.contains("skipping"), "reason was: {reason}");
     }
 
     #[test]
