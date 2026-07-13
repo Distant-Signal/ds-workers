@@ -13,7 +13,7 @@
 //!    optional pair — `validity_for_output` below picks one period for the
 //!    (still-singular) `LineStatus.validity` field.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use common::{
@@ -223,6 +223,11 @@ fn compute_sample_stats(
         .iter()
         .filter(|d| !d.is_cancelled && d.delay_minutes as i64 >= thresholds.delay_threshold_minutes)
         .count();
+    let line_stations: HashSet<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
+    let skipped = relevant
+        .iter()
+        .filter(|d| d.skipped_stations.iter().any(|crs| line_stations.contains(crs.as_str())))
+        .count();
     let running: Vec<&&StationDeparture> = relevant.iter().filter(|d| !d.is_cancelled).collect();
     let avg_delay_minutes = if running.is_empty() {
         0.0
@@ -230,7 +235,7 @@ fn compute_sample_stats(
         running.iter().map(|d| d.delay_minutes as f64).sum::<f64>() / running.len() as f64
     };
 
-    Some(SampleStats { total, delayed, cancelled, avg_delay_minutes })
+    Some(SampleStats { total, delayed, cancelled, skipped, avg_delay_minutes })
 }
 
 fn infer_from_samples(
@@ -243,9 +248,18 @@ fn infer_from_samples(
 
     let cancel_rate = stats.cancelled as f64 / stats.total as f64;
     let delay_rate = stats.delayed as f64 / stats.total as f64;
+    let skip_rate = stats.skipped as f64 / stats.total as f64;
 
-    let (severity, mut reason) =
-        classify(cancel_rate, delay_rate, &thresholds, stats.total, stats.cancelled, stats.delayed);
+    let (severity, mut reason) = classify(
+        cancel_rate,
+        delay_rate,
+        skip_rate,
+        &thresholds,
+        stats.total,
+        stats.cancelled,
+        stats.delayed,
+        stats.skipped,
+    );
     if severity == Severity::GoodService {
         let mut status = good_service();
         status.sample_stats = Some(stats);
@@ -317,10 +331,12 @@ fn belongs_to_line(dep: &StationDeparture, line: &LineDefinition) -> bool {
 fn classify(
     cancel_rate: f64,
     delay_rate: f64,
+    skip_rate: f64,
     thresholds: &Defaults,
     total: usize,
     cancelled: usize,
     delayed: usize,
+    skipped: usize,
 ) -> (Severity, String) {
     if cancel_rate >= thresholds.part_suspended_pct {
         return (Severity::PartSuspended, format!("{cancelled} of {total} sampled services cancelled."));
@@ -328,13 +344,38 @@ fn classify(
     if cancel_rate >= thresholds.reduced_service_pct {
         return (Severity::ReducedService, format!("{cancelled} of {total} sampled services cancelled."));
     }
-    if delay_rate >= thresholds.severe_delays_pct {
-        return (Severity::SevereDelays, format!("{delayed} of {total} sampled services delayed."));
+
+    let delay_severity = if delay_rate >= thresholds.severe_delays_pct {
+        Some(Severity::SevereDelays)
+    } else if delay_rate >= thresholds.minor_delays_pct {
+        Some(Severity::MinorDelays)
+    } else {
+        None
+    };
+    let skip_severity = if skip_rate >= thresholds.severe_delays_skip_pct {
+        Some(Severity::SevereDelays)
+    } else if skip_rate >= thresholds.minor_delays_skip_pct {
+        Some(Severity::MinorDelays)
+    } else {
+        None
+    };
+
+    match (delay_severity, skip_severity) {
+        (Some(d), Some(s)) if d == s => (
+            d,
+            format!(
+                "{delayed} of {total} sampled services delayed, {skipped} of {total} sampled services skipping a scheduled stop."
+            ),
+        ),
+        (Some(d), Some(s)) if d < s => (d, format!("{delayed} of {total} sampled services delayed.")),
+        (Some(_), Some(_)) => (
+            skip_severity.expect("skip_severity is Some in this arm"),
+            format!("{skipped} of {total} sampled services skipping a scheduled stop."),
+        ),
+        (Some(d), None) => (d, format!("{delayed} of {total} sampled services delayed.")),
+        (None, Some(s)) => (s, format!("{skipped} of {total} sampled services skipping a scheduled stop.")),
+        (None, None) => (Severity::GoodService, "Good Service".to_string()),
     }
-    if delay_rate >= thresholds.minor_delays_pct {
-        return (Severity::MinorDelays, format!("{delayed} of {total} sampled services delayed."));
-    }
-    (Severity::GoodService, "Good Service".to_string())
 }
 
 fn good_service() -> LineStatus {
@@ -528,6 +569,7 @@ mod tests {
             cancel_reason: if is_cancelled { Some("fault".to_string()) } else { None },
             delay_reason: if !is_cancelled && delay_minutes > 0 { Some("signal failure".to_string()) } else { None },
             headcode: None,
+            skipped_stations: vec![],
         }
     }
 
@@ -595,6 +637,112 @@ mod tests {
         let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
         assert_eq!(status.severity, Severity::SevereDelays);
         assert_eq!(status.data_quality, DataQuality::LdbwsInferred);
+    }
+
+    #[test]
+    fn infer_from_samples_classifies_severe_skip_rate() {
+        // swr-alton.toml: WOK is on the line's full `stations` list (part
+        // of the shared trunk) but is not a sample station or in
+        // destination_crs_filter — proves skip-relevance is checked
+        // against `line.stations`, not the narrower sample/filter lists.
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let skipping = StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("AON", 0, false) };
+        let mut samples = HashMap::new();
+        // 3 of 4 skip WOK -> 75% skip rate, above the default
+        // severe_delays_skip_pct of 0.50, with delay_rate at 0%.
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![skipping.clone(), skipping.clone(), skipping, departure("AON", 0, false)],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        assert_eq!(status.severity, Severity::SevereDelays);
+        assert_eq!(status.data_quality, DataQuality::LdbwsInferred);
+        assert_eq!(status.sample_stats.expect("stats").skipped, 3);
+    }
+
+    #[test]
+    fn infer_from_samples_classifies_minor_skip_rate() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let skipping = StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("AON", 0, false) };
+        let mut samples = HashMap::new();
+        // 1 of 4 skips WOK -> 25% skip rate, exactly at the default
+        // minor_delays_skip_pct of 0.25.
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![skipping, departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        assert_eq!(status.severity, Severity::MinorDelays);
+    }
+
+    #[test]
+    fn infer_from_samples_ignores_skip_of_station_not_on_line() {
+        // "ZZZ" isn't anywhere in swr-alton's `stations` list, so this skip
+        // must not count towards skip_rate at all.
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let skipping_unrelated = StationDeparture { skipped_stations: vec!["ZZZ".to_string()], ..departure("AON", 0, false) };
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    skipping_unrelated.clone(),
+                    skipping_unrelated.clone(),
+                    skipping_unrelated.clone(),
+                    skipping_unrelated,
+                ],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        assert_eq!(status.severity, Severity::GoodService);
+        assert_eq!(status.sample_stats.expect("stats").skipped, 0);
+    }
+
+    #[test]
+    fn classify_prefers_more_severe_of_delay_and_skip_candidates() {
+        // skip_rate (75%, >= severe_delays_skip_pct 0.50) is more severe
+        // than delay_rate (25%, only >= minor_delays_pct 0.25) -> the
+        // overall severity must be the skip candidate's SevereDelays, not
+        // the delay candidate's MinorDelays.
+        let (severity, reason) = classify(0.0, 0.25, 0.75, &Defaults::default(), 4, 0, 1, 3);
+        assert_eq!(severity, Severity::SevereDelays);
+        assert!(reason.contains("skipping"), "reason was: {reason}");
+    }
+
+    #[test]
+    fn classify_combines_reason_when_delay_and_skip_tie() {
+        // Both candidates land on MinorDelays (delay_rate 30% >= 0.25,
+        // skip_rate 30% >= 0.25, neither >= their severe threshold) ->
+        // combined message naming both counts.
+        let (severity, reason) = classify(0.0, 0.30, 0.30, &Defaults::default(), 10, 0, 3, 3);
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(reason.contains("delayed"), "reason was: {reason}");
+        assert!(reason.contains("skipping"), "reason was: {reason}");
+    }
+
+    #[test]
+    fn classify_cancel_rate_still_takes_priority_over_skip_and_delay() {
+        // cancel_rate alone (70%, >= part_suspended_pct 0.60) must win
+        // even though skip_rate and delay_rate would also qualify for a
+        // milder tier on their own.
+        let (severity, _) = classify(0.70, 0.75, 0.75, &Defaults::default(), 10, 7, 7, 7);
+        assert_eq!(severity, Severity::PartSuspended);
     }
 
     #[test]
