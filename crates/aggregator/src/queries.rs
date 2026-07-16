@@ -6,14 +6,26 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use common::{IncidentMessage, LineStatusReport, StationSample};
 use sqlx::{PgPool, Row};
 
-pub async fn load_incidents(pool: &PgPool) -> Result<Vec<IncidentMessage>> {
+/// One incident loaded from the `incidents` table for this aggregation
+/// cycle, paired with our own `first_seen_at` clock. Deliberately not part
+/// of `common::IncidentMessage` -- the wire type pollers/the API share --
+/// since `first_seen_at` is a fact only this crate's staleness check cares
+/// about. See docs/superpowers/specs/2026-07-16-stale-incident-handling-design.md.
+pub struct LoadedIncident {
+    pub message: IncidentMessage,
+    pub first_seen_at: DateTime<Utc>,
+}
+
+pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
-                priority, validity_periods, is_planned, is_cleared \
-         FROM incidents",
+                priority, validity_periods, is_planned, is_cleared, first_seen_at \
+         FROM incidents \
+         WHERE NOT is_cleared",
     )
     .fetch_all(pool)
     .await?;
@@ -21,7 +33,7 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<IncidentMessage>> {
     rows.into_iter()
         .map(|row| {
             let validity_json: serde_json::Value = row.try_get("validity_periods")?;
-            Ok(IncidentMessage {
+            let message = IncidentMessage {
                 incident_id: row.try_get("incident_id")?,
                 summary: row.try_get("summary")?,
                 description: row.try_get("description")?,
@@ -31,7 +43,8 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<IncidentMessage>> {
                 validity: serde_json::from_value(validity_json)?,
                 is_planned: row.try_get("is_planned")?,
                 is_cleared: row.try_get("is_cleared")?,
-            })
+            };
+            Ok(LoadedIncident { message, first_seen_at: row.try_get("first_seen_at")? })
         })
         .collect()
 }
@@ -193,6 +206,38 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                load_incidents_excludes_cleared_rows -- --ignored` against docker compose's postgres"]
+    async fn load_incidents_excludes_cleared_rows() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+
+        sqlx::query(
+            "INSERT INTO incidents \
+                (incident_id, summary, description, operators, affected_stations, priority, validity_periods, is_planned, is_cleared) \
+             VALUES \
+                ('TEST-ACTIVE', 'active', 'active incident', '{}', '{}', 0, '[]', false, false), \
+                ('TEST-CLEARED', 'cleared', 'cleared incident', '{}', '{}', 0, '[]', false, true) \
+             ON CONFLICT (incident_id) DO UPDATE SET is_cleared = EXCLUDED.is_cleared",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        let loaded = load_incidents(&pool).await.expect("load_incidents");
+        let ids: Vec<&str> = loaded.iter().map(|i| i.message.incident_id.as_str()).collect();
+
+        sqlx::query("DELETE FROM incidents WHERE incident_id IN ('TEST-ACTIVE', 'TEST-CLEARED')")
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture rows");
+
+        assert!(ids.contains(&"TEST-ACTIVE"), "non-cleared incident should be loaded");
+        assert!(!ids.contains(&"TEST-CLEARED"), "cleared incident should be excluded");
+    }
 
     #[test]
     fn normalize_for_diff_ignores_sample_stats_changes() {

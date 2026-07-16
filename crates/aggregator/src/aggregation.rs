@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use common::{
     AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition,
     LineStatus, LineStatusReport, SampleStats, Severity, StationDeparture, StationSample,
@@ -23,6 +23,7 @@ use common::{
 };
 
 use crate::matcher::{Match, MatchScope, lines_affected_by};
+use crate::queries::LoadedIncident;
 use crate::segments::SegmentRegistry;
 
 /// Merges DB-stored custom lines into the static catalogue, converting
@@ -44,7 +45,7 @@ pub fn merge_custom_lines(
 
 pub fn aggregate(
     lines: &HashMap<String, LineDefinition>,
-    incidents: &[IncidentMessage],
+    incidents: &[LoadedIncident],
     samples: &HashMap<String, StationSample>,
     registry: &SegmentRegistry,
     defaults: &Defaults,
@@ -65,10 +66,14 @@ pub fn aggregate(
         })
         .collect();
 
-    // Layer 1: incidents.
-    for incident in incidents {
-        for m in lines_affected_by(incident, lines, registry) {
-            let status = status_from_incident(&m, incident);
+    // Layer 1: incidents. Filtered through `is_active` first -- a cleared,
+    // temporally-expired, or stale-past-the-rail-day-cutoff incident never
+    // reaches the matcher, so its line falls through to Layer 2 exactly as
+    // if the incident didn't exist.
+    let now = Utc::now();
+    for loaded in incidents.iter().filter(|loaded| is_active(&loaded.message, loaded.first_seen_at, now)) {
+        for m in lines_affected_by(&loaded.message, lines, registry) {
+            let status = status_from_incident(&m, &loaded.message);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
         }
     }
@@ -140,9 +145,61 @@ fn validity_for_output(periods: &[ValidityPeriod]) -> ValidityPeriod {
     let now = Utc::now();
     periods
         .iter()
-        .find(|p| p.from_date <= now && p.to_date.map(|to| to > now).unwrap_or(true))
+        .find(|p| period_covers_now(p, now))
         .cloned()
         .unwrap_or_else(|| periods[0].clone())
+}
+
+/// The next UK rail "traffic day" boundary after `first_seen_at` -- 02:00
+/// Europe/London, per Network Rail's timetable convention (a traffic day
+/// runs 02:00-01:59, not a midnight-to-midnight calendar day). If
+/// `first_seen_at`'s local time-of-day is before 02:00, it belongs to the
+/// previous calendar day's rail day, so the boundary is that same calendar
+/// day's 02:00; otherwise it's the next calendar day's 02:00.
+///
+/// UK clocks change exactly at the 01:00/02:00 boundary in both directions
+/// (spring: 01:00 GMT -> 02:00 BST; autumn: 02:00 BST -> 01:00 GMT), so
+/// local 02:00 itself is never ambiguous or missing on a transition day --
+/// only 01:00-01:59 is. `LocalResult::Single` is therefore the only case
+/// expected for real UK dates; anything else is treated as a defensive
+/// failure rather than left to a confusing bare-unwrap panic.
+fn next_rail_day_boundary(first_seen_at: DateTime<Utc>) -> DateTime<Utc> {
+    let local = first_seen_at.with_timezone(&chrono_tz::Europe::London);
+    let boundary_time = NaiveTime::from_hms_opt(2, 0, 0).expect("2:00:00 is a valid time");
+
+    let boundary_date = if local.time() < boundary_time {
+        local.date_naive()
+    } else {
+        local.date_naive() + Duration::days(1)
+    };
+    let boundary_naive = boundary_date.and_time(boundary_time);
+
+    match chrono_tz::Europe::London.from_local_datetime(&boundary_naive) {
+        chrono::LocalResult::Single(dt) => dt.with_timezone(&Utc),
+        other => panic!(
+            "unexpected {other:?} resolving rail-day boundary {boundary_naive} in Europe/London; \
+             02:00 local should never be ambiguous or missing"
+        ),
+    }
+}
+
+/// Whether `period` covers the instant `now`. Shared by `validity_for_output`
+/// (picks which period to *display*) and `is_active` (decides whether an
+/// incident is included at all) so the "is this period active" condition
+/// has one definition, not two.
+fn period_covers_now(period: &ValidityPeriod, now: DateTime<Utc>) -> bool {
+    period.from_date <= now && period.to_date.map(|to| to > now).unwrap_or(true)
+}
+
+/// Whether an incident should still contribute a `LineStatus` to any line
+/// it matches. `is_cleared` isn't rechecked here -- `queries::load_incidents`
+/// already excludes cleared rows at the SQL layer, so by the time an
+/// incident reaches this function it's already known not to be cleared.
+fn is_active(incident: &IncidentMessage, first_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let validity_ok = incident.validity.is_empty()
+        || incident.validity.iter().any(|p| period_covers_now(p, now));
+    let age_ok = incident.is_planned || now < next_rail_day_boundary(first_seen_at);
+    validity_ok && age_ok
 }
 
 fn severity_from_incident(incident: &IncidentMessage) -> Severity {
@@ -434,7 +491,12 @@ mod tests {
     ) -> HashMap<String, LineStatusReport> {
         let registry = SegmentRegistry::new(lines);
         let defaults = Defaults::default();
-        aggregate(lines, incidents, &HashMap::new(), &registry, &defaults)
+        let loaded: Vec<LoadedIncident> = incidents
+            .iter()
+            .cloned()
+            .map(|message| LoadedIncident { message, first_seen_at: Utc::now() })
+            .collect();
+        aggregate(lines, &loaded, &HashMap::new(), &registry, &defaults)
     }
 
     #[test]
@@ -879,7 +941,8 @@ mod tests {
                 ],
             },
         );
-        let reports = aggregate(&lines, &[inc], &samples, &registry, &defaults);
+        let loaded = LoadedIncident { message: inc, first_seen_at: Utc::now() };
+        let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
         let alton = &reports["swr-alton"];
         assert_eq!(
             alton.worst_severity(),
@@ -912,5 +975,189 @@ mod tests {
         assert!(merged.contains_key("swr-alton"));
         assert_eq!(merged["custom-my-commute"].name, "My Commute");
         assert_eq!(merged["custom-my-commute"].category, "custom");
+    }
+
+    #[test]
+    fn next_rail_day_boundary_on_a_plain_midweek_day() {
+        // 2026-07-15 13:00 UTC is 14:00 BST (July is daylight saving) --
+        // still well before that rail day's 02:00-the-next-day end, so the
+        // boundary is 2026-07-16 02:00 BST = 2026-07-16 01:00 UTC.
+        let first_seen_at: DateTime<Utc> = "2026-07-15T13:00:00Z".parse().unwrap();
+        let boundary = next_rail_day_boundary(first_seen_at);
+        assert_eq!(boundary, "2026-07-16T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn next_rail_day_boundary_just_before_local_0200_stays_in_the_earlier_rail_day() {
+        // 2026-07-16 00:30 UTC is 01:30 BST -- still inside the rail day
+        // that started 2026-07-15 02:00 BST, so the boundary is only 30
+        // local minutes away: 2026-07-16 02:00 BST = 2026-07-16 01:00 UTC.
+        let first_seen_at: DateTime<Utc> = "2026-07-16T00:30:00Z".parse().unwrap();
+        let boundary = next_rail_day_boundary(first_seen_at);
+        assert_eq!(boundary, "2026-07-16T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn next_rail_day_boundary_just_after_local_0200_rolls_to_the_next_rail_day() {
+        // 2026-07-16 01:05 UTC is 02:05 BST -- just past that day's 02:00,
+        // so it belongs to the rail day that just started, and the next
+        // boundary is a full rail day away: 2026-07-17 02:00 BST = 01:00 UTC.
+        let first_seen_at: DateTime<Utc> = "2026-07-16T01:05:00Z".parse().unwrap();
+        let boundary = next_rail_day_boundary(first_seen_at);
+        assert_eq!(boundary, "2026-07-17T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn next_rail_day_boundary_across_the_spring_forward_transition() {
+        // UK clocks spring forward at 01:00 UTC on the last Sunday in March
+        // (2026-03-29), jumping local time from 01:00 GMT straight to 02:00
+        // BST. 2026-03-29 00:30 UTC is *before* that jump, so local time is
+        // still 00:30 GMT -- before that day's local 02:00, so the boundary
+        // is that same day's 02:00, which (having just jumped) is already
+        // BST: 2026-03-29 02:00 BST = 2026-03-29 01:00 UTC.
+        let first_seen_at: DateTime<Utc> = "2026-03-29T00:30:00Z".parse().unwrap();
+        let boundary = next_rail_day_boundary(first_seen_at);
+        assert_eq!(boundary, "2026-03-29T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn next_rail_day_boundary_across_the_autumn_fallback_transition() {
+        // UK clocks fall back at 02:00 BST -> 01:00 GMT on the last Sunday
+        // in October (2026-10-25). 2026-10-25 00:30 UTC is 01:30 BST --
+        // before that day's local 02:00, which (after the fallback
+        // completes) resolves as GMT -- so the boundary is 2026-10-25
+        // 02:00 GMT = 2026-10-25 02:00 UTC.
+        let first_seen_at: DateTime<Utc> = "2026-10-25T00:30:00Z".parse().unwrap();
+        let boundary = next_rail_day_boundary(first_seen_at);
+        assert_eq!(boundary, "2026-10-25T02:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn period_covers_now_true_when_now_falls_inside_the_period() {
+        let now = Utc::now();
+        let period = ValidityPeriod { from_date: now - Duration::hours(1), to_date: Some(now + Duration::hours(1)), is_now: true };
+        assert!(period_covers_now(&period, now));
+    }
+
+    #[test]
+    fn period_covers_now_false_once_to_date_has_passed() {
+        let now = Utc::now();
+        let period = ValidityPeriod { from_date: now - Duration::days(2), to_date: Some(now - Duration::days(1)), is_now: false };
+        assert!(!period_covers_now(&period, now));
+    }
+
+    #[test]
+    fn is_active_true_for_fresh_incident_with_no_validity_periods() {
+        let inc = incident("T1", "Delay", "Delay description", &[], &[]);
+        let now = Utc::now();
+        assert!(is_active(&inc, now, now));
+    }
+
+    #[test]
+    fn is_active_false_when_the_only_validity_period_has_elapsed() {
+        let mut inc = incident("T2", "Delay", "Delay description", &[], &[]);
+        let now = Utc::now();
+        inc.validity = vec![ValidityPeriod {
+            from_date: now - Duration::days(2),
+            to_date: Some(now - Duration::days(1)),
+            is_now: false,
+        }];
+        assert!(!is_active(&inc, now - Duration::days(2), now));
+    }
+
+    #[test]
+    fn is_active_true_when_a_validity_period_covers_now() {
+        let mut inc = incident("T3", "Delay", "Delay description", &[], &[]);
+        let now = Utc::now();
+        inc.validity = vec![ValidityPeriod { from_date: now - Duration::hours(1), to_date: None, is_now: true }];
+        assert!(is_active(&inc, now - Duration::hours(1), now));
+    }
+
+    #[test]
+    fn is_active_false_for_non_planned_incident_aged_past_the_rail_day_boundary() {
+        let inc = incident("T4", "Delay", "Delay description", &[], &[]);
+        let now = Utc::now();
+        let first_seen_at = now - Duration::days(2);
+        assert!(!is_active(&inc, first_seen_at, now));
+    }
+
+    #[test]
+    fn is_active_true_for_planned_incident_aged_past_the_rail_day_boundary() {
+        let mut inc = incident("T5", "Engineering work", "Planned engineering work", &[], &[]);
+        inc.is_planned = true;
+        let now = Utc::now();
+        let first_seen_at = now - Duration::days(2);
+        assert!(is_active(&inc, first_seen_at, now));
+    }
+
+    #[test]
+    fn is_active_true_when_one_of_several_validity_periods_covers_now() {
+        // Real Knowledgebase incidents can carry more than one validity
+        // window; the first is already over, the second is current.
+        let mut inc = incident("T6", "Delay", "Delay description", &[], &[]);
+        let now = Utc::now();
+        inc.validity = vec![
+            ValidityPeriod { from_date: now - Duration::days(2), to_date: Some(now - Duration::days(1)), is_now: false },
+            ValidityPeriod { from_date: now - Duration::hours(1), to_date: None, is_now: true },
+        ];
+        assert!(is_active(&inc, now, now));
+    }
+
+    #[test]
+    fn is_active_false_for_planned_incident_whose_validity_has_expired() {
+        // is_planned only exempts the rail-day age cutoff, not the
+        // validity-window check -- a planned closure whose own stated
+        // window has already ended should still be excluded, the same as
+        // any other incident with expired validity.
+        let mut inc = incident("T7", "Engineering work", "Planned engineering work", &[], &[]);
+        inc.is_planned = true;
+        let now = Utc::now();
+        inc.validity = vec![ValidityPeriod {
+            from_date: now - Duration::days(2),
+            to_date: Some(now - Duration::days(1)),
+            is_now: false,
+        }];
+        assert!(!is_active(&inc, now - Duration::days(2), now));
+    }
+
+    #[test]
+    fn stale_non_planned_incident_falls_back_to_good_service() {
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-STALE",
+            "Signal failure at Woking",
+            "Residual delays continue.",
+            &["SW"],
+            &["WOK"],
+        );
+        let registry = SegmentRegistry::new(&lines);
+        let defaults = Defaults::default();
+        let loaded = LoadedIncident { message: inc, first_seen_at: Utc::now() - Duration::days(5) };
+        let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
+        for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
+            assert_eq!(
+                reports[line_id].worst_severity(),
+                Severity::GoodService,
+                "{line_id} should fall back to Good Service once the incident is stale"
+            );
+        }
+    }
+
+    #[test]
+    fn planned_work_is_exempt_from_the_rail_day_cutoff() {
+        let lines = load_all_lines();
+        let mut inc = incident(
+            "SWR-PLANNED",
+            "Engineering work at Woking",
+            "Planned engineering work.",
+            &["SW"],
+            &["WOK"],
+        );
+        inc.is_planned = true;
+        let registry = SegmentRegistry::new(&lines);
+        let defaults = Defaults::default();
+        let loaded = LoadedIncident { message: inc, first_seen_at: Utc::now() - Duration::days(5) };
+        let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
+        assert_eq!(reports["swr-alton"].worst_severity(), Severity::PlannedClosure);
     }
 }
