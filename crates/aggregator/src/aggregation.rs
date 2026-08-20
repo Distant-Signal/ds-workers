@@ -494,7 +494,14 @@ mod tests {
         let loaded: Vec<LoadedIncident> = incidents
             .iter()
             .cloned()
-            .map(|message| LoadedIncident { message, first_seen_at: Utc::now() })
+            .map(|message| LoadedIncident {
+                message,
+                first_seen_at: Utc::now(),
+                extracted_resolution_status: None,
+                extraction_confidence: None,
+                extracted_schedule_window: None,
+                extracted_eta: None,
+            })
             .collect();
         aggregate(lines, &loaded, &HashMap::new(), &registry, &defaults)
     }
@@ -941,7 +948,14 @@ mod tests {
                 ],
             },
         );
-        let loaded = LoadedIncident { message: inc, first_seen_at: Utc::now() };
+        let loaded = LoadedIncident {
+            message: inc,
+            first_seen_at: Utc::now(),
+            extracted_resolution_status: None,
+            extraction_confidence: None,
+            extracted_schedule_window: None,
+            extracted_eta: None,
+        };
         let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
         let alton = &reports["swr-alton"];
         assert_eq!(
@@ -1132,7 +1146,14 @@ mod tests {
         );
         let registry = SegmentRegistry::new(&lines);
         let defaults = Defaults::default();
-        let loaded = LoadedIncident { message: inc, first_seen_at: Utc::now() - Duration::days(5) };
+        let loaded = LoadedIncident {
+            message: inc,
+            first_seen_at: Utc::now() - Duration::days(5),
+            extracted_resolution_status: None,
+            extraction_confidence: None,
+            extracted_schedule_window: None,
+            extracted_eta: None,
+        };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
         for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
             assert_eq!(
@@ -1156,7 +1177,14 @@ mod tests {
         inc.is_planned = true;
         let registry = SegmentRegistry::new(&lines);
         let defaults = Defaults::default();
-        let loaded = LoadedIncident { message: inc, first_seen_at: Utc::now() - Duration::days(5) };
+        let loaded = LoadedIncident {
+            message: inc,
+            first_seen_at: Utc::now() - Duration::days(5),
+            extracted_resolution_status: None,
+            extraction_confidence: None,
+            extracted_schedule_window: None,
+            extracted_eta: None,
+        };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
         assert_eq!(reports["swr-alton"].worst_severity(), Severity::PlannedClosure);
     }

@@ -18,12 +18,18 @@ use sqlx::{PgPool, Row};
 pub struct LoadedIncident {
     pub message: IncidentMessage,
     pub first_seen_at: DateTime<Utc>,
+    pub extracted_resolution_status: Option<String>,
+    pub extraction_confidence: Option<String>,
+    pub extracted_schedule_window: Option<serde_json::Value>,
+    pub extracted_eta: Option<DateTime<Utc>>,
 }
 
 pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
-                priority, validity_periods, is_planned, is_cleared, first_seen_at \
+                priority, validity_periods, is_planned, is_cleared, first_seen_at, \
+                extracted_resolution_status, extraction_confidence, \
+                extracted_schedule_window, extracted_eta \
          FROM incidents \
          WHERE NOT is_cleared",
     )
@@ -44,7 +50,14 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
                 is_planned: row.try_get("is_planned")?,
                 is_cleared: row.try_get("is_cleared")?,
             };
-            Ok(LoadedIncident { message, first_seen_at: row.try_get("first_seen_at")? })
+            Ok(LoadedIncident {
+                message,
+                first_seen_at: row.try_get("first_seen_at")?,
+                extracted_resolution_status: row.try_get("extracted_resolution_status")?,
+                extraction_confidence: row.try_get("extraction_confidence")?,
+                extracted_schedule_window: row.try_get("extracted_schedule_window")?,
+                extracted_eta: row.try_get("extracted_eta")?,
+            })
         })
         .collect()
 }
