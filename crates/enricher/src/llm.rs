@@ -103,6 +103,29 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     including whenever the text doesn't clearly say either way. `schedule_window` and `eta` are null unless \
     the text states them explicitly.";
 
+const ADVERSARIAL_SCHEMA_NAME: &str = "adversarial_resolution_check";
+
+fn adversarial_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "resolution_status": { "type": "string", "enum": ["ongoing", "residual", "resolved"] }
+        },
+        "required": ["resolution_status"]
+    })
+}
+
+const ADVERSARIAL_PROMPT: &str = "You are reviewing a UK National Rail incident report with a specific \
+    job: argue for the most cautious reading. Assume the disruption is still `ongoing` unless the text \
+    gives you clear, explicit, unambiguous evidence otherwise. Do not infer resolution from silence, from \
+    a lack of new updates, or from an optimistic tone -- only from an explicit statement that the issue is \
+    fixed or over.";
+
+#[derive(Deserialize)]
+struct AdversarialExtraction {
+    resolution_status: String,
+}
+
 impl LlmClient {
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
         Self { base_url, api_key, model, http: reqwest::Client::new() }
@@ -147,6 +170,16 @@ impl LlmClient {
         let extraction: PrimaryExtraction = serde_json::from_str(&content)
             .map_err(|err| anyhow::anyhow!("primary extraction returned malformed JSON: {err}"))?;
         Ok(extraction)
+    }
+
+    pub async fn extract_adversarial(&self, summary: &str, description: &str) -> anyhow::Result<String> {
+        let user_content = format!("Summary: {summary}\nDescription: {description}");
+        let content = self
+            .chat_completion(ADVERSARIAL_PROMPT, user_content, ADVERSARIAL_SCHEMA_NAME, adversarial_schema())
+            .await?;
+        let extraction: AdversarialExtraction = serde_json::from_str(&content)
+            .map_err(|err| anyhow::anyhow!("adversarial extraction returned malformed JSON: {err}"))?;
+        Ok(extraction.resolution_status)
     }
 }
 

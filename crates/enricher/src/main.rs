@@ -3,6 +3,7 @@
 //! LLM endpoint. See
 //! docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md.
 
+mod combine;
 mod config;
 mod hash;
 mod llm;
