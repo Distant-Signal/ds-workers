@@ -4,8 +4,7 @@
 //! docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md.
 
 mod config;
-
-use std::time::Duration;
+mod stream;
 
 use clap::Parser;
 use config::Config;
@@ -27,17 +26,29 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let redis_client = redis::Client::open(config.redis_url.clone())?;
-    let _redis = redis_client.get_connection_manager().await?;
+    let mut redis = redis_client.get_connection_manager().await?;
+    stream::ensure_group(&mut redis).await?;
 
-    tracing::info!("enricher connected to postgres and redis; consumer loop and sweep land in later tasks");
+    spawn_sweep_timer(pool.clone(), config.sweep_interval_secs); // implemented in Task 5
 
-    // Placeholder idle loop -- Task 4 replaces this with the real Redis
-    // Streams consumer-group loop, and Task 5 adds the sweep timer
-    // alongside it.
-    let mut interval = tokio::time::interval(Duration::from_secs(config.sweep_interval_secs));
     loop {
-        interval.tick().await;
-        tracing::info!("enricher heartbeat");
-        let _ = &pool;
+        match stream::read_one(&mut redis).await {
+            Ok(Some((entry_id, incident_id))) => {
+                tracing::info!(incident_id, "received text-changed event");
+                // Task 8 replaces this stub with the real two-pass
+                // extraction + DB write.
+                if let Err(err) = stream::ack(&mut redis, &entry_id).await {
+                    tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = ?err, "error reading from incident-text-changed stream");
+            }
+        }
     }
+}
+
+fn spawn_sweep_timer(_pool: sqlx::PgPool, _interval_secs: u64) {
+    // Task 5 fills this in.
 }
