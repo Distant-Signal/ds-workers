@@ -15,12 +15,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Utc};
 use common::{
     AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition,
     LineStatus, LineStatusReport, SampleStats, Severity, StationDeparture, StationSample,
     ValidityPeriod, thresholds_for,
 };
+use serde::Deserialize;
 
 use crate::matcher::{Match, MatchScope, lines_affected_by};
 use crate::queries::LoadedIncident;
@@ -73,7 +74,7 @@ pub fn aggregate(
     let now = Utc::now();
     for loaded in incidents.iter().filter(|loaded| is_active(&loaded.message, loaded.first_seen_at, now)) {
         for m in lines_affected_by(&loaded.message, lines, registry) {
-            let status = status_from_incident(&m, &loaded.message);
+            let status = status_from_incident(&m, loaded);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
         }
     }
@@ -102,9 +103,11 @@ pub fn aggregate(
 
 // --- Incident path ---
 
-fn status_from_incident(m: &Match, incident: &IncidentMessage) -> LineStatus {
+fn status_from_incident(m: &Match, loaded: &LoadedIncident) -> LineStatus {
+    let incident = &loaded.message;
     let base_severity = severity_from_incident(incident);
-    let severity = demote_for_scope(base_severity, m.scope);
+    let (extracted_severity, extraction_annotation) = apply_extraction(base_severity, loaded, Utc::now());
+    let severity = demote_for_scope(extracted_severity, m.scope);
 
     let affected_stations = m.evidence.stations.clone();
     let affected_routes = routes_from_stations(m.line, &affected_stations);
@@ -114,6 +117,9 @@ fn status_from_incident(m: &Match, incident: &IncidentMessage) -> LineStatus {
         MatchScope::SharedSegment => reason.push_str(" (shared trunk — also affects other lines)"),
         MatchScope::OperatorOnly => reason.push_str(" (operator-wide report)"),
         _ => {}
+    }
+    if let Some(annotation) = extraction_annotation {
+        reason.push_str(&format!(" ({annotation})"));
     }
 
     let disruption = Disruption {
@@ -235,6 +241,83 @@ fn demote_for_scope(severity: Severity, scope: MatchScope) -> Severity {
         MatchScope::KeywordOnly => severity.max(Severity::SevereDelays),
         MatchScope::OperatorOnly => severity.max(Severity::MinorDelays),
     }
+}
+
+#[derive(Deserialize)]
+struct ScheduleWindow {
+    days_of_week: Vec<u8>,
+    start_time: String,
+    end_time: String,
+}
+
+/// Whether `now` (converted to Europe/London local time) falls inside
+/// `window`. Handles overnight windows (e.g. 22:00-06:00, where
+/// `start_time > end_time`) by wraparound: "inside" means at or after
+/// `start_time` OR before `end_time`, rather than requiring both.
+fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
+    let local = now.with_timezone(&chrono_tz::Europe::London);
+    let weekday = local.weekday().number_from_monday() as u8; // 1=Monday..7=Sunday
+    if !window.days_of_week.contains(&weekday) {
+        return false;
+    }
+    let Ok(start) = NaiveTime::parse_from_str(&window.start_time, "%H:%M") else { return true };
+    let Ok(end) = NaiveTime::parse_from_str(&window.end_time, "%H:%M") else { return true };
+    let now_time = local.time();
+    if start <= end {
+        now_time >= start && now_time < end
+    } else {
+        now_time >= start || now_time < end
+    }
+}
+
+/// Adjusts `severity` based on NLP-extracted signals, and returns an
+/// optional annotation to append to the status's `reason` text. Runs
+/// between `severity_from_incident` and `demote_for_scope` in
+/// `status_from_incident`. Can only demote (raise the numeric severity,
+/// since lower is worse) or leave `severity` unchanged -- never make it
+/// more severe, and never signals suppression. A missing or
+/// low-confidence extraction is always a no-op: the absence of a signal
+/// must behave identically to this function not existing at all. See
+/// docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md §7.
+fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<Utc>) -> (Severity, Option<String>) {
+    let high_confidence = loaded.extraction_confidence.as_deref() == Some("high");
+
+    if high_confidence {
+        match loaded.extracted_resolution_status.as_deref() {
+            Some("resolved") => {
+                return (
+                    severity.max(Severity::MinorDelays),
+                    Some("reported resolved -- showing residual impact".to_string()),
+                );
+            }
+            Some("residual") => {
+                return (severity.max(Severity::Recovering), Some("reported as residual delays only".to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(window_json) = &loaded.extracted_schedule_window {
+        if let Ok(window) = serde_json::from_value::<ScheduleWindow>(window_json.clone()) {
+            if !now_within_window(&window, now) {
+                return (
+                    severity.max(Severity::MinorDelays),
+                    Some(format!("reported active {}-{} only", window.start_time, window.end_time)),
+                );
+            }
+        }
+    }
+
+    if let Some(eta) = loaded.extracted_eta {
+        if eta < now {
+            return (
+                severity.max(Severity::MinorDelays),
+                Some(format!("expected to end by {}", eta.with_timezone(&chrono_tz::Europe::London).format("%H:%M"))),
+            );
+        }
+    }
+
+    (severity, None)
 }
 
 fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<AffectedRoute> {
@@ -1162,6 +1245,115 @@ mod tests {
                 "{line_id} should fall back to Good Service once the incident is stale"
             );
         }
+    }
+
+    fn loaded_with_extraction(
+        resolution_status: Option<&str>,
+        confidence: Option<&str>,
+        schedule_window: Option<serde_json::Value>,
+        eta: Option<DateTime<Utc>>,
+    ) -> LoadedIncident {
+        LoadedIncident {
+            message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_resolution_status: resolution_status.map(str::to_string),
+            extraction_confidence: confidence.map(str::to_string),
+            extracted_schedule_window: schedule_window,
+            extracted_eta: eta,
+        }
+    }
+
+    #[test]
+    fn apply_extraction_is_a_no_op_with_no_extraction() {
+        let loaded = loaded_with_extraction(None, None, None, None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_ignores_low_confidence_resolved() {
+        let loaded = loaded_with_extraction(Some("resolved"), Some("low"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_demotes_high_confidence_resolved_to_minor_delays() {
+        let loaded = loaded_with_extraction(Some("resolved"), Some("high"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.unwrap().contains("resolved"));
+    }
+
+    #[test]
+    fn apply_extraction_never_demotes_resolved_below_minor_delays() {
+        // "Demote" means push toward a MILDER (higher-ordinal) severity,
+        // never a more severe one. GoodService's ordinal (10) is already
+        // higher/milder than MinorDelays' (9), so `.max(MinorDelays)` must
+        // leave it unchanged, not pull it back down to 9.
+        let loaded = loaded_with_extraction(Some("resolved"), Some("high"), None, None);
+        let (severity, _) = apply_extraction(Severity::GoodService, &loaded, Utc::now());
+        assert_eq!(severity, Severity::GoodService);
+    }
+
+    #[test]
+    fn apply_extraction_demotes_high_confidence_residual_to_recovering() {
+        let loaded = loaded_with_extraction(Some("residual"), Some("high"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Recovering);
+        assert!(annotation.is_some());
+    }
+
+    #[test]
+    fn apply_extraction_ongoing_is_a_no_op() {
+        let loaded = loaded_with_extraction(Some("ongoing"), Some("high"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_demotes_when_now_is_outside_the_schedule_window() {
+        // Window is 22:00-06:00 every day; "now" is fixed at a UTC instant
+        // that's midday in London.
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // 13:00 BST
+        let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
+        let loaded = loaded_with_extraction(None, None, Some(window), None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.is_some());
+    }
+
+    #[test]
+    fn apply_extraction_no_op_when_now_is_inside_an_overnight_schedule_window() {
+        let now: DateTime<Utc> = "2026-06-15T23:00:00Z".parse().unwrap(); // 00:00 BST, inside 22:00-06:00
+        let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
+        let loaded = loaded_with_extraction(None, None, Some(window), None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_demotes_when_eta_has_already_passed() {
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let eta = now - Duration::hours(1);
+        let loaded = loaded_with_extraction(None, None, None, Some(eta));
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.unwrap().contains("expected to end"));
+    }
+
+    #[test]
+    fn apply_extraction_no_op_when_eta_is_in_the_future() {
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let eta = now + Duration::hours(1);
+        let loaded = loaded_with_extraction(None, None, None, Some(eta));
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
     }
 
     #[test]
