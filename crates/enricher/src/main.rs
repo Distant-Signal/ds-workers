@@ -44,12 +44,25 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(sweep_loop(pool.clone(), Arc::clone(&llm), model_version.clone(), config.sweep_interval_secs));
 
+    let reclaim_redis = redis_client.get_connection_manager().await?;
+    tokio::spawn(reclaim_loop(
+        pool.clone(),
+        Arc::clone(&llm),
+        model_version.clone(),
+        reclaim_redis,
+        config.reclaim_interval_secs,
+        config.reclaim_min_idle_secs,
+    ));
+
     loop {
         match stream::read_one(&mut redis).await {
             Ok(Some((entry_id, incident_id))) => {
-                process_incident(&pool, &llm, &model_version, &incident_id).await;
-                if let Err(err) = stream::ack(&mut redis, &entry_id).await {
-                    tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
+                if process_incident(&pool, &llm, &model_version, &incident_id).await {
+                    if let Err(err) = stream::ack(&mut redis, &entry_id).await {
+                        tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
+                    }
+                } else {
+                    tracing::warn!(entry_id, incident_id, "extraction did not complete; leaving entry pending for reclaim");
                 }
             }
             Ok(None) => {}
@@ -107,19 +120,29 @@ async fn sweep_loop(pool: PgPool, llm: Arc<LlmClient>, model_version: String, in
 /// Runs both extraction passes for one incident and writes the result.
 /// Never propagates an error -- a bad response, a timeout, or a schema
 /// mismatch leaves the incident's existing columns untouched (or NULL, if
-/// this is the first attempt) and simply logs, so the next sweep pass
-/// retries it. This is deliberate per the spec: a broken enrichment step
-/// must never be able to take displayed status down with it.
-async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, incident_id: &str) {
+/// this is the first attempt) and simply logs. This is deliberate per the
+/// spec: a broken enrichment step must never be able to take displayed
+/// status down with it.
+///
+/// Returns `true` when the caller should `ack` the stream entry -- a
+/// successful write, or a terminal case with nothing left to retry (the
+/// incident no longer exists) -- and `false` for a transient failure (LLM
+/// call error/timeout, DB error). On `false` the caller leaves the entry
+/// unacked in the consumer group's pending-entries list, so
+/// `stream::claim_stale`'s reclaim loop retries it once it's been idle long
+/// enough, rather than relying on the hourly sweep alone for a failure mode
+/// the sweep wasn't designed to catch quickly (it only re-triggers on a
+/// text or model-version change, not a bare processing failure).
+async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, incident_id: &str) -> bool {
     let text = match queries::fetch_incident_text(pool, incident_id).await {
         Ok(Some(text)) => text,
         Ok(None) => {
             tracing::warn!(incident_id, "incident vanished before extraction ran");
-            return;
+            return true;
         }
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "failed to fetch incident text");
-            return;
+            return false;
         }
     };
     let (summary, description) = text;
@@ -128,7 +151,7 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         Ok(p) => p,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "primary extraction failed");
-            return;
+            return false;
         }
     };
 
@@ -136,7 +159,7 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         Ok(s) => s,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "adversarial extraction failed");
-            return;
+            return false;
         }
     };
 
@@ -145,8 +168,51 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
 
     if let Err(err) = queries::write_extraction(pool, incident_id, &primary, &resolution_status, &confidence, model_version, &text_hash).await {
         tracing::error!(error = ?err, incident_id, "failed to write extraction result");
-        return;
+        return false;
     }
 
     tracing::info!(incident_id, resolution_status, confidence, "extraction written");
+    true
+}
+
+/// Periodically reclaims stream entries stuck in the pending-entries list
+/// (see `stream::claim_stale`) and retries each through `process_incident`,
+/// acking on success and leaving a repeat failure pending for the next
+/// reclaim pass. Runs independently of the stream consumer loop and the
+/// hourly sweep -- this is the debounced retry path for a transient
+/// per-incident failure, distinct from both.
+async fn reclaim_loop(
+    pool: PgPool,
+    llm: Arc<LlmClient>,
+    model_version: String,
+    mut redis: redis::aio::ConnectionManager,
+    interval_secs: u64,
+    min_idle_secs: u64,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let min_idle = Duration::from_secs(min_idle_secs);
+    loop {
+        interval.tick().await;
+        match stream::claim_stale(&mut redis, min_idle).await {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    tracing::info!(count = entries.len(), "reclaimed stale pending entries for retry");
+                }
+                for (entry_id, incident_id) in entries {
+                    if process_incident(&pool, &llm, &model_version, &incident_id).await {
+                        if let Err(err) = stream::ack(&mut redis, &entry_id).await {
+                            tracing::error!(error = ?err, entry_id, "failed to ack reclaimed stream entry");
+                        }
+                    } else {
+                        tracing::warn!(
+                            entry_id,
+                            incident_id,
+                            "reclaimed extraction failed again; will be reclaimed once more after the idle window"
+                        );
+                    }
+                }
+            }
+            Err(err) => tracing::error!(error = ?err, "failed to check for stale pending entries"),
+        }
+    }
 }
