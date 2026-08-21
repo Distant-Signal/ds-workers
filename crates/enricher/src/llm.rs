@@ -168,20 +168,23 @@ struct SeverityAdversarialExtraction {
     apparent_severity: String,
 }
 
-/// Per-request ceiling on an LLM call. reqwest applies NO request timeout by
-/// default, and both callers of this client -- the stream consumer loop and
-/// the hourly sweep -- process incidents strictly serially, so a single hung
-/// endpoint would stall ALL enrichment indefinitely rather than just losing
-/// one incident. 60s is generous for a two-field structured extraction over
-/// a short incident summary while still bounding the damage; a timed-out
-/// request surfaces as an ordinary `Err`, which `process_incident` already
-/// logs and moves past, leaving the incident for the next sweep.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+// `request_timeout` (below) is the per-request ceiling on an LLM call,
+// configured via `Config::llm_request_timeout_secs` (see `config.rs`) --
+// reqwest applies NO request timeout by default, and both callers of this
+// client -- the stream consumer loop and the hourly sweep -- process
+// incidents strictly serially, so a single hung endpoint would stall ALL
+// enrichment indefinitely rather than just losing one incident.
+// Configurable rather than fixed because real self-hosted endpoints vary
+// widely in latency (a small local model on modest hardware, a remote
+// tunnel, load from other callers) -- a fixed 60s was observed too tight
+// against a real remote server. A timed-out request surfaces as an
+// ordinary `Err`, which `process_incident` already logs and moves past;
+// `main.rs`'s reclaim loop retries it once it's been idle long enough.
 
 impl LlmClient {
-    pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
+    pub fn new(base_url: String, api_key: Option<String>, model: String, request_timeout: std::time::Duration) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout)
             .build()
             // Only fails if the TLS backend can't initialize, which would
             // break every request anyway -- there is no useful degraded mode.
@@ -257,6 +260,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     #[tokio::test]
     async fn extract_primary_parses_a_well_formed_response() {
         let server = MockServer::start().await;
@@ -278,7 +283,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string());
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
         let result = client.extract_primary("Signal failure at Reading", "Now resolved").await.unwrap();
 
         assert_eq!(result.category, "signal_failure");
@@ -313,7 +318,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string());
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
         let result = client
             .extract_primary("Rail replacement buses", "Nightly 22:00-06:00")
             .await
@@ -340,7 +345,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string());
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
         let result = client.extract_severity_adversarial("Delays", "Minor knock-on delays").await.unwrap();
 
         assert_eq!(result, "moderate_disruption");
@@ -357,7 +362,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string());
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
         let result = client.extract_primary("Signal failure", "Delays").await;
 
         assert!(result.is_err(), "malformed content must be rejected, not silently stored");

@@ -39,7 +39,12 @@ async fn main() -> anyhow::Result<()> {
     let mut redis = redis_client.get_connection_manager().await?;
     stream::ensure_group(&mut redis).await?;
 
-    let llm = Arc::new(LlmClient::new(config.llm_base_url.clone(), config.llm_api_key.clone(), config.llm_model.clone()));
+    let llm = Arc::new(LlmClient::new(
+        config.llm_base_url.clone(),
+        config.llm_api_key.clone(),
+        config.llm_model.clone(),
+        Duration::from_secs(config.llm_request_timeout_secs),
+    ));
     let model_version = config.llm_model.clone();
 
     tokio::spawn(sweep_loop(pool.clone(), Arc::clone(&llm), model_version.clone(), config.sweep_interval_secs));
