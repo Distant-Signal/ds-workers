@@ -255,6 +255,15 @@ struct ScheduleWindow {
 /// `start_time > end_time`) by wraparound: "inside" means at or after
 /// `start_time` OR before `end_time`, rather than requiring both.
 fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
+    // An empty `days_of_week` is degenerate/malformed extraction data (the
+    // enricher's JSON schema permits it -- no `minItems` constraint), not a
+    // meaningful "never active" signal. Matching the fail-safe direction
+    // used two checks below for unparsable times: malformed extraction data
+    // must never be able to manufacture a demotion, so treat it as "inside
+    // the window" (no demotion) rather than "every day is outside it".
+    if window.days_of_week.is_empty() {
+        return true;
+    }
     let local = now.with_timezone(&chrono_tz::Europe::London);
     let weekday = local.weekday().number_from_monday() as u8; // 1=Monday..7=Sunday
     if !window.days_of_week.contains(&weekday) {
@@ -277,21 +286,31 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
 /// since lower is worse) or leave `severity` unchanged -- never make it
 /// more severe, and never signals suppression. A missing or
 /// low-confidence extraction is always a no-op: the absence of a signal
-/// must behave identically to this function not existing at all. See
+/// must behave identically to this function not existing at all.
+///
+/// Rows fire independently rather than as an if/else chain (an `ongoing`
+/// incident can still be demoted by a schedule-window or ETA check), and
+/// when multiple rows fire at once, the spec calls for taking "the most
+/// severe (lowest-numbered) resulting severity, then apply[ing] the
+/// corresponding annotation(s)" -- so every firing row's floor is
+/// collected, the most severe (lowest-ordinal) floor among them is the one
+/// `severity` is capped against, and every firing row's annotation is kept
+/// (not just the first one to fire). See
 /// docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md §7.
 fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<Utc>) -> (Severity, Option<String>) {
-    let high_confidence = loaded.extraction_confidence.as_deref() == Some("high");
+    let mut floors: Vec<Severity> = Vec::new();
+    let mut annotations: Vec<String> = Vec::new();
 
+    let high_confidence = loaded.extraction_confidence.as_deref() == Some("high");
     if high_confidence {
         match loaded.extracted_resolution_status.as_deref() {
             Some("resolved") => {
-                return (
-                    severity.max(Severity::MinorDelays),
-                    Some("reported resolved -- showing residual impact".to_string()),
-                );
+                floors.push(Severity::MinorDelays);
+                annotations.push("reported resolved -- showing residual impact".to_string());
             }
             Some("residual") => {
-                return (severity.max(Severity::Recovering), Some("reported as residual delays only".to_string()));
+                floors.push(Severity::Recovering);
+                annotations.push("reported as residual delays only".to_string());
             }
             _ => {}
         }
@@ -300,24 +319,34 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
     if let Some(window_json) = &loaded.extracted_schedule_window {
         if let Ok(window) = serde_json::from_value::<ScheduleWindow>(window_json.clone()) {
             if !now_within_window(&window, now) {
-                return (
-                    severity.max(Severity::MinorDelays),
-                    Some(format!("reported active {}-{} only", window.start_time, window.end_time)),
-                );
+                floors.push(Severity::MinorDelays);
+                annotations.push(format!("reported active {}-{} only", window.start_time, window.end_time));
             }
         }
     }
 
     if let Some(eta) = loaded.extracted_eta {
         if eta < now {
-            return (
-                severity.max(Severity::MinorDelays),
-                Some(format!("expected to end by {}", eta.with_timezone(&chrono_tz::Europe::London).format("%H:%M"))),
-            );
+            floors.push(Severity::MinorDelays);
+            annotations.push(format!(
+                "expected to end by {}",
+                eta.with_timezone(&chrono_tz::Europe::London).format("%H:%M")
+            ));
         }
     }
 
-    (severity, None)
+    // `Severity`'s `Ord` mirrors its discriminants, where lower is more
+    // severe, so the minimum of the firing floors is the "most severe
+    // (lowest-numbered)" one the spec calls for. `severity.max(floor)` is
+    // monotonic non-decreasing in `floor`, so capping against the single
+    // most severe floor is equivalent to (and simpler than) computing
+    // `severity.max(floor)` per row and taking the most severe of those
+    // results.
+    let Some(&binding_floor) = floors.iter().min() else {
+        return (severity, None);
+    };
+
+    (severity.max(binding_floor), Some(annotations.join("; ")))
 }
 
 fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<AffectedRoute> {
@@ -1351,6 +1380,39 @@ mod tests {
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
         let eta = now + Duration::hours(1);
         let loaded = loaded_with_extraction(None, None, None, Some(eta));
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_combines_multiple_firing_rows_taking_the_most_severe_floor() {
+        // Two rows fire at once: high-confidence "residual" (floor
+        // Recovering, ordinal 20) and an out-of-window schedule (floor
+        // MinorDelays, ordinal 9). Per spec §7, "take the most severe
+        // (lowest-numbered) resulting severity" -- MinorDelays (9) is more
+        // severe than Recovering (20), so the combined result must be
+        // MinorDelays, not Recovering from the resolution-status row alone.
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // 13:00 BST
+        let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
+        let loaded = loaded_with_extraction(Some("residual"), Some("high"), Some(window), None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::MinorDelays);
+        let annotation = annotation.unwrap();
+        assert!(annotation.contains("residual"), "annotation was: {annotation}");
+        assert!(annotation.contains("22:00"), "annotation was: {annotation}");
+    }
+
+    #[test]
+    fn apply_extraction_no_op_when_schedule_window_days_of_week_is_empty() {
+        // An empty days_of_week is malformed/degenerate extraction data
+        // (the enricher's JSON schema allows it -- no minItems constraint),
+        // not a meaningful "active on no day" signal. Must fail safe the
+        // same direction as an unparsable start_time/end_time: never
+        // manufacture a demotion out of malformed data.
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let window = serde_json::json!({ "days_of_week": [], "start_time": "22:00", "end_time": "06:00" });
+        let loaded = loaded_with_extraction(None, None, Some(window), None);
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::Suspended);
         assert_eq!(annotation, None);
