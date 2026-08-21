@@ -139,8 +139,8 @@ async fn sweep_loop(pool: PgPool, llm: Arc<LlmClient>, model_version: String, in
 /// the sweep wasn't designed to catch quickly (it only re-triggers on a
 /// text or model-version change, not a bare processing failure).
 async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, incident_id: &str) -> bool {
-    let text = match queries::fetch_incident_text(pool, incident_id).await {
-        Ok(Some(text)) => text,
+    let state = match queries::fetch_incident_state(pool, incident_id).await {
+        Ok(Some(state)) => state,
         Ok(None) => {
             tracing::warn!(incident_id, "incident vanished before extraction ran");
             return true;
@@ -150,7 +150,23 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
             return false;
         }
     };
-    let (summary, description) = text;
+    let (summary, description) = (state.summary, state.description);
+    let text_hash = hash::text_hash(&summary, &description);
+
+    // Guards every caller (stream loop, sweep, reclaim) against running the
+    // LLM again over text it already successfully extracted -- e.g. a
+    // successful write whose subsequent XACK failed gets redelivered by
+    // the reclaim loop even though nothing needs re-doing. Each caller
+    // already tries not to enqueue unchanged content (upsert_incidents'
+    // text_changed check, sweep's own hash comparison), but this is the
+    // one place all three paths funnel through, so it's the actual
+    // guarantee rather than three separate best-effort ones.
+    if state.source_text_hash.as_deref() == Some(text_hash.as_str())
+        && state.extraction_model_version.as_deref() == Some(model_version)
+    {
+        tracing::info!(incident_id, "text unchanged since last successful extraction; skipping");
+        return true;
+    }
 
     let primary = match llm.extract_primary(&summary, &description).await {
         Ok(p) => p,
@@ -178,7 +194,6 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
 
     let (resolution_status, confidence) = combine::combine(&primary.resolution_status, &adversarial_status);
     let (severity, severity_confidence) = combine::combine_severity(&primary.apparent_severity, &severity_adversarial);
-    let text_hash = hash::text_hash(&summary, &description);
 
     if let Err(err) = queries::write_extraction(
         pool,

@@ -82,8 +82,10 @@ pub fn aggregate(
     // Layer 2: sample-derived stats. Always computed for every line. Used
     // as the status itself when a line has no incident-derived status
     // (unchanged behavior); attached as supplementary `sample_stats` on top
-    // of the incident-derived status(es) otherwise, never overriding their
-    // severity — incident-reported severity stays authoritative.
+    // of the incident-derived status(es) otherwise, AND (2026-08-21) allowed
+    // to escalate their severity -- never demote it -- when live delay/
+    // cancellation data implies something worse than the incident text
+    // alone accounted for. See `escalate_from_sample_stats`.
     for line in lines.values() {
         let report = reports.get_mut(&line.id).unwrap();
         if report.statuses.is_empty() {
@@ -92,7 +94,13 @@ pub fn aggregate(
             continue;
         }
         if let Some(stats) = compute_sample_stats(line, samples, defaults) {
+            let thresholds = thresholds_for(defaults, &line.severity_overrides);
             for status in &mut report.statuses {
+                let (escalated, annotation) = escalate_from_sample_stats(status.severity, &stats, &thresholds);
+                status.severity = escalated;
+                if let Some(annotation) = annotation {
+                    status.reason.push_str(&format!(" ({annotation})"));
+                }
                 status.sample_stats = Some(stats.clone());
             }
         }
@@ -676,6 +684,36 @@ fn classify(
     }
 }
 
+/// Lets live LDBWS sample stats (average delay, cancellation rate) escalate
+/// an incident-derived status's severity -- never demote it, mirroring
+/// `escalate_from_severity_hint`'s escalate-only shape. Reuses `classify`,
+/// the same thresholds/severity mapping `infer_from_samples` applies when a
+/// line has no incident-derived status at all, so live delay data is held
+/// to one consistent standard regardless of whether an incident also
+/// happens to be reported for the line: a "Minor Delays" incident whose
+/// live samples actually show severe cancellations displays as severe, not
+/// as a footnote under a status that undersells it.
+///
+/// Only escalates on a STRICTLY higher `severity_rank` than the status
+/// already carries, same tie-break rule as the severity-hint escalation --
+/// at an equal or lower rank this is a no-op, so a status already at least
+/// as severe as what the samples imply is left untouched.
+fn escalate_from_sample_stats(severity: Severity, stats: &SampleStats, thresholds: &Defaults) -> (Severity, Option<String>) {
+    if stats.total == 0 {
+        return (severity, None);
+    }
+    let cancel_rate = stats.cancelled as f64 / stats.total as f64;
+    let delay_rate = stats.delayed as f64 / stats.total as f64;
+    let skip_rate = stats.skipped as f64 / stats.total as f64;
+    let (sample_severity, reason) =
+        classify(cancel_rate, delay_rate, skip_rate, thresholds, stats.total, stats.cancelled, stats.delayed, stats.skipped);
+
+    if severity_rank(sample_severity) <= severity_rank(severity) {
+        return (severity, None);
+    }
+    (sample_severity, Some(format!("live samples show: {reason}")))
+}
+
 fn good_service() -> LineStatus {
     LineStatus {
         severity: Severity::GoodService,
@@ -1166,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_stats_are_attached_alongside_an_active_incident_without_changing_severity() {
+    fn sample_stats_escalate_an_incident_status_that_undersells_live_delay_data() {
         let lines = load_all_lines();
         let inc = incident(
             "SWR-5",
@@ -1178,9 +1216,11 @@ mod tests {
         let registry = SegmentRegistry::new(&lines);
         let defaults = Defaults::default();
         let mut samples = HashMap::new();
-        // 4 departures, 3 delayed >= 5 minutes -> would classify as SevereDelays
-        // on its own (75% delay rate, above the 50% severe_delays_pct default),
-        // but the incident's MinorDelays severity must still win.
+        // 4 departures, 3 delayed >= 5 minutes -> classifies as SevereDelays
+        // on its own (75% delay rate, above the 50% severe_delays_pct
+        // default). Live sample data is allowed to escalate an
+        // incident-reported severity that undersells what's actually
+        // happening -- see `escalate_from_sample_stats`.
         samples.insert(
             "AHT".to_string(),
             StationSample {
@@ -1208,8 +1248,8 @@ mod tests {
         let alton = &reports["swr-alton"];
         assert_eq!(
             alton.worst_severity(),
-            Severity::MinorDelays,
-            "incident severity must stay authoritative"
+            Severity::SevereDelays,
+            "live sample data showing severe delays must escalate a status that undersells it"
         );
         let stats = alton.statuses[0]
             .sample_stats
@@ -1218,6 +1258,54 @@ mod tests {
         assert_eq!(stats.total, 4);
         assert_eq!(stats.delayed, 3);
         assert_eq!(stats.cancelled, 0);
+        assert!(alton.statuses[0].reason.contains("live samples show"));
+    }
+
+    #[test]
+    fn sample_stats_never_demote_an_already_more_severe_incident_status() {
+        let lines = load_all_lines();
+        let mut inc = incident(
+            "SWR-6",
+            "Signal failure blocking lines at Alton",
+            "All lines blocked between Alton and Farnham.",
+            &["SW"],
+            &["AON"],
+        );
+        inc.summary = "lines blocked at Alton".to_string(); // matches severity_from_incident's keyword
+        let registry = SegmentRegistry::new(&lines);
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        // Good service by sample data (0/4 delayed, 0/4 cancelled) -- must
+        // never DEMOTE the incident's own severity, only ever escalate.
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                ],
+            },
+        );
+        let loaded = LoadedIncident {
+            message: inc,
+            first_seen_at: Utc::now(),
+            extracted_resolution_status: None,
+            extraction_confidence: None,
+            extracted_schedule_window: None,
+            extracted_eta: None,
+            extracted_severity: None,
+            extracted_severity_confidence: None,
+        };
+        let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
+        assert_eq!(
+            reports["swr-alton"].worst_severity(),
+            Severity::PartSuspended,
+            "good live sample data must never demote a more severe incident-reported status"
+        );
     }
 
     #[test]
