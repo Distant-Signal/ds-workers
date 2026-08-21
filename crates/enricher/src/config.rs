@@ -28,7 +28,14 @@ pub struct Config {
     /// this value. Real self-hosted endpoints vary widely in latency; raise
     /// this if extractions are timing out against a slow/remote server, but
     /// raise `reclaim_min_idle_secs` to match (see its doc comment).
-    #[arg(long, env, default_value_t = 120)]
+    ///
+    /// Raised from 120 to 300 (2026-08-21) after a live eval against a real
+    /// self-hosted endpoint (Ollama, qwen3.5:4b) measured single-call
+    /// latencies of 86-104s for the *flat* single-period case alone -- within
+    /// striking distance of the old 120s default, and multi-period payloads
+    /// (larger prompt/response) push that further. See
+    /// docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md.
+    #[arg(long, env, default_value_t = 300)]
     pub llm_request_timeout_secs: u64,
 
     /// How often the reconciliation sweep runs, independent of the Redis
@@ -48,8 +55,8 @@ pub struct Config {
     /// three extraction calls (each bounded by `llm_request_timeout_secs`)
     /// plus the DB write, so a still-in-flight attempt is never reclaimed
     /// out from under itself -- if you raise `llm_request_timeout_secs`,
-    /// raise this too (default here is set for the default 120s timeout:
-    /// 3 * 120s = 360s worst case, plus headroom).
-    #[arg(long, env, default_value_t = 600)]
+    /// raise this too (default here is set for the default 300s timeout:
+    /// 3 * 300s = 900s worst case, plus headroom).
+    #[arg(long, env, default_value_t = 1000)]
     pub reclaim_min_idle_secs: u64,
 }

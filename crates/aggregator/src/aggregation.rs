@@ -217,32 +217,46 @@ fn is_active(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
     let validity_ok = incident.validity.is_empty()
         || incident.validity.iter().any(|p| period_covers_now(p, now));
     let age_ok = incident.is_planned
-        || has_recurring_schedule(loaded)
+        || has_recurring_schedule(loaded, now)
         || now < next_rail_day_boundary(loaded.first_seen_at);
     validity_ok && age_ok
 }
 
-/// Whether `loaded` carries a high-confidence, successfully-parsed
-/// `extracted_schedule_window` -- evidence of a genuinely recurring,
-/// time-bounded disruption (e.g. nightly rail replacement while a fault is
-/// repaired) rather than the "SWR forgot about it" case the rail-day
-/// cutoff exists to catch. A real-time (non-`is_planned`) incident like
-/// that would otherwise still get evicted by the age cutoff the first time
-/// `now` crosses the next rail-day boundary after `first_seen_at`, even
-/// though it recurs every night for weeks -- so this exempts it from that
-/// cutoff the same way `is_planned` already is, in `is_active` above.
+/// Whether `loaded` carries at least one currently-`Active` period with a
+/// high-confidence, successfully-parsed `schedule_window` -- evidence of a
+/// genuinely recurring, time-bounded disruption (e.g. nightly rail
+/// replacement while a fault is repaired) rather than the "SWR forgot about
+/// it" case the rail-day cutoff exists to catch. A real-time
+/// (non-`is_planned`) incident like that would otherwise still get evicted
+/// by the age cutoff the first time `now` crosses the next rail-day
+/// boundary after `first_seen_at`, even though it recurs every night for
+/// weeks -- so this exempts it from that cutoff the same way `is_planned`
+/// already is, in `is_active` above.
+///
+/// **Filtering to `Active` periods only is load-bearing, not incidental**
+/// (design doc §4): checking any period in the raw array, regardless of
+/// phase, would let an incident whose only recurring-schedule period has
+/// already elapsed keep exempting itself from the rail-day cutoff forever
+/// -- exactly the "SWR forgot about it" failure mode this cutoff exists to
+/// catch. An `Elapsed` period is allowed to contribute its synthetic
+/// demotion floor in `apply_extraction`, but must never be allowed to
+/// contribute a recurring-schedule *exemption* here.
 ///
 /// Malformed or absent schedule-window data does NOT count: unlike
 /// `now_within_window`'s fail-safe direction (bad data must never
 /// manufacture a *demotion*), granting an age-cutoff *exemption* from bad
 /// data would be the unsafe direction here, so this requires an actual
-/// successful parse.
-fn has_recurring_schedule(loaded: &LoadedIncident) -> bool {
-    loaded.extraction_confidence.as_deref() == Some("high")
-        && loaded
-            .extracted_schedule_window
-            .as_ref()
-            .is_some_and(|window| serde_json::from_value::<ScheduleWindow>(window.clone()).is_ok())
+/// successful parse (a period whose `schedule_window` JSON doesn't match
+/// `ScheduleWindow`'s shape fails the whole `extracted_periods` parse via
+/// `parse_periods`, and is therefore excluded along with every other period
+/// on that incident -- the same fail-safe direction, just applied one level
+/// up).
+fn has_recurring_schedule(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
+    parse_periods(loaded).iter().any(|period| {
+        period_phase(period, now) == PeriodPhase::Active
+            && period.resolution_status_confidence == "high"
+            && period.schedule_window.is_some()
+    })
 }
 
 fn severity_from_incident(incident: &IncidentMessage) -> Severity {
@@ -285,6 +299,146 @@ struct ScheduleWindow {
     days_of_week: Vec<u8>,
     start_time: String,
     end_time: String,
+}
+
+/// Mirrors `enricher`'s `DateRange`
+/// (docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md
+/// §1), but keeps `from_date`/`to_date` as raw strings rather than
+/// `DateTime<Utc>`. A `#[derive(Deserialize)]` `DateTime<Utc>` field would
+/// fail the entire `extracted_periods` parse on one malformed date; keeping
+/// them as `String` lets `period_phase` below fail safe to `Active` for
+/// just the one period with an unparseable date instead, matching
+/// `now_within_window`'s existing fail-safe treatment of unparseable
+/// `start_time`/`end_time`.
+#[derive(Deserialize)]
+struct DateRange {
+    from_date: Option<String>,
+    to_date: Option<String>,
+}
+
+/// Mirrors `enricher`'s `ExtractionPeriod` (design doc §1) -- one entry per
+/// distinct period the primary extraction pass segmented an incident's
+/// text into (always >= 1 in a well-formed row; the common single-fact
+/// case is one element with `date_range: None`).
+///
+/// `#[serde(default)]` on the two confidence fields is load-bearing, not
+/// decorative: the primary pass's own JSON schema never sends them (they
+/// only exist once `enricher`'s combination step runs the two adversarial
+/// passes), so without it, deserializing a row written between the primary
+/// pass and the combination step -- or any row shaped by a version this
+/// crate doesn't fully understand -- would hard-fail on a missing-field
+/// error instead of degrading to "no extraction": an empty string never
+/// equals `"high"`, so both confidence gates below fail closed exactly the
+/// same as an absent extraction.
+#[derive(Deserialize)]
+struct ExtractionPeriod {
+    scope_description: Option<String>,
+    date_range: Option<DateRange>,
+    schedule_window: Option<ScheduleWindow>,
+    resolution_status: String,
+    apparent_severity: String,
+    #[serde(default)]
+    resolution_status_confidence: String,
+    #[serde(default)]
+    severity_confidence: String,
+}
+
+/// Whether a period is currently relevant to `now`, and if not, *why* --
+/// see
+/// docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md §4.
+/// Unlike a plain in/out-of-scope boolean, `apply_extraction` needs to tell
+/// an elapsed period (which still contributes a synthetic demotion floor)
+/// apart from one that hasn't started yet (which contributes nothing at
+/// all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodPhase {
+    Active,
+    Elapsed,
+    NotStarted,
+}
+
+/// `None` `date_range` (the common single-fact case), or a `date_range`
+/// that covers `now`, is `Active`. A `to_date` that has already passed is
+/// `Elapsed` -- checked before `from_date`, matching the design doc's
+/// stated precedence. A `from_date` still in the future is `NotStarted`.
+/// A `from_date`/`to_date` string that's present but unparseable fails safe
+/// to `Active` -- NOT `Elapsed` (which would manufacture a demotion out of
+/// bad data) and NOT `NotStarted` (which would silently drop a period that
+/// might genuinely be live right now), mirroring `now_within_window`'s
+/// existing "malformed -> assume inside, no forced outcome" fail-safe
+/// shape.
+fn period_phase(period: &ExtractionPeriod, now: DateTime<Utc>) -> PeriodPhase {
+    let Some(range) = &period.date_range else { return PeriodPhase::Active };
+
+    let parse = |raw: &Option<String>| -> Result<Option<DateTime<Utc>>, ()> {
+        match raw {
+            None => Ok(None),
+            Some(s) => DateTime::parse_from_rfc3339(s)
+                .map(|dt| Some(dt.with_timezone(&Utc)))
+                .map_err(|_| ()),
+        }
+    };
+    let (Ok(from), Ok(to)) = (parse(&range.from_date), parse(&range.to_date)) else {
+        return PeriodPhase::Active;
+    };
+
+    let covers_now = from.is_none_or(|f| f <= now) && to.is_none_or(|t| t > now);
+    if covers_now {
+        return PeriodPhase::Active;
+    }
+    if let Some(to) = to
+        && to <= now
+    {
+        return PeriodPhase::Elapsed;
+    }
+    if let Some(from) = from
+        && from > now
+    {
+        return PeriodPhase::NotStarted;
+    }
+    PeriodPhase::Active
+}
+
+/// Deserializes `loaded.extracted_periods` into `Vec<ExtractionPeriod>`,
+/// treating a missing column or any parse failure (wrong-shaped JSON, a
+/// stale/foreign row, an empty array, ...) identically to "no periods at
+/// all" -- the same fail-safe posture as every other extraction consumer in
+/// this module: malformed or absent data never manufactures a demotion,
+/// escalation, or age-cutoff exemption on its own.
+fn parse_periods(loaded: &LoadedIncident) -> Vec<ExtractionPeriod> {
+    loaded
+        .extracted_periods
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Prefixes `text` with `period.scope_description` when present, per design
+/// doc §4's "platform 2 (...): reported active ..." annotation style --
+/// keeps a multi-period incident's annotations attributable to the
+/// specific period they came from once several are semicolon-joined into
+/// one `reason` string.
+fn scope_qualify(period: &ExtractionPeriod, text: String) -> String {
+    match period.scope_description.as_deref() {
+        Some(scope) if !scope.is_empty() => format!("{scope}: {text}"),
+        _ => text,
+    }
+}
+
+/// The synthetic annotation an `Elapsed` period contributes alongside its
+/// `Severity::MinorDelays` floor -- mirrors the pre-multi-period design's
+/// eta-passed annotation ("expected to end by HH:MM"), reusing the period's
+/// own `date_range.to_date` (exactly the old flat `eta` field, once folded
+/// into a period per design doc §1).
+fn elapsed_annotation(period: &ExtractionPeriod) -> String {
+    let text = period
+        .date_range
+        .as_ref()
+        .and_then(|range| range.to_date.as_deref())
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| format!("expected to end by {}", dt.with_timezone(&chrono_tz::Europe::London).format("%H:%M")))
+        .unwrap_or_else(|| "reported period has ended".to_string());
+    scope_qualify(period, text)
 }
 
 /// Whether `now` (converted to Europe/London local time) falls inside
@@ -348,64 +502,47 @@ fn escalation_ceiling(hint: &str) -> Option<Severity> {
     }
 }
 
-/// Escalation counterpart to `apply_extraction`'s demote-only floors, in
-/// the opposite direction: raises `severity` toward `extracted_severity`'s
-/// mapped ceiling when the text reads as more severe than the regex-based
-/// base classifier (`severity_from_incident`) caught -- e.g. "the lines...
-/// are blocked" doesn't match the literal substring `"lines blocked"`, so
-/// it falls through to the classifier's weakest default. Gated by its OWN
-/// confidence field, `extracted_severity_confidence` -- independent of
-/// `extraction_confidence`, which only covers the demote-only signals (see
-/// the migration's doc comment for why they're kept separate). Escalate-only:
-/// never lowers `severity`, and a missing/low-confidence/unrecognized hint
-/// is always a no-op, mirroring the demote-only floors' one-directional
-/// guarantee. Only escalates on a STRICTLY higher `severity_rank` -- at an
-/// equal or lower rank the regex-derived severity is left untouched, since
-/// (unlike the demote-only floors) there's no established case for
-/// preferring a differently-named severity within the same rank tier here.
-fn escalate_from_severity_hint(severity: Severity, loaded: &LoadedIncident) -> (Severity, Option<String>) {
-    if loaded.extracted_severity_confidence.as_deref() != Some("high") {
-        return (severity, None);
-    }
-    let Some(ceiling) = loaded.extracted_severity.as_deref().and_then(escalation_ceiling) else {
-        return (severity, None);
-    };
-    if severity_rank(ceiling) <= severity_rank(severity) {
-        return (severity, None);
-    }
-    let annotation = format!("reported more severe than automatically classified: {}", ceiling.description().to_lowercase());
-    (ceiling, Some(annotation))
-}
-
 /// Adjusts `severity` based on NLP-extracted signals, and returns an
 /// optional annotation to append to the status's `reason` text. Runs
 /// between `severity_from_incident` and `demote_for_scope` in
-/// `status_from_incident`. First escalates (see `escalate_from_severity_hint`
-/// above), then demotes -- so a "fault fixed, but severe knock-on delays
-/// remain" incident can be escalated by the severity-hint signal and then
-/// correctly re-capped by a resolution-status floor in the same pass,
-/// without the two fighting. A missing or low-confidence extraction is
-/// always a no-op for whichever half of this function it gates: the
-/// absence of a signal must behave identically to that half not existing.
+/// `status_from_incident`.
 ///
-/// CONFIDENCE GATES EVERY SIGNAL WITHIN ITS OWN HALF. The spec (§7 row 1)
-/// and the plan's Global Constraints state, with no carve-out, that a
-/// low-confidence extraction "behaves identically to no extraction at
-/// all" -- so `extraction_confidence`'s check is hoisted to the top of the
-/// demote-only half rather than wrapping only the resolution-status arm,
-/// and a schedule window or ETA extracted with low confidence can no
-/// longer demote on its own. The escalation half has its own, independent
-/// gate (`extracted_severity_confidence`) for the same reason.
+/// Generalized (design doc
+/// docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md §4)
+/// from "one flat set of signals per incident" to "one set of signals per
+/// period, combined across all of an incident's periods". For every
+/// `Active` period this runs the *same* per-row checks the original,
+/// single-period design established (resolved/residual floor,
+/// schedule-window-excludes-now floor, severity-hint escalation ceiling),
+/// scoped with that period's `scope_description` in the annotation text
+/// when present. For every `Elapsed` period it contributes exactly one
+/// synthetic `Severity::MinorDelays` floor and an "expected to end by
+/// HH:MM"-style annotation, regardless of what that period's own
+/// `resolution_status` asserts -- deterministic date arithmetic wins over
+/// the model's textual guess about whether a period that's already over is
+/// "resolved" or still "ongoing". `NotStarted` periods contribute nothing.
 ///
-/// Rows fire independently rather than as an if/else chain (an `ongoing`
-/// incident can still be demoted by a schedule-window or ETA check), and
-/// when multiple rows fire at once, the spec calls for taking "the most
-/// severe (lowest-numbered) resulting severity, then apply[ing] the
-/// corresponding annotation(s)" -- so every firing row's floor is
-/// collected, the most severe floor among them is the one `severity` is
-/// capped against, and every firing row's annotation is kept (not just the
-/// first one to fire). See
-/// docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md §7.
+/// All fired floors/escalations across every `Active`/`Elapsed` period are
+/// combined with the exact same rule the original single-period design
+/// used for its independent demote-only rows -- most severe (highest
+/// `common::severity_rank`) wins, every firing annotation is kept and
+/// joined -- just generalized from "one row per rule" to "one row per
+/// (period, rule) pair". This still runs escalation first (the most severe
+/// firing `apparent_severity` ceiling across `Active` periods, if any
+/// exceeds the base severity's rank) and then caps the result against the
+/// most severe firing demote-only floor, so a "fault fixed, but severe
+/// knock-on delays remain" period can still be escalated and then
+/// correctly re-capped in the same pass, without the two fighting.
+///
+/// CONFIDENCE GATES EVERY SIGNAL WITHIN ITS OWN HALF, per period. A period's
+/// `resolution_status_confidence` gates its resolved/residual/schedule-window
+/// checks *and* its `Elapsed` synthetic floor (matching the original design's
+/// eta-passed rule exactly: an untrustworthy overall extraction shouldn't
+/// demote via any channel, elapsed-floor included); a period's
+/// `severity_confidence` independently gates only its escalation candidate.
+/// A missing or non-"high" confidence value is always a no-op for whichever
+/// half it gates -- the absence of a trustworthy signal must behave
+/// identically to that signal not existing.
 ///
 /// "Most severe" and "demote" are both measured with `common::severity_rank`,
 /// NOT with `Severity`'s discriminant order: `Diverted = 21` and
@@ -414,55 +551,83 @@ fn escalate_from_severity_hint(severity: Severity, loaded: &LoadedIncident) -> (
 /// appending a "reported resolved" annotation -- a passenger shown a severe
 /// status whose own reason text says it is over. See `severity_rank`'s docs.
 fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<Utc>) -> (Severity, Option<String>) {
-    let (severity, escalation_annotation) = escalate_from_severity_hint(severity, loaded);
+    let periods = parse_periods(loaded);
 
-    if loaded.extraction_confidence.as_deref() != Some("high") {
-        return (severity, escalation_annotation);
-    }
+    // Escalation candidates: one per `Active` period at high
+    // `severity_confidence` whose `apparent_severity` maps to a ceiling
+    // strictly more severe than the base `severity`. Combined the same way
+    // as the floors below -- most severe candidate wins. `Elapsed`/
+    // `NotStarted` periods never escalate: once a period is no longer live,
+    // its own severity read is exactly the kind of model claim the
+    // elapsed-floor logic below already distrusts in favor of computed
+    // date arithmetic.
+    let escalation_candidates: Vec<(Severity, String)> = periods
+        .iter()
+        .filter(|period| period_phase(period, now) == PeriodPhase::Active)
+        .filter(|period| period.severity_confidence == "high")
+        .filter_map(|period| {
+            let ceiling = escalation_ceiling(&period.apparent_severity)?;
+            if severity_rank(ceiling) <= severity_rank(severity) {
+                return None;
+            }
+            let annotation = scope_qualify(
+                period,
+                format!("reported more severe than automatically classified: {}", ceiling.description().to_lowercase()),
+            );
+            Some((ceiling, annotation))
+        })
+        .collect();
+
+    let (severity, escalation_annotation) = escalation_candidates
+        .into_iter()
+        .max_by_key(|(ceiling, _)| (severity_rank(*ceiling), std::cmp::Reverse(*ceiling)))
+        .map_or((severity, None), |(ceiling, annotation)| (ceiling, Some(annotation)));
 
     let mut floors: Vec<Severity> = Vec::new();
     let mut annotations: Vec<String> = escalation_annotation.into_iter().collect();
 
-    match loaded.extracted_resolution_status.as_deref() {
-        Some("resolved") => {
-            floors.push(Severity::MinorDelays);
-            annotations.push("reported resolved — showing residual impact".to_string());
-        }
-        Some("residual") => {
-            floors.push(Severity::Recovering);
-            annotations.push("reported as residual delays only".to_string());
-        }
-        _ => {}
-    }
-
-    if let Some(window_json) = &loaded.extracted_schedule_window {
-        if let Ok(window) = serde_json::from_value::<ScheduleWindow>(window_json.clone()) {
-            if !now_within_window(&window, now) {
-                floors.push(Severity::MinorDelays);
-                annotations.push(format!("reported active {}-{} only", window.start_time, window.end_time));
+    for period in &periods {
+        match period_phase(period, now) {
+            PeriodPhase::NotStarted => {}
+            PeriodPhase::Elapsed => {
+                if period.resolution_status_confidence == "high" {
+                    floors.push(Severity::MinorDelays);
+                    annotations.push(elapsed_annotation(period));
+                }
             }
-        }
-    }
-
-    if let Some(eta) = loaded.extracted_eta {
-        if eta < now {
-            floors.push(Severity::MinorDelays);
-            annotations.push(format!(
-                "expected to end by {}",
-                eta.with_timezone(&chrono_tz::Europe::London).format("%H:%M")
-            ));
+            PeriodPhase::Active => {
+                if period.resolution_status_confidence != "high" {
+                    continue;
+                }
+                match period.resolution_status.as_str() {
+                    "resolved" => {
+                        floors.push(Severity::MinorDelays);
+                        annotations.push(scope_qualify(period, "reported resolved — showing residual impact".to_string()));
+                    }
+                    "residual" => {
+                        floors.push(Severity::Recovering);
+                        annotations.push(scope_qualify(period, "reported as residual delays only".to_string()));
+                    }
+                    _ => {}
+                }
+                if let Some(window) = &period.schedule_window
+                    && !now_within_window(window, now)
+                {
+                    floors.push(Severity::MinorDelays);
+                    annotations.push(scope_qualify(
+                        period,
+                        format!("reported active {}-{} only", window.start_time, window.end_time),
+                    ));
+                }
+            }
         }
     }
 
     // The binding floor is the most severe of the firing floors: highest
     // `severity_rank` first, and among equal ranks the lowest discriminant,
-    // which is the spec's literal "lowest-numbered". (Today's two floors,
-    // MinorDelays and Recovering, are both rank 3 -- mild -- so that
-    // tie-break is what actually decides between them, and it must be
-    // deterministic rather than dependent on which row happened to push
-    // first.) Capping against the single most severe floor is equivalent to
-    // capping per row and taking the most severe result, because the cap is
-    // monotonic in the floor.
+    // which is the spec's literal "lowest-numbered". Capping against the
+    // single most severe floor is equivalent to capping per row and taking
+    // the most severe result, because the cap is monotonic in the floor.
     let Some(&binding_floor) = floors
         .iter()
         .max_by_key(|floor| (severity_rank(**floor), std::cmp::Reverse(**floor)))
@@ -470,19 +635,19 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
         return (severity, if annotations.is_empty() { None } else { Some(annotations.join("; ")) });
     };
 
-    // Demote-only, on the rank scale: if the current severity is already
-    // strictly milder than the floor, leave it alone. Otherwise -- whether
-    // `severity` is more severe than the floor, or merely at the *same*
-    // rank as it -- land on the floor itself, since the floor is the
-    // specific named severity the rule table calls for (e.g. `MinorDelays`
-    // for `resolved`), not just "some severity in that rank bucket". Equal
-    // rank must still land on the floor: `ReducedService` and `MinorDelays`
-    // share the mild rank, but a `resolved` extraction against a
-    // `ReducedService` base must still land on `MinorDelays` specifically,
-    // not stay at `ReducedService`, or the displayed status keeps a "showing
-    // residual impact" annotation stapled to a severity the annotation
-    // wasn't actually written for. Never raises the rank, exactly the
-    // intent the old `severity.max(floor)` had before the non-monotonic
+    // Demote-only, on the rank scale: if the current (possibly escalated)
+    // severity is already strictly milder than the floor, leave it alone.
+    // Otherwise -- whether `severity` is more severe than the floor, or
+    // merely at the *same* rank as it -- land on the floor itself, since the
+    // floor is the specific named severity the rule table calls for (e.g.
+    // `MinorDelays` for `resolved`), not just "some severity in that rank
+    // bucket". Equal rank must still land on the floor: `ReducedService` and
+    // `MinorDelays` share the mild rank, but a `resolved` extraction against
+    // a `ReducedService` base must still land on `MinorDelays`
+    // specifically, not stay at `ReducedService`, or the displayed status
+    // keeps a "showing residual impact" annotation stapled to a severity the
+    // annotation wasn't actually written for. Never raises the rank, exactly
+    // the intent the old `severity.max(floor)` had before the non-monotonic
     // discriminants broke it for Diverted/PartClosed.
     let demoted = if severity_rank(severity) < severity_rank(binding_floor) { severity } else { binding_floor };
 
@@ -779,12 +944,7 @@ mod tests {
             .map(|message| LoadedIncident {
                 message,
                 first_seen_at: Utc::now(),
-                extracted_resolution_status: None,
-                extraction_confidence: None,
-                extracted_schedule_window: None,
-                extracted_eta: None,
-                extracted_severity: None,
-                extracted_severity_confidence: None,
+                extracted_periods: None,
             })
             .collect();
         aggregate(lines, &loaded, &HashMap::new(), &registry, &defaults)
@@ -1237,12 +1397,7 @@ mod tests {
         let loaded = LoadedIncident {
             message: inc,
             first_seen_at: Utc::now(),
-            extracted_resolution_status: None,
-            extraction_confidence: None,
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: None,
-            extracted_severity_confidence: None,
+            extracted_periods: None,
         };
         let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
         let alton = &reports["swr-alton"];
@@ -1293,12 +1448,7 @@ mod tests {
         let loaded = LoadedIncident {
             message: inc,
             first_seen_at: Utc::now(),
-            extracted_resolution_status: None,
-            extraction_confidence: None,
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: None,
-            extracted_severity_confidence: None,
+            extracted_periods: None,
         };
         let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
         assert_eq!(
@@ -1400,12 +1550,7 @@ mod tests {
         LoadedIncident {
             message,
             first_seen_at,
-            extracted_resolution_status: None,
-            extraction_confidence: None,
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: None,
-            extracted_severity_confidence: None,
+            extracted_periods: None,
         }
     }
 
@@ -1491,9 +1636,15 @@ mod tests {
         let inc = incident("T8", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
         let now = Utc::now();
         let mut loaded = loaded_at(inc, now - Duration::days(10));
-        loaded.extraction_confidence = Some("high".to_string());
-        loaded.extracted_schedule_window =
-            Some(serde_json::json!({ "days_of_week": [1, 2, 3, 4, 5], "start_time": "23:00", "end_time": "05:00" }));
+        loaded.extracted_periods = Some(serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": { "days_of_week": [1, 2, 3, 4, 5], "start_time": "23:00", "end_time": "05:00" },
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }]));
         assert!(is_active(&loaded, now));
     }
 
@@ -1505,9 +1656,15 @@ mod tests {
         let inc = incident("T9", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
         let now = Utc::now();
         let mut loaded = loaded_at(inc, now - Duration::days(10));
-        loaded.extraction_confidence = Some("low".to_string());
-        loaded.extracted_schedule_window =
-            Some(serde_json::json!({ "days_of_week": [1, 2, 3, 4, 5], "start_time": "23:00", "end_time": "05:00" }));
+        loaded.extracted_periods = Some(serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": { "days_of_week": [1, 2, 3, 4, 5], "start_time": "23:00", "end_time": "05:00" },
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "low",
+            "severity_confidence": ""
+        }]));
         assert!(!is_active(&loaded, now));
     }
 
@@ -1515,12 +1672,24 @@ mod tests {
     fn is_active_false_for_non_planned_incident_with_malformed_schedule_window() {
         // Bad extraction data must not manufacture an age-cutoff exemption
         // -- the opposite fail-safe direction from `now_within_window`,
-        // where bad data must not manufacture a demotion.
+        // where bad data must not manufacture a demotion. A malformed
+        // `schedule_window` (missing days_of_week/start_time/end_time)
+        // fails the *whole* `extracted_periods` parse -- see
+        // `parse_periods` -- which `has_recurring_schedule` then correctly
+        // treats as "no periods at all", same fail-safe direction one
+        // level up.
         let inc = incident("T10", "Signal fault", "Rail replacement nightly", &[], &[]);
         let now = Utc::now();
         let mut loaded = loaded_at(inc, now - Duration::days(10));
-        loaded.extraction_confidence = Some("high".to_string());
-        loaded.extracted_schedule_window = Some(serde_json::json!({ "not": "a schedule window" }));
+        loaded.extracted_periods = Some(serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": { "not": "a schedule window" },
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }]));
         assert!(!is_active(&loaded, now));
     }
 
@@ -1539,12 +1708,7 @@ mod tests {
         let loaded = LoadedIncident {
             message: inc,
             first_seen_at: Utc::now() - Duration::days(5),
-            extracted_resolution_status: None,
-            extraction_confidence: None,
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: None,
-            extracted_severity_confidence: None,
+            extracted_periods: None,
         };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
         for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
@@ -1556,40 +1720,84 @@ mod tests {
         }
     }
 
+    /// Builds a `LoadedIncident` with a single extraction period -- the
+    /// direct analogue of the pre-multi-period design's flat
+    /// `extracted_resolution_status`/`extraction_confidence`/
+    /// `extracted_schedule_window`/`extracted_eta` fields, now folded into
+    /// one `ExtractionPeriod` JSON object (design doc §1). `eta` folds into
+    /// `date_range.to_date` with no stated `from_date`, exactly as the
+    /// design specifies -- so a past `eta` makes this period `Elapsed`, and
+    /// a future (or absent) `eta` leaves it `Active`.
     fn loaded_with_extraction(
         resolution_status: Option<&str>,
         confidence: Option<&str>,
         schedule_window: Option<serde_json::Value>,
         eta: Option<DateTime<Utc>>,
     ) -> LoadedIncident {
+        let date_range = eta.map(|eta| serde_json::json!({ "from_date": null, "to_date": eta.to_rfc3339() }));
+        let period = serde_json::json!({
+            "scope_description": null,
+            "date_range": date_range,
+            "schedule_window": schedule_window,
+            "resolution_status": resolution_status.unwrap_or("ongoing"),
+            "apparent_severity": "normal",
+            "resolution_status_confidence": confidence.unwrap_or(""),
+            "severity_confidence": "",
+        });
         LoadedIncident {
             message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
             first_seen_at: Utc::now(),
-            extracted_resolution_status: resolution_status.map(str::to_string),
-            extraction_confidence: confidence.map(str::to_string),
-            extracted_schedule_window: schedule_window,
-            extracted_eta: eta,
-            extracted_severity: None,
-            extracted_severity_confidence: None,
+            extracted_periods: Some(serde_json::Value::Array(vec![period])),
         }
     }
 
+    /// Builds a `LoadedIncident` with a single `Active` extraction period
+    /// carrying only an `apparent_severity`/`severity_confidence` --
+    /// `resolution_status_confidence` is left empty (never `"high"`) so the
+    /// demote-only half of `apply_extraction` can never fire, keeping these
+    /// tests focused on the escalation half alone.
     fn loaded_with_severity(severity: Option<&str>, confidence: Option<&str>) -> LoadedIncident {
+        let period = serde_json::json!({
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": severity.unwrap_or("normal"),
+            "resolution_status_confidence": "",
+            "severity_confidence": confidence.unwrap_or(""),
+        });
         LoadedIncident {
             message: incident("EXT2", "Signal failure", "Delays expected", &[], &[]),
             first_seen_at: Utc::now(),
-            extracted_resolution_status: None,
-            extraction_confidence: None,
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: severity.map(str::to_string),
-            extracted_severity_confidence: confidence.map(str::to_string),
+            extracted_periods: Some(serde_json::Value::Array(vec![period])),
         }
     }
 
     #[test]
     fn apply_extraction_is_a_no_op_with_no_extraction() {
-        let loaded = loaded_with_extraction(None, None, None, None);
+        // extracted_periods is None entirely -- no extraction has ever
+        // succeeded for this incident.
+        let loaded = LoadedIncident {
+            message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: None,
+        };
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_is_a_no_op_with_an_empty_periods_array() {
+        // A malformed/degenerate `extracted_periods: []` (which `enricher`
+        // should never write, per design doc §1's "always >= 1 entry"
+        // invariant, but this crate has no way to enforce that from the
+        // read side) must behave identically to no extraction at all.
+        let loaded = LoadedIncident {
+            message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(serde_json::json!([])),
+        };
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
         assert_eq!(severity, Severity::Suspended);
         assert_eq!(annotation, None);
@@ -1722,6 +1930,12 @@ mod tests {
 
     #[test]
     fn apply_extraction_demotes_when_eta_has_already_passed() {
+        // Regression for design doc §4/testing plan: `eta` folds into a
+        // single period's `date_range.to_date` (§1) with no stated
+        // `from_date`, which makes the period `Elapsed` once that instant
+        // passes -- and an `Elapsed` period's synthetic `MinorDelays` floor
+        // must reproduce today's pre-multi-period `extracted_eta`-passed
+        // rule exactly.
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
         let eta = now - Duration::hours(1);
         let loaded = loaded_with_extraction(None, Some("high"), None, Some(eta));
@@ -1743,14 +1957,43 @@ mod tests {
     #[test]
     fn apply_extraction_ignores_schedule_window_and_eta_below_high_confidence() {
         // The confidence gate covers EVERY signal, not just resolution
-        // status. Both a demoting schedule window and an already-passed ETA
-        // are present; at anything below "high" confidence the whole
-        // function must behave exactly as if no extraction existed.
+        // status -- and, per design doc §4, an `Elapsed` period's synthetic
+        // floor too. Two SEPARATE periods are used here (one `Active` with
+        // a demoting schedule window, one `Elapsed` via a passed
+        // `date_range.to_date`, i.e. the folded-in ETA) rather than one
+        // combined period, since an `Elapsed` period ignores its own
+        // `schedule_window` entirely regardless of confidence (§4) -- the
+        // only way to test both signals independently is two periods. At
+        // anything below "high" confidence, NEITHER period's floor may
+        // fire.
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // 13:00 BST, outside 22:00-06:00
         let eta = now - Duration::hours(1);
-        for confidence in [None, Some("low")] {
-            let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
-            let loaded = loaded_with_extraction(None, confidence, Some(window), Some(eta));
+        for confidence in ["", "low"] {
+            let periods = serde_json::json!([
+                {
+                    "scope_description": null,
+                    "date_range": null,
+                    "schedule_window": { "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" },
+                    "resolution_status": "ongoing",
+                    "apparent_severity": "normal",
+                    "resolution_status_confidence": confidence,
+                    "severity_confidence": ""
+                },
+                {
+                    "scope_description": null,
+                    "date_range": { "from_date": null, "to_date": eta.to_rfc3339() },
+                    "schedule_window": null,
+                    "resolution_status": "ongoing",
+                    "apparent_severity": "normal",
+                    "resolution_status_confidence": confidence,
+                    "severity_confidence": ""
+                }
+            ]);
+            let loaded = LoadedIncident {
+                message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
+                first_seen_at: Utc::now(),
+                extracted_periods: Some(periods),
+            };
             let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
             assert_eq!(severity, Severity::Suspended, "confidence {confidence:?}");
             assert_eq!(annotation, None, "confidence {confidence:?}");
@@ -1871,11 +2114,13 @@ mod tests {
 
     #[test]
     fn apply_extraction_escalation_confidence_is_independent_of_resolution_confidence() {
-        // extraction_confidence gates the demote-only signals only;
-        // extracted_severity_confidence is its own gate, so a severity hint
-        // can escalate even when extraction_confidence is low/absent.
-        let mut loaded = loaded_with_severity(Some("blocked_or_suspended"), Some("high"));
-        loaded.extraction_confidence = None;
+        // resolution_status_confidence gates the demote-only signals only;
+        // severity_confidence is its own gate, so a severity hint can
+        // escalate even when resolution_status_confidence is low/absent.
+        // `loaded_with_severity` already leaves resolution_status_confidence
+        // empty (never "high"), so this is really just re-asserting that
+        // fact explicitly as its own test.
+        let loaded = loaded_with_severity(Some("blocked_or_suspended"), Some("high"));
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::PartSuspended);
         assert!(annotation.is_some());
@@ -1887,15 +2132,19 @@ mod tests {
         // severity hint escalates the regex-derived base up, and the
         // resolution-status floor then re-caps it back down to MinorDelays
         // -- the two signals don't fight, and both annotations survive.
+        let period = serde_json::json!({
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "resolved",
+            "apparent_severity": "severe_disruption",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "high",
+        });
         let loaded = LoadedIncident {
             message: incident("EXT3", "Signal failure", "Delays expected", &[], &[]),
             first_seen_at: Utc::now(),
-            extracted_resolution_status: Some("resolved".to_string()),
-            extraction_confidence: Some("high".to_string()),
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: Some("severe_disruption".to_string()),
-            extracted_severity_confidence: Some("high".to_string()),
+            extracted_periods: Some(serde_json::Value::Array(vec![period])),
         };
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::MinorDelays);
@@ -1920,14 +2169,303 @@ mod tests {
         let loaded = LoadedIncident {
             message: inc,
             first_seen_at: Utc::now() - Duration::days(5),
-            extracted_resolution_status: None,
-            extraction_confidence: None,
-            extracted_schedule_window: None,
-            extracted_eta: None,
-            extracted_severity: None,
-            extracted_severity_confidence: None,
+            extracted_periods: None,
         };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
         assert_eq!(reports["swr-alton"].worst_severity(), Severity::PlannedClosure);
+    }
+
+    // --- Multi-period extraction tests ---
+    //
+    // See docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md
+    // §4 and its testing plan.
+
+    fn period_from_json(value: serde_json::Value) -> ExtractionPeriod {
+        serde_json::from_value(value).expect("test period should deserialize")
+    }
+
+    #[test]
+    fn period_phase_active_when_date_range_is_null() {
+        // The common single-fact case -- no distinct date range at all.
+        let period = period_from_json(serde_json::json!({
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }));
+        assert_eq!(period_phase(&period, Utc::now()), PeriodPhase::Active);
+    }
+
+    #[test]
+    fn period_phase_active_when_date_range_covers_now() {
+        let now = Utc::now();
+        let period = period_from_json(serde_json::json!({
+            "scope_description": null,
+            "date_range": {
+                "from_date": (now - Duration::hours(1)).to_rfc3339(),
+                "to_date": (now + Duration::hours(1)).to_rfc3339()
+            },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }));
+        assert_eq!(period_phase(&period, now), PeriodPhase::Active);
+    }
+
+    #[test]
+    fn period_phase_elapsed_once_to_date_has_passed() {
+        let now = Utc::now();
+        let period = period_from_json(serde_json::json!({
+            "scope_description": null,
+            "date_range": { "from_date": null, "to_date": (now - Duration::hours(1)).to_rfc3339() },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }));
+        assert_eq!(period_phase(&period, now), PeriodPhase::Elapsed);
+    }
+
+    #[test]
+    fn period_phase_not_started_when_from_date_is_in_the_future() {
+        let now = Utc::now();
+        let period = period_from_json(serde_json::json!({
+            "scope_description": null,
+            "date_range": { "from_date": (now + Duration::hours(1)).to_rfc3339(), "to_date": null },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }));
+        assert_eq!(period_phase(&period, now), PeriodPhase::NotStarted);
+    }
+
+    #[test]
+    fn period_phase_fails_safe_to_active_on_malformed_dates() {
+        // Malformed/unparseable dates must resolve to `Active`, NOT
+        // `Elapsed` (which would manufacture a demotion out of bad data)
+        // and NOT `NotStarted` (which would silently drop a period that
+        // might genuinely be live right now).
+        let now = Utc::now();
+        let malformed_to = period_from_json(serde_json::json!({
+            "scope_description": null,
+            "date_range": { "from_date": null, "to_date": "not a date" },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }));
+        assert_eq!(period_phase(&malformed_to, now), PeriodPhase::Active);
+
+        let malformed_from = period_from_json(serde_json::json!({
+            "scope_description": null,
+            "date_range": { "from_date": "not a date", "to_date": null },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }));
+        assert_eq!(period_phase(&malformed_from, now), PeriodPhase::Active);
+    }
+
+    #[test]
+    fn apply_extraction_two_active_periods_both_fire_most_severe_wins_both_annotations_kept() {
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let periods = serde_json::json!([
+            {
+                "scope_description": "platform 2 closed, calls at platform 1",
+                "date_range": null,
+                "schedule_window": null,
+                "resolution_status": "residual",
+                "apparent_severity": "normal",
+                "resolution_status_confidence": "high",
+                "severity_confidence": ""
+            },
+            {
+                "scope_description": "platform 3 closed, calls at platform 4",
+                "date_range": null,
+                "schedule_window": { "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" },
+                "resolution_status": "ongoing",
+                "apparent_severity": "normal",
+                "resolution_status_confidence": "high",
+                "severity_confidence": ""
+            }
+        ]);
+        let loaded = LoadedIncident {
+            message: incident("MULTI1", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        // residual -> Recovering floor (rank 3); schedule-excludes-now ->
+        // MinorDelays floor (also rank 3) -- same tie-break as the
+        // single-period case picks MinorDelays.
+        assert_eq!(severity, Severity::MinorDelays);
+        let annotation = annotation.unwrap();
+        assert!(annotation.contains("platform 2 closed"), "annotation was: {annotation}");
+        assert!(annotation.contains("platform 3 closed"), "annotation was: {annotation}");
+        assert!(annotation.contains("residual"), "annotation was: {annotation}");
+        assert!(annotation.contains("22:00"), "annotation was: {annotation}");
+    }
+
+    #[test]
+    fn apply_extraction_elapsed_period_never_uses_its_own_resolution_status_or_severity_claims() {
+        // One `Elapsed` period (whose own resolution_status/apparent_severity
+        // claim severe/escalation-worthy things it must NOT be trusted for)
+        // alongside one genuinely `Active` period, whose own checks still
+        // run normally.
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let periods = serde_json::json!([
+            {
+                "scope_description": "phase 1",
+                "date_range": { "from_date": null, "to_date": (now - Duration::hours(2)).to_rfc3339() },
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "severe_disruption",
+                "resolution_status_confidence": "high",
+                "severity_confidence": "high"
+            },
+            {
+                "scope_description": "phase 2",
+                "date_range": null,
+                "schedule_window": null,
+                "resolution_status": "residual",
+                "apparent_severity": "normal",
+                "resolution_status_confidence": "high",
+                "severity_confidence": ""
+            }
+        ]);
+        let loaded = LoadedIncident {
+            message: incident("MULTI2", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        // Elapsed synthetic floor = MinorDelays (rank 3); Active residual
+        // floor = Recovering (rank 3) -- tie-break picks MinorDelays.
+        assert_eq!(severity, Severity::MinorDelays);
+        let annotation = annotation.unwrap();
+        assert!(annotation.contains("phase 1"), "annotation was: {annotation}");
+        assert!(annotation.contains("expected to end by"), "annotation was: {annotation}");
+        assert!(annotation.contains("phase 2"), "annotation was: {annotation}");
+        assert!(annotation.contains("residual"), "annotation was: {annotation}");
+        assert!(
+            !annotation.contains("more severe"),
+            "an Elapsed period's apparent_severity must never escalate, even at high severity_confidence: {annotation}"
+        );
+    }
+
+    #[test]
+    fn apply_extraction_elapsed_period_demotes_regardless_of_its_own_resolution_status_claim() {
+        // "An ongoing-claiming elapsed period must demote identically to a
+        // resolved-claiming one, since the claim is ignored either way."
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let to_date = now - Duration::hours(1);
+        for claim in ["ongoing", "resolved", "residual"] {
+            let periods = serde_json::json!([{
+                "scope_description": null,
+                "date_range": { "from_date": null, "to_date": to_date.to_rfc3339() },
+                "schedule_window": null,
+                "resolution_status": claim,
+                "apparent_severity": "normal",
+                "resolution_status_confidence": "high",
+                "severity_confidence": ""
+            }]);
+            let loaded = LoadedIncident {
+                message: incident("MULTI3", "Signal failure", "Delays expected", &[], &[]),
+                first_seen_at: Utc::now(),
+                extracted_periods: Some(periods),
+            };
+            let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+            assert_eq!(severity, Severity::MinorDelays, "claim {claim}");
+            assert!(annotation.unwrap().contains("expected to end"), "claim {claim}");
+        }
+    }
+
+    #[test]
+    fn apply_extraction_not_started_period_contributes_nothing() {
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let periods = serde_json::json!([{
+            "scope_description": null,
+            "date_range": { "from_date": (now + Duration::hours(1)).to_rfc3339(), "to_date": null },
+            "schedule_window": null,
+            "resolution_status": "resolved",
+            "apparent_severity": "severe_disruption",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "high"
+        }]);
+        let loaded = LoadedIncident {
+            message: incident("MULTI4", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_escalation_combines_across_periods_most_severe_wins() {
+        let periods = serde_json::json!([
+            {
+                "scope_description": "phase 1",
+                "date_range": null,
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "moderate_disruption",
+                "resolution_status_confidence": "",
+                "severity_confidence": "high"
+            },
+            {
+                "scope_description": "phase 2",
+                "date_range": null,
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "blocked_or_suspended",
+                "resolution_status_confidence": "",
+                "severity_confidence": "high"
+            }
+        ]);
+        let loaded = LoadedIncident {
+            message: incident("MULTI5", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::PartSuspended);
+        assert!(annotation.unwrap().contains("phase 2"));
+    }
+
+    #[test]
+    fn has_recurring_schedule_elapsed_period_no_longer_exempts_from_rail_day_cutoff() {
+        // The trap flagged in design doc §4: an incident whose only
+        // recurring-schedule period has already elapsed must NOT keep
+        // exempting itself from the rail-day cutoff -- exactly the "SWR
+        // forgot about it" failure mode that cutoff exists to catch.
+        let inc = incident("T11", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
+        let now = Utc::now();
+        let mut loaded = loaded_at(inc, now - Duration::days(10));
+        loaded.extracted_periods = Some(serde_json::json!([{
+            "scope_description": null,
+            "date_range": { "from_date": null, "to_date": (now - Duration::days(1)).to_rfc3339() },
+            "schedule_window": { "days_of_week": [1,2,3,4,5,6,7], "start_time": "23:00", "end_time": "05:00" },
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }]));
+        assert!(
+            !is_active(&loaded, now),
+            "an elapsed recurring-schedule period must not exempt an incident from the rail-day cutoff"
+        );
     }
 }

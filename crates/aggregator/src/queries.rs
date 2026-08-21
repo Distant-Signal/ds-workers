@@ -18,21 +18,21 @@ use sqlx::{PgPool, Row};
 pub struct LoadedIncident {
     pub message: IncidentMessage,
     pub first_seen_at: DateTime<Utc>,
-    pub extracted_resolution_status: Option<String>,
-    pub extraction_confidence: Option<String>,
-    pub extracted_schedule_window: Option<serde_json::Value>,
-    pub extracted_eta: Option<DateTime<Utc>>,
-    pub extracted_severity: Option<String>,
-    pub extracted_severity_confidence: Option<String>,
+    /// `Vec<ExtractionPeriod>` JSON (see
+    /// docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md
+    /// §1/§3), or `None` if no extraction has succeeded yet. Deserialized
+    /// into `aggregation`'s private `ExtractionPeriod` mirror lazily, in
+    /// `aggregation::apply_extraction`/`has_recurring_schedule` -- not here,
+    /// so this crate's DB layer stays agnostic to the JSON shape those
+    /// functions consume.
+    pub extracted_periods: Option<serde_json::Value>,
 }
 
 pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
                 priority, validity_periods, is_planned, is_cleared, first_seen_at, \
-                extracted_resolution_status, extraction_confidence, \
-                extracted_schedule_window, extracted_eta, \
-                extracted_severity, extracted_severity_confidence \
+                extracted_periods \
          FROM incidents \
          WHERE NOT is_cleared",
     )
@@ -56,12 +56,7 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
             Ok(LoadedIncident {
                 message,
                 first_seen_at: row.try_get("first_seen_at")?,
-                extracted_resolution_status: row.try_get("extracted_resolution_status")?,
-                extraction_confidence: row.try_get("extraction_confidence")?,
-                extracted_schedule_window: row.try_get("extracted_schedule_window")?,
-                extracted_eta: row.try_get("extracted_eta")?,
-                extracted_severity: row.try_get("extracted_severity")?,
-                extracted_severity_confidence: row.try_get("extracted_severity_confidence")?,
+                extracted_periods: row.try_get("extracted_periods")?,
             })
         })
         .collect()
