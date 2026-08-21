@@ -388,12 +388,21 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
         return (severity, None);
     };
 
-    // Demote-only, on the rank scale: if the current severity is already at
-    // or milder than the floor, leave it alone; otherwise drop it to the
-    // floor. Never raises the rank, exactly the intent the old
-    // `severity.max(floor)` had before the non-monotonic discriminants
-    // broke it for Diverted/PartClosed.
-    let demoted = if severity_rank(severity) <= severity_rank(binding_floor) { severity } else { binding_floor };
+    // Demote-only, on the rank scale: if the current severity is already
+    // strictly milder than the floor, leave it alone. Otherwise -- whether
+    // `severity` is more severe than the floor, or merely at the *same*
+    // rank as it -- land on the floor itself, since the floor is the
+    // specific named severity the rule table calls for (e.g. `MinorDelays`
+    // for `resolved`), not just "some severity in that rank bucket". Equal
+    // rank must still land on the floor: `ReducedService` and `MinorDelays`
+    // share the mild rank, but a `resolved` extraction against a
+    // `ReducedService` base must still land on `MinorDelays` specifically,
+    // not stay at `ReducedService`, or the displayed status keeps a "showing
+    // residual impact" annotation stapled to a severity the annotation
+    // wasn't actually written for. Never raises the rank, exactly the
+    // intent the old `severity.max(floor)` had before the non-monotonic
+    // discriminants broke it for Diverted/PartClosed.
+    let demoted = if severity_rank(severity) < severity_rank(binding_floor) { severity } else { binding_floor };
 
     (demoted, Some(annotations.join("; ")))
 }
@@ -1367,13 +1376,40 @@ mod tests {
 
     #[test]
     fn apply_extraction_never_demotes_resolved_below_minor_delays() {
-        // "Demote" means push toward a MILDER (higher-ordinal) severity,
-        // never a more severe one. GoodService's ordinal (10) is already
-        // higher/milder than MinorDelays' (9), so `.max(MinorDelays)` must
-        // leave it unchanged, not pull it back down to 9.
+        // "Demote" means push toward a MILDER `severity_rank`, never a more
+        // severe one. GoodService's rank is already strictly milder than
+        // MinorDelays' rank, so the rank comparison must leave it unchanged
+        // rather than pulling it down to the MinorDelays floor. (Contrast
+        // with the equal-rank case, e.g. ReducedService + resolved, which
+        // *does* land on the floor -- see the tie-break tests below.)
         let loaded = loaded_with_extraction(Some("resolved"), Some("high"), None, None);
         let (severity, _) = apply_extraction(Severity::GoodService, &loaded, Utc::now());
         assert_eq!(severity, Severity::GoodService);
+    }
+
+    #[test]
+    fn apply_extraction_lands_equal_rank_resolved_on_minor_delays() {
+        // ReducedService and MinorDelays share the mild `severity_rank` (3),
+        // but they are not the same severity. A `resolved` extraction must
+        // still land on the specific named floor (MinorDelays), not leave
+        // `severity` unchanged just because the ranks already match --
+        // otherwise the "reported resolved" annotation ends up stapled to a
+        // ReducedService status whose own text never claims resolution.
+        let loaded = loaded_with_extraction(Some("resolved"), Some("high"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::ReducedService, &loaded, Utc::now());
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.unwrap().contains("resolved"));
+    }
+
+    #[test]
+    fn apply_extraction_lands_equal_rank_residual_on_recovering() {
+        // MinorDelays and Recovering also share the mild rank (3). A
+        // `residual` extraction must still land on Recovering specifically,
+        // not leave a MinorDelays base severity unchanged.
+        let loaded = loaded_with_extraction(Some("residual"), Some("high"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Recovering);
+        assert!(annotation.unwrap().contains("residual"));
     }
 
     #[test]
