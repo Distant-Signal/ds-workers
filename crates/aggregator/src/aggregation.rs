@@ -72,7 +72,7 @@ pub fn aggregate(
     // reaches the matcher, so its line falls through to Layer 2 exactly as
     // if the incident didn't exist.
     let now = Utc::now();
-    for loaded in incidents.iter().filter(|loaded| is_active(&loaded.message, loaded.first_seen_at, now)) {
+    for loaded in incidents.iter().filter(|loaded| is_active(loaded, now)) {
         for m in lines_affected_by(&loaded.message, lines, registry) {
             let status = status_from_incident(&m, loaded, now);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
@@ -204,11 +204,37 @@ fn period_covers_now(period: &ValidityPeriod, now: DateTime<Utc>) -> bool {
 /// it matches. `is_cleared` isn't rechecked here -- `queries::load_incidents`
 /// already excludes cleared rows at the SQL layer, so by the time an
 /// incident reaches this function it's already known not to be cleared.
-fn is_active(incident: &IncidentMessage, first_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+fn is_active(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
+    let incident = &loaded.message;
     let validity_ok = incident.validity.is_empty()
         || incident.validity.iter().any(|p| period_covers_now(p, now));
-    let age_ok = incident.is_planned || now < next_rail_day_boundary(first_seen_at);
+    let age_ok = incident.is_planned
+        || has_recurring_schedule(loaded)
+        || now < next_rail_day_boundary(loaded.first_seen_at);
     validity_ok && age_ok
+}
+
+/// Whether `loaded` carries a high-confidence, successfully-parsed
+/// `extracted_schedule_window` -- evidence of a genuinely recurring,
+/// time-bounded disruption (e.g. nightly rail replacement while a fault is
+/// repaired) rather than the "SWR forgot about it" case the rail-day
+/// cutoff exists to catch. A real-time (non-`is_planned`) incident like
+/// that would otherwise still get evicted by the age cutoff the first time
+/// `now` crosses the next rail-day boundary after `first_seen_at`, even
+/// though it recurs every night for weeks -- so this exempts it from that
+/// cutoff the same way `is_planned` already is, in `is_active` above.
+///
+/// Malformed or absent schedule-window data does NOT count: unlike
+/// `now_within_window`'s fail-safe direction (bad data must never
+/// manufacture a *demotion*), granting an age-cutoff *exemption* from bad
+/// data would be the unsafe direction here, so this requires an actual
+/// successful parse.
+fn has_recurring_schedule(loaded: &LoadedIncident) -> bool {
+    loaded.extraction_confidence.as_deref() == Some("high")
+        && loaded
+            .extracted_schedule_window
+            .as_ref()
+            .is_some_and(|window| serde_json::from_value::<ScheduleWindow>(window.clone()).is_ok())
 }
 
 fn severity_from_incident(incident: &IncidentMessage) -> Severity {
@@ -1230,11 +1256,22 @@ mod tests {
         assert!(!period_covers_now(&period, now));
     }
 
+    fn loaded_at(message: IncidentMessage, first_seen_at: DateTime<Utc>) -> LoadedIncident {
+        LoadedIncident {
+            message,
+            first_seen_at,
+            extracted_resolution_status: None,
+            extraction_confidence: None,
+            extracted_schedule_window: None,
+            extracted_eta: None,
+        }
+    }
+
     #[test]
     fn is_active_true_for_fresh_incident_with_no_validity_periods() {
         let inc = incident("T1", "Delay", "Delay description", &[], &[]);
         let now = Utc::now();
-        assert!(is_active(&inc, now, now));
+        assert!(is_active(&loaded_at(inc, now), now));
     }
 
     #[test]
@@ -1246,7 +1283,7 @@ mod tests {
             to_date: Some(now - Duration::days(1)),
             is_now: false,
         }];
-        assert!(!is_active(&inc, now - Duration::days(2), now));
+        assert!(!is_active(&loaded_at(inc, now - Duration::days(2)), now));
     }
 
     #[test]
@@ -1254,7 +1291,7 @@ mod tests {
         let mut inc = incident("T3", "Delay", "Delay description", &[], &[]);
         let now = Utc::now();
         inc.validity = vec![ValidityPeriod { from_date: now - Duration::hours(1), to_date: None, is_now: true }];
-        assert!(is_active(&inc, now - Duration::hours(1), now));
+        assert!(is_active(&loaded_at(inc, now - Duration::hours(1)), now));
     }
 
     #[test]
@@ -1262,7 +1299,7 @@ mod tests {
         let inc = incident("T4", "Delay", "Delay description", &[], &[]);
         let now = Utc::now();
         let first_seen_at = now - Duration::days(2);
-        assert!(!is_active(&inc, first_seen_at, now));
+        assert!(!is_active(&loaded_at(inc, first_seen_at), now));
     }
 
     #[test]
@@ -1271,7 +1308,7 @@ mod tests {
         inc.is_planned = true;
         let now = Utc::now();
         let first_seen_at = now - Duration::days(2);
-        assert!(is_active(&inc, first_seen_at, now));
+        assert!(is_active(&loaded_at(inc, first_seen_at), now));
     }
 
     #[test]
@@ -1284,7 +1321,7 @@ mod tests {
             ValidityPeriod { from_date: now - Duration::days(2), to_date: Some(now - Duration::days(1)), is_now: false },
             ValidityPeriod { from_date: now - Duration::hours(1), to_date: None, is_now: true },
         ];
-        assert!(is_active(&inc, now, now));
+        assert!(is_active(&loaded_at(inc, now), now));
     }
 
     #[test]
@@ -1301,7 +1338,48 @@ mod tests {
             to_date: Some(now - Duration::days(1)),
             is_now: false,
         }];
-        assert!(!is_active(&inc, now - Duration::days(2), now));
+        assert!(!is_active(&loaded_at(inc, now - Duration::days(2)), now));
+    }
+
+    #[test]
+    fn is_active_true_for_non_planned_incident_aged_past_the_boundary_with_high_confidence_schedule_window() {
+        // The nightly-rail-replacement case: not `is_planned`, but the
+        // extraction found a genuine recurring schedule, so it's exempted
+        // from the age cutoff the same way `is_planned` already is.
+        let inc = incident("T8", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
+        let now = Utc::now();
+        let mut loaded = loaded_at(inc, now - Duration::days(10));
+        loaded.extraction_confidence = Some("high".to_string());
+        loaded.extracted_schedule_window =
+            Some(serde_json::json!({ "days_of_week": [1, 2, 3, 4, 5], "start_time": "23:00", "end_time": "05:00" }));
+        assert!(is_active(&loaded, now));
+    }
+
+    #[test]
+    fn is_active_false_for_non_planned_incident_with_low_confidence_schedule_window() {
+        // A schedule window extracted at low confidence isn't trustworthy
+        // enough to grant the age-cutoff exemption -- same confidence bar
+        // `apply_extraction` already holds every other signal to.
+        let inc = incident("T9", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
+        let now = Utc::now();
+        let mut loaded = loaded_at(inc, now - Duration::days(10));
+        loaded.extraction_confidence = Some("low".to_string());
+        loaded.extracted_schedule_window =
+            Some(serde_json::json!({ "days_of_week": [1, 2, 3, 4, 5], "start_time": "23:00", "end_time": "05:00" }));
+        assert!(!is_active(&loaded, now));
+    }
+
+    #[test]
+    fn is_active_false_for_non_planned_incident_with_malformed_schedule_window() {
+        // Bad extraction data must not manufacture an age-cutoff exemption
+        // -- the opposite fail-safe direction from `now_within_window`,
+        // where bad data must not manufacture a demotion.
+        let inc = incident("T10", "Signal fault", "Rail replacement nightly", &[], &[]);
+        let now = Utc::now();
+        let mut loaded = loaded_at(inc, now - Duration::days(10));
+        loaded.extraction_confidence = Some("high".to_string());
+        loaded.extracted_schedule_window = Some(serde_json::json!({ "not": "a schedule window" }));
+        assert!(!is_active(&loaded, now));
     }
 
     #[test]
