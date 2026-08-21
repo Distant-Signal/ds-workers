@@ -22,6 +22,8 @@ pub struct LoadedIncident {
     pub extraction_confidence: Option<String>,
     pub extracted_schedule_window: Option<serde_json::Value>,
     pub extracted_eta: Option<DateTime<Utc>>,
+    pub extracted_severity: Option<String>,
+    pub extracted_severity_confidence: Option<String>,
 }
 
 pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
@@ -29,7 +31,8 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
         "SELECT incident_id, summary, description, operators, affected_stations, \
                 priority, validity_periods, is_planned, is_cleared, first_seen_at, \
                 extracted_resolution_status, extraction_confidence, \
-                extracted_schedule_window, extracted_eta \
+                extracted_schedule_window, extracted_eta, \
+                extracted_severity, extracted_severity_confidence \
          FROM incidents \
          WHERE NOT is_cleared",
     )
@@ -57,6 +60,8 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
                 extraction_confidence: row.try_get("extraction_confidence")?,
                 extracted_schedule_window: row.try_get("extracted_schedule_window")?,
                 extracted_eta: row.try_get("extracted_eta")?,
+                extracted_severity: row.try_get("extracted_severity")?,
+                extracted_severity_confidence: row.try_get("extracted_severity_confidence")?,
             })
         })
         .collect()

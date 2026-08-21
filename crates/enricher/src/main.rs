@@ -163,15 +163,36 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         }
     };
 
+    let severity_adversarial = match llm.extract_severity_adversarial(&summary, &description).await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(error = ?err, incident_id, "severity adversarial extraction failed");
+            return false;
+        }
+    };
+
     let (resolution_status, confidence) = combine::combine(&primary.resolution_status, &adversarial_status);
+    let (severity, severity_confidence) = combine::combine_severity(&primary.apparent_severity, &severity_adversarial);
     let text_hash = hash::text_hash(&summary, &description);
 
-    if let Err(err) = queries::write_extraction(pool, incident_id, &primary, &resolution_status, &confidence, model_version, &text_hash).await {
+    if let Err(err) = queries::write_extraction(
+        pool,
+        incident_id,
+        &primary,
+        &resolution_status,
+        &confidence,
+        &severity,
+        &severity_confidence,
+        model_version,
+        &text_hash,
+    )
+    .await
+    {
         tracing::error!(error = ?err, incident_id, "failed to write extraction result");
         return false;
     }
 
-    tracing::info!(incident_id, resolution_status, confidence, "extraction written");
+    tracing::info!(incident_id, resolution_status, confidence, severity, severity_confidence, "extraction written");
     true
 }
 

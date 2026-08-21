@@ -21,9 +21,10 @@ pub async fn fetch_incident_text(pool: &PgPool, incident_id: &str) -> anyhow::Re
     Ok(row)
 }
 
-/// Persists a completed extraction. `resolution_status` and `confidence`
-/// are passed separately from `extraction` because they're the output of
-/// `combine::combine`, not the raw primary-pass verdict.
+/// Persists a completed extraction. `resolution_status`/`confidence` and
+/// `severity`/`severity_confidence` are passed separately from `extraction`
+/// because they're the output of `combine::combine`/`combine::combine_severity`,
+/// not the raw primary-pass verdicts.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_extraction(
     pool: &PgPool,
@@ -31,6 +32,8 @@ pub async fn write_extraction(
     extraction: &PrimaryExtraction,
     resolution_status: &str,
     confidence: &str,
+    severity: &str,
+    severity_confidence: &str,
     model_version: &str,
     text_hash: &str,
 ) -> anyhow::Result<()> {
@@ -49,7 +52,9 @@ pub async fn write_extraction(
             extracted_schedule_window = $5, \
             extracted_eta = $6, \
             extraction_confidence = $7, \
-            extraction_model_version = $8, \
+            extracted_severity = $8, \
+            extracted_severity_confidence = $9, \
+            extraction_model_version = $10, \
             extracted_at = NOW() \
          WHERE incident_id = $1",
     )
@@ -60,6 +65,8 @@ pub async fn write_extraction(
     .bind(&schedule_window_json)
     .bind(eta)
     .bind(confidence)
+    .bind(severity)
+    .bind(severity_confidence)
     .bind(model_version)
     .execute(pool)
     .await?;

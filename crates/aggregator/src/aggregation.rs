@@ -327,21 +327,67 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
     }
 }
 
+/// Maps a high-confidence `extracted_severity` hint to the `Severity`
+/// ceiling the base classifier should be raised to. `normal` (or an
+/// unrecognized value -- schema drift, a model version mismatch) never
+/// escalates.
+fn escalation_ceiling(hint: &str) -> Option<Severity> {
+    match hint {
+        "moderate_disruption" => Some(Severity::ReducedService),
+        "severe_disruption" => Some(Severity::SevereDelays),
+        "blocked_or_suspended" => Some(Severity::PartSuspended),
+        _ => None,
+    }
+}
+
+/// Escalation counterpart to `apply_extraction`'s demote-only floors, in
+/// the opposite direction: raises `severity` toward `extracted_severity`'s
+/// mapped ceiling when the text reads as more severe than the regex-based
+/// base classifier (`severity_from_incident`) caught -- e.g. "the lines...
+/// are blocked" doesn't match the literal substring `"lines blocked"`, so
+/// it falls through to the classifier's weakest default. Gated by its OWN
+/// confidence field, `extracted_severity_confidence` -- independent of
+/// `extraction_confidence`, which only covers the demote-only signals (see
+/// the migration's doc comment for why they're kept separate). Escalate-only:
+/// never lowers `severity`, and a missing/low-confidence/unrecognized hint
+/// is always a no-op, mirroring the demote-only floors' one-directional
+/// guarantee. Only escalates on a STRICTLY higher `severity_rank` -- at an
+/// equal or lower rank the regex-derived severity is left untouched, since
+/// (unlike the demote-only floors) there's no established case for
+/// preferring a differently-named severity within the same rank tier here.
+fn escalate_from_severity_hint(severity: Severity, loaded: &LoadedIncident) -> (Severity, Option<String>) {
+    if loaded.extracted_severity_confidence.as_deref() != Some("high") {
+        return (severity, None);
+    }
+    let Some(ceiling) = loaded.extracted_severity.as_deref().and_then(escalation_ceiling) else {
+        return (severity, None);
+    };
+    if severity_rank(ceiling) <= severity_rank(severity) {
+        return (severity, None);
+    }
+    let annotation = format!("reported more severe than automatically classified: {}", ceiling.description().to_lowercase());
+    (ceiling, Some(annotation))
+}
+
 /// Adjusts `severity` based on NLP-extracted signals, and returns an
 /// optional annotation to append to the status's `reason` text. Runs
 /// between `severity_from_incident` and `demote_for_scope` in
-/// `status_from_incident`. Can only demote (move to a lower `severity_rank`)
-/// or leave `severity` unchanged -- never make it more severe, and never
-/// signals suppression. A missing or low-confidence extraction is always a
-/// no-op: the absence of a signal must behave identically to this function
-/// not existing at all.
+/// `status_from_incident`. First escalates (see `escalate_from_severity_hint`
+/// above), then demotes -- so a "fault fixed, but severe knock-on delays
+/// remain" incident can be escalated by the severity-hint signal and then
+/// correctly re-capped by a resolution-status floor in the same pass,
+/// without the two fighting. A missing or low-confidence extraction is
+/// always a no-op for whichever half of this function it gates: the
+/// absence of a signal must behave identically to that half not existing.
 ///
-/// CONFIDENCE GATES EVERY SIGNAL, not just resolution status. The spec (§7
-/// row 1) and the plan's Global Constraints both state, with no carve-out,
-/// that a low-confidence extraction "behaves identically to no extraction at
-/// all" -- so the check is hoisted to the top rather than wrapping only the
-/// resolution-status arm, and a schedule window or ETA extracted with low
-/// confidence can no longer demote on its own.
+/// CONFIDENCE GATES EVERY SIGNAL WITHIN ITS OWN HALF. The spec (§7 row 1)
+/// and the plan's Global Constraints state, with no carve-out, that a
+/// low-confidence extraction "behaves identically to no extraction at
+/// all" -- so `extraction_confidence`'s check is hoisted to the top of the
+/// demote-only half rather than wrapping only the resolution-status arm,
+/// and a schedule window or ETA extracted with low confidence can no
+/// longer demote on its own. The escalation half has its own, independent
+/// gate (`extracted_severity_confidence`) for the same reason.
 ///
 /// Rows fire independently rather than as an if/else chain (an `ongoing`
 /// incident can still be demoted by a schedule-window or ETA check), and
@@ -360,12 +406,14 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
 /// appending a "reported resolved" annotation -- a passenger shown a severe
 /// status whose own reason text says it is over. See `severity_rank`'s docs.
 fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<Utc>) -> (Severity, Option<String>) {
+    let (severity, escalation_annotation) = escalate_from_severity_hint(severity, loaded);
+
     if loaded.extraction_confidence.as_deref() != Some("high") {
-        return (severity, None);
+        return (severity, escalation_annotation);
     }
 
     let mut floors: Vec<Severity> = Vec::new();
-    let mut annotations: Vec<String> = Vec::new();
+    let mut annotations: Vec<String> = escalation_annotation.into_iter().collect();
 
     match loaded.extracted_resolution_status.as_deref() {
         Some("resolved") => {
@@ -411,7 +459,7 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
         .iter()
         .max_by_key(|floor| (severity_rank(**floor), std::cmp::Reverse(**floor)))
     else {
-        return (severity, None);
+        return (severity, if annotations.is_empty() { None } else { Some(annotations.join("; ")) });
     };
 
     // Demote-only, on the rank scale: if the current severity is already
@@ -697,6 +745,8 @@ mod tests {
                 extraction_confidence: None,
                 extracted_schedule_window: None,
                 extracted_eta: None,
+                extracted_severity: None,
+                extracted_severity_confidence: None,
             })
             .collect();
         aggregate(lines, &loaded, &HashMap::new(), &registry, &defaults)
@@ -1151,6 +1201,8 @@ mod tests {
             extraction_confidence: None,
             extracted_schedule_window: None,
             extracted_eta: None,
+            extracted_severity: None,
+            extracted_severity_confidence: None,
         };
         let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
         let alton = &reports["swr-alton"];
@@ -1264,6 +1316,8 @@ mod tests {
             extraction_confidence: None,
             extracted_schedule_window: None,
             extracted_eta: None,
+            extracted_severity: None,
+            extracted_severity_confidence: None,
         }
     }
 
@@ -1401,6 +1455,8 @@ mod tests {
             extraction_confidence: None,
             extracted_schedule_window: None,
             extracted_eta: None,
+            extracted_severity: None,
+            extracted_severity_confidence: None,
         };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
         for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
@@ -1425,6 +1481,21 @@ mod tests {
             extraction_confidence: confidence.map(str::to_string),
             extracted_schedule_window: schedule_window,
             extracted_eta: eta,
+            extracted_severity: None,
+            extracted_severity_confidence: None,
+        }
+    }
+
+    fn loaded_with_severity(severity: Option<&str>, confidence: Option<&str>) -> LoadedIncident {
+        LoadedIncident {
+            message: incident("EXT2", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_resolution_status: None,
+            extraction_confidence: None,
+            extracted_schedule_window: None,
+            extracted_eta: None,
+            extracted_severity: severity.map(str::to_string),
+            extracted_severity_confidence: confidence.map(str::to_string),
         }
     }
 
@@ -1665,6 +1736,87 @@ mod tests {
     }
 
     #[test]
+    fn apply_extraction_escalates_a_high_confidence_severe_hint() {
+        let loaded = loaded_with_severity(Some("severe_disruption"), Some("high"));
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::SevereDelays);
+        assert!(annotation.unwrap().contains("more severe"));
+    }
+
+    #[test]
+    fn apply_extraction_escalates_a_blocked_or_suspended_hint_to_part_suspended() {
+        // The motivating case: "the lines...are blocked" doesn't match the
+        // base classifier's literal "lines blocked" substring, so it falls
+        // through to MinorDelays -- the severity-hint signal catches it.
+        let loaded = loaded_with_severity(Some("blocked_or_suspended"), Some("high"));
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::PartSuspended);
+        assert!(annotation.is_some());
+    }
+
+    #[test]
+    fn apply_extraction_ignores_low_confidence_severity_hint() {
+        let loaded = loaded_with_severity(Some("severe_disruption"), Some("low"));
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::MinorDelays);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_normal_severity_hint_never_escalates() {
+        let loaded = loaded_with_severity(Some("normal"), Some("high"));
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::MinorDelays);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_never_escalates_an_already_equally_severe_status() {
+        // Suspended and SevereDelays are both severity_rank 4 -- escalation
+        // must not swap in a different rank-4 named value over one the
+        // regex classifier already correctly identified as severe.
+        let loaded = loaded_with_severity(Some("severe_disruption"), Some("high"));
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_escalation_confidence_is_independent_of_resolution_confidence() {
+        // extraction_confidence gates the demote-only signals only;
+        // extracted_severity_confidence is its own gate, so a severity hint
+        // can escalate even when extraction_confidence is low/absent.
+        let mut loaded = loaded_with_severity(Some("blocked_or_suspended"), Some("high"));
+        loaded.extraction_confidence = None;
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::PartSuspended);
+        assert!(annotation.is_some());
+    }
+
+    #[test]
+    fn apply_extraction_escalation_and_demotion_compose_in_one_pass() {
+        // "The fault's fixed, but severe knock-on delays remain": the
+        // severity hint escalates the regex-derived base up, and the
+        // resolution-status floor then re-caps it back down to MinorDelays
+        // -- the two signals don't fight, and both annotations survive.
+        let loaded = LoadedIncident {
+            message: incident("EXT3", "Signal failure", "Delays expected", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_resolution_status: Some("resolved".to_string()),
+            extraction_confidence: Some("high".to_string()),
+            extracted_schedule_window: None,
+            extracted_eta: None,
+            extracted_severity: Some("severe_disruption".to_string()),
+            extracted_severity_confidence: Some("high".to_string()),
+        };
+        let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
+        assert_eq!(severity, Severity::MinorDelays);
+        let annotation = annotation.unwrap();
+        assert!(annotation.contains("more severe"), "escalation annotation missing: {annotation}");
+        assert!(annotation.contains("reported resolved"), "demotion annotation missing: {annotation}");
+    }
+
+    #[test]
     fn planned_work_is_exempt_from_the_rail_day_cutoff() {
         let lines = load_all_lines();
         let mut inc = incident(
@@ -1684,6 +1836,8 @@ mod tests {
             extraction_confidence: None,
             extracted_schedule_window: None,
             extracted_eta: None,
+            extracted_severity: None,
+            extracted_severity_confidence: None,
         };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
         assert_eq!(reports["swr-alton"].worst_severity(), Severity::PlannedClosure);

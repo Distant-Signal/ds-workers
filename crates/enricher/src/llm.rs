@@ -21,6 +21,13 @@ pub struct PrimaryExtraction {
     pub resolution_status: String,
     pub schedule_window: Option<ScheduleWindow>,
     pub eta: Option<DateTime<Utc>>,
+    /// The model's own read of how severe the disruption sounds from the
+    /// full text -- `normal` | `moderate_disruption` | `severe_disruption`
+    /// | `blocked_or_suspended`. Exists to catch disruptions the regex-based
+    /// base classifier's exact-keyword matching misses due to phrasing
+    /// (e.g. "the lines...are blocked" rather than the literal substring
+    /// "lines blocked"), without hardcoding more brittle keyword variants.
+    pub apparent_severity: String,
 }
 
 pub struct LlmClient {
@@ -90,9 +97,13 @@ fn primary_schema() -> serde_json::Value {
                 },
                 "required": ["days_of_week", "start_time", "end_time"]
             },
-            "eta": { "type": ["string", "null"] }
+            "eta": { "type": ["string", "null"] },
+            "apparent_severity": {
+                "type": "string",
+                "enum": ["normal", "moderate_disruption", "severe_disruption", "blocked_or_suspended"]
+            }
         },
-        "required": ["category", "resolution_status", "schedule_window", "eta"]
+        "required": ["category", "resolution_status", "schedule_window", "eta", "apparent_severity"]
     })
 }
 
@@ -101,7 +112,12 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     states. `resolution_status` is `resolved` only if the text explicitly says the disruption/root cause \
     has ended; `residual` if it says the cause is fixed but knock-on effects continue; `ongoing` otherwise, \
     including whenever the text doesn't clearly say either way. `schedule_window` and `eta` are null unless \
-    the text states them explicitly.";
+    the text states them explicitly. `apparent_severity` is your own read of how severe the disruption \
+    sounds, independent of any specific keywords: `blocked_or_suspended` if any line, route, or station is \
+    described as blocked, suspended, or closed to trains; `severe_disruption` if the text describes major/\
+    widespread delays, cancellations, or long journey-time increases without an outright blockage; \
+    `moderate_disruption` for a noticeable but contained impact (e.g. a single service pattern change, a \
+    short-notice alteration); `normal` for routine minor delay language with no sign of broader impact.";
 
 const ADVERSARIAL_SCHEMA_NAME: &str = "adversarial_resolution_check";
 
@@ -124,6 +140,32 @@ const ADVERSARIAL_PROMPT: &str = "You are reviewing a UK National Rail incident 
 #[derive(Deserialize)]
 struct AdversarialExtraction {
     resolution_status: String,
+}
+
+const SEVERITY_ADVERSARIAL_SCHEMA_NAME: &str = "adversarial_severity_check";
+
+fn severity_adversarial_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "apparent_severity": {
+                "type": "string",
+                "enum": ["normal", "moderate_disruption", "severe_disruption", "blocked_or_suspended"]
+            }
+        },
+        "required": ["apparent_severity"]
+    })
+}
+
+const SEVERITY_ADVERSARIAL_PROMPT: &str = "You are reviewing a UK National Rail incident report with a \
+    specific job: argue for the LEAST severe reading the text can honestly support. Do not assume a full \
+    blockage, suspension, or major disruption unless the text gives clear, explicit, unambiguous evidence \
+    of one -- vague or routine-sounding delay language should read as `normal` or `moderate_disruption`, \
+    not escalated on tone or length alone.";
+
+#[derive(Deserialize)]
+struct SeverityAdversarialExtraction {
+    apparent_severity: String,
 }
 
 /// Per-request ceiling on an LLM call. reqwest applies NO request timeout by
@@ -197,6 +239,16 @@ impl LlmClient {
             .map_err(|err| anyhow::anyhow!("adversarial extraction returned malformed JSON: {err}"))?;
         Ok(extraction.resolution_status)
     }
+
+    pub async fn extract_severity_adversarial(&self, summary: &str, description: &str) -> anyhow::Result<String> {
+        let user_content = format!("Summary: {summary}\nDescription: {description}");
+        let content = self
+            .chat_completion(SEVERITY_ADVERSARIAL_PROMPT, user_content, SEVERITY_ADVERSARIAL_SCHEMA_NAME, severity_adversarial_schema())
+            .await?;
+        let extraction: SeverityAdversarialExtraction = serde_json::from_str(&content)
+            .map_err(|err| anyhow::anyhow!("severity adversarial extraction returned malformed JSON: {err}"))?;
+        Ok(extraction.apparent_severity)
+    }
 }
 
 #[cfg(test)]
@@ -217,7 +269,8 @@ mod tests {
                             "category": "signal_failure",
                             "resolution_status": "resolved",
                             "schedule_window": null,
-                            "eta": null
+                            "eta": null,
+                            "apparent_severity": "normal"
                         }).to_string()
                     }
                 }]
@@ -232,6 +285,7 @@ mod tests {
         assert_eq!(result.resolution_status, "resolved");
         assert_eq!(result.schedule_window, None);
         assert_eq!(result.eta, None);
+        assert_eq!(result.apparent_severity, "normal");
     }
 
     #[tokio::test]
@@ -250,7 +304,8 @@ mod tests {
                                 "start_time": "22:00",
                                 "end_time": "06:00"
                             },
-                            "eta": null
+                            "eta": null,
+                            "apparent_severity": "blocked_or_suspended"
                         }).to_string()
                     }
                 }]
@@ -268,6 +323,27 @@ mod tests {
             result.schedule_window,
             Some(ScheduleWindow { days_of_week: vec![1, 2, 3, 4, 5], start_time: "22:00".to_string(), end_time: "06:00".to_string() })
         );
+    }
+
+    #[tokio::test]
+    async fn extract_severity_adversarial_parses_a_well_formed_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({ "apparent_severity": "moderate_disruption" }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string());
+        let result = client.extract_severity_adversarial("Delays", "Minor knock-on delays").await.unwrap();
+
+        assert_eq!(result, "moderate_disruption");
     }
 
     #[tokio::test]
