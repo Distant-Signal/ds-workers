@@ -19,7 +19,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Utc};
 use common::{
     AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition,
     LineStatus, LineStatusReport, SampleStats, Severity, StationDeparture, StationSample,
-    ValidityPeriod, thresholds_for,
+    ValidityPeriod, severity_rank, thresholds_for,
 };
 use serde::Deserialize;
 
@@ -74,7 +74,7 @@ pub fn aggregate(
     let now = Utc::now();
     for loaded in incidents.iter().filter(|loaded| is_active(&loaded.message, loaded.first_seen_at, now)) {
         for m in lines_affected_by(&loaded.message, lines, registry) {
-            let status = status_from_incident(&m, loaded);
+            let status = status_from_incident(&m, loaded, now);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
         }
     }
@@ -103,10 +103,13 @@ pub fn aggregate(
 
 // --- Incident path ---
 
-fn status_from_incident(m: &Match, loaded: &LoadedIncident) -> LineStatus {
+/// `now` is threaded in from `aggregate()`'s single `Utc::now()` rather than
+/// re-read here, so every incident in one aggregation pass is judged against
+/// the same instant that `is_active` already filtered them by.
+fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) -> LineStatus {
     let incident = &loaded.message;
     let base_severity = severity_from_incident(incident);
-    let (extracted_severity, extraction_annotation) = apply_extraction(base_severity, loaded, Utc::now());
+    let (extracted_severity, extraction_annotation) = apply_extraction(base_severity, loaded, now);
     let severity = demote_for_scope(extracted_severity, m.scope);
 
     let affected_stations = m.evidence.stations.clone();
@@ -254,24 +257,43 @@ struct ScheduleWindow {
 /// `window`. Handles overnight windows (e.g. 22:00-06:00, where
 /// `start_time > end_time`) by wraparound: "inside" means at or after
 /// `start_time` OR before `end_time`, rather than requiring both.
+///
+/// `days_of_week` is matched against the day the *active window instance
+/// started on*, which for an overnight window in its early-morning tail is
+/// yesterday, not today. See the `window_start_date` comment below.
 fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
     // An empty `days_of_week` is degenerate/malformed extraction data (the
     // enricher's JSON schema permits it -- no `minItems` constraint), not a
     // meaningful "never active" signal. Matching the fail-safe direction
-    // used two checks below for unparsable times: malformed extraction data
-    // must never be able to manufacture a demotion, so treat it as "inside
-    // the window" (no demotion) rather than "every day is outside it".
+    // used just below for unparsable times: malformed extraction data must
+    // never be able to manufacture a demotion, so treat it as "inside the
+    // window" (no demotion) rather than "every day is outside it".
     if window.days_of_week.is_empty() {
         return true;
     }
     let local = now.with_timezone(&chrono_tz::Europe::London);
-    let weekday = local.weekday().number_from_monday() as u8; // 1=Monday..7=Sunday
-    if !window.days_of_week.contains(&weekday) {
-        return false;
-    }
     let Ok(start) = NaiveTime::parse_from_str(&window.start_time, "%H:%M") else { return true };
     let Ok(end) = NaiveTime::parse_from_str(&window.end_time, "%H:%M") else { return true };
     let now_time = local.time();
+
+    // Which calendar day did the window instance covering `now` START on?
+    // For a same-day window (start <= end) that is always today. For an
+    // overnight window it is today during the evening portion, but
+    // YESTERDAY once we are past midnight in the early-morning tail: at
+    // 00:30 on a Saturday, a `days_of_week: [1,2,3,4,5]` "Mon-Fri nights"
+    // window is Friday night's instance still running. Checking today's
+    // weekday there would report "outside the window" and manufacture a
+    // demotion for a disruption that is genuinely still active.
+    let window_start_date = if start > end && now_time < end {
+        local.date_naive() - Duration::days(1)
+    } else {
+        local.date_naive()
+    };
+    let weekday = window_start_date.weekday().number_from_monday() as u8; // 1=Monday..7=Sunday
+    if !window.days_of_week.contains(&weekday) {
+        return false;
+    }
+
     if start <= end {
         now_time >= start && now_time < end
     } else {
@@ -282,38 +304,53 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
 /// Adjusts `severity` based on NLP-extracted signals, and returns an
 /// optional annotation to append to the status's `reason` text. Runs
 /// between `severity_from_incident` and `demote_for_scope` in
-/// `status_from_incident`. Can only demote (raise the numeric severity,
-/// since lower is worse) or leave `severity` unchanged -- never make it
-/// more severe, and never signals suppression. A missing or
-/// low-confidence extraction is always a no-op: the absence of a signal
-/// must behave identically to this function not existing at all.
+/// `status_from_incident`. Can only demote (move to a lower `severity_rank`)
+/// or leave `severity` unchanged -- never make it more severe, and never
+/// signals suppression. A missing or low-confidence extraction is always a
+/// no-op: the absence of a signal must behave identically to this function
+/// not existing at all.
+///
+/// CONFIDENCE GATES EVERY SIGNAL, not just resolution status. The spec (§7
+/// row 1) and the plan's Global Constraints both state, with no carve-out,
+/// that a low-confidence extraction "behaves identically to no extraction at
+/// all" -- so the check is hoisted to the top rather than wrapping only the
+/// resolution-status arm, and a schedule window or ETA extracted with low
+/// confidence can no longer demote on its own.
 ///
 /// Rows fire independently rather than as an if/else chain (an `ongoing`
 /// incident can still be demoted by a schedule-window or ETA check), and
 /// when multiple rows fire at once, the spec calls for taking "the most
 /// severe (lowest-numbered) resulting severity, then apply[ing] the
 /// corresponding annotation(s)" -- so every firing row's floor is
-/// collected, the most severe (lowest-ordinal) floor among them is the one
-/// `severity` is capped against, and every firing row's annotation is kept
-/// (not just the first one to fire). See
+/// collected, the most severe floor among them is the one `severity` is
+/// capped against, and every firing row's annotation is kept (not just the
+/// first one to fire). See
 /// docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md §7.
+///
+/// "Most severe" and "demote" are both measured with `common::severity_rank`,
+/// NOT with `Severity`'s discriminant order: `Diverted = 21` and
+/// `PartClosed = 11` are numerically high but genuinely severe, so a raw
+/// `severity.max(floor)` left them completely undemoted while still
+/// appending a "reported resolved" annotation -- a passenger shown a severe
+/// status whose own reason text says it is over. See `severity_rank`'s docs.
 fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<Utc>) -> (Severity, Option<String>) {
+    if loaded.extraction_confidence.as_deref() != Some("high") {
+        return (severity, None);
+    }
+
     let mut floors: Vec<Severity> = Vec::new();
     let mut annotations: Vec<String> = Vec::new();
 
-    let high_confidence = loaded.extraction_confidence.as_deref() == Some("high");
-    if high_confidence {
-        match loaded.extracted_resolution_status.as_deref() {
-            Some("resolved") => {
-                floors.push(Severity::MinorDelays);
-                annotations.push("reported resolved -- showing residual impact".to_string());
-            }
-            Some("residual") => {
-                floors.push(Severity::Recovering);
-                annotations.push("reported as residual delays only".to_string());
-            }
-            _ => {}
+    match loaded.extracted_resolution_status.as_deref() {
+        Some("resolved") => {
+            floors.push(Severity::MinorDelays);
+            annotations.push("reported resolved — showing residual impact".to_string());
         }
+        Some("residual") => {
+            floors.push(Severity::Recovering);
+            annotations.push("reported as residual delays only".to_string());
+        }
+        _ => {}
     }
 
     if let Some(window_json) = &loaded.extracted_schedule_window {
@@ -335,18 +372,30 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
         }
     }
 
-    // `Severity`'s `Ord` mirrors its discriminants, where lower is more
-    // severe, so the minimum of the firing floors is the "most severe
-    // (lowest-numbered)" one the spec calls for. `severity.max(floor)` is
-    // monotonic non-decreasing in `floor`, so capping against the single
-    // most severe floor is equivalent to (and simpler than) computing
-    // `severity.max(floor)` per row and taking the most severe of those
-    // results.
-    let Some(&binding_floor) = floors.iter().min() else {
+    // The binding floor is the most severe of the firing floors: highest
+    // `severity_rank` first, and among equal ranks the lowest discriminant,
+    // which is the spec's literal "lowest-numbered". (Today's two floors,
+    // MinorDelays and Recovering, are both rank 3 -- mild -- so that
+    // tie-break is what actually decides between them, and it must be
+    // deterministic rather than dependent on which row happened to push
+    // first.) Capping against the single most severe floor is equivalent to
+    // capping per row and taking the most severe result, because the cap is
+    // monotonic in the floor.
+    let Some(&binding_floor) = floors
+        .iter()
+        .max_by_key(|floor| (severity_rank(**floor), std::cmp::Reverse(**floor)))
+    else {
         return (severity, None);
     };
 
-    (severity.max(binding_floor), Some(annotations.join("; ")))
+    // Demote-only, on the rank scale: if the current severity is already at
+    // or milder than the floor, leave it alone; otherwise drop it to the
+    // floor. Never raises the rank, exactly the intent the old
+    // `severity.max(floor)` had before the non-monotonic discriminants
+    // broke it for Diverted/PartClosed.
+    let demoted = if severity_rank(severity) <= severity_rank(binding_floor) { severity } else { binding_floor };
+
+    (demoted, Some(annotations.join("; ")))
 }
 
 fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<AffectedRoute> {
@@ -1346,10 +1395,12 @@ mod tests {
     #[test]
     fn apply_extraction_demotes_when_now_is_outside_the_schedule_window() {
         // Window is 22:00-06:00 every day; "now" is fixed at a UTC instant
-        // that's midday in London.
+        // that's midday in London. High confidence because EVERY signal is
+        // confidence-gated, not just resolution status -- this test exercises
+        // the window logic, so it has to clear that gate first.
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // 13:00 BST
         let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
-        let loaded = loaded_with_extraction(None, None, Some(window), None);
+        let loaded = loaded_with_extraction(None, Some("high"), Some(window), None);
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::MinorDelays);
         assert!(annotation.is_some());
@@ -1359,17 +1410,48 @@ mod tests {
     fn apply_extraction_no_op_when_now_is_inside_an_overnight_schedule_window() {
         let now: DateTime<Utc> = "2026-06-15T23:00:00Z".parse().unwrap(); // 00:00 BST, inside 22:00-06:00
         let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
-        let loaded = loaded_with_extraction(None, None, Some(window), None);
+        let loaded = loaded_with_extraction(None, Some("high"), Some(window), None);
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::Suspended);
         assert_eq!(annotation, None);
     }
 
     #[test]
+    fn apply_extraction_no_op_in_the_early_morning_tail_of_a_weeknights_only_window() {
+        // Regression: an overnight window on a PARTIAL day-of-week set.
+        // 2026-06-19T23:30:00Z is 00:30 BST on Saturday the 20th -- but the
+        // window instance still running is FRIDAY night's, which is in the
+        // Mon-Fri set. Matching today's weekday (Saturday, 6) instead of the
+        // window's start day (Friday, 5) reported "outside the window" and
+        // demoted a disruption that is genuinely still active.
+        let now: DateTime<Utc> = "2026-06-19T23:30:00Z".parse().unwrap();
+        let window = serde_json::json!({ "days_of_week": [1,2,3,4,5], "start_time": "22:00", "end_time": "06:00" });
+        let loaded = loaded_with_extraction(None, Some("high"), Some(window), None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::Suspended);
+        assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_still_demotes_in_a_morning_tail_whose_window_never_started() {
+        // The counterpart to the test above, proving the yesterday-lookup
+        // didn't just make every early morning "inside". 2026-06-20T23:30:00Z
+        // is 00:30 BST on SUNDAY; the window that would be running started
+        // Saturday night, and Saturday (6) is not in the Mon-Fri set, so
+        // nothing is active and the demotion still fires.
+        let now: DateTime<Utc> = "2026-06-20T23:30:00Z".parse().unwrap();
+        let window = serde_json::json!({ "days_of_week": [1,2,3,4,5], "start_time": "22:00", "end_time": "06:00" });
+        let loaded = loaded_with_extraction(None, Some("high"), Some(window), None);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.is_some());
+    }
+
+    #[test]
     fn apply_extraction_demotes_when_eta_has_already_passed() {
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
         let eta = now - Duration::hours(1);
-        let loaded = loaded_with_extraction(None, None, None, Some(eta));
+        let loaded = loaded_with_extraction(None, Some("high"), None, Some(eta));
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::MinorDelays);
         assert!(annotation.unwrap().contains("expected to end"));
@@ -1379,10 +1461,60 @@ mod tests {
     fn apply_extraction_no_op_when_eta_is_in_the_future() {
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
         let eta = now + Duration::hours(1);
-        let loaded = loaded_with_extraction(None, None, None, Some(eta));
+        let loaded = loaded_with_extraction(None, Some("high"), None, Some(eta));
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::Suspended);
         assert_eq!(annotation, None);
+    }
+
+    #[test]
+    fn apply_extraction_ignores_schedule_window_and_eta_below_high_confidence() {
+        // The confidence gate covers EVERY signal, not just resolution
+        // status. Both a demoting schedule window and an already-passed ETA
+        // are present; at anything below "high" confidence the whole
+        // function must behave exactly as if no extraction existed.
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // 13:00 BST, outside 22:00-06:00
+        let eta = now - Duration::hours(1);
+        for confidence in [None, Some("low")] {
+            let window = serde_json::json!({ "days_of_week": [1,2,3,4,5,6,7], "start_time": "22:00", "end_time": "06:00" });
+            let loaded = loaded_with_extraction(None, confidence, Some(window), Some(eta));
+            let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
+            assert_eq!(severity, Severity::Suspended, "confidence {confidence:?}");
+            assert_eq!(annotation, None, "confidence {confidence:?}");
+        }
+    }
+
+    #[test]
+    fn apply_extraction_demotes_a_diverted_incident_reported_resolved() {
+        // Regression for the discriminant-vs-rank bug. Diverted's
+        // discriminant is 21, higher than MinorDelays' 9, so the old
+        // `severity.max(MinorDelays)` left it at Diverted -- a passenger saw
+        // a severe status carrying an annotation that said it was over.
+        // Ranked properly, Diverted is severe (4) and MinorDelays mild (3),
+        // so it demotes.
+        let loaded = loaded_with_extraction(Some("resolved"), Some("high"), None, None);
+        let (severity, annotation) = apply_extraction(Severity::Diverted, &loaded, Utc::now());
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.unwrap().contains("resolved"));
+    }
+
+    #[test]
+    fn apply_extraction_demotes_a_part_closed_incident_reported_residual() {
+        // Same bug, the other non-monotonic code (PartClosed = 11) and the
+        // other floor (Recovering = 20, mild).
+        let loaded = loaded_with_extraction(Some("residual"), Some("high"), None, None);
+        let (severity, _) = apply_extraction(Severity::PartClosed, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Recovering);
+    }
+
+    #[test]
+    fn apply_extraction_never_promotes_a_mild_status_via_a_severe_looking_floor() {
+        // Demote-only in the rank direction: Recovering (rank 3, mild) is
+        // already at the floor's rank, so a "residual" extraction must leave
+        // it exactly where it is rather than swapping it for the floor.
+        let loaded = loaded_with_extraction(Some("residual"), Some("high"), None, None);
+        let (severity, _) = apply_extraction(Severity::Recovering, &loaded, Utc::now());
+        assert_eq!(severity, Severity::Recovering);
     }
 
     #[test]
@@ -1412,7 +1544,7 @@ mod tests {
         // manufacture a demotion out of malformed data.
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
         let window = serde_json::json!({ "days_of_week": [], "start_time": "22:00", "end_time": "06:00" });
-        let loaded = loaded_with_extraction(None, None, Some(window), None);
+        let loaded = loaded_with_extraction(None, Some("high"), Some(window), None);
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::Suspended);
         assert_eq!(annotation, None);
