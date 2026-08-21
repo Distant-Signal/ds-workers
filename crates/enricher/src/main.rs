@@ -5,6 +5,7 @@
 
 mod config;
 mod hash;
+mod llm;
 mod stream;
 mod sweep;
 
