@@ -54,11 +54,32 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(None) => {}
             Err(err) => {
-                tracing::error!(error = ?err, "error reading from incident-text-changed stream");
+                // Redis is deployed WITHOUT persistence on purpose -- it is a
+                // disposable trigger queue, not a system of record -- so a pod
+                // restart takes the stream and the consumer group with it and
+                // every subsequent read fails NOGROUP. Recreating the group
+                // here (`ensure_group` is idempotent; BUSYGROUP is swallowed)
+                // makes that self-heal within seconds instead of needing a
+                // manual enricher restart. The sleep is what stops the same
+                // error from becoming a tight CPU-burning retry loop in the
+                // meantime; `read_one` only blocks when it gets far enough to
+                // block at all, which a NOGROUP read never does.
+                tracing::error!(error = ?err, "error reading from incident-text-changed stream; recreating consumer group and backing off");
+                if let Err(err) = stream::ensure_group(&mut redis).await {
+                    tracing::error!(error = ?err, "failed to recreate the consumer group");
+                }
+                tokio::time::sleep(STREAM_ERROR_BACKOFF).await;
             }
         }
     }
 }
+
+/// How long the stream consumer loop waits after a failed read before trying
+/// again. Short enough that a Redis restart is picked back up promptly, long
+/// enough that a persistent error (Redis down, network partition) costs a
+/// couple of log lines a second rather than a pegged core. Correctness never
+/// depends on this: the hourly sweep re-finds anything the stream missed.
+const STREAM_ERROR_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Hourly (by default) backstop that re-checks every uncleared incident's
 /// text hash / extraction model version against what's stored, catching

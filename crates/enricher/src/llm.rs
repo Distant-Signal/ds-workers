@@ -126,9 +126,25 @@ struct AdversarialExtraction {
     resolution_status: String,
 }
 
+/// Per-request ceiling on an LLM call. reqwest applies NO request timeout by
+/// default, and both callers of this client -- the stream consumer loop and
+/// the hourly sweep -- process incidents strictly serially, so a single hung
+/// endpoint would stall ALL enrichment indefinitely rather than just losing
+/// one incident. 60s is generous for a two-field structured extraction over
+/// a short incident summary while still bounding the damage; a timed-out
+/// request surfaces as an ordinary `Err`, which `process_incident` already
+/// logs and moves past, leaving the incident for the next sweep.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl LlmClient {
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
-        Self { base_url, api_key, model, http: reqwest::Client::new() }
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            // Only fails if the TLS backend can't initialize, which would
+            // break every request anyway -- there is no useful degraded mode.
+            .expect("reqwest client with a timeout must build");
+        Self { base_url, api_key, model, http }
     }
 
     async fn chat_completion(&self, system_prompt: &str, user_content: String, schema_name: &'static str, schema: serde_json::Value) -> anyhow::Result<String> {
