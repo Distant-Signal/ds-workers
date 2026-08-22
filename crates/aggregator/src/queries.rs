@@ -150,10 +150,15 @@ async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_
 /// - `sample_stats`: recomputed from live LDBWS samples every poll cycle,
 ///   so its counts and `avg_delay_minutes` roll over every cycle even when
 ///   the line's actual status is unchanged.
+/// - the `(live samples show: ...)` suffix `escalate_from_sample_stats`
+///   (aggregation.rs) appends to `reason` on escalation: it carries the
+///   same live counts as `sample_stats`, just formatted into text instead
+///   of left structured, so it churns every cycle for the same reason and
+///   needs the same stripping.
 ///
-/// Without stripping both, a "change" would be seen on every single poll
-/// cycle for most lines, defeating the point of only recording history on
-/// real changes.
+/// Without stripping all three, a "change" would be seen on every single
+/// poll cycle for most lines, defeating the point of only recording history
+/// on real changes.
 fn normalize_for_diff(statuses: &serde_json::Value) -> serde_json::Value {
     let mut statuses = statuses.clone();
     if let Some(entries) = statuses.as_array_mut() {
@@ -164,9 +169,27 @@ fn normalize_for_diff(statuses: &serde_json::Value) -> serde_json::Value {
             if let Some(obj) = entry.as_object_mut() {
                 obj.remove("sample_stats");
             }
+            if let Some(reason) = entry.get_mut("reason")
+                && let Some(stripped) = reason.as_str().map(strip_live_sample_annotation)
+            {
+                *reason = serde_json::Value::String(stripped.to_string());
+            }
         }
     }
     statuses
+}
+
+/// Strips a trailing `" (live samples show: ...)"` annotation from a
+/// status `reason`, if present. See `normalize_for_diff`: the annotation's
+/// live counts roll over almost every poll cycle even when nothing about
+/// the underlying disruption has changed, so it must not participate in
+/// change detection.
+fn strip_live_sample_annotation(reason: &str) -> &str {
+    const MARKER: &str = " (live samples show: ";
+    match reason.rfind(MARKER) {
+        Some(idx) if reason.ends_with(')') => &reason[..idx],
+        _ => reason,
+    }
 }
 
 /// Upserts one line's computed report into `line_status` (always), and
@@ -366,5 +389,64 @@ mod tests {
         ]);
 
         assert_ne!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_for_diff_ignores_live_sample_annotation_churn() {
+        let a = serde_json::json!([
+            {
+                "severity": "severe-delays",
+                "reason": "Major improvement works in the Wrexham General area (live samples show: 5 of 9 sampled services delayed.)",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live"
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "severe-delays",
+                "reason": "Major improvement works in the Wrexham General area (live samples show: 7 of 14 sampled services delayed.)",
+                "validity": {"from_date": "2026-07-09T10:01:00Z"},
+                "data_quality": "live"
+            }
+        ]);
+
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_for_diff_still_detects_a_reason_change_under_a_live_sample_annotation() {
+        let a = serde_json::json!([
+            {
+                "severity": "severe-delays",
+                "reason": "Major improvement works in the Wrexham General area (live samples show: 5 of 9 sampled services delayed.)",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live"
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "severe-delays",
+                "reason": "Signal failure near Chester (live samples show: 5 of 9 sampled services delayed.)",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live"
+            }
+        ]);
+
+        assert_ne!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn strip_live_sample_annotation_only_strips_a_trailing_annotation() {
+        assert_eq!(
+            strip_live_sample_annotation("Works in the area (live samples show: 5 of 9 sampled services delayed.)"),
+            "Works in the area",
+        );
+        assert_eq!(strip_live_sample_annotation("Works in the area"), "Works in the area");
+        // A reason mentioning "live samples show" mid-sentence rather than as
+        // the appended trailing annotation must not be touched.
+        assert_eq!(
+            strip_live_sample_annotation("Works in the area (live samples show: something) more text"),
+            "Works in the area (live samples show: something) more text",
+        );
     }
 }
