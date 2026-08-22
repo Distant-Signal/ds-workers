@@ -109,11 +109,19 @@ pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>>
 /// rather than lingering forever (custom lines are the only way a line can
 /// disappear between cycles — the static catalogue is fixed for the
 /// process's lifetime).
+///
+/// Scoped to `source = 'aggregator'`: this crate is no longer the only
+/// writer of `line_status`. TfL lines are written by the api crate's
+/// `/private/tfl-line-status` ingest and are pruned by that endpoint
+/// against its own batch — they are invisible to this crate's line set, so
+/// an unscoped DELETE here would wipe them on the very next cycle.
 pub async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM line_status WHERE NOT (line_id = ANY($1))")
-        .bind(current_line_ids)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM line_status WHERE source = 'aggregator' AND NOT (line_id = ANY($1))",
+    )
+    .bind(current_line_ids)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -174,14 +182,15 @@ pub async fn write_line_status(pool: &PgPool, report: &LineStatusReport) -> Resu
 
     sqlx::query(
         r#"
-        INSERT INTO line_status (line_id, name, mode_name, operators, statuses, computed_at)
-        VALUES ($1, $2, $3, $4, $5, NOW())
+        INSERT INTO line_status (line_id, name, mode_name, operators, statuses, computed_at, source)
+        VALUES ($1, $2, $3, $4, $5, NOW(), 'aggregator')
         ON CONFLICT (line_id) DO UPDATE SET
             name        = EXCLUDED.name,
             mode_name   = EXCLUDED.mode_name,
             operators   = EXCLUDED.operators,
             statuses    = EXCLUDED.statuses,
-            computed_at = NOW()
+            computed_at = NOW(),
+            source      = 'aggregator'
         "#,
     )
     .bind(&report.id)
@@ -250,6 +259,45 @@ mod tests {
 
         assert!(ids.contains(&"TEST-ACTIVE"), "non-cleared incident should be loaded");
         assert!(!ids.contains(&"TEST-CLEARED"), "cleared incident should be excluded");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; see the plan's Global Constraints for the \
+                DATABASE_URL incantation, then run with `cargo test -p aggregator \
+                prune_removed_lines_leaves_other_sources_alone -- --ignored`"]
+    async fn prune_removed_lines_leaves_other_sources_alone() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+
+        sqlx::query(
+            "INSERT INTO line_status (line_id, name, mode_name, operators, statuses, source) \
+             VALUES \
+                ('TEST-AGG', 'test aggregator line', 'national-rail', '{}', '[]', 'aggregator'), \
+                ('TEST-TFL', 'test tfl line', 'tube', '{TfL}', '[]', 'tfl') \
+             ON CONFLICT (line_id) DO UPDATE SET source = EXCLUDED.source",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        // An empty current-line set is the worst case: the aggregator has
+        // nothing of its own left, so anything it does not own must still
+        // survive.
+        prune_removed_lines(&pool, &[]).await.expect("prune_removed_lines");
+
+        let survivors: Vec<String> =
+            sqlx::query_scalar("SELECT line_id FROM line_status WHERE line_id IN ('TEST-AGG', 'TEST-TFL')")
+                .fetch_all(&pool)
+                .await
+                .expect("read survivors");
+
+        sqlx::query("DELETE FROM line_status WHERE line_id IN ('TEST-AGG', 'TEST-TFL')")
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture rows");
+
+        assert!(!survivors.contains(&"TEST-AGG".to_string()), "the aggregator's own stale row should go");
+        assert!(survivors.contains(&"TEST-TFL".to_string()), "a TfL-owned row must not be collateral damage");
     }
 
     #[test]
