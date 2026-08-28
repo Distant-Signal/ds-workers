@@ -165,6 +165,19 @@ struct ChatChoiceMessage {
 
 const PRIMARY_SCHEMA_NAME: &str = "incident_extraction";
 
+/// Soft cap on `PrimaryExtraction::periods.len()`, enforced in Rust after
+/// parsing rather than in the JSON schema (design §7 item 6: a `maxItems`
+/// schema constraint may not be reliably enforced by every backend, and the
+/// exact number is a prompt-engineering/eval question, not an architectural
+/// one -- the design deliberately leaves the number unresolved and only
+/// requires *some* enforcement point exists). 8 is chosen as generous
+/// headroom over every motivating example in the design doc (the
+/// Wandsworth Town fixture has 2; the design's own soft-cap sanity-check
+/// fixture is described as "3+") while still catching runaway
+/// over-segmentation (e.g. one period per sentence) before it reaches
+/// storage.
+const MAX_PERIODS: usize = 8;
+
 /// JSON schema for the primary pass. Deliberately omits
 /// `resolution_status_confidence`/`severity_confidence` (design §1) --
 /// those don't exist until the combination step runs against the
@@ -424,6 +437,12 @@ impl LlmClient {
             // discarded, existing columns untouched, sweep retries later.
             anyhow::bail!("primary extraction returned an empty `periods` array");
         }
+        if extraction.periods.len() > MAX_PERIODS {
+            // Design §7 item 6: treat over-cap as a schema-adjacent
+            // validation failure, discarded the same as any other malformed
+            // response, rather than storing a hallucinated over-segmentation.
+            anyhow::bail!("primary extraction returned {} periods, exceeding the soft cap of {MAX_PERIODS}", extraction.periods.len());
+        }
         Ok(extraction)
     }
 
@@ -616,6 +635,68 @@ mod tests {
         let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
 
         assert!(result.is_err(), "an empty periods array must be a hard failure, not a zero-period success");
+    }
+
+    #[tokio::test]
+    async fn extract_primary_rejects_periods_beyond_the_soft_cap() {
+        let server = MockServer::start().await;
+        let over_cap_period = serde_json::json!({
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal"
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({
+                            "category": "signal_failure",
+                            "periods": vec![over_cap_period; MAX_PERIODS + 1]
+                        }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
+
+        assert!(result.is_err(), "exceeding the soft period-count cap must be a hard failure, not stored as-is");
+    }
+
+    #[tokio::test]
+    async fn extract_primary_accepts_periods_exactly_at_the_soft_cap() {
+        let server = MockServer::start().await;
+        let period = serde_json::json!({
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal"
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({
+                            "category": "signal_failure",
+                            "periods": vec![period; MAX_PERIODS]
+                        }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
+
+        assert!(result.is_ok(), "exactly MAX_PERIODS should still be accepted, only exceeding it is a hard failure: {result:?}");
     }
 
     #[tokio::test]
