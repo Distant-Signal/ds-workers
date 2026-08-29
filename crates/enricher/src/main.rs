@@ -173,7 +173,7 @@ impl MismatchTracker {
 
     /// Current count of incidents with at least one recorded consecutive
     /// combine-mismatch failure -- exposed as
-    /// `nr_status_enricher_mismatch_incidents` (Task 9).
+    /// `distant_signal_enricher_mismatch_incidents` (Task 9).
     fn len(&self) -> usize {
         self.counts.lock().expect("mismatch tracker mutex poisoned").len()
     }
