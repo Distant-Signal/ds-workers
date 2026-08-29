@@ -30,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    if config.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&config.database_url)
@@ -46,7 +49,12 @@ async fn main() -> anyhow::Result<()> {
     loop {
         interval.tick().await;
 
-        if let Err(err) = run_cycle(&pool, &static_lines, &defaults, config.history_retention_days).await {
+        let cycle_start = std::time::Instant::now();
+        let result = run_cycle(&pool, &static_lines, &defaults, config.history_retention_days).await;
+        metrics::histogram!(common::metrics::metric_name("aggregator_cycle_duration_seconds"))
+            .record(cycle_start.elapsed().as_secs_f64());
+
+        if let Err(err) = result {
             tracing::error!(error = ?err, "aggregation cycle failed; will retry next interval");
         }
     }
@@ -75,6 +83,11 @@ async fn run_cycle(
     let removed = queries::prune_removed_lines(pool, &current_line_ids).await?;
 
     let pruned = queries::prune_history(pool, retention_days).await?;
+
+    metrics::gauge!(common::metrics::metric_name("aggregator_lines_total")).set(reports.len() as f64);
+    metrics::gauge!(common::metrics::metric_name("aggregator_incidents_loaded")).set(incidents.len() as f64);
+    metrics::counter!(common::metrics::metric_name("aggregator_history_rows_pruned_total")).increment(pruned);
+
     tracing::info!(
         lines = reports.len(),
         incidents = incidents.len(),

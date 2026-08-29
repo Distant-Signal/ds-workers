@@ -22,6 +22,14 @@ use llm::LlmClient;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+/// Bare (unprefixed) name of the LLM-call duration histogram, shared by the
+/// `install_with_buckets` bucket override in `main` and the `histogram!`
+/// call in `record_llm_call_metrics`. Both must name the *same* metric --
+/// the override is matched by exact name, so two independently hand-written
+/// copies of this string could silently desync, leaving the histogram on
+/// the module-wide default buckets with nothing to flag it.
+const LLM_DURATION_METRIC: &str = "enricher_llm_call_duration_seconds";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -31,6 +39,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    if config.metrics_enabled {
+        common::metrics::install_with_buckets(
+            config.metrics_port,
+            &[(
+                &common::metrics::metric_name(LLM_DURATION_METRIC),
+                &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0],
+            )],
+        )?;
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -153,6 +170,13 @@ impl MismatchTracker {
         let mut counts = self.counts.lock().expect("mismatch tracker mutex poisoned");
         counts.remove(incident_id);
     }
+
+    /// Current count of incidents with at least one recorded consecutive
+    /// combine-mismatch failure -- exposed as
+    /// `nr_status_enricher_mismatch_incidents` (Task 9).
+    fn len(&self) -> usize {
+        self.counts.lock().expect("mismatch tracker mutex poisoned").len()
+    }
 }
 
 /// Hourly (by default) backstop that re-checks every uncleared incident's
@@ -176,6 +200,36 @@ async fn sweep_loop(pool: PgPool, llm: Arc<LlmClient>, model_version: String, mi
             Err(err) => tracing::error!(error = ?err, "sweep query failed"),
         }
     }
+}
+
+/// Records one LLM call's duration and success/error outcome. `call` names
+/// the call site (`"primary"`, `"resolution_adversarial"`,
+/// `"severity_adversarial"`) as both a log field and the metric's `call`
+/// label -- a small, fixed set, not user data, so no cardinality risk.
+///
+/// `outcome` is `success`/`error` only, not the design doc's illustrative
+/// `success`/`error`/`timeout` three-way split -- `LlmClient::extract_*`
+/// returns a bare `anyhow::Result`, with no typed distinction between "the
+/// request timed out" (`config.llm_request_timeout_secs`, currently 300s)
+/// and any other request failure. Distinguishing them would need `llm.rs`
+/// to expose a typed error enum, which is out of scope for this plan --
+/// this mirrors the same restraint the aggregator/pollers' `result` label
+/// already applies (design doc Open Question 5): the histogram's own
+/// bucket boundaries (extended past the tuned timeout, see `main`'s
+/// `install_with_buckets` call) are what actually serves "is a call about
+/// to time out," not the outcome label.
+fn record_llm_call_metrics(call: &'static str, elapsed: std::time::Duration, success: bool) {
+    metrics::histogram!(
+        common::metrics::metric_name(LLM_DURATION_METRIC),
+        "call" => call
+    )
+    .record(elapsed.as_secs_f64());
+    metrics::counter!(
+        common::metrics::metric_name("enricher_llm_call_total"),
+        "call" => call,
+        "outcome" => if success { "success" } else { "error" }
+    )
+    .increment(1);
 }
 
 /// Runs all three extraction passes for one incident and writes the result.
@@ -225,7 +279,10 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         return true;
     }
 
-    let primary = match llm.extract_primary(&summary, &description, first_seen_at).await {
+    let primary_start = std::time::Instant::now();
+    let primary_result = llm.extract_primary(&summary, &description, first_seen_at).await;
+    record_llm_call_metrics("primary", primary_start.elapsed(), primary_result.is_ok());
+    let primary = match primary_result {
         Ok(p) => p,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "primary extraction failed");
@@ -233,7 +290,10 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         }
     };
 
-    let resolution_adversarial = match llm.extract_adversarial(&summary, &description, &primary.periods).await {
+    let resolution_adversarial_start = std::time::Instant::now();
+    let resolution_adversarial_result = llm.extract_adversarial(&summary, &description, &primary.periods).await;
+    record_llm_call_metrics("resolution_adversarial", resolution_adversarial_start.elapsed(), resolution_adversarial_result.is_ok());
+    let resolution_adversarial = match resolution_adversarial_result {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "adversarial extraction failed");
@@ -241,7 +301,10 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         }
     };
 
-    let severity_adversarial = match llm.extract_severity_adversarial(&summary, &description, &primary.periods).await {
+    let severity_adversarial_start = std::time::Instant::now();
+    let severity_adversarial_result = llm.extract_severity_adversarial(&summary, &description, &primary.periods).await;
+    record_llm_call_metrics("severity_adversarial", severity_adversarial_start.elapsed(), severity_adversarial_result.is_ok());
+    let severity_adversarial = match severity_adversarial_result {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "severity adversarial extraction failed");
@@ -302,6 +365,16 @@ async fn reclaim_loop(
     let min_idle = Duration::from_secs(min_idle_secs);
     loop {
         interval.tick().await;
+
+        match stream::group_lag(&mut redis).await {
+            Ok(Some(lag)) => {
+                metrics::gauge!(common::metrics::metric_name("enricher_stream_lag")).set(lag as f64);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(error = ?err, "failed to sample stream consumer-group lag"),
+        }
+        metrics::gauge!(common::metrics::metric_name("enricher_mismatch_incidents")).set(mismatch_tracker.len() as f64);
+
         match stream::claim_stale(&mut redis, min_idle).await {
             Ok(entries) => {
                 if !entries.is_empty() {

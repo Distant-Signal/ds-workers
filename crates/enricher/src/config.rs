@@ -59,4 +59,23 @@ pub struct Config {
     /// 3 * 300s = 900s worst case, plus headroom).
     #[arg(long, env, default_value_t = 1000)]
     pub reclaim_min_idle_secs: u64,
+
+    /// Port for this service's Prometheus `/metrics` endpoint. See
+    /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
+    /// for why this differs from api.service.port -- api reuses its
+    /// existing HTTP listener, this service has none, so it needs a new one.
+    #[arg(long, env, default_value_t = 9091)]
+    pub metrics_port: u16,
+
+    /// Whether to start this service's Prometheus `/metrics` listener at
+    /// all. Distinct from `metrics_port` (which port to use IF started) --
+    /// this is what actually satisfies "metrics.enabled=false leaves the
+    /// service working exactly as it does today" (see the Helm chart's
+    /// `metrics.enabled` value and this branch's final whole-branch
+    /// review, Important finding #2): omitting the containerPort/env/
+    /// annotations in the chart alone does not stop the process from
+    /// listening, since Kubernetes container ports are purely
+    /// declarative.
+    #[arg(long, env, default_value_t = true)]
+    pub metrics_enabled: bool,
 }

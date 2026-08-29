@@ -109,3 +109,36 @@ pub async fn claim_stale(conn: &mut ConnectionManager, min_idle: Duration) -> an
     }
     Ok(claimed)
 }
+
+/// Redis 7's `XINFO GROUPS` reply is an array of per-group entries, each a
+/// flat array of alternating field name/value pairs. This pulls out the
+/// `enricher` group's own `lag` field -- how many stream entries the
+/// group's last-delivered id is behind the stream's tail. `None` if the
+/// group doesn't exist yet (a fresh stream before `ensure_group` has ever
+/// run, or immediately after a Redis restart wiped it -- see `main.rs`'s
+/// own NOGROUP self-heal comment for that exact scenario) or if this Redis
+/// server predates the `lag` field (added in Redis 7.0; this app's own
+/// deployments always run Redis 7, but a self-managed external Redis might
+/// not be).
+pub async fn group_lag(conn: &mut ConnectionManager) -> anyhow::Result<Option<i64>> {
+    let reply: Vec<redis::Value> = redis::cmd("XINFO").arg("GROUPS").arg(STREAM).query_async(conn).await?;
+
+    for group in reply {
+        let redis::Value::Array(fields) = group else { continue };
+        let mut name: Option<String> = None;
+        let mut lag: Option<i64> = None;
+        let mut iter = fields.into_iter();
+        while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+            let key: String = redis::from_redis_value(&key)?;
+            match key.as_str() {
+                "name" => name = redis::from_redis_value(&value).ok(),
+                "lag" => lag = redis::from_redis_value(&value).ok(),
+                _ => {}
+            }
+        }
+        if name.as_deref() == Some(GROUP) {
+            return Ok(lag);
+        }
+    }
+    Ok(None)
+}
