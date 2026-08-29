@@ -26,13 +26,11 @@ COPY . .
 # recompiles only what actually changed instead of the whole dependency
 # tree. Requires the `# syntax=` directive at the top of this file.
 #
-# The target cache id is keyed by rustc version (`cargo-target-1.88`) rather
-# than shared across all seven Rust services. Cargo's fingerprints include the
-# compiler version, so the 1.88 services (api, aggregator, enricher) and the
-# 1.86 ones (the four pollers) would otherwise invalidate and fully recompile
-# each other's artifacts on every alternating build. The registry and git
-# caches hold only downloaded sources, so sharing those across all seven is
-# safe.
+# The target cache id is keyed by rustc version (`cargo-target-1.88`). Every
+# Rust service in this workspace now builds with the same rustc version, so
+# this id is shared across all of them -- see docker-compose.yml's top-of-file
+# comment for the full list. The registry and git caches hold only downloaded
+# sources, so sharing those across all of them is safe too.
 #
 # `sharing=locked` because docker-compose builds services in parallel, and
 # concurrent cargo invocations must not share one target dir unserialised.
