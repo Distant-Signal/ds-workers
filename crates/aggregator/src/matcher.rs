@@ -581,4 +581,209 @@ mod tests {
         assert_eq!(matched_ids, HashSet::from(["emr-rural-branches".to_string()]));
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
+
+    #[test]
+    fn cumbrian_coast_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("NT-1", "Signal failure at Whitehaven", "Signal failure causing delays on the Cumbrian Coast.", &["NT"], &["WTH"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-cumbrian-coast".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn cumbrian_coast_shared_trunk_incident_propagates_to_furness() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("NT-2", "Points failure at Barrow-in-Furness", "Points failure causing delays at Barrow.", &["NT"], &["BIF"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert!(matched_ids.contains("northern-cumbrian-coast"));
+        assert!(matched_ids.contains("northern-furness"));
+        for m in &matches {
+            if m.line.id == "northern-cumbrian-coast" || m.line.id == "northern-furness" {
+                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            }
+        }
+    }
+
+    // Regression test for the segment-split fix applied when
+    // `lines/northern-cumbrian-coast.toml` was merged: `northern-furness.toml`
+    // originally tagged ALL FOUR of its stations (not just the shared
+    // junction, BIF) with `segment = "northern-furness"`, which would have
+    // silently reclassified a Lancaster/Carnforth/Ulverston incident as
+    // SharedSegment purely because a second file also used that literal
+    // segment name for BIF. LAN/CNF/ULV now sit on their own exclusive
+    // `northern-furness-branch` segment -- this asserts that split holds.
+    #[test]
+    fn furness_branch_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("NT-FUR", "Signal failure at Ulverston", "Signal failure causing delays at Ulverston.", &["NT"], &["ULV"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-furness".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn calder_valley_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-3",
+            "Signal failure at Todmorden",
+            "Signal failure causing delays on the Calder Valley Line at Todmorden.",
+            &["NT"],
+            &["TOD"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-calder-valley".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn airedale_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-4",
+            "Signal failure at Keighley",
+            "Signal failure causing delays on the Airedale Line at Keighley.",
+            &["NT"],
+            &["KEI"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-airedale".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn wharfedale_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-5",
+            "Signal failure at Ilkley",
+            "Signal failure causing delays on the Wharfedale Line at Ilkley.",
+            &["NT"],
+            &["ILK"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-wharfedale".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // The `northern-shipley-trunk` shared-trunk regression test, owned by
+    // Task 8.4 per the plan (added once `lines/northern-wharfedale.toml`
+    // also exists and shares that segment name - see the shared-trunk
+    // naming comment at the top of `lines/northern-airedale.toml`).
+    #[test]
+    fn shipley_trunk_shared_incident_propagates_to_airedale_and_wharfedale() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-6",
+            "Signal failure at Shipley",
+            "Signal failure causing delays to Northern services at Shipley.",
+            &["NT"],
+            &["SHY"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert!(matched_ids.contains("northern-airedale"));
+        assert!(matched_ids.contains("northern-wharfedale"));
+        for m in &matches {
+            if m.line.id == "northern-airedale" || m.line.id == "northern-wharfedale" {
+                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            }
+        }
+    }
+
+    // `lines/northern-esk-valley.toml` (Task 8.5) is a genuinely standalone
+    // line per the gap analysis ("entirely separate from anything currently
+    // modelled") - no other line in this catalogue shares any track with
+    // it, so there is no shared-trunk regression test to write, only the
+    // exclusive-segment one below.
+    #[test]
+    fn esk_valley_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-7",
+            "Signal failure at Glaisdale",
+            "Signal failure causing delays on the Esk Valley Line at Glaisdale.",
+            &["NT"],
+            &["GLS"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-esk-valley".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn clitheroe_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-8",
+            "Signal failure at Blackburn",
+            "Signal failure causing delays on the Ribble Valley Line at Blackburn.",
+            &["NT"],
+            &["BBN"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["northern-clitheroe".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `northern-clitheroe.toml`'s MCV entry joins the existing
+    // `northern-manchester` shared segment already used by `northern.toml`
+    // and `northern-blackpool.toml` (confirmed genuine track-sharing through
+    // Bolton, not just both routes touching Manchester - see the
+    // top-of-file comment in `lines/northern-clitheroe.toml`), making it a
+    // three-way shared trunk.
+    #[test]
+    fn manchester_victoria_hub_incident_propagates_to_northern_blackpool_and_clitheroe() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "NT-9",
+            "Signal failure at Manchester Victoria",
+            "Signal failure causing delays to Northern services at Manchester Victoria.",
+            &["NT"],
+            &["MCV"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert!(matched_ids.contains("northern"));
+        assert!(matched_ids.contains("northern-blackpool"));
+        assert!(matched_ids.contains("northern-clitheroe"));
+        for m in &matches {
+            if m.line.id == "northern" || m.line.id == "northern-blackpool" || m.line.id == "northern-clitheroe" {
+                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            }
+        }
+        // `northern-calder-valley.toml` also has an MCV entry, but tagged
+        // with its own exclusive `northern-calder-valley` segment rather
+        // than `northern-manchester` (see that file's own comment on why
+        // the two termini are unrelated track). Guard against a future
+        // regression where Calder Valley's MCV entry gets accidentally
+        // merged into the shared `northern-manchester` segment.
+        if matched_ids.contains("northern-calder-valley") {
+            let calder_valley_match = matches.iter().find(|m| m.line.id == "northern-calder-valley").unwrap();
+            assert_eq!(
+                calder_valley_match.scope,
+                MatchScope::ExclusiveSegment,
+                "northern-calder-valley should be ExclusiveSegment"
+            );
+        }
+    }
 }
