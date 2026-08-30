@@ -1004,9 +1004,10 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         // Leeds is now this catalogue's most-contested station, per Batch 8's
         // own final review: five more Northern-family files (all landed on
-        // `main` after this test was originally written) also stop at LDS.
-        // Each line's scope here is a genuine, individually-derived fact
-        // about that line's OWN segment name at LDS -- not a blanket
+        // `main` after this test was originally written) also stop at LDS,
+        // and Batch 9 (TransPennine Express) added a sixth line. Each line's
+        // scope here is a genuine, individually-derived fact about that
+        // line's OWN segment name at LDS -- not a blanket
         // "Northern shares, LNER doesn't" rule:
         //   - lner-leeds: its own `lner-leeds` segment, used nowhere else.
         //   - northern / northern-yorkshire-coast: both on `northern-yorkshire`,
@@ -1021,6 +1022,9 @@ mod tests {
         //     sharing `northern-shipley-trunk` with Airedale at BDQ/SHY.
         //   - northern-calder-valley: its own `northern-calder-valley`
         //     segment, used nowhere else.
+        //   - tpe-north: its own `tpe-north` segment, used nowhere else in
+        //     the catalogue (confirmed via exact-match grep, not the
+        //     substring search that once wrongly suggested 4 files used it).
         assert_eq!(
             matched_ids,
             HashSet::from([
@@ -1030,11 +1034,14 @@ mod tests {
                 "northern-airedale".to_string(),
                 "northern-wharfedale".to_string(),
                 "northern-calder-valley".to_string(),
+                "tpe-north".to_string(),
             ])
         );
         for m in &matches {
             let expected = match m.line.id.as_str() {
-                "lner-leeds" | "northern-wharfedale" | "northern-calder-valley" => MatchScope::ExclusiveSegment,
+                "lner-leeds" | "northern-wharfedale" | "northern-calder-valley" | "tpe-north" => {
+                    MatchScope::ExclusiveSegment
+                }
                 "northern" | "northern-yorkshire-coast" | "northern-airedale" => MatchScope::SharedSegment,
                 other => panic!("unexpected line in Leeds overlap test: {other}"),
             };
@@ -1233,6 +1240,131 @@ mod tests {
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["lumo".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+
+    // No shared-segment-propagation test for tpe-anglo-scottish: per the
+    // batch's pre-flight scan it only overlaps sibling TPE lines at
+    // station level (Liverpool Lime Street / Manchester Piccadilly, and
+    // Edinburgh Waverley with tpe-borders), and has no shared segment with
+    // wcml/xc-manchester/northern by design (station-overlap-only, same
+    // precedent as xc-manchester.toml). It's a genuinely standalone line
+    // for this assertion.
+    #[test]
+    fn tpe_anglo_scottish_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "TPE-1",
+            "Points failure at Motherwell",
+            "Points failure causing delays to TransPennine Express services at Motherwell.",
+            &["TP"],
+            &["MTH"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tpe-anglo-scottish".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // No shared-segment-propagation test for tpe-south either: per this
+    // task's own pre-flight scan it only overlaps sibling TPE lines at
+    // station level (Liverpool Lime Street / Manchester Piccadilly with
+    // tpe-anglo-scottish and tpe-north; no overlap at all with
+    // tpe-borders), and has no shared segment with xc-manchester/northern
+    // by design (station-overlap-only, same precedent as
+    // xc-manchester.toml and tpe-anglo-scottish.toml). Genuinely standalone
+    // for this assertion.
+    #[test]
+    fn tpe_south_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "TPE-2",
+            "Signal failure at Grimsby Town",
+            "Signal failure causing delays to TransPennine Express services at Grimsby Town.",
+            &["TP"],
+            &["GMB"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tpe-south".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // No shared-SEGMENT-propagation test for tpe-borders: per this task's
+    // own pre-flight scan its own segment name `tpe-borders` has no real
+    // overlap with anything else in the catalogue, including this batch's
+    // own tpe-north — the Newcastle boundary between them is ruled a
+    // terminus-to-terminus handoff, not a shared trunk (mirrors how
+    // west-coast-main-line.toml and xc-manchester.toml treat their own
+    // Crewe overlap). What this task's own pre-flight scan didn't (and
+    // couldn't) anticipate: `lner-ecml.toml` (merged separately, in an
+    // earlier batch, and absent from this batch's own isolated worktree)
+    // also stops at Berwick-upon-Tweed, via its own distinct `ecml-borders`
+    // segment (confirmed exclusive to `lner-ecml.toml` via exact-match
+    // grep). Station-level overlap, different segment names — same pattern
+    // as the Halifax/Grand-Central-Bradford precedent: both lines match by
+    // station, both stay ExclusiveSegment on their own segment names.
+    #[test]
+    fn tpe_borders_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "TPE-3",
+            "Signal failure at Berwick-upon-Tweed",
+            "Signal failure causing delays to TransPennine Express services at Berwick-upon-Tweed.",
+            &["TP"],
+            &["BWK"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tpe-borders".to_string(), "lner-ecml".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    // No shared-segment-propagation test for tpe-north: no segment name it
+    // uses is shared with any other line, including this batch's own
+    // tpe-borders (the Newcastle boundary between them is a
+    // terminus-to-terminus handoff, not a shared trunk — see tpe-north's
+    // own file comments, consistent with tpe-borders's). Genuinely
+    // standalone for that assertion, despite unusually heavy *station*-level
+    // overlap with northern/cross-country/northern-tyne-valley (station
+    // hits alone still produce a `Match` per overlapping line — see below).
+    //
+    // Station choice for the exclusive-segment test below: almost every
+    // principal station on tpe-north's route also appears in another line
+    // file (LIV/NLW/MCV/HUD/LDS/YRK in `northern.toml`, DAR/DHM/YRK also in
+    // `cross-country.toml`, NCL in `cross-country.toml`/
+    // `northern-tyne-valley.toml`/`tpe-borders.toml`), and `match_one`
+    // matches per-line on raw station hits before segment classification —
+    // so an incident at any of those stations would also match those other
+    // lines (each independently as their own ExclusiveSegment, since no
+    // segment *name* collides), failing a "matches only tpe-north"
+    // assertion. Verified by grepping `lines/*.toml`: Chester-le-Street
+    // (CLS) is the one tpe-north station that appears in no other line
+    // file, so it's used here instead of the Darlington/Newcastle choice
+    // this task's brief originally suggested.
+    #[test]
+    fn tpe_north_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "TPE-4",
+            "Signal failure at Chester-le-Street",
+            "Signal failure causing delays to TransPennine Express services at Chester-le-Street.",
+            &["TP"],
+            &["CLS"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tpe-north".to_string()]));
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 }
