@@ -2348,6 +2348,11 @@ mod tests {
         // segment tag, even though `wcml-manchester.toml` and
         // `wcml-liverpool.toml` also diverge at Crewe (onto different
         // physical branches, via Wilmslow and Runcorn respectively).
+        //
+        // Rhyl is also tfw-north-wales-coast.toml's own station (merged
+        // separately, Batch 11), on its exclusive `tfw-north-wales-coast`
+        // segment -- station-level overlap, distinct segment names, both
+        // stay ExclusiveSegment.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -2359,8 +2364,13 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["wcml-north-wales".to_string()]));
-        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["wcml-north-wales".to_string(), "tfw-north-wales-coast".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
     }
 
     #[test]
@@ -2704,19 +2714,33 @@ mod tests {
     // task's file-scope limits).
     #[test]
     fn gwr_south_wales_station_overlap_with_xc_cardiff_stays_exclusive_each_line() {
+        // Cardiff Central is also both tfw-valley-lines-north.toml's and
+        // tfw-valley-lines-south.toml's own terminus (merged separately,
+        // Batch 11), tagged on both sides with their genuinely shared
+        // `tfw-valley-cardiff-hub` segment -- those two resolve
+        // SharedSegment *with each other*, while gwr-south-wales/xc-cardiff
+        // stay ExclusiveSegment on their own distinct segment names, same
+        // station-overlap-only pattern as this test already established.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident("GW-6", "Points failure at Cardiff Central", "Points failure causing delays at Cardiff Central.", &["GW"], &["CDF"]);
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-south-wales".to_string(), "xc-cardiff".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "gwr-south-wales".to_string(),
+                "xc-cardiff".to_string(),
+                "tfw-valley-lines-north".to_string(),
+                "tfw-valley-lines-south".to_string(),
+            ])
+        );
         for m in &matches {
-            assert_eq!(
-                m.scope,
-                MatchScope::ExclusiveSegment,
-                "{} should stay ExclusiveSegment (station overlap, not a shared segment)",
-                m.line.id
-            );
+            let expected = match m.line.id.as_str() {
+                "tfw-valley-lines-north" | "tfw-valley-lines-south" => MatchScope::SharedSegment,
+                _ => MatchScope::ExclusiveSegment,
+            };
+            assert_eq!(m.scope, expected, "{} scope mismatch", m.line.id);
         }
     }
 
@@ -3033,5 +3057,498 @@ mod tests {
                 m.line.id
             );
         }
+    }
+
+    // `tfw-cambrian`'s own trunk segment (`tfw-cambrian-trunk`) is still
+    // unique to Cambrian -- no other file shares that exact segment name,
+    // so an incident away from Shrewsbury only ever matches Cambrian as
+    // `MatchScope::ExclusiveSegment`, which is what this test covers.
+    // Shrewsbury itself, however, is now a genuine three-way overlap point:
+    // `tfw-marches.toml` (Task 11.5) and `tfw-heart-of-wales.toml` both tag
+    // SHR with the shared `tfw-heart-of-wales-shrewsbury` segment, while
+    // Cambrian keeps SHR on its own exclusive `tfw-cambrian-trunk` segment
+    // (the Cambrian Line diverges west immediately, still station-overlap
+    // only there -- see `lines/tfw-cambrian.toml`'s own comment). So an
+    // incident specifically at Shrewsbury resolves three ways at once: see
+    // `shrewsbury_three_way_overlap_resolves_per_line` below for that case.
+    #[test]
+    fn cambrian_coast_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-1",
+            "Signal failure at Barmouth",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["BRM"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-cambrian".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn cambrian_aberystwyth_branch_incident_does_not_propagate_to_coast_branch() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-2",
+            "Trespass incident at Aberystwyth",
+            "Trespass incident causing delays to Transport for Wales services.",
+            &["AW"],
+            &["AYW"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-cambrian".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `tfw-heart-of-wales` is standalone on its own southern stretch
+    // (Craven Arms southwards) -- `tfw-marches.toml` (Task 11.5) now exists
+    // but only shares the Shrewsbury-Craven Arms stretch, not the branch
+    // south of Craven Arms towards Llandrindod/Swansea, so an incident well
+    // south of Craven Arms should still match only Heart of Wales, as
+    // `MatchScope::ExclusiveSegment`. See
+    // `heart_of_wales_shrewsbury_shared_trunk_propagates` below for the
+    // shared-trunk case Task 11.5 decided on.
+    #[test]
+    fn heart_of_wales_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-3",
+            "Signal failure at Llandrindod",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["LLO"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-heart-of-wales".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `tfw-conwy-valley` is, at this point in the line catalogue, a
+    // genuinely standalone line: it uses a single whole-line segment name
+    // and no other file in the catalogue shares it yet.
+    // `tfw-north-wales-coast.toml` (Task 11.4) now exists and also reaches
+    // Llandudno Junction, but Task 11.4 deliberately ruled that overlap
+    // "station-overlap-only" rather than a genuine shared trunk (the Conwy
+    // Valley Line diverges south immediately at the junction, with no track
+    // actually shared by both lines' services beyond that one calling
+    // point) -- so the two files use distinct segment names there and this
+    // remains an exclusive-segment case for Conwy Valley. See
+    // `lines/tfw-north-wales-coast.toml`'s comments for the full reasoning,
+    // and `llj_station_overlap_matches_both_lines_as_exclusive` below for
+    // the assertion that exercises the overlap itself.
+    #[test]
+    fn conwy_valley_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-4",
+            "Signal failure at Betws-y-Coed",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["BYC"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-conwy-valley".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `tfw-north-wales-coast` (Task 11.4). An incident on a station well
+    // away from the Llandudno Junction overlap should match only this line,
+    // as `MatchScope::ExclusiveSegment` -- e.g. Rhyl.
+    #[test]
+    fn north_wales_coast_exclusive_segment_incident_does_not_propagate() {
+        // Rhyl is also wcml-north-wales.toml's own station (merged
+        // separately, Batch 1), on its exclusive `wcml-north-wales-branch`
+        // segment -- station-level overlap, distinct segment names, both
+        // stay ExclusiveSegment.
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "VT-1",
+            "Signal failure at Rhyl",
+            "Signal failure causing delays to services on the North Wales Coast Line.",
+            &["AW"],
+            &["RHL"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-north-wales-coast".to_string(), "wcml-north-wales".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    // Llandudno Junction is on both `tfw-conwy-valley` and
+    // `tfw-north-wales-coast`, but Task 11.4 ruled that overlap
+    // station-overlap-only rather than a shared trunk (see the comment
+    // above `conwy_valley_exclusive_segment_incident_does_not_propagate`
+    // and the comments in `lines/tfw-north-wales-coast.toml`). So an
+    // incident there should match both lines independently, each still
+    // classified as `MatchScope::ExclusiveSegment` (not `SharedSegment` --
+    // that scope only applies when a segment name is genuinely shared
+    // across line files, which is deliberately not the case here).
+    #[test]
+    fn llj_station_overlap_matches_both_lines_as_exclusive() {
+        // Llandudno Junction is also wcml-north-wales.toml's own station
+        // (merged separately, Batch 1), on its exclusive
+        // `wcml-north-wales-branch` segment -- a third independent
+        // ExclusiveSegment match by the same station-overlap pattern.
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-5",
+            "Points failure at Llandudno Junction",
+            "Points failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["LLJ"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "tfw-conwy-valley".to_string(),
+                "tfw-north-wales-coast".to_string(),
+                "wcml-north-wales".to_string(),
+            ])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    // `tfw-marches` (Task 11.5). An incident on a station well away from
+    // both coordination points (the Shrewsbury-Craven Arms shared trunk
+    // with Heart of Wales, and the Chester station-overlap with North
+    // Wales Coast) should match only this line, as
+    // `MatchScope::ExclusiveSegment` -- e.g. Hereford, which sits on
+    // `tfw-marches-south`, a segment no other line in the catalogue uses.
+    #[test]
+    fn marches_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-6",
+            "Signal failure at Hereford",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["HFD"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-marches".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Craven Arms is on both `tfw-marches` and `tfw-heart-of-wales`, and
+    // Task 11.5 ruled -- after independently verifying the physical
+    // track-sharing claim against three separate Wikipedia articles (see
+    // the comments above Craven Arms in `lines/tfw-marches.toml`) -- that
+    // this is a genuine shared trunk, not mere station overlap: Heart of
+    // Wales services physically run over Marches Line metals between
+    // Craven Arms and Shrewsbury, calling at the intermediate station
+    // Church Stretton along the way. Both files tag Craven Arms (and
+    // Church Stretton, and Shrewsbury) with the same segment name,
+    // `tfw-heart-of-wales-shrewsbury` (reusing the forward-bet name
+    // `tfw-heart-of-wales.toml` left for this file to pick up), so an
+    // incident there should propagate to both lines, each classified
+    // `MatchScope::SharedSegment`.
+    #[test]
+    fn heart_of_wales_shrewsbury_shared_trunk_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-7",
+            "Points failure at Craven Arms",
+            "Points failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["CRV"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-marches".to_string(), "tfw-heart-of-wales".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Church Stretton (CTT) is an ordinary intermediate stop on the same
+    // Shrewsbury-Craven Arms shared trunk exercised above, added to
+    // `tfw-heart-of-wales.toml` during the final whole-branch review's fix
+    // wave (Important #2) -- previously that file's station list jumped
+    // straight from Shrewsbury to Craven Arms, omitting Church Stretton
+    // entirely, which silently broke this exact propagation guarantee for
+    // an incident reported there specifically (it would have matched
+    // `tfw-marches` correctly but had no way to also match
+    // `tfw-heart-of-wales`, since CTT wasn't in that file's station list at
+    // all). Both files now tag Church Stretton with the same segment name,
+    // `tfw-heart-of-wales-shrewsbury` (see the sourcing/decision note above
+    // Craven Arms in `lines/tfw-marches.toml`, and the comment above CTT in
+    // `lines/tfw-heart-of-wales.toml`), so an incident there should
+    // propagate to both lines, each classified `MatchScope::SharedSegment`
+    // -- mirroring `heart_of_wales_shrewsbury_shared_trunk_propagates`
+    // above exactly, just at a different station on the same shared trunk.
+    #[test]
+    fn church_stretton_shared_trunk_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-15",
+            "Signal failure at Church Stretton",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["CTT"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-marches".to_string(), "tfw-heart-of-wales".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Chester is on both `tfw-marches` and `tfw-north-wales-coast`, but
+    // Task 11.5 ruled that overlap station-overlap-only rather than a
+    // shared trunk, mirroring `tfw-north-wales-coast.toml`'s own Llandudno
+    // Junction decision against `tfw-conwy-valley.toml`: despite genuine
+    // physical track sharing existing at Saltney Junction on the final
+    // approach into Chester (see the comment above Chester in
+    // `lines/tfw-marches.toml`), `tfw-north-wales-coast.toml` uses one
+    // single whole-line segment name for its entire route, so reusing it
+    // here would incorrectly mark that line's whole route (Rhyl, Bangor,
+    // Holyhead, etc.) as shared with Marches. So the two files use distinct
+    // segment names at Chester, and an incident there should match both
+    // lines independently, each still classified as
+    // `MatchScope::ExclusiveSegment` (not `SharedSegment`).
+    #[test]
+    fn chester_station_overlap_matches_both_lines_as_exclusive() {
+        // Chester is also wcml-north-wales.toml's (Batch 1) and
+        // merseyrail-wirral.toml's (Batch 12) own station, each on its own
+        // exclusive segment (`wcml-north-wales-branch`,
+        // `merseyrail-wirral-chester`) -- two more independent
+        // ExclusiveSegment matches by the same station-overlap pattern.
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-8",
+            "Points failure at Chester",
+            "Points failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["CTR"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "tfw-marches".to_string(),
+                "tfw-north-wales-coast".to_string(),
+                "wcml-north-wales".to_string(),
+                "merseyrail-wirral".to_string(),
+            ])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    // Shrewsbury is a genuine three-way overlap point, introduced by Task
+    // 11.5: `tfw-cambrian.toml` tags SHR with its own exclusive
+    // `tfw-cambrian-trunk` segment (the Cambrian Line diverges west
+    // immediately -- station-overlap only there, per that file's own
+    // comment), while `tfw-marches.toml` and `tfw-heart-of-wales.toml` both
+    // tag SHR with the shared `tfw-heart-of-wales-shrewsbury` segment (see
+    // the comment above Craven Arms in `lines/tfw-marches.toml` for the
+    // shared-trunk sourcing). So a single incident at SHR should resolve
+    // differently per line, all at once: Cambrian stays
+    // `MatchScope::ExclusiveSegment`, while Marches and Heart of Wales are
+    // both `MatchScope::SharedSegment`.
+    #[test]
+    fn shrewsbury_three_way_overlap_resolves_per_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-9",
+            "Signal failure at Shrewsbury",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["SHR"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let scopes: HashMap<String, MatchScope> =
+            matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+        assert_eq!(
+            scopes.keys().cloned().collect::<HashSet<String>>(),
+            HashSet::from(["tfw-cambrian".to_string(), "tfw-marches".to_string(), "tfw-heart-of-wales".to_string()])
+        );
+        assert_eq!(scopes["tfw-cambrian"], MatchScope::ExclusiveSegment);
+        assert_eq!(scopes["tfw-marches"], MatchScope::SharedSegment);
+        assert_eq!(scopes["tfw-heart-of-wales"], MatchScope::SharedSegment);
+    }
+
+    // `tfw-valley-lines-north` (Task 11.6). An incident on a station well
+    // into the Rhymney Line's own exclusive corridor (its own segment,
+    // `tfw-valley-rhymney`, used by no other branch in this file and no
+    // other file in the catalogue) should match only this line, as
+    // `MatchScope::ExclusiveSegment` -- e.g. Caerphilly.
+    #[test]
+    fn valley_lines_north_exclusive_rhymney_segment_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-10",
+            "Signal failure at Caerphilly",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["CPH"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-valley-lines-north".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `tfw-valley-lines-north` (Task 11.6) x `tfw-valley-lines-south`
+    // (Task 11.7): the Cardiff hub segment-sharing decision. This test
+    // supersedes the batch's earlier
+    // `valley_lines_north_cardiff_hub_is_exclusive_pending_task_11_7`, which
+    // documented the interim state before Task 11.7 existed (back then only
+    // one line file used the `tfw-valley-cardiff-hub` segment name, so the
+    // registry resolved it as `ExclusiveSegment`). Task 11.7 independently
+    // verified genuine same-platform sharing (both files' routes call at
+    // Cardiff Central and/or Cardiff Queen Street) and deliberately reused
+    // `tfw-valley-lines-north.toml`'s `tfw-valley-cardiff-hub` segment name
+    // in `tfw-valley-lines-south.toml` -- see that file's own Cardiff hub
+    // segment-sharing decision comment. With two line files now sharing the
+    // name, an incident at Cardiff Queen Street correctly propagates to both
+    // as `MatchScope::SharedSegment`, mirroring
+    // `xc_hub_incident_propagates_to_every_cross_country_arm`.
+    // `tfw-valley-lines-north.toml` itself was not edited to make this
+    // happen -- only this test (whose docstring always said the outcome was
+    // pending Task 11.7) and the new `tfw-valley-lines-south.toml` file.
+    #[test]
+    fn valley_lines_cardiff_hub_shared_segment_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-11",
+            "Points failure at Cardiff Queen Street",
+            "Points failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["CDQ"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-valley-lines-north".to_string(), "tfw-valley-lines-south".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // `tfw-valley-lines-south` (Task 11.7). An incident on a station well
+    // into the Coryton Line's own exclusive corridor (its own segment,
+    // `tfw-valley-coryton`, used by no other branch in this file and no
+    // other file in the catalogue) should match only this line, as
+    // `MatchScope::ExclusiveSegment` -- e.g. Birchgrove.
+    #[test]
+    fn valley_lines_south_exclusive_coryton_segment_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-12",
+            "Signal failure at Birchgrove",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["BCG"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-valley-lines-south".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `tfw-valley-lines-north` (Task 11.6) x `tfw-valley-lines-south`
+    // (Task 11.7): the Radyr junction-sharing decision (see
+    // `tfw-valley-lines-south.toml`'s own comment). Radyr carries its own
+    // dedicated, Radyr-only segment name, `tfw-valley-radyr-junction`,
+    // minted in both files (fix round 1: this used to reuse
+    // `tfw-valley-lines-north.toml`'s `tfw-valley-taff-trunk` segment name
+    // for Radyr alone, which incorrectly made every other station on that
+    // segment register as shared too -- see
+    // `valley_lines_north_exclusive_pontypridd_segment_does_not_propagate`
+    // below for the regression test guarding against that) -- so an
+    // incident at Radyr itself should still propagate to both files, both
+    // `MatchScope::SharedSegment`.
+    #[test]
+    fn valley_lines_radyr_junction_shared_segment_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-13",
+            "Points failure at Radyr",
+            "Points failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["RDR"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-valley-lines-north".to_string(), "tfw-valley-lines-south".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // `tfw-valley-lines-north` (Task 11.6), fix round 1 regression test.
+    // Pontypridd (PPD) sits on `tfw-valley-taff-trunk`, the segment shared
+    // *within this file* by the Merthyr, Aberdare and Rhondda/Treherbert
+    // branches -- but it is not, and must never become, shared with
+    // `tfw-valley-lines-south.toml`: the City Line (that file) only touches
+    // this trunk at Radyr itself, via its own dedicated
+    // `tfw-valley-radyr-junction` segment, not at Pontypridd or any of the
+    // other five stations on `tfw-valley-taff-trunk` (Cathays, Llandaf,
+    // Taffs Well, Treforest, Treforest Estate). This guards against the
+    // original Task 11.7 bug, where south's Radyr entry reused
+    // `tfw-valley-taff-trunk` verbatim and made `SegmentRegistry` (which
+    // indexes sharing by segment-name string across the whole catalogue,
+    // not per-station) incorrectly resolve Pontypridd as `SharedSegment`
+    // too.
+    #[test]
+    fn valley_lines_north_exclusive_pontypridd_segment_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "AW-14",
+            "Signal failure at Pontypridd",
+            "Signal failure causing delays to Transport for Wales services.",
+            &["AW"],
+            &["PPD"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tfw-valley-lines-north".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 }
