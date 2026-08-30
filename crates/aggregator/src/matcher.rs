@@ -249,4 +249,139 @@ mod tests {
         assert_eq!(matched_ids, HashSet::from(["swr-alton".to_string()]));
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
+
+    // London Overground's Liberty line (Romford - Emerson Park - Upminster)
+    // is a standalone line with no interchange with any sibling Overground
+    // line (confirmed by its own sourcing in the line-catalogue research
+    // pass). Per the Global Constraints, standalone lines get an
+    // exclusive-segment test only — no shared-segment propagation test is
+    // possible or required, the same exception class as c2c/Merseyrail.
+    #[test]
+    fn overground_liberty_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-1", "Signal failure at Upminster", "Signal failure causing delays at Upminster.", &["LO"], &["UPM"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["overground-liberty".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // London Overground's Lioness line (former Watford DC line, Euston -
+    // Watford Junction) shares only a single station (Willesden Junction)
+    // with the Mildmay line, on physically separate track either side of
+    // it — a station-level overlap, not a shared segment. Standalone for
+    // the shared-segment testing convention: exclusive-segment test only,
+    // same exception class as c2c/Merseyrail.
+    //
+    // Uses Bushey (BSH) rather than Watford Junction (WFJ): WFJ also
+    // appears on `west-coast-main-line.toml` (a real station-level overlap
+    // the brief didn't call out), which would make an incident there match
+    // both lines and defeat the point of this exclusive-segment test.
+    #[test]
+    fn overground_lioness_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-2", "Points failure at Bushey", "Points failure causing delays at Bushey.", &["LO"], &["BSH"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["overground-lioness".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // London Overground's Mildmay line (former North London line core +
+    // West London line north end) — exclusive segment test, mirroring
+    // `elizabeth_branch_incident_stays_on_its_branch`. Mildmay's
+    // shared-segment propagation test (`overground-canonbury-curve` with
+    // the Windrush line) lives alongside `overground-windrush`'s own tests
+    // below, since it needs both lines' files to exist.
+    //
+    // Uses Richmond (RMD) rather than Stratford (SRA): SRA also appears on
+    // `elizabeth-shenfield.toml` (a real station-level overlap the brief
+    // didn't call out), which would make an incident there match both
+    // lines and defeat the point of this exclusive-segment test.
+    #[test]
+    fn overground_mildmay_exclusive_segment_incident_stays_on_its_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-3", "Trespass at Richmond", "Trespass incident causing delays at Richmond.", &["LO"], &["RMD"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["overground-mildmay".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // London Overground's Suffragette line (former Gospel Oak to Barking
+    // line) has no genuine shared segment with any sibling Overground
+    // line — its only touchpoint (Gospel Oak, with Mildmay) is a
+    // station-level overlap, and South Tottenham (this line) is a
+    // genuinely different station from Seven Sisters (Weaver line)
+    // despite being nearby. Standalone for the shared-segment testing
+    // convention: exclusive-segment test only, same exception class as
+    // c2c/Merseyrail.
+    #[test]
+    fn overground_suffragette_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-4", "Points failure at Barking Riverside", "Points failure causing delays at Barking Riverside.", &["LO"], &["BGV"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["overground-suffragette".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // London Overground's Weaver line (former Lea Valley lines) has no
+    // genuine shared segment with any sibling Overground line — its
+    // Enfield Town/Cheshunt sub-trunk sharing is internal to this one
+    // line, and Seven Sisters (this line) is a genuinely different
+    // station from Suffragette's South Tottenham despite proximity.
+    // Standalone for the shared-segment testing convention:
+    // exclusive-segment test only, same exception class as c2c/Merseyrail.
+    #[test]
+    fn overground_weaver_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-5", "Signal failure at Chingford", "Signal failure causing delays at Chingford.", &["LO"], &["CHI"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["overground-weaver".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // London Overground's Windrush line (former East London line,
+    // extended) — exclusive segment test for its West Croydon branch,
+    // well clear of the shared Canonbury curve.
+    #[test]
+    fn overground_windrush_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-6", "Signal failure at West Croydon", "Signal failure causing delays at West Croydon.", &["LO"], &["WCY"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["overground-windrush".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // The `overground-canonbury-curve` shared segment (Highbury &
+    // Islington, Canonbury) is the only genuine cross-line shared trunk
+    // among the six London Overground lines — a real curve of track
+    // connecting the North London (Mildmay) and East London (Windrush)
+    // route alignments. Mirrors `swr_shared_trunk_incident_propagates`;
+    // needs both `overground-mildmay` and `overground-windrush` loaded,
+    // hence `load_all_lines()` and placement here (after both files exist).
+    #[test]
+    fn overground_canonbury_curve_incident_propagates_to_mildmay_and_windrush() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("LO-7", "Signal failure at Canonbury", "Signal failure causing delays at Canonbury.", &["LO"], &["CNN"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["overground-mildmay".to_string(), "overground-windrush".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
 }

@@ -128,4 +128,23 @@ mod tests {
         assert!(touched.contains("swr-trunk-waterloo"));
         assert!(touched.contains("swr-alton-branch"));
     }
+
+    #[test]
+    fn overground_canonbury_curve_is_shared_between_mildmay_and_windrush() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        assert!(registry.is_shared("overground-canonbury-curve"));
+        let mut users = registry.lines_for_segment("overground-canonbury-curve");
+        users.sort();
+        assert_eq!(users, vec!["overground-mildmay", "overground-windrush"]);
+    }
+
+    #[test]
+    fn overground_exclusive_segments_are_not_shared() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        assert!(!registry.is_shared("overground-liberty"));
+        assert!(!registry.is_shared("overground-suffragette"));
+        assert!(!registry.is_shared("overground-weaver-chingford"));
+    }
 }
