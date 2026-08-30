@@ -160,23 +160,83 @@ async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_
 /// poll cycle for most lines, defeating the point of only recording history
 /// on real changes.
 fn normalize_for_diff(statuses: &serde_json::Value) -> serde_json::Value {
-    let mut statuses = statuses.clone();
-    if let Some(entries) = statuses.as_array_mut() {
-        for entry in entries {
-            if let Some(validity) = entry.get_mut("validity").and_then(|v| v.as_object_mut()) {
-                validity.remove("from_date");
-            }
-            if let Some(obj) = entry.as_object_mut() {
-                obj.remove("sample_stats");
-            }
-            if let Some(reason) = entry.get_mut("reason")
-                && let Some(stripped) = reason.as_str().map(strip_live_sample_annotation)
-            {
-                *reason = serde_json::Value::String(stripped.to_string());
-            }
+    match statuses.as_array() {
+        Some(entries) => serde_json::Value::Array(entries.iter().map(normalize_entry_for_diff).collect()),
+        None => statuses.clone(),
+    }
+}
+
+/// Per-entry half of `normalize_for_diff`, split out so
+/// `carry_forward_ldbws_from_date` (below) can reuse the exact same
+/// "does this entry mean the same thing as last cycle" definition when
+/// deciding whether to carry forward `from_date`, rather than
+/// re-implementing a second, potentially-diverging notion of equality.
+fn normalize_entry_for_diff(entry: &serde_json::Value) -> serde_json::Value {
+    let mut entry = entry.clone();
+    if let Some(validity) = entry.get_mut("validity").and_then(|v| v.as_object_mut()) {
+        validity.remove("from_date");
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        obj.remove("sample_stats");
+    }
+    if let Some(reason) = entry.get_mut("reason")
+        && let Some(stripped) = reason.as_str().map(strip_live_sample_annotation)
+    {
+        *reason = serde_json::Value::String(stripped.to_string());
+    }
+    entry
+}
+
+/// The one `DataQuality` value affected by the `Utc::now()`-every-cycle bug
+/// this exists to work around. See
+/// docs/superpowers/specs/2026-08-30-inferred-time-ranges-design.md.
+const LDBWS_INFERRED: &str = "ldbws-inferred";
+
+/// Given the previous cycle's stored `statuses` JSON array (`existing`) and
+/// this cycle's freshly-computed one (`fresh`), returns a copy of `fresh`
+/// with each `"ldbws-inferred"` entry's `validity.from_date` overwritten by
+/// the positionally-corresponding entry in `existing`, provided that entry
+/// is also `"ldbws-inferred"` and the two entries are equal once run
+/// through `normalize_entry_for_diff` (i.e. "same underlying disruption,
+/// just a fresh poll of it" -- `sample_stats` and the live-sample-count
+/// reason suffix are allowed to churn without defeating the carry-forward,
+/// since `normalize_entry_for_diff` already strips both).
+///
+/// Positional matching (`existing[i]` vs. `fresh[i]`) is safe today because
+/// `infer_from_samples`/`good_service()` (`aggregation.rs`) only ever
+/// produce a single-entry `statuses` array per line -- see the design doc's
+/// Open Question 2 for what would need to change if that ever stops being
+/// true.
+///
+/// A new or genuinely-changed status (no prior entry at this position,
+/// prior entry has a different `data_quality`, or the stripped content
+/// differs) is left with its fresh `Utc::now()` stamp untouched -- this is
+/// the correct behavior for those cases, not a gap in the fix.
+fn carry_forward_ldbws_from_date(existing: &serde_json::Value, fresh: &serde_json::Value) -> serde_json::Value {
+    let mut fresh = fresh.clone();
+    let existing_entries = existing.as_array();
+    let Some(fresh_entries) = fresh.as_array_mut() else { return fresh };
+
+    for (i, entry) in fresh_entries.iter_mut().enumerate() {
+        if entry.get("data_quality").and_then(|v| v.as_str()) != Some(LDBWS_INFERRED) {
+            continue;
+        }
+        let Some(existing_entry) = existing_entries.and_then(|arr| arr.get(i)) else { continue };
+        if existing_entry.get("data_quality").and_then(|v| v.as_str()) != Some(LDBWS_INFERRED) {
+            continue;
+        }
+        if normalize_entry_for_diff(entry) != normalize_entry_for_diff(existing_entry) {
+            continue;
+        }
+        let Some(old_from_date) = existing_entry.get("validity").and_then(|v| v.get("from_date")).cloned() else {
+            continue;
+        };
+        if let Some(validity) = entry.get_mut("validity").and_then(|v| v.as_object_mut()) {
+            validity.insert("from_date".to_string(), old_from_date);
         }
     }
-    statuses
+
+    fresh
 }
 
 /// Strips a trailing `" (live samples show: ...)"` annotation from a
@@ -196,11 +256,22 @@ fn strip_live_sample_annotation(reason: &str) -> &str {
 /// inserts a `line_status_history` snapshot only if the statuses actually
 /// changed since the last cycle.
 pub async fn write_line_status(pool: &PgPool, report: &LineStatusReport) -> Result<()> {
-    let statuses_json = serde_json::to_value(&report.statuses)?;
+    let fresh_statuses_json = serde_json::to_value(&report.statuses)?;
+    let existing = existing_statuses(pool, &report.id).await?;
 
-    let changed = match existing_statuses(pool, &report.id).await? {
+    // Carry forward `from_date` for any `ldbws-inferred` entry whose content
+    // is unchanged from last cycle, before comparing/persisting -- see
+    // docs/superpowers/specs/2026-08-30-inferred-time-ranges-design.md. This
+    // does not change `changed`'s outcome (normalize_for_diff already strips
+    // `from_date` from both sides), only what gets stored.
+    let statuses_json = match &existing {
+        Some(existing) => carry_forward_ldbws_from_date(existing, &fresh_statuses_json),
+        None => fresh_statuses_json,
+    };
+
+    let changed = match &existing {
         None => true,
-        Some(existing) => normalize_for_diff(&existing) != normalize_for_diff(&statuses_json),
+        Some(existing) => normalize_for_diff(existing) != normalize_for_diff(&statuses_json),
     };
 
     sqlx::query(
@@ -321,6 +392,155 @@ mod tests {
 
         assert!(!survivors.contains(&"TEST-AGG".to_string()), "the aggregator's own stale row should go");
         assert!(survivors.contains(&"TEST-TFL".to_string()), "a TfL-owned row must not be collateral damage");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; see the plan's Global Constraints for the \
+                DATABASE_URL incantation, then run with `cargo test -p aggregator \
+                a_stable_ldbws_inferred_status_carries_its_from_date_across_two_cycles -- --ignored`"]
+    async fn a_stable_ldbws_inferred_status_carries_its_from_date_across_two_cycles() {
+        // Real two-cycle aggregate() -> write_line_status() sequence, per
+        // docs/superpowers/specs/2026-08-30-inferred-time-ranges-design.md's
+        // "Testing" section: a stable LdbwsInferred status across two cycles
+        // should still produce exactly one line_status_history row
+        // (unchanged from today) AND a stable `from_date` in the second
+        // cycle's stored row (the new behavior this design fixes).
+        use crate::aggregation::aggregate;
+        use crate::queries::LoadedIncident;
+        use crate::segments::SegmentRegistry;
+        use common::{Defaults, LineDefinition, StationDeparture, StationSample};
+        use std::collections::HashMap;
+
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+
+        const LINE_ID: &str = "TEST-CARRY-FORWARD-LINE";
+
+        let line = LineDefinition {
+            id: LINE_ID.to_string(),
+            name: "Test Carry-Forward Line".to_string(),
+            mode: "national-rail".to_string(),
+            category: "regional".to_string(),
+            operators: vec!["SW".to_string()],
+            stations: vec![],
+            sample_stations: vec!["AHT".to_string()],
+            match_keywords: vec![],
+            excluded_keywords: vec![],
+            severity_overrides: HashMap::new(),
+            exclusive_segments: vec![],
+            destination_crs_filter: vec!["AON".to_string()],
+            headcode_prefixes: vec![],
+        };
+        let mut lines = HashMap::new();
+        lines.insert(LINE_ID.to_string(), line);
+
+        fn departure(delay_minutes: i32) -> StationDeparture {
+            StationDeparture {
+                service_id: "svc".to_string(),
+                operator: "SW".to_string(),
+                destination_crs: "AON".to_string(),
+                scheduled: "10:00".to_string(),
+                estimated: "10:00".to_string(),
+                is_cancelled: false,
+                delay_minutes,
+                cancel_reason: None,
+                delay_reason: if delay_minutes > 0 { Some("signal failure".to_string()) } else { None },
+                headcode: None,
+                skipped_stations: vec![],
+            }
+        }
+
+        // 1 of 4 delayed (>= the 5-minute default threshold) -> exactly at
+        // the 25% minor-delays default threshold -> a stable, non-good-
+        // service `LdbwsInferred` status, the design doc's primary/
+        // high-volume case (not the lower-stakes good_service() fallback).
+        let samples: HashMap<String, StationSample> = HashMap::from([(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![departure(10), departure(0), departure(0), departure(0)],
+            },
+        )]);
+
+        let registry = SegmentRegistry::new(&lines);
+        let defaults = Defaults::default();
+        let no_incidents: Vec<LoadedIncident> = vec![];
+
+        // Cleanup any leftovers from a prior failed run before starting.
+        sqlx::query("DELETE FROM line_status_history WHERE line_id = $1")
+            .bind(LINE_ID)
+            .execute(&pool)
+            .await
+            .expect("pre-test cleanup of line_status_history");
+        sqlx::query("DELETE FROM line_status WHERE line_id = $1")
+            .bind(LINE_ID)
+            .execute(&pool)
+            .await
+            .expect("pre-test cleanup of line_status");
+
+        // Cycle 1.
+        let reports1 = aggregate(&lines, &no_incidents, &samples, &registry, &defaults);
+        let report1 = reports1.get(LINE_ID).expect("line should have a report");
+        assert_eq!(
+            report1.statuses[0].data_quality,
+            common::DataQuality::LdbwsInferred,
+            "sanity check: this scenario should hit the LdbwsInferred path, not an incident-derived one"
+        );
+        write_line_status(&pool, report1).await.expect("write_line_status cycle 1");
+
+        let stored_after_cycle_1: serde_json::Value = sqlx::query_scalar("SELECT statuses FROM line_status WHERE line_id = $1")
+            .bind(LINE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read stored statuses after cycle 1");
+        let from_date_after_cycle_1 = stored_after_cycle_1[0]["validity"]["from_date"].clone();
+
+        // Cycle 2: identical samples (a real re-poll of the same ongoing,
+        // unchanged disruption), but a later, distinct Utc::now() internally.
+        let reports2 = aggregate(&lines, &no_incidents, &samples, &registry, &defaults);
+        let report2 = reports2.get(LINE_ID).expect("line should have a report");
+        let fresh_from_date_cycle_2 =
+            serde_json::to_value(report2.statuses[0].validity.from_date).expect("serialize fresh from_date");
+        write_line_status(&pool, report2).await.expect("write_line_status cycle 2");
+
+        let stored_after_cycle_2: serde_json::Value = sqlx::query_scalar("SELECT statuses FROM line_status WHERE line_id = $1")
+            .bind(LINE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read stored statuses after cycle 2");
+        let from_date_after_cycle_2 = stored_after_cycle_2[0]["validity"]["from_date"].clone();
+
+        let history_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_history WHERE line_id = $1")
+            .bind(LINE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count history rows");
+
+        sqlx::query("DELETE FROM line_status_history WHERE line_id = $1")
+            .bind(LINE_ID)
+            .execute(&pool)
+            .await
+            .expect("cleanup line_status_history");
+        sqlx::query("DELETE FROM line_status WHERE line_id = $1")
+            .bind(LINE_ID)
+            .execute(&pool)
+            .await
+            .expect("cleanup line_status");
+
+        assert_eq!(
+            history_count, 1,
+            "a stable status across two cycles should still write exactly one history row, unchanged from today"
+        );
+        assert_eq!(
+            from_date_after_cycle_2, from_date_after_cycle_1,
+            "the stored from_date must stay stable across two cycles of an unchanged disruption"
+        );
+        assert_ne!(
+            fresh_from_date_cycle_2, from_date_after_cycle_2,
+            "sanity check: cycle 2's own freshly-computed from_date must differ from what actually got \
+             stored, proving the carry-forward -- not coincidence -- is what kept the stored value stable"
+        );
     }
 
     #[test]
@@ -448,5 +668,183 @@ mod tests {
             strip_live_sample_annotation("Works in the area (live samples show: something) more text"),
             "Works in the area (live samples show: something) more text",
         );
+    }
+
+    // --- carry_forward_ldbws_from_date ---
+    //
+    // See docs/superpowers/specs/2026-08-30-inferred-time-ranges-design.md's
+    // "Testing" section for the full list this covers.
+
+    fn ldbws_status(from_date: &str, severity: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!([
+            {
+                "severity": severity,
+                "reason": reason,
+                "validity": {"from_date": from_date, "to_date": null, "is_now": true},
+                "data_quality": "ldbws-inferred",
+                "disruption": {
+                    "category": "RealTime",
+                    "description": reason,
+                    "affected_stops": ["PAD"],
+                    "affected_routes": [],
+                    "source": "ldbws-sampling"
+                },
+                "sample_stats": {"total": 10, "delayed": 3, "cancelled": 0, "skipped": 0, "avg_delay_minutes": 4.0}
+            }
+        ])
+    }
+
+    fn knowledgebase_status(from_date: &str) -> serde_json::Value {
+        serde_json::json!([
+            {
+                "severity": "minor-delays",
+                "reason": "Signal failure near Reading",
+                "validity": {"from_date": from_date, "to_date": null, "is_now": true},
+                "data_quality": "knowledgebase",
+                "disruption": {
+                    "category": "RealTime",
+                    "description": "Signal failure near Reading",
+                    "affected_stops": [],
+                    "affected_routes": [],
+                    "source": "knowledgebase-incident-1"
+                }
+            }
+        ])
+    }
+
+    #[test]
+    fn carry_forward_keeps_the_old_from_date_when_content_is_unchanged() {
+        let existing = ldbws_status("2026-08-30T06:00:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let fresh = ldbws_status("2026-08-30T09:30:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], existing[0]["validity"]["from_date"],
+            "unchanged content should carry forward the OLD from_date, not the fresh stamp"
+        );
+    }
+
+    #[test]
+    fn carry_forward_uses_the_fresh_stamp_when_severity_changes() {
+        let existing = ldbws_status("2026-08-30T06:00:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let fresh = ldbws_status("2026-08-30T09:30:00Z", "severe-delays", "7 of 10 sampled services delayed.");
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], fresh[0]["validity"]["from_date"],
+            "a genuine severity change must not carry forward the old from_date"
+        );
+    }
+
+    #[test]
+    fn carry_forward_uses_the_fresh_stamp_when_reason_changes() {
+        let existing = ldbws_status("2026-08-30T06:00:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let fresh = ldbws_status(
+            "2026-08-30T09:30:00Z",
+            "minor-delays",
+            "3 of 10 sampled services skipping a scheduled stop.",
+        );
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], fresh[0]["validity"]["from_date"],
+            "a genuine reason change must not carry forward the old from_date"
+        );
+    }
+
+    #[test]
+    fn carry_forward_uses_the_fresh_stamp_when_no_prior_entry_exists() {
+        let existing = serde_json::json!([]);
+        let fresh = ldbws_status("2026-08-30T09:30:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], fresh[0]["validity"]["from_date"],
+            "a line with no prior stored status has nothing to carry forward from"
+        );
+    }
+
+    #[test]
+    fn carry_forward_uses_the_fresh_stamp_when_the_prior_entry_has_a_different_data_quality() {
+        let existing = knowledgebase_status("2026-08-30T06:00:00Z");
+        let fresh = ldbws_status("2026-08-30T09:30:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], fresh[0]["validity"]["from_date"],
+            "an incident replaced by LDBWS inference is a new status, not a continuation"
+        );
+    }
+
+    #[test]
+    fn carry_forward_never_touches_a_non_ldbws_fresh_entry() {
+        // A Knowledgebase/Planned entry's from_date already comes from real
+        // incident data and must be left alone regardless of what the
+        // previous cycle stored.
+        let existing = knowledgebase_status("2026-08-30T06:00:00Z");
+        let fresh = knowledgebase_status("2026-08-30T09:30:00Z");
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(result, fresh, "non-ldbws-inferred entries must pass through untouched");
+    }
+
+    #[test]
+    fn carry_forward_applies_to_good_service_entries_too() {
+        let existing = ldbws_status("2026-08-30T06:00:00Z", "good-service", "Good Service");
+        let fresh = ldbws_status("2026-08-30T09:30:00Z", "good-service", "Good Service");
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], existing[0]["validity"]["from_date"],
+            "good_service() entries should carry forward exactly like any other ldbws-inferred entry"
+        );
+    }
+
+    #[test]
+    fn carry_forward_is_not_defeated_by_sample_stats_or_live_annotation_churn() {
+        // Deliberately built without the shared `ldbws_status`/`disruption`
+        // helper: `disruption.description` is not one of the fields
+        // `normalize_entry_for_diff` strips (nor should it be -- a real
+        // `infer_from_samples` entry never puts the live-sample-count
+        // suffix into `description`, only into top-level `reason`), so
+        // exercising that specific stripping needs a fixture that isolates
+        // it, matching this file's existing
+        // `normalize_for_diff_ignores_live_sample_annotation_churn` style.
+        let existing = serde_json::json!([
+            {
+                "severity": "severe-delays",
+                "reason": "Points failure at Crewe (live samples show: 4 of 8 sampled services delayed.)",
+                "validity": {"from_date": "2026-08-30T06:00:00Z", "to_date": null, "is_now": true},
+                "data_quality": "ldbws-inferred",
+                "sample_stats": {"total": 8, "delayed": 4, "cancelled": 0, "skipped": 0, "avg_delay_minutes": 12.0}
+            }
+        ]);
+        let fresh = serde_json::json!([
+            {
+                "severity": "severe-delays",
+                "reason": "Points failure at Crewe (live samples show: 9 of 17 sampled services delayed.)",
+                "validity": {"from_date": "2026-08-30T09:30:00Z", "to_date": null, "is_now": true},
+                "data_quality": "ldbws-inferred",
+                "sample_stats": {"total": 17, "delayed": 9, "cancelled": 1, "skipped": 2, "avg_delay_minutes": 15.5}
+            }
+        ]);
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], existing[0]["validity"]["from_date"],
+            "sample_stats/live-count-suffix churn alone must not defeat the carry-forward"
+        );
+        // And the churned fields themselves must still be the fresh values,
+        // not accidentally overwritten along with from_date.
+        assert_eq!(result[0]["sample_stats"], fresh[0]["sample_stats"]);
+        assert_eq!(result[0]["reason"], fresh[0]["reason"]);
     }
 }
