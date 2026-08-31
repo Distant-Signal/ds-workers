@@ -913,11 +913,21 @@ mod tests {
         // branches will share `ecml-doncaster`/`ecml-fenland` with — no
         // other line touches `ecml-aberdeen` today, so this should stay
         // exclusive to `lner-ecml` and not propagate anywhere else.
+        //
+        // Aberdeen is also scotrail-aberdeen-inverness.toml's own terminus
+        // (merged separately, Batch 10), on its exclusive
+        // `scotrail-aberdeen-inverness` segment -- station-level overlap,
+        // distinct segment names, both stay ExclusiveSegment.
         let inc = incident("LNER-1", "Points failure at Aberdeen", "Points failure causing delays at Aberdeen.", &["GR"], &["ABD"]);
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["lner-ecml".to_string()]));
-        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["lner-ecml".to_string(), "scotrail-aberdeen-inverness".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
     }
 
     #[test]
@@ -1347,6 +1357,11 @@ mod tests {
         // with `lner-hull.toml`) — checked: no other test in this file
         // references King's Cross, Stevenage, Newcastle, Morpeth, Edinburgh
         // Waverley or Haymarket.
+        //
+        // Falkirk High is also scotrail-central-belt.toml's own station
+        // (merged separately, Batch 10), on its exclusive
+        // `scotrail-central-belt` segment -- station-level overlap,
+        // distinct segment names, both stay ExclusiveSegment.
         let inc = incident(
             "LD-1",
             "Signal failure at Falkirk High",
@@ -1356,8 +1371,13 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["lumo".to_string()]));
-        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["lumo".to_string(), "scotrail-central-belt".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
     }
 
 
@@ -1370,6 +1390,10 @@ mod tests {
     // for this assertion.
     #[test]
     fn tpe_anglo_scottish_exclusive_segment_incident_does_not_propagate() {
+        // Motherwell is also scotrail-glasgow-suburban.toml's own junction
+        // (its own `scotrail-glasgow-suburban-argyle-east` segment, merged
+        // separately, Batch 10) -- station-level overlap, distinct segment
+        // names, both stay ExclusiveSegment.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -1381,8 +1405,13 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tpe-anglo-scottish".to_string()]));
-        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tpe-anglo-scottish".to_string(), "scotrail-glasgow-suburban".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
     }
 
     // No shared-segment-propagation test for tpe-south either: per this
@@ -4886,6 +4915,602 @@ mod tests {
         );
         for m in &matches {
             assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+        }
+    }
+
+    // Task 10.1 (ScotRail Central Belt): no sibling ScotRail line exists yet
+    // in `lines/` to share `scotrail-central-belt`/
+    // `scotrail-central-belt-edinburgh-throat` with, so there is no
+    // shared-segment propagation to assert today -- see
+    // `lines/scotrail-central-belt.toml`'s own comments for the segment-
+    // naming groundwork left for Task 10.2. Only the exclusive-segment
+    // non-propagation assertion applies for now, mirroring
+    // `swr_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_central_belt_exclusive_segment_incident_does_not_propagate() {
+        // Falkirk High is also lumo.toml's own station (merged separately,
+        // Batch 10), on its exclusive `lumo-glasgow` segment -- station-level
+        // overlap, distinct segment names, both stay ExclusiveSegment.
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-1",
+            "Signal failure at Falkirk High",
+            "Signal failure causing delays to ScotRail services at Falkirk High.",
+            &["SR"],
+            &["FKK"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-central-belt".to_string(), "lumo".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    // Task 10.2 (ScotRail Glasgow Suburban): no other `lines/*.toml` file
+    // touches North Clyde/Argyle Line territory yet, and this file
+    // deliberately stops short of sharing a segment with
+    // `scotrail-central-belt.toml` (see this file's own comments on the
+    // Airdrie/Bathgate boundary decision) -- so there is no shared-segment
+    // propagation to assert today, mirroring
+    // `scotrail_central_belt_exclusive_segment_incident_does_not_propagate`.
+    // Only the exclusive-segment non-propagation assertion applies for now.
+    #[test]
+    fn scotrail_glasgow_suburban_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-2",
+            "Signal failure at Milngavie",
+            "Signal failure causing delays to ScotRail services at Milngavie.",
+            &["SR"],
+            &["MLN"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-glasgow-suburban".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.3 (ScotRail Ayrshire Coast): no other `lines/*.toml` file
+    // touches this line's Glasgow-Ayr trunk or its Girvan/Stranraer branch
+    // yet (see `lines/scotrail-ayrshire.toml`'s own comments), so there is
+    // no shared-segment propagation to assert today -- only exclusive-
+    // segment non-propagation for each of this file's two segments,
+    // mirroring `scotrail_central_belt_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_ayrshire_glasgow_ayr_trunk_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-3",
+            "Signal failure at Kilwinning",
+            "Signal failure causing delays to ScotRail services at Kilwinning.",
+            &["SR"],
+            &["KWN"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-ayrshire".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn scotrail_ayrshire_stranraer_branch_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-4",
+            "Level crossing fault at Girvan",
+            "Level crossing fault causing delays to ScotRail services at Girvan.",
+            &["SR"],
+            &["GIR"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-ayrshire".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.4 (ScotRail Fife Circle + Borders Railway): this file
+    // bundles two genuinely separate routes with distinct segment-name
+    // prefixes (`scotrail-fife-circle*` / `scotrail-borders`), neither of
+    // which is shared with any other `lines/*.toml` file today (see
+    // `lines/scotrail-fife-borders.toml`'s own comments on why the
+    // Edinburgh Waverley/Haymarket overlap with `scotrail-central-belt`
+    // isn't modelled as a shared segment) -- so, mirroring Task 10.3's
+    // two-exclusive-segments treatment, one exclusive-segment
+    // non-propagation assertion per route, not a shared-segment one.
+    #[test]
+    fn scotrail_fife_circle_exclusive_segment_incident_does_not_propagate() {
+        // Kirkcaldy is also lner-ecml.toml's own station (its own
+        // `ecml-aberdeen` segment, merged separately), on the Edinburgh-
+        // Aberdeen main line via the Forth Bridge -- station-level overlap,
+        // distinct segment names, both stay ExclusiveSegment.
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-5",
+            "Signal failure at Kirkcaldy",
+            "Signal failure causing delays to ScotRail services at Kirkcaldy.",
+            &["SR"],
+            &["KDY"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-fife-borders".to_string(), "lner-ecml".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    #[test]
+    fn scotrail_borders_railway_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-6",
+            "Points failure at Galashiels",
+            "Points failure causing delays to ScotRail services at Galashiels.",
+            &["SR"],
+            &["GAL"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-fife-borders".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.5 (ScotRail Highland Main Line): no sibling `lines/*.toml`
+    // file touches this line's `scotrail-highland-main-line` segment yet
+    // (see `lines/scotrail-highland-main-line.toml`'s own comments on the
+    // Inverness-area segment-naming handoff left open for Tasks
+    // 10.6/10.7/10.10), so there is no shared-segment propagation to
+    // assert today -- only exclusive-segment non-propagation, mirroring
+    // `scotrail_central_belt_exclusive_segment_incident_does_not_propagate`.
+    // The incident is placed at Kingussie (on the line's exclusive
+    // Perth-Carrbridge segment), not Inverness, since Inverness's own
+    // segment fate is deliberately left open for a later task to decide.
+    #[test]
+    fn scotrail_highland_main_line_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-7",
+            "Signal failure at Kingussie",
+            "Signal failure causing delays to ScotRail services at Kingussie.",
+            &["SR"],
+            &["KIN"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-highland-main-line".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.6 (ScotRail Far North Line): the Wick and Thurso branches
+    // each get their own exclusive segment
+    // (`scotrail-far-north-wick`/`scotrail-far-north-thurso`), used only by
+    // this one file, so an incident on either branch should stay local to
+    // `scotrail-far-north` with `ExclusiveSegment` scope -- mirroring
+    // `swr_exclusive_segment_incident_does_not_propagate`.
+    //
+    // This file also tags Inverness-Dingwall as
+    // `scotrail-inverness-dingwall-trunk`, a segment name Task 10.7's
+    // Kyle of Lochalsh Line (`lines/scotrail-kyle.toml`) now independently
+    // confirmed and reused for its own Inverness-Dingwall stations -- see
+    // `scotrail_shared_inverness_dingwall_trunk_incident_propagates` below
+    // for the resulting cross-file `SharedSegment` propagation assertion.
+    // The same-file trunk-vs-branch structure this file also has
+    // (Inverness-Georgemas Junction shared by both the Wick and Thurso
+    // branches) is separately asserted directly via `SegmentRegistry` in
+    // `crates/aggregator/src/segments.rs`, since that particular sharing
+    // is internal to one line/file and `MatchScope::SharedSegment` only
+    // applies across distinct line files.
+    #[test]
+    fn scotrail_far_north_wick_branch_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-8",
+            "Points failure at Wick",
+            "Points failure causing delays to ScotRail services at Wick.",
+            &["SR"],
+            &["WCK"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-far-north".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
+    fn scotrail_far_north_thurso_branch_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-9",
+            "Signal failure at Thurso",
+            "Signal failure causing delays to ScotRail services at Thurso.",
+            &["SR"],
+            &["THS"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-far-north".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.7 (ScotRail Kyle of Lochalsh Line): this line's own exclusive
+    // track west of Dingwall Junction (Garve through Kyle of Lochalsh) is
+    // tagged `scotrail-kyle-exclusive`, used only by this one file, so an
+    // incident there should stay local to `scotrail-kyle` with
+    // `ExclusiveSegment` scope -- mirroring
+    // `swr_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_kyle_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-10",
+            "Landslip near Strathcarron",
+            "Landslip causing delays to ScotRail services at Strathcarron.",
+            &["SR"],
+            &["STC"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-kyle".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.7 (ScotRail Kyle of Lochalsh Line): the load-bearing
+    // shared-trunk test this Batch 10 pairing exists for. Task 10.6
+    // (`scotrail-far-north.toml`) reserved the segment name
+    // `scotrail-inverness-dingwall-trunk` for the Inverness-Dingwall
+    // stretch both lines' services physically run over; this file
+    // independently re-confirmed that shared-track claim (see
+    // `lines/scotrail-kyle.toml`'s own Sources comments) and reused the
+    // exact same segment name. Now that both files exist,
+    // `SegmentRegistry::is_shared` correctly reports the segment shared
+    // between two distinct line IDs, so an incident at Dingwall (a
+    // station on that shared segment) should match BOTH
+    // `scotrail-far-north` and `scotrail-kyle`, each with
+    // `MatchScope::SharedSegment` -- mirroring
+    // `swr_shared_trunk_incident_propagates`.
+    #[test]
+    fn scotrail_shared_inverness_dingwall_trunk_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-11",
+            "Signal failure at Dingwall",
+            "Signal failure causing delays to ScotRail services at Dingwall.",
+            &["SR"],
+            &["DIN"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-far-north".to_string(), "scotrail-kyle".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Task 10.8/10.9 (ScotRail West Highland Line pairing): the
+    // load-bearing shared-trunk test this Batch 10 pairing exists for,
+    // mirroring `scotrail_shared_inverness_dingwall_trunk_incident_propagates`.
+    // Task 10.8 (`scotrail-west-highland-fort-william.toml`) reserved the
+    // segment name `scotrail-west-highland-glasgow-crianlarich` for the
+    // Glasgow-Crianlarich stretch both West Highland Line branches
+    // physically run over (combined trains splitting/joining at
+    // Crianlarich); Task 10.9 (`scotrail-west-highland-oban.toml`)
+    // independently re-confirmed that shared-track claim against a fresh
+    // fetch of Wikipedia's "West Highland Line" and "Crianlarich railway
+    // station" articles (see that file's own verification-note comments)
+    // and reused the exact same segment name. `SegmentRegistry::is_shared`
+    // now correctly reports the segment shared between two distinct line
+    // IDs, so an incident at Ardlui (a station on that shared segment)
+    // matches BOTH `scotrail-west-highland-fort-william` and
+    // `scotrail-west-highland-oban`, each with `MatchScope::SharedSegment`.
+    #[test]
+    fn scotrail_west_highland_shares_glasgow_crianlarich_trunk_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-12",
+            "Landslip near Ardlui",
+            "Landslip causing delays to ScotRail services at Ardlui.",
+            &["SR"],
+            &["AUI"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "scotrail-west-highland-fort-william".to_string(),
+                "scotrail-west-highland-oban".to_string()
+            ])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Task 10.8: this line's own exclusive track between Crianlarich and
+    // Fort William (tagged `scotrail-west-highland-fort-william-exclusive`,
+    // used only by this one file) should stay local to
+    // `scotrail-west-highland-fort-william` with `ExclusiveSegment` scope --
+    // mirroring `scotrail_ayrshire_glasgow_ayr_trunk_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_west_highland_fort_william_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-13",
+            "Signal failure at Tulloch",
+            "Signal failure causing delays to ScotRail services at Tulloch.",
+            &["SR"],
+            &["TUL"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-west-highland-fort-william".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.8: the Mallaig extension beyond Fort William (tagged
+    // `scotrail-west-highland-mallaig`, used only by this one file) is a
+    // second, distinct exclusive segment within the same file -- mirroring
+    // `scotrail_ayrshire_stranraer_branch_incident_does_not_propagate`'s
+    // identical trunk+branch treatment.
+    #[test]
+    fn scotrail_west_highland_mallaig_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-14",
+            "Landslip near Glenfinnan",
+            "Landslip causing delays to ScotRail services at Glenfinnan.",
+            &["SR"],
+            &["GLF"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-west-highland-fort-william".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.8/10.9: unlike the Crianlarich reservation above, this
+    // line's Glasgow-area sharing with `scotrail-glasgow-suburban.toml`'s
+    // own `scotrail-glasgow-suburban-west-trunk` segment (Dalmuir -
+    // Dumbarton Central) is a REAL, already-merged sibling -- see this
+    // line's own Sources comments for the independent verification. Task
+    // 10.9 (`scotrail-west-highland-oban.toml`) independently confirmed
+    // that Oban services also call at Dumbarton Central before diverging
+    // near Craigendoran Junction (Dumbarton Central's own Wikipedia
+    // article explicitly names "trains ... between Glasgow and Oban and
+    // Mallaig") and reused this exact segment name for its own DMR/DBC
+    // entries too, making this a genuine three-way shared segment. An
+    // incident at Dumbarton Central should therefore match ALL THREE of
+    // `scotrail-glasgow-suburban`, `scotrail-west-highland-fort-william`
+    // and `scotrail-west-highland-oban` with `MatchScope::SharedSegment`,
+    // mirroring `scotrail_shared_inverness_dingwall_trunk_incident_propagates`.
+    #[test]
+    fn scotrail_west_highland_shares_glasgow_suburban_west_trunk_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-15",
+            "Signal failure at Dumbarton Central",
+            "Signal failure causing delays to ScotRail services at Dumbarton Central.",
+            &["SR"],
+            &["DBC"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "scotrail-glasgow-suburban".to_string(),
+                "scotrail-west-highland-fort-william".to_string(),
+                "scotrail-west-highland-oban".to_string()
+            ])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Post-review fix round 2: unlike Dumbarton Central above, Hyndland
+    // (and Dalreoch/Partick alongside it) is NOT physically traversed by
+    // West Highland Line trains -- they run non-stop between Glasgow
+    // Queen Street and Dumbarton Central. Hyndland/Dalreoch/Partick were
+    // previously mistakenly tagged onto the same
+    // `scotrail-glasgow-suburban-west-trunk` segment name as DMR/DBC,
+    // which made `SegmentRegistry::is_shared` (name-keyed, not
+    // station-keyed) incorrectly report an incident here as shared with
+    // the West Highland lines too. They are now retagged onto
+    // `scotrail-glasgow-suburban-west-approach`, exclusive to this file --
+    // see `lines/scotrail-glasgow-suburban.toml`'s own HYN comment for the
+    // full explanation. An incident at Hyndland should therefore match
+    // only `scotrail-glasgow-suburban`, with `ExclusiveSegment` scope.
+    #[test]
+    fn scotrail_glasgow_suburban_west_approach_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-15B",
+            "Signal failure at Hyndland",
+            "Signal failure causing delays to ScotRail services at Hyndland.",
+            &["SR"],
+            &["HYN"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-glasgow-suburban".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.9 (ScotRail West Highland Line, Oban arm): this line's own
+    // exclusive track beyond Crianlarich (tagged
+    // `scotrail-west-highland-oban-exclusive`, used only by this one file)
+    // should stay local to `scotrail-west-highland-oban` with
+    // `ExclusiveSegment` scope -- mirroring
+    // `scotrail_west_highland_fort_william_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_west_highland_oban_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-16",
+            "Signal failure at Taynuilt",
+            "Signal failure causing delays to ScotRail services at Taynuilt.",
+            &["SR"],
+            &["TAY"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-west-highland-oban".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.9 (fix round 1, post-review): GLQ (Glasgow Queen Street) is
+    // reused verbatim as `scotrail-west-highland-glasgow-terminus` by both
+    // `scotrail-west-highland-fort-william` and
+    // `scotrail-west-highland-oban` -- see both files' own GLQ comments
+    // for why (the "combined trains ... splitting at Crianlarich" sourcing
+    // means the shared corridor genuinely starts at GLQ itself, not just
+    // from Dalmuir onward). GLQ is ALSO a real `[[stations]]` entry in
+    // `scotrail-central-belt.toml` (its own exclusive
+    // `scotrail-central-belt` segment) and `scotrail-glasgow-suburban.toml`
+    // (its own exclusive `scotrail-glasgow-suburban-core` segment) -- both
+    // genuinely different physical platform groups/services at the same
+    // named station, unaffected by this fix. So an incident at GLQ
+    // correctly matches all four lines, but with different scopes: the two
+    // West Highland lines get `SharedSegment` (this test's own point),
+    // while Central Belt and Glasgow Suburban each stay `ExclusiveSegment`
+    // on their own unrelated segments.
+    #[test]
+    fn scotrail_west_highland_shares_glasgow_terminus_incident_propagates() {
+        // Glasgow Queen Street is also lumo.toml's own terminus (merged
+        // separately, Batch 10), on its exclusive `lumo-glasgow` segment --
+        // a fifth independent match, ExclusiveSegment (station overlap,
+        // distinct segment name, not part of the West Highland shared
+        // trunk).
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-17",
+            "Points failure at Glasgow Queen Street",
+            "Points failure causing delays to ScotRail services at Glasgow Queen Street.",
+            &["SR"],
+            &["GLQ"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "scotrail-central-belt".to_string(),
+                "scotrail-glasgow-suburban".to_string(),
+                "scotrail-west-highland-fort-william".to_string(),
+                "scotrail-west-highland-oban".to_string(),
+                "lumo".to_string(),
+            ])
+        );
+        for m in &matches {
+            let expected = match m.line.id.as_str() {
+                "scotrail-west-highland-fort-william" | "scotrail-west-highland-oban" => {
+                    MatchScope::SharedSegment
+                }
+                _ => MatchScope::ExclusiveSegment,
+            };
+            assert_eq!(m.scope, expected, "{} scope mismatch", m.line.id);
+        }
+    }
+
+    // Task 10.10 (ScotRail Aberdeen - Inverness Line): this line's own
+    // exclusive track (Aberdeen through Inverness Airport, tagged
+    // `scotrail-aberdeen-inverness`) is used only by this one file, so an
+    // incident there should stay local with `ExclusiveSegment` scope --
+    // mirroring `swr_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_aberdeen_inverness_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-18",
+            "Signal failure at Elgin",
+            "Signal failure causing delays to ScotRail services at Elgin.",
+            &["SR"],
+            &["ELG"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-aberdeen-inverness".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 10.10 (ScotRail Aberdeen - Inverness Line): the load-bearing
+    // shared-trunk test this pairing exists for. Task 10.5
+    // (`scotrail-highland-main-line.toml`) reserved the segment name
+    // `scotrail-highland-inverness-approach` for its own Inverness station
+    // entry, deliberately not assuming a shared segment on
+    // platform-sharing evidence alone; this file independently confirmed
+    // genuine track-sharing (Wikipedia's Millburn Junction detail,
+    // cross-checked against railwaycodes.org.uk's own ELR database -- see
+    // `lines/scotrail-aberdeen-inverness.toml`'s own Sources comments) and
+    // reused the exact same segment name.
+    //
+    // Inverness is also a station on `scotrail-far-north` and
+    // `scotrail-kyle` (tagged `scotrail-inverness-dingwall-trunk`, that
+    // pair's own independently-confirmed shared trunk from Task 10.6/10.7)
+    // -- `LineDefinition::has_station` matches on station presence
+    // regardless of segment name, so an incident at Inverness hits all
+    // four lines, mirroring
+    // `scotrail_west_highland_shares_glasgow_terminus_incident_propagates`'s
+    // precedent for a station where two independent shared-trunk pairs
+    // happen to converge. Since Inverness sits on a genuine cross-file
+    // shared segment for *both* pairs (not merely a same-line exclusive
+    // segment for either), all four lines get `MatchScope::SharedSegment`
+    // here -- unlike the Glasgow Queen Street case, where only two of the
+    // four lines had a cross-file shared segment at that station.
+    #[test]
+    fn scotrail_shared_highland_inverness_approach_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-19",
+            "Points failure at Inverness",
+            "Points failure causing delays to ScotRail services at Inverness.",
+            &["SR"],
+            &["INV"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "scotrail-highland-main-line".to_string(),
+                "scotrail-aberdeen-inverness".to_string(),
+                "scotrail-far-north".to_string(),
+                "scotrail-kyle".to_string(),
+            ])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
         }
     }
 }

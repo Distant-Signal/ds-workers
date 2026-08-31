@@ -147,4 +147,43 @@ mod tests {
         assert!(!registry.is_shared("overground-suffragette"));
         assert!(!registry.is_shared("overground-weaver-chingford"));
     }
+
+    // Task 10.6 (ScotRail Far North Line): unlike `swr-alton`'s trunk
+    // (`swr-trunk-waterloo`, shared cross-file with two sibling lines),
+    // `scotrail-far-north-trunk` (Alness-Georgemas Junction) is shared
+    // same-file between this one line's own Wick and Thurso branches --
+    // there is no sibling `lines/*.toml` file for either branch, so
+    // `is_shared`/`MatchScope::SharedSegment` (a cross-line-file concept)
+    // doesn't apply here the way it does for SWR. What *is* true, and
+    // worth asserting directly, is the same structural fact
+    // `segments_touched_by_finds_shared_and_exclusive_together` asserts
+    // for SWR: the trunk segment is touched together with *each* branch's
+    // own exclusive segment, proving the Georgemas Junction split and the
+    // Alness-Georgemas shared stretch are both tagged correctly within
+    // this one file.
+    #[test]
+    fn scotrail_far_north_georgemas_trunk_is_shared_by_both_branches() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let far_north = &lines["scotrail-far-north"];
+
+        // Alness (trunk) + Wick (exclusive Wick branch).
+        let touched_wick = registry.segments_touched_by(far_north, &["ASS".to_string(), "WCK".to_string()]);
+        assert_eq!(touched_wick.len(), 2);
+        assert!(touched_wick.contains("scotrail-far-north-trunk"));
+        assert!(touched_wick.contains("scotrail-far-north-wick"));
+
+        // Alness (trunk) + Thurso (exclusive Thurso branch) -- the same
+        // trunk segment, proving both branches share it.
+        let touched_thurso = registry.segments_touched_by(far_north, &["ASS".to_string(), "THS".to_string()]);
+        assert_eq!(touched_thurso.len(), 2);
+        assert!(touched_thurso.contains("scotrail-far-north-trunk"));
+        assert!(touched_thurso.contains("scotrail-far-north-thurso"));
+
+        // Neither branch segment is shared with the other, or with
+        // anything outside this file yet.
+        assert!(registry.is_exclusive_to("scotrail-far-north-wick", "scotrail-far-north"));
+        assert!(registry.is_exclusive_to("scotrail-far-north-thurso", "scotrail-far-north"));
+        assert!(registry.is_exclusive_to("scotrail-far-north-trunk", "scotrail-far-north"));
+    }
 }
