@@ -5435,20 +5435,28 @@ mod tests {
     // from Dalmuir onward). GLQ is ALSO a real `[[stations]]` entry in
     // `scotrail-central-belt.toml` (its own exclusive
     // `scotrail-central-belt` segment) and `scotrail-glasgow-suburban.toml`
-    // (its own exclusive `scotrail-glasgow-suburban-core` segment) -- both
-    // genuinely different physical platform groups/services at the same
-    // named station, unaffected by this fix. So an incident at GLQ
-    // correctly matches all four lines, but with different scopes: the two
-    // West Highland lines get `SharedSegment` (this test's own point),
-    // while Central Belt and Glasgow Suburban each stay `ExclusiveSegment`
-    // on their own unrelated segments.
+    // (its own `scotrail-glasgow-suburban-core` segment) -- both genuinely
+    // different physical platform groups/services at the same named
+    // station, unaffected by this fix.
+    //
+    // UPDATE (added alongside `lines/scotrail-bathgate.toml`): that file's
+    // own GLQ entry reuses `scotrail-glasgow-suburban.toml`'s exact
+    // `scotrail-glasgow-suburban-core` segment name (a genuine shared
+    // fact -- see that file's own sourcing), so Glasgow Suburban's own
+    // scope at GLQ changes from `ExclusiveSegment` to `SharedSegment` too,
+    // and `scotrail-bathgate` itself now also matches here. So an incident
+    // at GLQ correctly matches all five lines, with three different
+    // scopes: the two West Highland lines get `SharedSegment` on their own
+    // `scotrail-west-highland-glasgow-terminus` segment; Glasgow Suburban
+    // and Bathgate get `SharedSegment` on their own, separate
+    // `scotrail-glasgow-suburban-core` segment; Central Belt and Lumo stay
+    // `ExclusiveSegment` on their own unrelated segments.
     #[test]
     fn scotrail_west_highland_shares_glasgow_terminus_incident_propagates() {
         // Glasgow Queen Street is also lumo.toml's own terminus (merged
         // separately, Batch 10), on its exclusive `lumo-glasgow` segment --
-        // a fifth independent match, ExclusiveSegment (station overlap,
-        // distinct segment name, not part of the West Highland shared
-        // trunk).
+        // an independent match, ExclusiveSegment (station overlap,
+        // distinct segment name, not part of either shared trunk below).
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5465,6 +5473,7 @@ mod tests {
             HashSet::from([
                 "scotrail-central-belt".to_string(),
                 "scotrail-glasgow-suburban".to_string(),
+                "scotrail-bathgate".to_string(),
                 "scotrail-west-highland-fort-william".to_string(),
                 "scotrail-west-highland-oban".to_string(),
                 "lumo".to_string(),
@@ -5472,9 +5481,10 @@ mod tests {
         );
         for m in &matches {
             let expected = match m.line.id.as_str() {
-                "scotrail-west-highland-fort-william" | "scotrail-west-highland-oban" => {
-                    MatchScope::SharedSegment
-                }
+                "scotrail-west-highland-fort-william"
+                | "scotrail-west-highland-oban"
+                | "scotrail-glasgow-suburban"
+                | "scotrail-bathgate" => MatchScope::SharedSegment,
                 _ => MatchScope::ExclusiveSegment,
             };
             assert_eq!(m.scope, expected, "{} scope mismatch", m.line.id);
@@ -5548,6 +5558,179 @@ mod tests {
                 "scotrail-far-north".to_string(),
                 "scotrail-kyle".to_string(),
             ])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Follow-up task closing the Batch 10 gap flagged in
+    // `scotrail-central-belt.toml` (Shotts and Bathgate had no dedicated
+    // files). `scotrail-shotts.toml` has no internal branching -- one
+    // exclusive segment, `scotrail-shotts-exclusive`, covering everything
+    // from Glasgow Central to Slateford. An incident at Shotts itself (the
+    // line's own namesake mid-corridor station) should therefore match
+    // only `scotrail-shotts`, with `ExclusiveSegment` scope, mirroring
+    // `scotrail_glasgow_suburban_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_shotts_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-20",
+            "Signal failure at Shotts",
+            "Signal failure causing delays to ScotRail services at Shotts.",
+            &["SR"],
+            &["SHS"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-shotts".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `scotrail-bathgate.toml`'s own middle section (Drumgelloch through
+    // Edinburgh Park) is genuinely exclusive to that file today -- no other
+    // `lines/*.toml` file has a station entry there. An incident at
+    // Bathgate itself (the line's own namesake town) should therefore
+    // match only `scotrail-bathgate`, with `ExclusiveSegment` scope,
+    // mirroring `scotrail_shotts_exclusive_segment_incident_does_not_propagate`.
+    #[test]
+    fn scotrail_bathgate_exclusive_segment_incident_does_not_propagate() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-21",
+            "Points failure at Bathgate",
+            "Points failure causing delays to ScotRail services at Bathgate.",
+            &["SR"],
+            &["BHG"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["scotrail-bathgate".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // `scotrail-central-belt.toml`'s own Haymarket comment pre-emptively
+    // reserved `scotrail-central-belt-edinburgh-throat` for whoever
+    // eventually modelled the Shotts and Bathgate routings, on the sourced
+    // basis that both genuinely rejoin the Falkirk High routing's own
+    // track before Haymarket and Edinburgh Waverley (RAILSCOT/Wikipedia
+    // "Airdrie-Bathgate rail link" and "Edinburgh-Bathgate line" for
+    // Bathgate's own Newbridge Junction rejoin; Wikipedia "Haymarket
+    // railway station", independently, for Shotts's own 1853 Slateford
+    // connection). `scotrail-shotts.toml` and `scotrail-bathgate.toml` both
+    // reuse this exact segment name for their own Haymarket/Edinburgh
+    // Waverley entries, so an incident at Haymarket should match all three
+    // of `scotrail-central-belt`, `scotrail-shotts` and `scotrail-bathgate`
+    // with `MatchScope::SharedSegment`, mirroring
+    // `scotrail_west_highland_shares_glasgow_suburban_west_trunk_incident_propagates`'s
+    // three-way shared-segment shape.
+    //
+    // Haymarket is also a real, major interchange for several other
+    // already-merged lines with no track-sharing claim sourced against this
+    // throat (`scotrail-fife-borders`, `tpe-anglo-scottish`, `lner-ecml`,
+    // `lumo`) -- each of those stays `ExclusiveSegment` on its own,
+    // unrelated segment, mirroring
+    // `scotrail_west_highland_shares_glasgow_terminus_incident_propagates`'s
+    // mixed-scope shape at a heavily-overlapped hub station.
+    #[test]
+    fn scotrail_central_belt_edinburgh_throat_shared_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-22",
+            "Overhead line damage at Haymarket",
+            "Overhead line damage causing delays to ScotRail services at Haymarket.",
+            &["SR"],
+            &["HYM"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "scotrail-central-belt".to_string(),
+                "scotrail-shotts".to_string(),
+                "scotrail-bathgate".to_string(),
+                "scotrail-fife-borders".to_string(),
+                "tpe-anglo-scottish".to_string(),
+                "lner-ecml".to_string(),
+                "lumo".to_string(),
+            ])
+        );
+        for m in &matches {
+            let expected = match m.line.id.as_str() {
+                "scotrail-central-belt" | "scotrail-shotts" | "scotrail-bathgate" => MatchScope::SharedSegment,
+                _ => MatchScope::ExclusiveSegment,
+            };
+            assert_eq!(m.scope, expected, "{} scope mismatch", m.line.id);
+        }
+    }
+
+    // `scotrail-glasgow-suburban.toml`'s own Bellgrove comment already
+    // named Bathgate as one of the three eastbound splits from its North
+    // Clyde core trackage. `scotrail-bathgate.toml` reuses that file's own
+    // `scotrail-glasgow-suburban-core` segment name for its own Charing
+    // Cross/Glasgow Queen Street/Bellgrove entries, so an incident at
+    // Charing Cross should match both `scotrail-glasgow-suburban` and
+    // `scotrail-bathgate`, each with `MatchScope::SharedSegment`, mirroring
+    // `scotrail_shared_inverness_dingwall_trunk_incident_propagates`'s
+    // two-way shared-segment shape. Charing Cross (unlike Glasgow Queen
+    // Street itself, which several unrelated lines also touch -- see
+    // `scotrail_west_highland_shares_glasgow_terminus_incident_propagates`)
+    // is not a `[[stations]]` entry in any other `lines/*.toml` file, so
+    // this test's own `matched_ids` stays a clean two-line set.
+    #[test]
+    fn scotrail_bathgate_shares_glasgow_suburban_core_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-23",
+            "Signal failure at Charing Cross",
+            "Signal failure causing delays to ScotRail services at Charing Cross.",
+            &["SR"],
+            &["CHC"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-glasgow-suburban".to_string(), "scotrail-bathgate".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // `scotrail-glasgow-suburban.toml`'s own Airdrie comment already noted
+    // that real electrified track continues beyond its own North Clyde
+    // terminus towards Bathgate. `scotrail-bathgate.toml` reuses that
+    // file's own `scotrail-glasgow-suburban-airdrie-branch` segment name
+    // for its own Airdrie entry (the junction-in-service-pattern where
+    // Bathgate-bound trains continue past the North Clyde terminus
+    // pattern), so an incident at Airdrie should match both
+    // `scotrail-glasgow-suburban` and `scotrail-bathgate`, each with
+    // `MatchScope::SharedSegment`, mirroring
+    // `scotrail_bathgate_shares_glasgow_suburban_core_incident_propagates`
+    // immediately above.
+    #[test]
+    fn scotrail_bathgate_shares_glasgow_suburban_airdrie_branch_incident_propagates() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "SR-24",
+            "Points failure at Airdrie",
+            "Points failure causing delays to ScotRail services at Airdrie.",
+            &["SR"],
+            &["ADR"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-glasgow-suburban".to_string(), "scotrail-bathgate".to_string()])
         );
         for m in &matches {
             assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
