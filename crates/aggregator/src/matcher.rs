@@ -2524,17 +2524,20 @@ mod tests {
     }
 
     #[test]
-    fn lnwr_northampton_shared_segment_incident_propagates_to_both_lnwr_lines() {
-        // Task 1.8 resolved the WOL/NMP question `lnwr-euston-commuter.toml`
-        // (Task 1.7) deliberately left open: Northampton is on the
-        // `lnwr-northampton` segment, which both LNWR files now use, because
-        // Task 1.8's research found this isn't really two distinct
-        // real-world workings -- every LNWR train calling at Northampton
-        // continues on to Birmingham New Street (see
-        // `lines/lnwr-birmingham-crewe.toml`'s own comment for the full
-        // sourcing). This test replaces the old
-        // `lnwr_euston_commuter_exclusive_segment_incident_does_not_propagate`
-        // test, which asserted ExclusiveSegment here before that resolution.
+    fn lnwr_northampton_incident_matches_single_remaining_lnwr_line() {
+        // Was `lnwr_northampton_shared_segment_incident_propagates_to_both_lnwr_lines`,
+        // asserting a two-line SharedSegment match between this file and
+        // Task 1.7's `lnwr-euston-commuter.toml`. That file was deleted
+        // (2026-08-31 line-catalogue-coverage follow-up): fresh research
+        // reconfirmed it modelled a service that doesn't exist as a distinct
+        // real-world working, and its entire station list was already a
+        // strict subset of this file's own -- see the FOLD-IN NOTE in
+        // `lines/lnwr-birmingham-crewe.toml`. With only one catalogued LNWR
+        // line left, `lnwr-northampton` is no longer a name shared across
+        // multiple files, so an incident here is now ExclusiveSegment, not
+        // SharedSegment -- same shape as
+        // `lnwr_birmingham_crewe_exclusive_segment_incident_does_not_propagate`
+        // below.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -2546,25 +2549,21 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(
-            matched_ids,
-            HashSet::from(["lnwr-euston-commuter".to_string(), "lnwr-birmingham-crewe".to_string()])
-        );
-        for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
-        }
+        assert_eq!(matched_ids, HashSet::from(["lnwr-birmingham-crewe".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
     #[test]
-    fn lnwr_euston_trunk_shared_segment_incident_propagates_to_both_lnwr_lines() {
-        // Leighton Buzzard is on `lnwr-euston-trunk`, the confirmed
-        // LNWR-internal shared-trunk segment (Euston through Milton Keynes
-        // Central) that `lnwr-birmingham-crewe.toml` (Task 1.8) reuses
-        // verbatim from `lnwr-euston-commuter.toml` (Task 1.7) -- see that
-        // file's own comment for the full derivation. Leighton Buzzard
-        // appears in no other catalogued line, so this is a clean two-line
-        // assertion, mirroring `swr_shared_trunk_incident_propagates` and
-        // `xc_hub_incident_propagates_to_every_cross_country_arm`.
+    fn lnwr_euston_trunk_incident_matches_single_remaining_lnwr_line() {
+        // Was `lnwr_euston_trunk_shared_segment_incident_propagates_to_both_lnwr_lines`,
+        // asserting a two-line SharedSegment match between this file and
+        // Task 1.7's `lnwr-euston-commuter.toml`. That file was deleted
+        // (2026-08-31 line-catalogue-coverage follow-up) -- see the FOLD-IN
+        // NOTE in `lines/lnwr-birmingham-crewe.toml` for the full research
+        // and sourcing. Leighton Buzzard appears in no other catalogued
+        // line, and with only one catalogued LNWR line left,
+        // `lnwr-euston-trunk` is no longer shared across multiple files, so
+        // this is now a plain single-line ExclusiveSegment match.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -2576,13 +2575,8 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(
-            matched_ids,
-            HashSet::from(["lnwr-euston-commuter".to_string(), "lnwr-birmingham-crewe".to_string()])
-        );
-        for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
-        }
+        assert_eq!(matched_ids, HashSet::from(["lnwr-birmingham-crewe".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
     #[test]
