@@ -672,44 +672,74 @@ fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<Affec
 /// `aggregate()` attaches the result to a line's status either way.
 /// `avg_delay_minutes` is averaged over non-cancelled ("running") sampled
 /// departures only.
-fn compute_sample_stats(
+/// Departures at `line`'s configured `sample_stations` that belong to
+/// `line` (operator/destination/headcode filtered via `belongs_to_line`).
+/// Extracted so this exact filtering definition has one place, not several:
+/// shared by `compute_sample_stats`, `infer_from_samples`'s "most cited
+/// reason" pass, and (`pub(crate)`) `dedup::dedup_new_sample_stats`, which
+/// needs the identical relevance filter before applying its own
+/// per-service-id dedup on top.
+pub(crate) fn relevant_departures<'a>(
     line: &LineDefinition,
-    samples: &HashMap<String, StationSample>,
-    defaults: &Defaults,
-) -> Option<SampleStats> {
-    let thresholds = thresholds_for(defaults, &line.severity_overrides);
-
-    let relevant: Vec<&StationDeparture> = line
-        .sample_stations
+    samples: &'a HashMap<String, StationSample>,
+) -> Vec<&'a StationDeparture> {
+    line.sample_stations
         .iter()
         .filter_map(|crs| samples.get(crs))
         .flat_map(|sample| sample.departures.iter())
         .filter(|dep| belongs_to_line(dep, line))
-        .collect();
+        .collect()
+}
 
-    if (relevant.len() as i64) < thresholds.min_sample_size {
-        return None;
-    }
-
-    let total = relevant.len();
-    let cancelled = relevant.iter().filter(|d| d.is_cancelled).count();
-    let delayed = relevant
+/// Turns an already-filtered list of departures into raw `SampleStats`
+/// counts, given `line`'s (already-merged) classification `thresholds`.
+/// Extracted from the old `compute_sample_stats` body so the actual
+/// delayed/cancelled/skipped/avg-delay arithmetic has one definition,
+/// shared by `compute_sample_stats` (raw, per-cycle, every visible
+/// departure -- correct for live severity classification, which wants "what
+/// does the window look like right now") and `dedup::dedup_new_sample_stats`
+/// (only the departures not already counted this period -- correct for a
+/// real "distinct trains" rollup). See `crate::dedup`'s module docs for why
+/// these two must stay separate rather than sharing one `SampleStats`.
+pub(crate) fn stats_from_departures(
+    departures: &[&StationDeparture],
+    line: &LineDefinition,
+    thresholds: &Defaults,
+) -> SampleStats {
+    let total = departures.len();
+    let cancelled = departures.iter().filter(|d| d.is_cancelled).count();
+    let delayed = departures
         .iter()
         .filter(|d| !d.is_cancelled && d.delay_minutes as i64 >= thresholds.delay_threshold_minutes)
         .count();
     let line_stations: HashSet<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
-    let skipped = relevant
+    let skipped = departures
         .iter()
         .filter(|d| !d.is_cancelled && d.skipped_stations.iter().any(|crs| line_stations.contains(crs.as_str())))
         .count();
-    let running: Vec<&&StationDeparture> = relevant.iter().filter(|d| !d.is_cancelled).collect();
+    let running: Vec<&&StationDeparture> = departures.iter().filter(|d| !d.is_cancelled).collect();
     let avg_delay_minutes = if running.is_empty() {
         0.0
     } else {
         running.iter().map(|d| d.delay_minutes as f64).sum::<f64>() / running.len() as f64
     };
 
-    Some(SampleStats { total, delayed, cancelled, skipped, avg_delay_minutes })
+    SampleStats { total, delayed, cancelled, skipped, avg_delay_minutes }
+}
+
+fn compute_sample_stats(
+    line: &LineDefinition,
+    samples: &HashMap<String, StationSample>,
+    defaults: &Defaults,
+) -> Option<SampleStats> {
+    let thresholds = thresholds_for(defaults, &line.severity_overrides);
+    let relevant = relevant_departures(line, samples);
+
+    if (relevant.len() as i64) < thresholds.min_sample_size {
+        return None;
+    }
+
+    Some(stats_from_departures(&relevant, line, &thresholds))
 }
 
 fn infer_from_samples(
@@ -742,15 +772,9 @@ fn infer_from_samples(
 
     // `compute_sample_stats` only returns aggregate counts, not the raw
     // departures, so the "most cited reason" text below re-derives its own
-    // small filtered view. Cheap: a handful of departures per line per
-    // cycle, and keeps `compute_sample_stats` focused on just the numbers.
-    let relevant: Vec<&StationDeparture> = line
-        .sample_stations
-        .iter()
-        .filter_map(|crs| samples.get(crs))
-        .flat_map(|sample| sample.departures.iter())
-        .filter(|dep| belongs_to_line(dep, line))
-        .collect();
+    // small filtered view via the shared `relevant_departures` helper.
+    // Cheap: a handful of departures per line per cycle.
+    let relevant = relevant_departures(line, samples);
     let reasons: Vec<&str> = relevant
         .iter()
         .filter_map(|d| d.delay_reason.as_deref().or(d.cancel_reason.as_deref()))
