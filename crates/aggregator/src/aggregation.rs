@@ -1105,6 +1105,35 @@ mod tests {
     }
 
     #[test]
+    fn belongs_to_line_gatwick_express_operator_folds_in_via_operators_list() {
+        // Task 5.6 (southern-brighton-main-line.toml). Its own header
+        // comment folds Gatwick Express (`GX`) into `operators = ["SN",
+        // "GX"]` rather than a separate file. This is the test that
+        // actually exercises what that fold-in buys in production: LDBWS
+        // sample classification (`belongs_to_line`, used by
+        // `infer_from_samples`) reads `operators`, unlike the incident
+        // matcher's station-hit path in `matcher.rs` (`match_one`), which
+        // matches on `line.has_station(crs)` alone and never consults
+        // `operators` - so a station-hit test there (see
+        // `southern_bml_gatwick_express_operator_folds_into_brighton_main_line`
+        // in `matcher.rs`) would pass identically whether or not `GX` were
+        // ever added to this file's `operators` list. This test, by
+        // contrast, would fail without it.
+        let lines = load_all_lines();
+        let bml = &lines["southern-brighton-main-line"];
+        // `departure()` defaults `operator` to "SW" (built for the SWR
+        // fixtures above), so it's overridden explicitly for both cases
+        // exercised here instead of relying on the helper's default.
+        let base = departure("BTN", 0, false);
+        let southern = StationDeparture { operator: "SN".to_string(), ..base.clone() };
+        let gatwick_express = StationDeparture { operator: "GX".to_string(), ..base.clone() };
+        let wrong_operator = StationDeparture { operator: "XX".to_string(), ..base };
+        assert!(belongs_to_line(&southern, bml));
+        assert!(belongs_to_line(&gatwick_express, bml));
+        assert!(!belongs_to_line(&wrong_operator, bml));
+    }
+
+    #[test]
     fn infer_from_samples_returns_none_below_min_sample_size() {
         // swr-alton.toml: sample_stations = ["AHT", "FRM", "AON"]
         let lines = load_all_lines();
