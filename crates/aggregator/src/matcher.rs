@@ -4624,6 +4624,52 @@ mod tests {
         }
     }
 
+    // Cross-batch follow-up (resolved): `lines/emr-midland-main-line.toml`'s
+    // "Bedford-St Pancras: cross-batch dependency ruling" header comment
+    // confirms Luton Airport Parkway, Luton and Bedford are genuine
+    // station-overlap-only stations between the two EMR files
+    // (`emr-midland-main-line` and `emr-connect`, which genuinely share
+    // `emr-mml-south`'s calling pattern with EACH OTHER and so report
+    // SharedSegment for one another) and `thameslink-bedford.toml`'s
+    // `mml-bedford-st-pancras` segment (which calls at 13 additional local
+    // stations neither EMR service stops at, so it does NOT share the
+    // segment name and reports ExclusiveSegment). Mirrors the STP case
+    // already exercised by
+    // `stp_station_overlap_matches_thameslink_core_bedford_and_highspeed_as_independent_exclusive_segments`
+    // above; this test covers the three remaining overlap stations.
+    #[test]
+    fn ltn_lut_bdm_station_overlap_between_emr_and_thameslink_bedford_stays_exclusive_for_thameslink() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        for (crs, station_name) in [
+            ("LTN", "Luton Airport Parkway"),
+            ("LUT", "Luton"),
+            ("BDM", "Bedford"),
+        ] {
+            let inc = incident(
+                &format!("EMR-TL-{crs}"),
+                &format!("Signal failure at {station_name}"),
+                &format!("Signal failure causing delays to train services at {station_name}."),
+                &["EM"],
+                &[crs],
+            );
+            let matches = lines_affected_by(&inc, &lines, &registry);
+            let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+            assert_eq!(
+                by_id.keys().cloned().collect::<HashSet<_>>(),
+                HashSet::from([
+                    "emr-midland-main-line".to_string(),
+                    "emr-connect".to_string(),
+                    "thameslink-bedford".to_string(),
+                ]),
+                "unexpected match set for {crs}"
+            );
+            assert_eq!(by_id.get("emr-midland-main-line"), Some(&MatchScope::SharedSegment), "{crs}");
+            assert_eq!(by_id.get("emr-connect"), Some(&MatchScope::SharedSegment), "{crs}");
+            assert_eq!(by_id.get("thameslink-bedford"), Some(&MatchScope::ExclusiveSegment), "{crs}");
+        }
+    }
+
     // Task 5.13 (thameslink-cambridge.toml). Per that file's own OVERLAP (c)
     // header comment: the direct Peterborough branch (Arlesey, Biggleswade,
     // Sandy, St Neots, Huntingdon, Peterborough) is a genuine shared trunk
