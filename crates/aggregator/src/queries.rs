@@ -147,9 +147,10 @@ async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_
 ///   unaffected: their `from_date` comes from the incident's own stored
 ///   `validity_periods` and stays stable across cycles as long as the
 ///   incident data doesn't change.
-/// - `sample_stats`: recomputed from live LDBWS samples every poll cycle,
-///   so its counts and `avg_delay_minutes` roll over every cycle even when
-///   the line's actual status is unchanged.
+/// - `sample_stats`/`sample_availability`: recomputed from live LDBWS
+///   samples every poll cycle, so their counts (and `sample_availability`'s
+///   `BelowThreshold.observed`) roll over every cycle even when the line's
+///   actual status is unchanged.
 /// - the `(live samples show: ...)` suffix `escalate_from_sample_stats`
 ///   (aggregation.rs) appends to `reason` on escalation: it carries the
 ///   same live counts as `sample_stats`, just formatted into text instead
@@ -178,6 +179,7 @@ fn normalize_entry_for_diff(entry: &serde_json::Value) -> serde_json::Value {
     }
     if let Some(obj) = entry.as_object_mut() {
         obj.remove("sample_stats");
+        obj.remove("sample_availability");
     }
     if let Some(reason) = entry.get_mut("reason")
         && let Some(stripped) = reason.as_str().map(strip_live_sample_annotation)
@@ -659,6 +661,44 @@ mod tests {
         ]);
 
         assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_for_diff_ignores_sample_availability_only_changes() {
+        let a = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live",
+                "sample_availability": {"state": "below-threshold", "observed": 2, "required": 3}
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:01:00Z"},
+                "data_quality": "live",
+                "sample_availability": {"state": "below-threshold", "observed": 3, "required": 3}
+            }
+        ]);
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+
+        let c = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:02:00Z"},
+                "data_quality": "live",
+                "sample_availability": {"state": "no-coverage"}
+            }
+        ]);
+        assert_eq!(
+            normalize_for_diff(&a),
+            normalize_for_diff(&c),
+            "no-coverage <-> below-threshold churn must not register as changed either"
+        );
     }
 
     #[test]

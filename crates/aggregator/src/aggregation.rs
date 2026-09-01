@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Utc};
 use common::{
     AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition,
-    LineStatus, LineStatusReport, SampleStats, Severity, StationDeparture, StationSample,
-    ValidityPeriod, severity_rank, thresholds_for,
+    LineStatus, LineStatusReport, SampleAvailability, SampleStats, Severity, StationDeparture,
+    StationSample, ValidityPeriod, severity_rank, thresholds_for,
 };
 use serde::Deserialize;
 
@@ -89,11 +89,14 @@ pub fn aggregate(
     for line in lines.values() {
         let report = reports.get_mut(&line.id).unwrap();
         if report.statuses.is_empty() {
-            let inferred = infer_from_samples(line, samples, defaults);
-            report.statuses.push(inferred.unwrap_or_else(good_service));
+            report.statuses.push(infer_from_samples(line, samples, defaults));
             continue;
         }
-        if let Some(stats) = compute_sample_stats(line, samples, defaults) {
+        let availability = compute_sample_availability(line, samples, defaults);
+        for status in &mut report.statuses {
+            status.sample_availability = availability.clone();
+        }
+        if let Some(stats) = availability.sample_stats() {
             let thresholds = thresholds_for(defaults, &line.severity_overrides);
             for status in &mut report.statuses {
                 let (escalated, annotation) = escalate_from_sample_stats(status.severity, &stats, &thresholds);
@@ -148,6 +151,7 @@ fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) 
         disruption: Some(disruption),
         data_quality: if incident.is_planned { DataQuality::Planned } else { DataQuality::Knowledgebase },
         sample_stats: None,
+        sample_availability: SampleAvailability::NoCoverage, // always overwritten by aggregate()'s Layer 2, immediately after construction
     }
 }
 
@@ -727,27 +731,49 @@ pub(crate) fn stats_from_departures(
     SampleStats { total, delayed, cancelled, skipped, avg_delay_minutes }
 }
 
-fn compute_sample_stats(
+/// `has_any_row` is deliberately not folded into `relevant_departures`
+/// itself, per Decision 2 -- that function's shared job
+/// (`compute_sample_availability`, `infer_from_samples`'s "most cited
+/// reason" pass at line 777, and `dedup::dedup_new_sample_stats`) is "give
+/// me the relevant departures," and a second return channel would change
+/// its signature for two callers that don't need the distinction.
+fn compute_sample_availability(
     line: &LineDefinition,
     samples: &HashMap<String, StationSample>,
     defaults: &Defaults,
-) -> Option<SampleStats> {
+) -> common::SampleAvailability {
     let thresholds = thresholds_for(defaults, &line.severity_overrides);
-    let relevant = relevant_departures(line, samples);
-
-    if (relevant.len() as i64) < thresholds.min_sample_size {
-        return None;
+    let has_any_row = line.sample_stations.iter().any(|crs| samples.contains_key(crs));
+    if !has_any_row {
+        return common::SampleAvailability::NoCoverage;
     }
 
-    Some(stats_from_departures(&relevant, line, &thresholds))
+    let relevant = relevant_departures(line, samples);
+    if (relevant.len() as i64) < thresholds.min_sample_size {
+        return common::SampleAvailability::BelowThreshold {
+            observed: relevant.len(),
+            required: thresholds.min_sample_size,
+        };
+    }
+
+    common::SampleAvailability::Available(stats_from_departures(&relevant, line, &thresholds))
 }
 
 fn infer_from_samples(
     line: &LineDefinition,
     samples: &HashMap<String, StationSample>,
     defaults: &Defaults,
-) -> Option<LineStatus> {
-    let stats = compute_sample_stats(line, samples, defaults)?;
+) -> LineStatus {
+    let availability = compute_sample_availability(line, samples, defaults);
+    let Some(stats) = availability.sample_stats() else {
+        // NoCoverage or BelowThreshold: severity is unchanged (still
+        // GoodService, same as today's `.unwrap_or_else(good_service)`
+        // fallback), but -- unlike today -- the reason it's absent is no
+        // longer discarded here. This is the core fix this plan exists for.
+        let mut status = good_service();
+        status.sample_availability = availability;
+        return status;
+    };
     let thresholds = thresholds_for(defaults, &line.severity_overrides);
 
     let cancel_rate = stats.cancelled as f64 / stats.total as f64;
@@ -767,12 +793,13 @@ fn infer_from_samples(
     if severity == Severity::GoodService {
         let mut status = good_service();
         status.sample_stats = Some(stats);
-        return Some(status);
+        status.sample_availability = availability;
+        return status;
     }
 
-    // `compute_sample_stats` only returns aggregate counts, not the raw
-    // departures, so the "most cited reason" text below re-derives its own
-    // small filtered view via the shared `relevant_departures` helper.
+    // `compute_sample_availability` only returns aggregate counts, not the
+    // raw departures, so the "most cited reason" text below re-derives its
+    // own small filtered view via the shared `relevant_departures` helper.
     // Cheap: a handful of departures per line per cycle.
     let relevant = relevant_departures(line, samples);
     let reasons: Vec<&str> = relevant
@@ -792,7 +819,7 @@ fn infer_from_samples(
     let mut affected_stops: Vec<String> = samples.keys().cloned().collect();
     affected_stops.sort();
 
-    Some(LineStatus {
+    LineStatus {
         severity,
         reason: reason.clone(),
         validity: ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
@@ -805,7 +832,8 @@ fn infer_from_samples(
         }),
         data_quality: DataQuality::LdbwsInferred,
         sample_stats: Some(stats),
-    })
+        sample_availability: availability,
+    }
 }
 
 /// Operator filter is mandatory; destination-CRS/headcode-prefix filters
@@ -911,6 +939,7 @@ fn good_service() -> LineStatus {
         disruption: None,
         data_quality: DataQuality::LdbwsInferred,
         sample_stats: None,
+        sample_availability: SampleAvailability::NoCoverage, // placeholder; always overwritten by every caller
     }
 }
 
@@ -1158,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn infer_from_samples_returns_none_below_min_sample_size() {
+    fn infer_from_samples_returns_below_threshold_availability_with_the_correct_counts() {
         // swr-alton.toml: sample_stations = ["AHT", "FRM", "AON"]
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
@@ -1173,7 +1202,89 @@ mod tests {
                 departures: vec![departure("AON", 0, false), departure("AON", 0, false)],
             },
         );
-        assert!(infer_from_samples(alton, &samples, &defaults).is_none());
+        let status = infer_from_samples(alton, &samples, &defaults);
+        assert_eq!(status.severity, Severity::GoodService, "severity behavior is unchanged by this plan");
+        assert_eq!(status.sample_availability, SampleAvailability::BelowThreshold { observed: 2, required: 3 });
+        assert_eq!(status.sample_stats, None);
+    }
+
+    #[test]
+    fn infer_from_samples_returns_no_coverage_when_no_sample_station_has_a_row() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let samples = HashMap::new(); // no rows for AHT/FRM/AON at all
+        let status = infer_from_samples(alton, &samples, &defaults);
+        assert_eq!(status.severity, Severity::GoodService);
+        assert_eq!(status.sample_availability, SampleAvailability::NoCoverage);
+        assert_eq!(status.sample_stats, None);
+    }
+
+    #[test]
+    fn infer_from_samples_at_or_above_threshold_yields_available_matching_compute_sample_stats_today() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
+            },
+        );
+        let status = infer_from_samples(alton, &samples, &defaults);
+        let SampleAvailability::Available(stats) = &status.sample_availability else {
+            panic!("expected Available, got {:?}", status.sample_availability);
+        };
+        assert_eq!(status.sample_stats.as_ref(), Some(stats));
+    }
+
+    #[test]
+    fn compute_sample_availability_below_threshold_reports_the_line_specific_override() {
+        // Mirrors the existing severity_overrides tests at
+        // crates/common/src/lib.rs:839-849: a line with min_sample_size
+        // overridden to 5 should report `required: 5`, not the global
+        // default of 3.
+        let lines = load_all_lines();
+        let mut alton = lines["swr-alton"].clone();
+        alton.severity_overrides.insert("min_sample_size".to_string(), 5.0);
+        let defaults = Defaults::default();
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                ],
+            },
+        );
+        let availability = compute_sample_availability(&alton, &samples, &defaults);
+        assert_eq!(availability, SampleAvailability::BelowThreshold { observed: 4, required: 5 });
+    }
+
+    #[test]
+    fn aggregate_attaches_no_coverage_to_incident_derived_statuses_with_zero_sample_coverage() {
+        // Today this information is dropped entirely at this call site --
+        // the direct regression test for aggregate()'s second Layer-2
+        // branch (the has-an-incident path).
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-99",
+            "Points failure on Alton line",
+            "A points failure on the Alton line is causing disruption.",
+            &["SW"],
+            &["AHT"],
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        let status = &reports["swr-alton"].statuses[0];
+        assert_eq!(status.sample_availability, SampleAvailability::NoCoverage);
     }
 
     #[test]
@@ -1197,7 +1308,7 @@ mod tests {
                 ],
             },
         );
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let status = infer_from_samples(alton, &samples, &defaults);
         assert_eq!(status.severity, Severity::SevereDelays);
         assert_eq!(status.data_quality, DataQuality::LdbwsInferred);
     }
@@ -1223,7 +1334,7 @@ mod tests {
                 departures: vec![skipping.clone(), skipping.clone(), skipping, departure("AON", 0, false)],
             },
         );
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let status = infer_from_samples(alton, &samples, &defaults);
         assert_eq!(status.severity, Severity::SevereDelays);
         assert_eq!(status.data_quality, DataQuality::LdbwsInferred);
         assert_eq!(status.sample_stats.expect("stats").skipped, 3);
@@ -1246,7 +1357,7 @@ mod tests {
                 departures: vec![skipping, departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
             },
         );
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let status = infer_from_samples(alton, &samples, &defaults);
         assert_eq!(status.severity, Severity::MinorDelays);
     }
 
@@ -1272,7 +1383,7 @@ mod tests {
                 ],
             },
         );
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let status = infer_from_samples(alton, &samples, &defaults);
         assert_eq!(status.severity, Severity::GoodService);
         assert_eq!(status.sample_stats.expect("stats").skipped, 0);
     }
@@ -1304,7 +1415,7 @@ mod tests {
                 ],
             },
         );
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let status = infer_from_samples(alton, &samples, &defaults);
         let stats = status.sample_stats.expect("stats");
         assert_eq!(stats.skipped, 0);
         assert_eq!(stats.cancelled, 1);
@@ -1393,7 +1504,7 @@ mod tests {
             StationSample { crs: "AHT".to_string(), polled_at: Utc::now(), departures: severe },
         );
 
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should classify");
+        let status = infer_from_samples(alton, &samples, &defaults);
         let stops = status.disruption.expect("severe delays should produce a disruption").affected_stops;
         assert_eq!(stops, vec!["AHT".to_string(), "FRM".to_string()], "affected_stops must be sorted alphabetically");
     }
@@ -1412,7 +1523,7 @@ mod tests {
                 departures: vec![departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
             },
         );
-        let status = infer_from_samples(alton, &samples, &defaults).expect("should still classify (Good Service)");
+        let status = infer_from_samples(alton, &samples, &defaults);
         assert_eq!(status.severity, Severity::GoodService);
     }
 

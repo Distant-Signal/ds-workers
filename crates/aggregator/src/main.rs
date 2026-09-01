@@ -186,7 +186,7 @@ fn lines_with_sample_coverage<'a>(
 
 #[cfg(test)]
 mod tests {
-    use common::{DataQuality, LineStatus, SampleStats, Severity, ValidityPeriod};
+    use common::{DataQuality, LineStatus, SampleAvailability, SampleStats, Severity, ValidityPeriod};
 
     use super::*;
 
@@ -216,6 +216,7 @@ mod tests {
             disruption: None,
             data_quality: DataQuality::default(),
             sample_stats: stats,
+            sample_availability: SampleAvailability::NoCoverage,
         }
     }
 
