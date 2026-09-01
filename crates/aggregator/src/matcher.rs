@@ -2677,6 +2677,44 @@ mod tests {
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
+    // Station Catalogue Completeness Task 1.2: fills in five previously
+    // missing minor Cotswold Line halts on gwr-cotswold.toml (Hanborough,
+    // Combe, Finstock, Ascott-under-Wychwood, Shipton), two-source confirmed
+    // and inserted at their true geographic position between OXF and KGM.
+    // Hanborough was not in the task's original starting list (Combe,
+    // Finstock, Ascott-under-Wychwood, Shipton) but was surfaced by a fresh
+    // route-diagram read required by that task. See that file's own
+    // "Ordered London to Worcester" comment for the full sourcing/rationale.
+    #[test]
+    fn gwr_cotswold_minor_halts_infill_stations_present() {
+        let lines = load_line("gwr-cotswold");
+        let line = lines.get("gwr-cotswold").expect("gwr-cotswold line should exist");
+        for crs in ["HND", "CME", "FIN", "AUW", "SIP"] {
+            assert!(line.has_station(crs), "gwr-cotswold should now list {crs}");
+        }
+    }
+
+    // Same task: an incident at one of the newly-added stations (Hanborough)
+    // should behave exactly like the pre-existing Moreton-in-Marsh
+    // exclusive-segment case above -- `gwr-cotswold` is not shared with any
+    // sibling line's segment (confirmed by grepping the catalogue: only
+    // comments in gwr-thames-valley.toml reference the name, no other file's
+    // `[[stations]]` entries actually set `segment = "gwr-cotswold"`), so
+    // this stays a clean ExclusiveSegment match with no shared-segment
+    // propagation to assert, mirroring
+    // `gwr_cornish_main_line_saltash_incident_stays_on_its_own_line`'s
+    // identical judgment call for that file's own infill task.
+    #[test]
+    fn gwr_cotswold_hanborough_incident_stays_on_its_own_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("GW-18", "Signal failure at Hanborough", "Signal failure causing delays at Hanborough.", &["GW"], &["HND"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["gwr-cotswold".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
     // `gwr-main-line` and `gwr-cotswold` both share the `gwr-trunk-paddington`
     // segment (PAD/RDG/DID) established by Task 4.1 and reused verbatim by
     // Task 4.2. An incident at Didcot (a station on that shared segment)
@@ -2720,6 +2758,50 @@ mod tests {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident("GW-4", "Overhead line damage at Bridgend", "Overhead line damage causing delays at Bridgend.", &["GW"], &["BGN"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["gwr-south-wales".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Station Catalogue Completeness Task 1.3: fills in three previously
+    // missing intermediate stations on gwr-south-wales.toml (Patchway,
+    // Pilning, Severn Tunnel Junction), two-source confirmed and inserted at
+    // their true geographic position between BPW and NWP. See that file's
+    // own segment-naming comment for the full sourcing/rationale.
+    #[test]
+    fn gwr_south_wales_infill_stations_present() {
+        let lines = load_line("gwr-south-wales");
+        let line = lines.get("gwr-south-wales").expect("gwr-south-wales line should exist");
+        for crs in ["PWY", "PIL", "STJ"] {
+            assert!(line.has_station(crs), "gwr-south-wales should now list {crs}");
+        }
+    }
+
+    // Same task: an incident at one of the newly-added stations (Severn
+    // Tunnel Junction) should behave exactly like the pre-existing Bridgend
+    // exclusive-segment case above -- `gwr-south-wales` is not shared with
+    // any sibling line's own segment at this station (grepping the
+    // catalogue confirms no other line file lists PWY/PIL/STJ as a station
+    // at all, let alone shares the `gwr-south-wales` segment name -- see
+    // that file's own research comment on the deliberate decision not to
+    // reuse `xc-cardiff`'s segment name despite the genuine physical track
+    // convergence there), so this stays a clean ExclusiveSegment match with
+    // no shared-segment propagation to assert, mirroring
+    // `gwr_cornish_main_line_saltash_incident_stays_on_its_own_line`'s /
+    // `gwr_cotswold_hanborough_incident_stays_on_its_own_line`'s identical
+    // judgment call for those files' own infill tasks.
+    #[test]
+    fn gwr_south_wales_severn_tunnel_junction_incident_stays_on_its_own_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "GW-19",
+            "Flooding at Severn Tunnel Junction",
+            "Flooding causing delays at Severn Tunnel Junction.",
+            &["GW"],
+            &["STJ"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["gwr-south-wales".to_string()]));
@@ -2857,6 +2939,40 @@ mod tests {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident("GW-8", "Signal failure at Truro", "Signal failure causing delays at Truro.", &["GW"], &["TRU"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["gwr-cornish-main-line".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Station Catalogue Completeness Task 1.1: fills in seven previously
+    // missing Plymouth-area suburban stations on gwr-cornish-main-line.toml
+    // (Devonport, Dockyard, Keyham, St Budeaux Ferry Road, Saltash, St
+    // Germans, Menheniot), two-source confirmed and inserted at their true
+    // geographic position between PLY and LSK. See that file's own
+    // segment-naming comment for the full sourcing/rationale.
+    #[test]
+    fn gwr_cornish_main_line_plymouth_area_infill_stations_present() {
+        let lines = load_line("gwr-cornish-main-line");
+        let line = lines.get("gwr-cornish-main-line").expect("gwr-cornish-main-line line should exist");
+        for crs in ["DPT", "DOC", "KEY", "SBF", "STS", "SGM", "MEN"] {
+            assert!(line.has_station(crs), "gwr-cornish-main-line should now list {crs}");
+        }
+    }
+
+    // Same task: an incident at one of the newly-added stations (Saltash)
+    // should behave exactly like the pre-existing Truro exclusive-segment
+    // case above -- `gwr-cornish-main-line` is not shared with any sibling
+    // line's segment (confirmed by grepping the catalogue: the segment name
+    // is exclusive to this one file), so this stays a clean ExclusiveSegment
+    // match with no shared-segment propagation to assert, mirroring
+    // `emr_rural_branches_bottesford_incident_stays_on_its_own_branch`'s
+    // identical judgment call for that file's own infill task.
+    #[test]
+    fn gwr_cornish_main_line_saltash_incident_stays_on_its_own_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("GW-10", "Points failure at Saltash", "Points failure causing delays at Saltash.", &["GW"], &["STS"]);
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["gwr-cornish-main-line".to_string()]));
@@ -3023,6 +3139,137 @@ mod tests {
                 m.line.id
             );
         }
+    }
+
+    // Station Catalogue Completeness Task 1.4: fills in the previously
+    // missing Paddington-area inner-suburban stations on
+    // gwr-thames-valley.toml (Southall, Hayes & Harlington, West Drayton,
+    // Iver, Langley, Burnham, Taplow), two-source confirmed and inserted at
+    // their true geographic position between PAD and MAI. Ealing Broadway,
+    // the eighth station in that task's starting candidate list, is
+    // deliberately NOT added — its own Wikipedia "Services" section and
+    // nationalrail.co.uk's own details page both show no current GWR
+    // calling service there (Elizabeth line/Underground only) — see that
+    // file's own segment-naming comment for the full sourcing/rationale.
+    #[test]
+    fn gwr_thames_valley_paddington_area_infill_stations_present() {
+        let lines = load_line("gwr-thames-valley");
+        let line = lines.get("gwr-thames-valley").expect("gwr-thames-valley line should exist");
+        for crs in ["STL", "HAY", "WDT", "IVR", "LNY", "BNM", "TAP"] {
+            assert!(line.has_station(crs), "gwr-thames-valley should now list {crs}");
+        }
+        assert!(
+            !line.has_station("EAL"),
+            "gwr-thames-valley should NOT list EAL (Ealing Broadway) — GWR does not currently call there, see the file's own Task 1.4 comment"
+        );
+    }
+
+    // Same task: Southall (STL) is a real, additional station overlap with
+    // elizabeth-line.toml's own `elizabeth-trunk-west` segment. Unlike the
+    // `elizabeth-west` overlap at MAI/SLO/TWY/WDT, `elizabeth-trunk-west` is
+    // itself a genuine shared trunk between elizabeth-line.toml and
+    // elizabeth-heathrow.toml (both list HAY/STL/EAL on that exact segment
+    // name — checked directly), so an incident at Southall propagates as
+    // SharedSegment between those two Elizabeth-line arms, while
+    // gwr-thames-valley — on its own unrelated `gwr-thames-valley` segment —
+    // still only sees a station-level hit and stays ExclusiveSegment,
+    // mirroring the MAI/SLO/TWY station-overlap precedent for this line's
+    // own segment even though the *other* two lines here happen to share a
+    // trunk with each other.
+    #[test]
+    fn gwr_thames_valley_station_overlap_with_elizabeth_trunk_west_stays_exclusive_each_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("GW-20", "Signal failure at Southall", "Signal failure causing delays at Southall.", &["GW"], &["STL"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+        assert_eq!(
+            by_id.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from(["gwr-thames-valley".to_string(), "elizabeth-line".to_string(), "elizabeth-heathrow".to_string()])
+        );
+        assert_eq!(
+            by_id.get("gwr-thames-valley"),
+            Some(&MatchScope::ExclusiveSegment),
+            "gwr-thames-valley should stay ExclusiveSegment (station overlap only, not a shared segment, for its own segment)"
+        );
+        assert_eq!(by_id.get("elizabeth-line"), Some(&MatchScope::SharedSegment), "elizabeth-line should be SharedSegment (elizabeth-trunk-west)");
+        assert_eq!(
+            by_id.get("elizabeth-heathrow"),
+            Some(&MatchScope::SharedSegment),
+            "elizabeth-heathrow should be SharedSegment (elizabeth-trunk-west)"
+        );
+    }
+
+    // Same task: Iver (IVR) is not currently in elizabeth-line.toml's own
+    // station list at all, so an incident there has no sibling segment to
+    // stay off of — a clean ExclusiveSegment case, mirroring
+    // `gwr_cornish_main_line_saltash_incident_stays_on_its_own_line`'s
+    // identical judgment call for that file's own infill task.
+    #[test]
+    fn gwr_thames_valley_iver_incident_stays_on_its_own_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("GW-21", "Points failure at Iver", "Points failure causing delays at Iver.", &["GW"], &["IVR"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["gwr-thames-valley".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Station Catalogue Completeness Task 1.5: fills in four previously
+    // missing stations on gwr-west-of-england.toml's own exclusive stretch
+    // west of Newbury — Kintbury (KIT), Hungerford (HGD), Bedwyn (BDW) and
+    // Pewsey (PEW), two-source confirmed (Wikipedia + nationalrail.co.uk,
+    // TIPLOCs additionally cross-checked against railwaycodes.org.uk) and
+    // inserted at their true geographic position between NBY and WSB, all
+    // tagged this line's own exclusive `gwr-west-of-england` segment (not
+    // `gwr-westbury-castle-cary`, which starts at the next station, WSB, per
+    // the shared-trunk rule of thumb). Six other named candidates from this
+    // task's starting list are deliberately NOT added here: Reading West,
+    // Theale, Aldermaston, Midgham, Thatcham and Newbury Racecourse already
+    // live on gwr-thames-valley.toml's own "Branch 2: Reading-Newbury"
+    // section (a different, Reading-based local service, not this file's
+    // Reading-Taunton express) and Frome already lives on
+    // gwr-bristol-suburban.toml (reached only via a branch off this line's
+    // direct route) — both untouched by this task. A further five named
+    // candidates — Savernake (Low Level), Woodborough, Patney and Chirton,
+    // Lavington, and Edington and Bratton — were checked to the same
+    // two-source bar and found closed (all closed to passengers between
+    // 1952 and 1966; railwaycodes.org.uk shows no CRS code for any of them)
+    // so they stay out too. See that file's own segment-naming comment for
+    // the full sourcing/rationale.
+    #[test]
+    fn gwr_west_of_england_berks_and_hants_infill_stations_present() {
+        let lines = load_line("gwr-west-of-england");
+        let line = lines.get("gwr-west-of-england").expect("gwr-west-of-england line should exist");
+        for crs in ["KIT", "HGD", "BDW", "PEW"] {
+            assert!(line.has_station(crs), "gwr-west-of-england should now list {crs}");
+        }
+        for crs in ["RDW", "THE", "AMT", "MDG", "THA", "NRC", "FRO"] {
+            assert!(
+                !line.has_station(crs),
+                "gwr-west-of-england should NOT list {crs} — it belongs to a sibling file, see the file's own Task 1.5 comment"
+            );
+        }
+    }
+
+    // Same task: none of the four newly-added stations sit on a segment name
+    // shared with any other catalogued line (`gwr-west-of-england` is this
+    // line's own exclusive segment throughout, confirmed by grepping the
+    // catalogue), so an incident at one of them — Kintbury, picked as a
+    // representative example — should stay a clean ExclusiveSegment case,
+    // mirroring `gwr_thames_valley_iver_incident_stays_on_its_own_line`'s /
+    // `gwr_cornish_main_line_saltash_incident_stays_on_its_own_line`'s
+    // identical judgment call for their own infill tasks.
+    #[test]
+    fn gwr_west_of_england_kintbury_incident_stays_on_its_own_line() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("GW-22", "Signal failure at Kintbury", "Signal failure causing delays at Kintbury.", &["GW"], &["KIT"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["gwr-west-of-england".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
     // Task 4.6's own exclusive segment (`gwr-severn-beach`) covers the whole
