@@ -699,6 +699,47 @@ mod tests {
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
+    // Same file, Task 7.4 (Batch 7): fills the five previously-omitted
+    // Nottingham-Grantham intermediate stations named directly in that
+    // task's spec (Netherfield & Colwick / NET, Radcliffe-on-Trent / RDF,
+    // Aslockton & Whatton / ALK, Elton & Orston / ELO, Bottesford / BTF),
+    // now two-source confirmed and inserted at their true geographic
+    // position around the pre-existing Bingham (BIN) entry - see the
+    // updated comment above `[[stations]] crs = "BIN"` in
+    // `lines/emr-rural-branches.toml` for the full sourcing. All five sit
+    // on `emr-poacher-skegness`, the same segment as their BIN/GRA
+    // neighbours, and (per that file's own Branch 2 ruling) that segment
+    // name is deliberately NOT shared with any sibling line's segment name
+    // even though genuine Nottingham-Grantham track-sharing exists with
+    // `emr-regional` - so unlike
+    // `emr_rural_branches_matlock_branch_shared_with_midland_main_line`
+    // above, there is no cross-file SharedSegment assertion to add here;
+    // see `emr_rural_branches_poacher_line_and_emr_regional_both_match_grantham_without_over_propagating`
+    // for why that's already covered at Grantham itself.
+    #[test]
+    fn emr_rural_branches_poacher_line_infill_stations_present() {
+        let lines = load_line("emr-rural-branches");
+        let line = lines.get("emr-rural-branches").expect("emr-rural-branches line should exist");
+        for crs in ["NET", "RDF", "ALK", "ELO", "BTF"] {
+            assert!(line.has_station(crs), "emr-rural-branches should now list {crs}");
+        }
+    }
+
+    // Same file, same task: an incident at one of the newly-added stations
+    // (Bottesford) should behave exactly like the pre-existing Worksop
+    // exclusive-segment case above - matches only this bundled line, as
+    // ExclusiveSegment on `emr-poacher-skegness`.
+    #[test]
+    fn emr_rural_branches_bottesford_incident_stays_on_its_own_branch() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident("EMRB-5", "Signal failure at Bottesford", "Signal failure causing delays to services at Bottesford.", &["EM"], &["BTF"]);
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["emr-rural-branches".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
     #[test]
     fn cumbrian_coast_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
