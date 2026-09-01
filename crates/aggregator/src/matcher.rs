@@ -1455,6 +1455,54 @@ mod tests {
         }
     }
 
+    // Task 8.1 (Batch 8): fills genuinely missing intermediate stations
+    // that TPE's own May-2026 Anglo-Scottish timetable PDF confirms this
+    // route calls at but which the file's prior "principal stations only"
+    // listing omitted - St Helens Central (SNH) and Wigan North Western
+    // (WGN) on the Liverpool leg, Manchester Oxford Road (MCO) and Bolton
+    // (BON) on the Manchester leg, and Carstairs (CRS, literally that
+    // three-letter code) - the route's actual Glasgow/Edinburgh split
+    // point, previously misattributed to Lockerbie. See the updated
+    // comments in lines/tpe-anglo-scottish.toml for full sourcing.
+    #[test]
+    fn tpe_anglo_scottish_batch8_infill_stations_present() {
+        let lines = load_line("tpe-anglo-scottish");
+        let line = lines.get("tpe-anglo-scottish").expect("tpe-anglo-scottish line should exist");
+        for crs in ["SNH", "WGN", "MCO", "BON", "CRS"] {
+            assert!(line.has_station(crs), "tpe-anglo-scottish should now list {crs}");
+        }
+    }
+
+    // Same task: St Helens Central sits on the newly-filled
+    // `tpe-anglo-scottish-nw` segment, which (per this batch's own
+    // pre-flight scan, confirmed unchanged by this task's research) is not
+    // shared with any sibling line - an incident here should match only
+    // tpe-anglo-scottish, as ExclusiveSegment, same shape as
+    // emr_rural_branches_bottesford_incident_stays_on_its_own_branch
+    // above. St Helens Central was chosen over Wigan North Western /
+    // Manchester Oxford Road / Bolton because those three also appear
+    // (station-level only, via wcml / emr-regional / northern-clitheroe /
+    // northern-blackpool) in other line files, which would otherwise
+    // widen this assertion's matched-line set without adding anything
+    // tpe_anglo_scottish_exclusive_segment_incident_does_not_propagate
+    // above doesn't already cover.
+    #[test]
+    fn tpe_anglo_scottish_st_helens_central_incident_stays_exclusive() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "TPE-3",
+            "Signal failure at St Helens Central",
+            "Signal failure causing delays to TransPennine Express services at St Helens Central.",
+            &["TP"],
+            &["SNH"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["tpe-anglo-scottish".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
     // No shared-segment-propagation test for tpe-south either: per this
     // task's own pre-flight scan it only overlaps sibling TPE lines at
     // station level (Liverpool Lime Street / Manchester Piccadilly with
@@ -1478,6 +1526,26 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["tpe-south".to_string()]));
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    // Task 8.4 (Batch 8): fills the 9 genuinely missing, currently-open,
+    // currently-served intermediate calls on this route's Liverpool leg
+    // (Liverpool South Parkway, Warrington West, Warrington Central,
+    // Birchwood, Irlam, Urmston) and Manchester Piccadilly-Cleethorpes leg
+    // (Manchester Oxford Road, Meadowhall, Barnetby, Habrough), confirmed
+    // via Wikipedia's TransPennine Express route table. See the updated
+    // comments in lines/tpe-south.toml for full sourcing. All nine sit on
+    // the file's own single `tpe-south` segment, which (per
+    // tpe_south_exclusive_segment_incident_does_not_propagate above) has no
+    // shared-segment overlap with any sibling line, so no second,
+    // MatchScope-asserting test is added for this task.
+    #[test]
+    fn tpe_south_batch8_infill_stations_present() {
+        let lines = load_line("tpe-south");
+        let line = lines.get("tpe-south").expect("tpe-south line should exist");
+        for crs in ["LPY", "WAW", "WAC", "BWD", "IRL", "URM", "MCO", "MHS", "BTB", "HAB"] {
+            assert!(line.has_station(crs), "tpe-south should now list {crs}");
+        }
     }
 
     // No shared-SEGMENT-propagation test for tpe-borders: per this task's
@@ -1513,6 +1581,25 @@ mod tests {
         );
         for m in &matches {
             assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
+    }
+
+    // Task 8.2 (Batch 8): fills two genuinely missing, currently-served,
+    // very-low-frequency intermediate stations Cramlington (CRM, one train
+    // per day, between Newcastle and Morpeth) and East Linton (ELT, reopened
+    // 13 December 2023, between Dunbar and Edinburgh Waverley) - both
+    // confirmed via Wikipedia and nationalrail.co.uk. See the updated
+    // comments in lines/tpe-borders.toml for full sourcing. Both stations
+    // sit on the file's own single `tpe-borders` segment, which (per
+    // tpe_borders_exclusive_segment_incident_does_not_propagate above) has
+    // no shared-segment overlap with any sibling line, so no second,
+    // MatchScope-asserting test is added for this task.
+    #[test]
+    fn tpe_borders_batch8_infill_stations_present() {
+        let lines = load_line("tpe-borders");
+        let line = lines.get("tpe-borders").expect("tpe-borders line should exist");
+        for crs in ["CRM", "ELT"] {
+            assert!(line.has_station(crs), "tpe-borders should now list {crs}");
         }
     }
 
