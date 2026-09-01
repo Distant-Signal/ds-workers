@@ -1815,6 +1815,46 @@ mod tests {
     }
 
     #[test]
+    fn c2c_rainham_branch_stations_are_in_the_catalogue() {
+        // Regression guard for the Rainham-branch research pass: lines/c2c.toml
+        // used to scope the Barking - Dagenham Dock - Rainham - Purfleet -
+        // Grays route out entirely ("omitted rather than guessed at"), so
+        // incidents on c2c's third route matched nothing by station. All three
+        // new stations are c2c-managed and currently passenger-served (see that
+        // file's `c2c-rainham-branch` comment for the two-source citations).
+        let lines = load_line("c2c");
+        let c2c = lines.get("c2c").expect("c2c line should exist");
+        for crs in ["DDK", "RNM", "PFL"] {
+            assert!(c2c.has_station(crs), "c2c should include {crs} on the Rainham branch");
+        }
+        // Rainham (Essex) is RNM; RAI is Rainham (Kent) on Southeastern's
+        // Chatham main line and must never appear here.
+        assert!(!c2c.has_station("RAI"), "RAI is Rainham (Kent), not c2c's Rainham (Essex)");
+    }
+
+    #[test]
+    fn c2c_rainham_branch_incident_does_not_propagate() {
+        // Same standalone-line exception class as
+        // `c2c_exclusive_segment_incident_does_not_propagate` above: `DDK`,
+        // `RNM` and `PFL` each appear only in lines/c2c.toml (re-checked
+        // catalogue-wide when they were added), so an incident on the new
+        // `c2c-rainham-branch` segment stays exclusive to c2c.
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "CC-2",
+            "Points failure at Rainham",
+            "Points failure causing delays to c2c services between Barking and Grays.",
+            &["CC"],
+            &["RNM"],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert_eq!(matched_ids, HashSet::from(["c2c".to_string()]));
+        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+    }
+
+    #[test]
     fn merseyrail_northern_kirkby_branch_incident_does_not_propagate() {
         // The Kirkby/Headbolt Lane branch (merseyrail-northern-kirkby) is
         // exclusive to merseyrail-northern.toml - it doesn't touch the
@@ -6109,6 +6149,45 @@ mod tests {
         );
         for m in &matches {
             assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+        }
+    }
+
+    // Task 10.2 (chiltern-main-line.toml catalogue-completeness pass).
+    // Sudbury & Harrow Road, Princes Risborough and a full run of other
+    // Marylebone-approach stations were previously omitted from this file
+    // as "minor intermediate calls" per its own stale header comment.
+    // Princes Risborough needed particular care: confirmed (see that
+    // station's own comment in lines/chiltern-main-line.toml) to be
+    // genuinely on this line's Marylebone-Bicester North-Banbury route,
+    // not only the separate Oxford or Aylesbury routes.
+    #[test]
+    fn chiltern_main_line_has_previously_omitted_marylebone_approach_stations() {
+        let lines = load_line("chiltern-main-line");
+        let line = lines.get("chiltern-main-line").expect("chiltern-main-line should exist");
+        assert!(line.has_station("SUD"), "chiltern-main-line should now include Sudbury & Harrow Road (SUD)");
+        assert!(line.has_station("PRR"), "chiltern-main-line should now include Princes Risborough (PRR)");
+    }
+
+    // Task 10.2, continued: Lapworth, Widney Manor, Olton, Acocks Green,
+    // Tyseley, Small Heath and Bordesley were previously omitted on the
+    // Hatton -> Birmingham approach (see that stretch's own comments in
+    // lines/chiltern-main-line.toml). Widney Manor, Olton and Acocks Green
+    // also appear in `wmr-snow-hill.toml`'s own independently-worked
+    // "omitted" list (Batch 9, a separate isolated worktree this task
+    // couldn't see or coordinate with live), but per the Task 10.2
+    // controller ruling this file deliberately keeps them on its own
+    // existing `chiltern-birmingham-approach` segment rather than
+    // guessing at whatever segment name that concurrent agent picks -- so,
+    // as this catalogue is loaded in this worktree today, no sibling line
+    // shares that segment name yet. Skip the second (shared-segment)
+    // assertion, and say so here, per the Testing convention: "Skip this
+    // second assertion... when the new station's segment has no sibling."
+    #[test]
+    fn chiltern_main_line_has_previously_omitted_birmingham_approach_stations() {
+        let lines = load_line("chiltern-main-line");
+        let line = lines.get("chiltern-main-line").expect("chiltern-main-line should exist");
+        for crs in ["LPW", "WMR", "OLT", "ACG", "TYS", "SMA", "BBS"] {
+            assert!(line.has_station(crs), "chiltern-main-line should now include {crs}");
         }
     }
 }
