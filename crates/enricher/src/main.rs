@@ -290,6 +290,29 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         }
     };
 
+    // Decision 3 of docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md:
+    // a truncated primary extraction is NOT an error -- it already
+    // succeeded, and the pipeline below continues completely unaware
+    // anything unusual happened (extract_adversarial/
+    // extract_severity_adversarial/combine::combine_periods/
+    // write_extraction all just see an already-in-bounds `periods` list).
+    // This is purely operator-facing visibility: a counter for an alert
+    // rule to fire on, and a human-readable log line alongside it -- the
+    // same split MismatchTracker already uses (gauge for the alertable
+    // signal there, tracing::error! for the human-readable why), except a
+    // counter (not a gauge, no "currently outstanding" set to track) and
+    // tracing::warn! (not tracing::error!, since this run still succeeds
+    // and writes normally, unlike a persistent combine mismatch).
+    if primary.dropped_period_count > 0 {
+        tracing::warn!(
+            incident_id,
+            original_count = primary.periods.len() + primary.dropped_period_count,
+            kept_count = primary.periods.len(),
+            "primary extraction exceeded the period cap; truncated to the N most severe/soonest periods"
+        );
+        metrics::counter!(common::metrics::metric_name("enricher_period_truncations_total")).increment(1);
+    }
+
     let resolution_adversarial_start = std::time::Instant::now();
     let resolution_adversarial_result = llm.extract_adversarial(&summary, &description, &primary.periods).await;
     record_llm_call_metrics("resolution_adversarial", resolution_adversarial_start.elapsed(), resolution_adversarial_result.is_ok());
@@ -397,4 +420,138 @@ async fn reclaim_loop(
             Err(err) => tracing::error!(error = ?err, "failed to check for stale pending entries"),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::postgres::PgPoolOptions;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    async fn test_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres")
+    }
+
+    /// The full crux of this plan: a primary extraction that exceeds
+    /// MAX_PERIODS must now (a) still write successfully, and (b) leave
+    /// `source_text_hash`/`extraction_model_version` matching the current
+    /// text/version -- proving `sweep::incidents_needing_extraction` will
+    /// NOT re-select this incident on its next tick (it re-selects only on
+    /// a hash or version mismatch, `sweep.rs:27-35`). Before Decision 3,
+    /// this incident would fail at `extract_primary` and neither column
+    /// would ever be written, reproducing the retry-forever bug this test
+    /// exists to close. Mocks all three LLM calls against one wiremock
+    /// server, distinguished by each request's `response_format.json_schema.name`
+    /// (`"incident_extraction"` / `"adversarial_resolution_check"` /
+    /// `"adversarial_severity_check"`, matching PRIMARY_SCHEMA_NAME/
+    /// ADVERSARIAL_SCHEMA_NAME/SEVERITY_ADVERSARIAL_SCHEMA_NAME in llm.rs)
+    /// so the primary call can return more than MAX_PERIODS periods while
+    /// the two adversarial calls return exactly MAX_PERIODS verdicts each
+    /// -- matching what extract_primary's own truncation guarantees
+    /// process_incident will actually send them.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored`"]
+    async fn process_incident_writes_successfully_and_advances_hash_and_version_when_primary_extraction_is_truncated() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-TRUNCATION-1";
+        let summary = "Test incident exceeding the period cap";
+        let description = "Thirteen distinct facts reported across this incident's lifetime.";
+
+        sqlx::query(
+            "INSERT INTO incidents (incident_id, summary, description, operators, affected_stations, priority) \
+             VALUES ($1, $2, $3, '{}', '{}', 3) \
+             ON CONFLICT (incident_id) DO UPDATE SET summary = EXCLUDED.summary, description = EXCLUDED.description, \
+                 source_text_hash = NULL, extraction_model_version = NULL, extracted_periods = NULL",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(description)
+        .execute(&pool)
+        .await
+        .expect("seed fixture incident row");
+
+        let server = MockServer::start().await;
+        let over_cap_periods: Vec<serde_json::Value> = (0..(MAX_PERIODS_FOR_TEST + 3))
+            .map(|i| {
+                serde_json::json!({
+                    "scope_description": format!("p{i}"),
+                    "date_range": null,
+                    "schedule_window": null,
+                    "resolution_status": "ongoing",
+                    "apparent_severity": "moderate_disruption",
+                })
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("incident_extraction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": serde_json::json!({ "category": "signal_failure", "periods": over_cap_periods }).to_string() } }]
+            })))
+            .mount(&server)
+            .await;
+        let kept_verdicts: Vec<serde_json::Value> = (0..MAX_PERIODS_FOR_TEST)
+            .map(|i| serde_json::json!({ "period_index": i, "scope_description": format!("p{i}"), "resolution_status": "ongoing" }))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("adversarial_resolution_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": serde_json::json!({ "periods": kept_verdicts }).to_string() } }]
+            })))
+            .mount(&server)
+            .await;
+        let kept_severity_verdicts: Vec<serde_json::Value> = (0..MAX_PERIODS_FOR_TEST)
+            .map(|i| serde_json::json!({ "period_index": i, "scope_description": format!("p{i}"), "apparent_severity": "moderate_disruption" }))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("adversarial_severity_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": serde_json::json!({ "periods": kept_severity_verdicts }).to_string() } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let llm = LlmClient::new(server.uri(), None, "test-model".to_string(), Duration::from_secs(30));
+        let model_version = "test-model@periods-v1";
+        let mismatch_tracker = MismatchTracker::default();
+
+        let ok = process_incident(&pool, &llm, model_version, incident_id, &mismatch_tracker).await;
+        assert!(ok, "a truncated-but-successful extraction must return true (ack the entry), not false");
+
+        let row: (Option<String>, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT source_text_hash, extraction_model_version, extracted_periods FROM incidents WHERE incident_id = $1",
+        )
+        .bind(incident_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch written row");
+        let expected_hash = hash::text_hash(summary, description);
+        assert_eq!(row.0.as_deref(), Some(expected_hash.as_str()), "source_text_hash must advance even though the extraction was truncated");
+        assert_eq!(row.1.as_deref(), Some(model_version), "extraction_model_version must advance even though the extraction was truncated");
+        let periods = row.2.expect("extracted_periods must be written");
+        assert_eq!(periods.as_array().expect("periods is an array").len(), MAX_PERIODS_FOR_TEST, "the written periods must be the truncated (in-cap) set, not the original over-cap one");
+
+        // The actual retry-forever-loop-is-closed assertion: re-running
+        // sweep::incidents_needing_extraction's own comparison against
+        // what was just written must NOT re-select this incident.
+        let current_hash = hash::text_hash(summary, description);
+        assert!(
+            row.0.as_deref() == Some(current_hash.as_str()) && row.1.as_deref() == Some(model_version),
+            "this incident must no longer match sweep::incidents_needing_extraction's re-select condition (sweep.rs:27-35)"
+        );
+
+        sqlx::query("DELETE FROM incidents WHERE incident_id = $1").bind(incident_id).execute(&pool).await.expect("cleanup");
+    }
+
+    // `MAX_PERIODS` itself is private to `llm.rs`; this local alias avoids
+    // either making it pub(crate) just for a test fixture or hardcoding
+    // the literal `8` twice in a way that would silently desync if
+    // Task 5's Axis 2 process ever changes the real constant. Update this
+    // alongside `llm::MAX_PERIODS` if that ever happens.
+    const MAX_PERIODS_FOR_TEST: usize = 8;
 }

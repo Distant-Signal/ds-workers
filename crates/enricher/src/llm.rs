@@ -89,6 +89,16 @@ pub struct ExtractionPeriod {
 pub struct PrimaryExtraction {
     pub category: String,
     pub periods: Vec<ExtractionPeriod>,
+    /// How many periods `extract_primary` dropped to bring the response
+    /// within `MAX_PERIODS`, if any. The model never sends this field --
+    /// `#[serde(default)]` is load-bearing, the same precedent already
+    /// established for `ExtractionPeriod.resolution_status_confidence`/
+    /// `severity_confidence` (see that struct's own doc comment above).
+    /// `extract_primary` always sets this explicitly after parsing
+    /// (0 when under/at the cap); `process_incident` (`main.rs`) reads it
+    /// to decide whether to log/count a truncation.
+    #[serde(default)]
+    pub dropped_period_count: usize,
 }
 
 /// One adversarial pass's per-period verdict, echoing back the ordinal
@@ -228,7 +238,17 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     date range and/or a distinct scope/impact -- if the entire text describes one continuous fact with no \
     clearly distinct sub-periods, return a single-element `periods` array with `date_range: null`. Err \
     toward fewer periods when in doubt: do NOT split for stylistic variation, repeated wording, or several \
-    stations/lines listed under one shared date range -- that is still one period. `periods` must always \
+    stations/lines listed under one shared date range -- that is still one period. When a shared date \
+    range covers multiple named route legs, keep them in one period only if every leg is treated \
+    identically -- same substitute service or lack of one, same `apparent_severity`, same \
+    `resolution_status` -- and describe every affected leg together in `scope_description`. Split into a \
+    separate period per leg (or per leg-and-day-of-week combination) whenever the text states a genuinely \
+    different treatment for one leg or for specific days within the range -- e.g. one leg gets a rail \
+    replacement bus while another has no scheduled service at all, or a leg's rule only applies on certain \
+    days of the week and a different rule applies on the rest. A no-scheduled-service statement is never \
+    the same fact as a rail-replacement-bus statement, even when both fall inside the same date range and \
+    even when the text presents them as neighboring clauses -- do not merge them, and do not let the shared \
+    date range alone suggest they are one period. `periods` must always \
     contain at least one element. \
     For each period: `scope_description` is short, display-only text distinguishing what's different about \
     that period from the incident's other periods (e.g. \"platform 2 closed, calls at platform 1\"), or \
@@ -271,7 +291,26 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     `scope_description` \"platform 5 closed, calls at platform 6\", `date_range` `{\"from_date\": \
     \"2026-05-16T00:00:00Z\", \"to_date\": \"2026-06-15T00:00:00Z\"}`, `resolution_status: \"ongoing\"`. Note \
     both periods got real `date_range` values -- never null when dates are stated -- and neither was marked \
-    `resolved` just because the text is matter-of-fact.";
+    `resolved` just because the text is matter-of-fact. \
+    Second worked example, reference date 2026-08-01T00:00:00Z: input \"From Saturday 29 August to Friday \
+    11 September, buses replace trains between Barrhead and Kilmarnock / Dumfries. Monday to Saturday \
+    during this period, buses operate between Kilmarnock and Troon, where passengers can connect with \
+    trains to / from Ayr. No scheduled services operate between Kilmarnock and Ayr / Stranraer on \
+    Sundays.\" segments into exactly three periods, all sharing the same overall date range but none \
+    merged into one, because each names a different leg and/or a different treatment: period 1 -- \
+    `scope_description` \"buses replace trains, Barrhead to Kilmarnock / Dumfries\", `date_range` \
+    `{\"from_date\": \"2026-08-29T00:00:00Z\", \"to_date\": \"2026-09-12T00:00:00Z\"}`, `schedule_window: \
+    null` (applies every day of the range), `apparent_severity: \"severe_disruption\"`; period 2 -- \
+    `scope_description` \"buses operate Kilmarnock to Troon, connecting to Ayr trains\", same `date_range`, \
+    `schedule_window` `{\"days_of_week\": [1,2,3,4,5,6], \"start_time\": \"00:00\", \"end_time\": \"23:59\"}` \
+    (Monday-Saturday only), `apparent_severity: \"severe_disruption\"`; period 3 -- `scope_description` \"no \
+    scheduled service, Kilmarnock to Ayr / Stranraer\", same `date_range`, `schedule_window` \
+    `{\"days_of_week\": [7], \"start_time\": \"00:00\", \"end_time\": \"23:59\"}` (Sunday only), \
+    `apparent_severity: \"blocked_or_suspended\"` (a full withdrawal is more severe than a bus substitute, \
+    not the same fact restated). Note periods 2 and 3 are NOT merged despite sharing both the date range \
+    and the same underlying Kilmarnock-Ayr/Stranraer leg -- the text states two different treatments for \
+    different days, which is exactly the case that must still split even though 'several things under one \
+    shared date range' would otherwise argue for merging.";
 
 const ADVERSARIAL_SCHEMA_NAME: &str = "adversarial_resolution_check";
 
@@ -426,7 +465,7 @@ impl LlmClient {
         let content = self
             .chat_completion(PRIMARY_PROMPT, user_content, PRIMARY_SCHEMA_NAME, primary_schema())
             .await?;
-        let extraction: PrimaryExtraction = serde_json::from_str(&content)
+        let mut extraction: PrimaryExtraction = serde_json::from_str(&content)
             .map_err(|err| anyhow::anyhow!("primary extraction returned malformed JSON: {err}"))?;
         if extraction.periods.is_empty() {
             // Design §1: an empty `periods` array parses without a schema
@@ -437,12 +476,21 @@ impl LlmClient {
             // discarded, existing columns untouched, sweep retries later.
             anyhow::bail!("primary extraction returned an empty `periods` array");
         }
-        if extraction.periods.len() > MAX_PERIODS {
-            // Design §7 item 6: treat over-cap as a schema-adjacent
-            // validation failure, discarded the same as any other malformed
-            // response, rather than storing a hallucinated over-segmentation.
-            anyhow::bail!("primary extraction returned {} periods, exceeding the soft cap of {MAX_PERIODS}", extraction.periods.len());
+        // Decision 3 of docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md:
+        // an over-cap response used to be a hard failure here (discarded,
+        // sweep retries forever, all NLP-derived severity signal lost for
+        // this incident). Instead, keep the MAX_PERIODS most-severe/soonest
+        // periods and let extraction succeed -- `dropped_period_count`
+        // records how many were cut, so `process_incident` (main.rs) can
+        // log/count it without any downstream step (extract_adversarial,
+        // extract_severity_adversarial, combine::combine_periods,
+        // queries::write_extraction) needing to know anything unusual
+        // happened; they only ever see an already-in-bounds `periods` list.
+        let original_count = extraction.periods.len();
+        if original_count > MAX_PERIODS {
+            extraction.periods = select_periods_within_cap(extraction.periods);
         }
+        extraction.dropped_period_count = original_count.saturating_sub(MAX_PERIODS);
         Ok(extraction)
     }
 
@@ -469,6 +517,32 @@ impl LlmClient {
             .map_err(|err| anyhow::anyhow!("severity adversarial extraction returned malformed JSON: {err}"))?;
         Ok(extraction.periods)
     }
+}
+
+/// `None` (whether from a wholly absent `date_range`, or an explicit
+/// `date_range.from_date: null`) sorts first in the truncation selection
+/// below -- both already mean "treat as already active" per `DateRange`'s
+/// own doc comment (this file, lines 18-19), the most urgent reading.
+/// `Option<T>`'s derived `Ord` already puts `None` before `Some(_)`, so no
+/// custom comparator is needed for that part.
+fn effective_from_date(period: &ExtractionPeriod) -> Option<DateTime<Utc>> {
+    period.date_range.as_ref().and_then(|range| range.from_date)
+}
+
+/// Keeps the `MAX_PERIODS` periods ranked highest by
+/// `(severity_hint_rank(apparent_severity) descending, effective_from_date
+/// ascending, None-first)` -- Decision 3 of
+/// docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md.
+/// `sort_by_key` is a stable sort, so periods tied on both keys keep the
+/// model's own original relative order rather than being reordered
+/// arbitrarily. Called only when `periods.len() > MAX_PERIODS`; a caller
+/// passing an already-in-bounds list is a no-op that still runs the sort
+/// (cheap for at most a handful of periods, and keeping the function
+/// total rather than adding an unused early-return branch is simpler).
+fn select_periods_within_cap(mut periods: Vec<ExtractionPeriod>) -> Vec<ExtractionPeriod> {
+    periods.sort_by_key(|period| (std::cmp::Reverse(crate::combine::severity_hint_rank(&period.apparent_severity)), effective_from_date(period)));
+    periods.truncate(MAX_PERIODS);
+    periods
 }
 
 /// Builds the shared user-content shape both adversarial passes send: the
@@ -638,24 +712,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_primary_rejects_periods_beyond_the_soft_cap() {
+    async fn extract_primary_truncates_periods_beyond_the_soft_cap() {
         let server = MockServer::start().await;
-        let over_cap_period = serde_json::json!({
-            "scope_description": null,
-            "date_range": null,
-            "schedule_window": null,
-            "resolution_status": "ongoing",
-            "apparent_severity": "normal"
-        });
+        // 13 periods against a cap of 8 -- the same "13 vs 8" shape the
+        // design doc's own root-cause research called out as more
+        // consistent with real compound incident structure than runaway
+        // hallucination. 8 are rank-2 severity (blocked_or_suspended /
+        // severe_disruption, tied), 5 are rank-0 (normal) -- distinct
+        // severities per period, so this test isolates severity ordering
+        // without also exercising the date tiebreak (that's the dedicated
+        // test below).
+        let severities = [
+            "blocked_or_suspended", "severe_disruption", "blocked_or_suspended", "severe_disruption",
+            "blocked_or_suspended", "severe_disruption", "blocked_or_suspended", "severe_disruption",
+            "normal", "normal", "normal", "normal", "normal",
+        ];
+        let periods: Vec<serde_json::Value> = severities
+            .iter()
+            .enumerate()
+            .map(|(i, severity)| {
+                serde_json::json!({
+                    "scope_description": format!("p{i}"),
+                    "date_range": null,
+                    "schedule_window": null,
+                    "resolution_status": "ongoing",
+                    "apparent_severity": severity,
+                })
+            })
+            .collect();
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{
                     "message": {
-                        "content": serde_json::json!({
-                            "category": "signal_failure",
-                            "periods": vec![over_cap_period; MAX_PERIODS + 1]
-                        }).to_string()
+                        "content": serde_json::json!({ "category": "signal_failure", "periods": periods }).to_string()
                     }
                 }]
             })))
@@ -665,7 +755,76 @@ mod tests {
         let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
         let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
 
-        assert!(result.is_err(), "exceeding the soft period-count cap must be a hard failure, not stored as-is");
+        let extraction = result.expect("exceeding the soft cap must now truncate and succeed, not fail");
+        assert_eq!(extraction.periods.len(), 8);
+        assert_eq!(extraction.dropped_period_count, 5);
+        let kept: Vec<&str> = extraction.periods.iter().map(|p| p.scope_description.as_deref().unwrap()).collect();
+        assert_eq!(
+            kept,
+            vec!["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+            "the 8 rank-2-severity periods must be kept in their original relative order (stable sort, no date tiebreak triggered here); the 5 rank-0 (normal) periods must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_primary_truncation_tiebreaks_by_from_date_ascending_with_none_first() {
+        let server = MockServer::start().await;
+        // 7 filler periods at blocked_or_suspended (rank 2), spread across
+        // distinct dates so none of them tie with each other -- guaranteed
+        // to be kept regardless of the two candidates below.
+        let mut periods: Vec<serde_json::Value> = (0..7)
+            .map(|i| {
+                serde_json::json!({
+                    "scope_description": format!("filler{i}"),
+                    "date_range": { "from_date": format!("2026-0{}-01T00:00:00Z", i + 1), "to_date": null },
+                    "schedule_window": null,
+                    "resolution_status": "ongoing",
+                    "apparent_severity": "blocked_or_suspended",
+                })
+            })
+            .collect();
+        // 2 candidates at moderate_disruption (rank 1, strictly below the
+        // fillers' rank 2) competing for the single remaining slot: one
+        // with from_date: null, one with a stated future date. Per the
+        // "None sorts first" rule, the null one must be kept.
+        periods.push(serde_json::json!({
+            "scope_description": "candidate_none_date",
+            "date_range": { "from_date": null, "to_date": null },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "moderate_disruption",
+        }));
+        periods.push(serde_json::json!({
+            "scope_description": "candidate_some_date",
+            "date_range": { "from_date": "2026-12-01T00:00:00Z", "to_date": null },
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "moderate_disruption",
+        }));
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({ "category": "signal_failure", "periods": periods }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let extraction = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await
+            .expect("9 periods against a cap of 8 must truncate and succeed");
+
+        assert_eq!(extraction.periods.len(), 8);
+        assert_eq!(extraction.dropped_period_count, 1);
+        let kept: Vec<&str> = extraction.periods.iter().map(|p| p.scope_description.as_deref().unwrap()).collect();
+        assert!(kept.contains(&"candidate_none_date"), "the null-from_date candidate must win the tiebreak: {kept:?}");
+        assert!(!kept.contains(&"candidate_some_date"), "the dated candidate must lose the tiebreak: {kept:?}");
     }
 
     #[tokio::test]
@@ -696,7 +855,9 @@ mod tests {
         let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
         let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
 
-        assert!(result.is_ok(), "exactly MAX_PERIODS should still be accepted, only exceeding it is a hard failure: {result:?}");
+        let extraction = result.expect("exactly MAX_PERIODS should still be accepted, only exceeding it truncates");
+        assert_eq!(extraction.periods.len(), MAX_PERIODS);
+        assert_eq!(extraction.dropped_period_count, 0, "the boundary case must not report any truncation");
     }
 
     #[tokio::test]
@@ -942,6 +1103,34 @@ mod tests {
         will open at 08:00 instead of 06:00 and close at 18:00 instead of 20:00 for the duration of this \
         period.";
 
+    // Day-of-week-across-legs stress test (design doc Decision 1): two
+    // date ranges, each containing three co-existing legs with genuinely
+    // different treatments -- the exact shape the new PRIMARY_PROMPT
+    // guidance (Task 1) targets. Built only from fragments confirmed
+    // quoted in docs/superpowers/specs/2026-09-01-disruption-type-extraction-research.md
+    // (lines 325-334), not invented prose.
+    const BARRHEAD_DUMFRIES_SUMMARY: &str = "Buses replace trains between Barrhead and Dumfries";
+    const BARRHEAD_DUMFRIES_DESCRIPTION: &str = "From Saturday 29 August to Friday 11 September, buses \
+        replace trains between Barrhead and Kilmarnock / Dumfries. Monday to Saturday during this period, \
+        buses operate between Kilmarnock and Troon, where passengers can connect with trains to / from Ayr. \
+        No scheduled services operate between Kilmarnock and Ayr / Stranraer on Sundays. \
+        From Saturday 12 September to Sunday 13 September, buses replace trains between Barrhead and \
+        Kilmarnock / Carlisle. On Saturday during this period, buses operate between Kilmarnock and Troon, \
+        where passengers can connect with trains to / from Ayr. No scheduled services operate between \
+        Kilmarnock and Ayr / Stranraer on Sunday.";
+
+    // Undated-aside observational fixture (design doc Decision 1): a
+    // dated bus-replacement clause plus a separate, undated, vaguely-scoped
+    // clause. Deliberately has NO dedicated hard-count expectation -- the
+    // sibling research doc explicitly left "does this get its own period,
+    // or fold into scope_description" unresolved; this fixture's job is to
+    // observe what the improved prompt actually does, not assert a
+    // pre-decided right answer.
+    const NORWOOD_JUNCTION_SUMMARY: &str = "Buses replace trains via Norwood Junction";
+    const NORWOOD_JUNCTION_DESCRIPTION: &str = "Monday to Thursday overnight, buses will replace trains \
+        between the affected stations via Norwood Junction. Some trains will be diverted via an alternative \
+        route.";
+
     fn eval_reference_date() -> DateTime<Utc> {
         "2026-04-01T00:00:00Z".parse().unwrap()
     }
@@ -993,6 +1182,12 @@ mod tests {
         for attempt in 1..=repeats.min(2) {
             run_battery_attempt(&client, "trap", attempt, TRAP_SUMMARY, TRAP_DESCRIPTION).await;
         }
+        for attempt in 1..=repeats {
+            run_battery_attempt(&client, "dow_legs", attempt, BARRHEAD_DUMFRIES_SUMMARY, BARRHEAD_DUMFRIES_DESCRIPTION).await;
+        }
+        for attempt in 1..=repeats.min(2) {
+            run_battery_attempt(&client, "undated_aside", attempt, NORWOOD_JUNCTION_SUMMARY, NORWOOD_JUNCTION_DESCRIPTION).await;
+        }
     }
 
     #[tokio::test]
@@ -1038,6 +1233,41 @@ mod tests {
             eprintln!(
                 "NOTE: expected 2 periods for the Wandsworth Town fixture (two sequential platform \
                  closures), model produced {} -- see design doc risk #1 (segmentation reliability)",
+                primary.periods.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to a real LLM_BASE_URL; run explicitly, see comment above"]
+    async fn live_eval_barrhead_dumfries_segments_into_six_periods() {
+        let client = live_client_from_env();
+        let reference_date = "2026-08-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let start = std::time::Instant::now();
+        let primary = client
+            .extract_primary(BARRHEAD_DUMFRIES_SUMMARY, BARRHEAD_DUMFRIES_DESCRIPTION, reference_date)
+            .await
+            .expect("primary extraction should succeed against a real endpoint");
+        eprintln!("primary call took {:?}, category={:?}, periods={}", start.elapsed(), primary.category, primary.periods.len());
+        for (i, p) in primary.periods.iter().enumerate() {
+            eprintln!(
+                "  period[{i}]: scope={:?} date_range={:?} schedule_window={:?} resolution_status={:?} apparent_severity={:?}",
+                p.scope_description, p.date_range, p.schedule_window, p.resolution_status, p.apparent_severity
+            );
+        }
+        assert!(!primary.periods.is_empty(), "periods must never be empty on a successful parse");
+
+        // Soft signal, not a hard assertion -- exactly like
+        // live_eval_wandsworth_town_segments_into_two_periods above. The
+        // expected count of 6 (three legs x two date ranges) is this
+        // plan's own reasoned prediction, not an observed result; it has
+        // not been run against a live model.
+        if primary.periods.len() != 6 {
+            eprintln!(
+                "NOTE: expected 6 periods for the Barrhead-Dumfries fixture (three co-existing legs per \
+                 date range, two date ranges), model produced {} -- see design doc Decision 1 and its Open \
+                 Questions section (counts not yet validated against a live model)",
                 primary.periods.len()
             );
         }

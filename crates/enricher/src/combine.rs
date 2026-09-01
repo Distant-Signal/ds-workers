@@ -32,8 +32,14 @@ pub fn combine(primary_status: &str, adversarial_status: &str) -> (String, Strin
 /// escalation. `severe_disruption` and `blocked_or_suspended` rank equally
 /// -- both map to `common::severity_rank`'s "severe" tier in
 /// `aggregation::escalation_ceiling`, so neither is a milder read of the
-/// other for the purpose of detecting disagreement here.
-fn severity_hint_rank(hint: &str) -> u8 {
+/// other for the purpose of detecting disagreement here. `pub(crate)`
+/// because `llm.rs`'s over-cap truncation (Decision 3,
+/// docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md)
+/// reuses this exact ordering to rank which periods survive the
+/// `MAX_PERIODS` cap -- the same relative severity order applies to both
+/// "does the adversarial pass disagree" and "which periods are most
+/// consequential to keep," so this is shared, not duplicated.
+pub(crate) fn severity_hint_rank(hint: &str) -> u8 {
     match hint {
         "severe_disruption" | "blocked_or_suspended" => 2,
         "moderate_disruption" => 1,
