@@ -3124,6 +3124,13 @@ mod tests {
     // judgment call for those files' own infill tasks.
     #[test]
     fn gwr_south_wales_severn_tunnel_junction_incident_stays_on_its_own_line() {
+        // `xc-cardiff.toml` (Task 9.4, added after this test was first
+        // written) independently added Severn Tunnel Junction too -- a real
+        // second line affected by this incident, on its own exclusive
+        // `xc-cardiff` segment, not `gwr-south-wales`'s. Station-level
+        // overlap only, same precedent as
+        // `lnwr_birmingham_crewe_exclusive_segment_incident_does_not_propagate`
+        // above, so still ExclusiveSegment for both.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -3135,8 +3142,13 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-south-wales".to_string()]));
-        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["gwr-south-wales".to_string(), "xc-cardiff".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
     }
 
     // `gwr-main-line`, `gwr-cotswold` and `gwr-south-wales` all share the
@@ -7219,13 +7231,15 @@ mod tests {
 
     // None of wmr-snow-hill.toml's three segments (`wmr-snow-hill-trunk`,
     // `wmr-snow-hill-dorridge`, `wmr-snow-hill-stratford`) are shared with
-    // any other file in the catalogue -- confirmed both by the file's own
-    // header comment (no segment-name collision found by grep) and by the
-    // task controller's own pre-check. So, per the exception class already
-    // used by `overground_liberty_exclusive_segment_incident_does_not_propagate`
-    // above, only an ExclusiveSegment regression is possible/required here
-    // -- there is no sibling line to assert a SharedSegment propagation
-    // against.
+    // any other file's segment tag in the catalogue -- confirmed both by the
+    // file's own header comment (no segment-name collision found by grep)
+    // and by the task controller's own pre-check. `chiltern-main-line.toml`
+    // (Task 10.2, a parallel worktree neither task could see) independently
+    // added Bordesley too, on its own exclusive `chiltern-birmingham-approach`
+    // segment -- station-level overlap only, same "overlap is fine,
+    // segment-sharing is a deliberate choice" precedent as
+    // `lnwr_birmingham_crewe_exclusive_segment_incident_does_not_propagate`
+    // above, so still ExclusiveSegment for both.
     #[test]
     fn wmr_snow_hill_bordesley_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
@@ -7233,7 +7247,12 @@ mod tests {
         let inc = incident("WMR-1", "Signal failure at Bordesley", "Signal failure causing delays to West Midlands Railway services.", &["LM"], &["BBS"]);
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["wmr-snow-hill".to_string()]));
-        assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["wmr-snow-hill".to_string(), "chiltern-main-line".to_string()])
+        );
+        for m in &matches {
+            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+        }
     }
 }
