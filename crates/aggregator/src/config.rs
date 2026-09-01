@@ -53,6 +53,18 @@ pub struct Config {
     #[arg(long, env, default_value_t = 7)]
     pub history_retention_days: i64,
 
+    /// How long to keep `line_status_daily_stats` rows before pruning them.
+    /// Deliberately `Option`, defaulting to `None` (no pruning at all) --
+    /// unlike `history_retention_days`, this rollup exists specifically to
+    /// answer "how has this line trended over weeks/months," and the real
+    /// retention ceiling is an unresolved product decision, not a technical
+    /// one (storage is trivial at daily granularity either way -- see
+    /// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md,
+    /// Open question 1). Set this via CLI/env once that's decided; until
+    /// then rows accumulate indefinitely.
+    #[arg(long, env)]
+    pub daily_stats_retention_days: Option<i64>,
+
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
     /// for why this differs from api.service.port -- api reuses its

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use common::{IncidentMessage, LineStatusReport, StationSample};
 use sqlx::{PgPool, Row};
 
@@ -316,6 +316,90 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
     .bind(retention_days.to_string())
     .execute(pool)
     .await?;
+    Ok(result.rows_affected())
+}
+
+/// The plain Europe/London CALENDAR day (midnight-to-midnight) `instant`
+/// falls on -- matching `frontend/lib/dateFormat.ts`'s `londonDayKey`, the
+/// convention the Timeline tab already groups by. Deliberately NOT
+/// `next_rail_day_boundary`'s rail-day 02:00 cutoff, a different boundary
+/// used elsewhere in this crate for incident staleness -- see
+/// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md, Open
+/// question 5, for why these two conventions coexist.
+pub fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
+    instant.with_timezone(&chrono_tz::Europe::London).date_naive()
+}
+
+/// Upserts one line's contribution to its `(line_id, day)` daily rollup row
+/// for this cycle. Called from `run_cycle` (`main.rs`, a later task) AT MOST
+/// ONCE per line per cycle, gated on the line having had ANY raw sample
+/// coverage this cycle (`report.statuses.first().and_then(|s| s.sample_stats)`
+/// being `Some`) -- that gate is what `sample_cycles` counts, so it always
+/// increments by 1 whenever this function is called, regardless of whether
+/// `stats` is `Some` or `None`.
+///
+/// `stats`, when `Some`, must be the DEDUPED per-cycle contribution from
+/// `dedup::dedup_new_sample_stats` (this cycle's genuinely NEW distinct
+/// trains only, by Darwin `service_id`) -- deliberately NOT the raw,
+/// undeduped `SampleStats` attached to the line's report. Summing this
+/// across a day therefore yields true per-distinct-train totals rather than
+/// poll-cycle-weighted counts, closing the "rate is per sampled poll cycle,
+/// not per train" v1 limitation flagged in
+/// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md
+/// Decision 2 -- see `crates/aggregator/src/dedup.rs`'s module doc, which
+/// names this function as its intended consumer.
+///
+/// `stats: None` is the common, expected case (most cycles see zero new
+/// trains once a line's currently-dwelling services have already been
+/// counted this period) -- it still counts as a covered cycle
+/// (`sample_cycles += 1`) but contributes zero to every other sum.
+pub async fn record_daily_stats(
+    pool: &PgPool,
+    line_id: &str,
+    day: NaiveDate,
+    stats: Option<&common::SampleStats>,
+) -> Result<()> {
+    let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
+        Some(s) => {
+            let running = s.total.saturating_sub(s.cancelled) as i64;
+            (s.total as i64, s.delayed as i64, s.cancelled as i64, s.skipped as i64, running, s.avg_delay_minutes * running as f64)
+        }
+        None => (0, 0, 0, 0, 0, 0.0),
+    };
+    sqlx::query(
+        "INSERT INTO line_status_daily_stats
+            (line_id, day, sample_cycles, total, delayed, cancelled, skipped,
+             running_count, delay_minutes_sum)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (line_id, day) DO UPDATE SET
+            sample_cycles     = line_status_daily_stats.sample_cycles + 1,
+            total             = line_status_daily_stats.total + EXCLUDED.total,
+            delayed           = line_status_daily_stats.delayed + EXCLUDED.delayed,
+            cancelled         = line_status_daily_stats.cancelled + EXCLUDED.cancelled,
+            skipped           = line_status_daily_stats.skipped + EXCLUDED.skipped,
+            running_count     = line_status_daily_stats.running_count + EXCLUDED.running_count,
+            delay_minutes_sum = line_status_daily_stats.delay_minutes_sum + EXCLUDED.delay_minutes_sum",
+    )
+    .bind(line_id)
+    .bind(day)
+    .bind(total)
+    .bind(delayed)
+    .bind(cancelled)
+    .bind(skipped)
+    .bind(running)
+    .bind(delay_minutes_sum)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mirrors `prune_history`'s shape. Only called from `run_cycle` when
+/// `daily_stats_retention_days` is `Some` -- see `config.rs`.
+pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM line_status_daily_stats WHERE day < (CURRENT_DATE - $1::int)")
+        .bind(retention_days as i32)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -846,5 +930,247 @@ mod tests {
         // not accidentally overwritten along with from_date.
         assert_eq!(result[0]["sample_stats"], fresh[0]["sample_stats"]);
         assert_eq!(result[0]["reason"], fresh[0]["reason"]);
+    }
+
+    // --- london_calendar_day ---
+    //
+    // Mirrors the DST-transition rigor of `aggregation.rs`'s
+    // `next_rail_day_boundary_*` tests, but for the plain calendar-day
+    // boundary instead of the rail-day 02:00 one.
+
+    #[test]
+    fn london_calendar_day_just_before_london_midnight_in_bst_stays_on_the_earlier_day() {
+        // 2026-07-15 22:59 UTC is 2026-07-15 23:59 BST (July is daylight
+        // saving, UTC+1) -- still the same London calendar day.
+        let instant: DateTime<Utc> = "2026-07-15T22:59:00Z".parse().unwrap();
+        assert_eq!(london_calendar_day(instant), NaiveDate::from_ymd_opt(2026, 7, 15).unwrap());
+    }
+
+    #[test]
+    fn london_calendar_day_just_after_london_midnight_in_bst_rolls_to_the_next_day() {
+        // 2026-07-15 23:00 UTC is 2026-07-16 00:00 BST -- just crossed into
+        // the next London calendar day.
+        let instant: DateTime<Utc> = "2026-07-15T23:00:00Z".parse().unwrap();
+        assert_eq!(london_calendar_day(instant), NaiveDate::from_ymd_opt(2026, 7, 16).unwrap());
+    }
+
+    #[test]
+    fn london_calendar_day_around_london_midnight_in_gmt() {
+        // January is GMT (UTC+0), so the London calendar day boundary lines
+        // up exactly with the UTC one -- no offset to account for.
+        let just_before: DateTime<Utc> = "2026-01-15T23:59:00Z".parse().unwrap();
+        let just_after: DateTime<Utc> = "2026-01-16T00:00:00Z".parse().unwrap();
+        assert_eq!(london_calendar_day(just_before), NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
+        assert_eq!(london_calendar_day(just_after), NaiveDate::from_ymd_opt(2026, 1, 16).unwrap());
+    }
+
+    #[test]
+    fn london_calendar_day_across_the_spring_forward_transition() {
+        // UK clocks spring forward at 01:00 UTC on 2026-03-29, jumping local
+        // time from 01:00 GMT straight to 02:00 BST. Neither side of that
+        // jump is anywhere near local midnight, so the calendar day must
+        // stay 2026-03-29 on both sides -- this exercises that converting a
+        // UTC instant (never ambiguous/missing, unlike the reverse
+        // direction `next_rail_day_boundary` deals with) through the jump
+        // doesn't perturb the resulting date.
+        let just_before: DateTime<Utc> = "2026-03-29T00:59:00Z".parse().unwrap();
+        let just_after: DateTime<Utc> = "2026-03-29T01:30:00Z".parse().unwrap();
+        assert_eq!(london_calendar_day(just_before), NaiveDate::from_ymd_opt(2026, 3, 29).unwrap());
+        assert_eq!(london_calendar_day(just_after), NaiveDate::from_ymd_opt(2026, 3, 29).unwrap());
+    }
+
+    #[test]
+    fn london_calendar_day_across_the_fall_back_transition() {
+        // UK clocks fall back at 01:00 UTC on 2026-10-25, jumping local time
+        // from 02:00 BST back to 01:00 GMT. Again nowhere near local
+        // midnight, so the calendar day is unaffected by the repeated local
+        // hour.
+        let just_before: DateTime<Utc> = "2026-10-25T00:30:00Z".parse().unwrap();
+        let just_after: DateTime<Utc> = "2026-10-25T01:30:00Z".parse().unwrap();
+        assert_eq!(london_calendar_day(just_before), NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
+        assert_eq!(london_calendar_day(just_after), NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
+    }
+
+    // --- record_daily_stats / prune_daily_stats ---
+
+    async fn cleanup_daily_stats(pool: &PgPool, line_id: &str) {
+        sqlx::query("DELETE FROM line_status_daily_stats WHERE line_id = $1")
+            .bind(line_id)
+            .execute(pool)
+            .await
+            .expect("cleanup line_status_daily_stats");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_daily_stats_accumulates_deduped_contributions_across_a_day -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_daily_stats_accumulates_deduped_contributions_across_a_day() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-DAILY-STATS-ACCUMULATE";
+        let day = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+
+        let cycle1 =
+            common::SampleStats { total: 4, delayed: 1, cancelled: 1, skipped: 0, avg_delay_minutes: 6.0 };
+        let cycle2 =
+            common::SampleStats { total: 2, delayed: 2, cancelled: 0, skipped: 1, avg_delay_minutes: 12.0 };
+
+        record_daily_stats(&pool, LINE_ID, day, Some(&cycle1)).await.expect("record cycle 1");
+        record_daily_stats(&pool, LINE_ID, day, Some(&cycle2)).await.expect("record cycle 2");
+
+        let row = sqlx::query(
+            "SELECT sample_cycles, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
+             FROM line_status_daily_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("read accumulated row");
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+
+        let sample_cycles: i64 = row.try_get("sample_cycles").unwrap();
+        let total: i64 = row.try_get("total").unwrap();
+        let delayed: i64 = row.try_get("delayed").unwrap();
+        let cancelled: i64 = row.try_get("cancelled").unwrap();
+        let skipped: i64 = row.try_get("skipped").unwrap();
+        let running_count: i64 = row.try_get("running_count").unwrap();
+        let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(sample_cycles, 2, "two Some(stats) calls should each count as one covered cycle");
+        assert_eq!(total, 6);
+        assert_eq!(delayed, 3);
+        assert_eq!(cancelled, 1);
+        assert_eq!(skipped, 1);
+        // running_count = (4 - 1) + (2 - 0) = 5.
+        assert_eq!(running_count, 5);
+        // delay_minutes_sum = 6.0 * 3 + 12.0 * 2 = 42.0.
+        assert!((delay_minutes_sum - 42.0).abs() < 1e-9);
+
+        // Recovering each cycle's avg_delay_minutes via division must match
+        // within floating-point tolerance -- checked per-cycle here since
+        // the accumulated row only proves the *sum* recovers correctly when
+        // divided by the accumulated running_count as a whole.
+        let recovered_overall_avg = delay_minutes_sum / running_count as f64;
+        assert!((recovered_overall_avg - (42.0 / 5.0)).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_daily_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_daily_stats_none_still_counts_the_cycle_but_adds_nothing() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-DAILY-STATS-NONE";
+        let day = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+
+        record_daily_stats(&pool, LINE_ID, day, None).await.expect("record a None cycle");
+        record_daily_stats(&pool, LINE_ID, day, None).await.expect("record a second None cycle");
+
+        let row = sqlx::query(
+            "SELECT sample_cycles, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
+             FROM line_status_daily_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("read row");
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+
+        let sample_cycles: i64 = row.try_get("sample_cycles").unwrap();
+        let total: i64 = row.try_get("total").unwrap();
+        let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(sample_cycles, 2, "None still counts as a covered cycle");
+        assert_eq!(total, 0, "None must contribute zero to every sum column");
+        assert_eq!(delay_minutes_sum, 0.0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_daily_stats_a_new_day_starts_a_fresh_row -- --ignored` against docker \
+                compose's postgres"]
+    async fn record_daily_stats_a_new_day_starts_a_fresh_row() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-DAILY-STATS-NEW-DAY";
+        let day1 = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+
+        let stats = common::SampleStats { total: 5, delayed: 1, cancelled: 0, skipped: 0, avg_delay_minutes: 3.0 };
+        record_daily_stats(&pool, LINE_ID, day1, Some(&stats)).await.expect("record day 1");
+        record_daily_stats(&pool, LINE_ID, day2, Some(&stats)).await.expect("record day 2");
+
+        let day2_cycles: i64 = sqlx::query_scalar(
+            "SELECT sample_cycles FROM line_status_daily_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day2)
+        .fetch_one(&pool)
+        .await
+        .expect("read day 2 row");
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+
+        assert_eq!(day2_cycles, 1, "a new day must start its own fresh row, not accumulate into day 1's");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_daily_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                against docker compose's postgres"]
+    async fn prune_daily_stats_deletes_only_rows_older_than_the_retention_window() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const OLD_LINE_ID: &str = "TEST-DAILY-STATS-PRUNE-OLD";
+        const RECENT_LINE_ID: &str = "TEST-DAILY-STATS-PRUNE-RECENT";
+        const RETENTION_DAYS: i64 = 30;
+
+        cleanup_daily_stats(&pool, OLD_LINE_ID).await;
+        cleanup_daily_stats(&pool, RECENT_LINE_ID).await;
+
+        sqlx::query(
+            "INSERT INTO line_status_daily_stats (line_id, day, sample_cycles, total) VALUES \
+                ($1, CURRENT_DATE - ($3::int + 1), 1, 1), \
+                ($2, CURRENT_DATE - ($3::int - 1), 1, 1)",
+        )
+        .bind(OLD_LINE_ID)
+        .bind(RECENT_LINE_ID)
+        .bind(RETENTION_DAYS as i32)
+        .execute(&pool)
+        .await
+        .expect("seed old and recent rows");
+
+        prune_daily_stats(&pool, RETENTION_DAYS).await.expect("prune_daily_stats");
+
+        let old_survives: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM line_status_daily_stats WHERE line_id = $1")
+                .bind(OLD_LINE_ID)
+                .fetch_one(&pool)
+                .await
+                .expect("count old survivors");
+        let recent_survives: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM line_status_daily_stats WHERE line_id = $1")
+                .bind(RECENT_LINE_ID)
+                .fetch_one(&pool)
+                .await
+                .expect("count recent survivors");
+
+        cleanup_daily_stats(&pool, OLD_LINE_ID).await;
+        cleanup_daily_stats(&pool, RECENT_LINE_ID).await;
+
+        assert_eq!(old_survives, 0, "a row older than the retention window should be pruned");
+        assert_eq!(recent_survives, 1, "a row within the retention window should be kept");
     }
 }
