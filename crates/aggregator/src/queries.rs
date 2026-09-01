@@ -395,8 +395,10 @@ pub async fn record_daily_stats(
     Ok(())
 }
 
-/// Mirrors `prune_history`'s shape. Only called from `run_cycle` when
-/// `daily_stats_retention_days` is `Some` -- see `config.rs`.
+/// Mirrors `prune_history`'s shape exactly -- called unconditionally every
+/// cycle from `run_cycle`, same as `prune_history`, now that
+/// `daily_stats_retention_days` always carries a real value (see
+/// `config.rs` and docs/superpowers/plans/2026-09-01-ldbws-data-retention.md).
 pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
     let result = sqlx::query("DELETE FROM line_status_daily_stats WHERE day < (CURRENT_DATE - $1::int)")
         .bind(retention_days as i32)

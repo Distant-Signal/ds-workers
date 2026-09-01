@@ -83,7 +83,7 @@ async fn run_cycle(
     static_lines: &HashMap<String, LineDefinition>,
     defaults: &Defaults,
     retention_days: i64,
-    daily_stats_retention_days: Option<i64>,
+    daily_stats_retention_days: i64,
     dedup_ledger: &mut SeenServiceLedger,
 ) -> anyhow::Result<()> {
     let custom_lines = queries::load_custom_lines(pool).await?;
@@ -127,11 +127,7 @@ async fn run_cycle(
     }
     dedup_ledger.prune_before(today);
 
-    let daily_stats_pruned = if let Some(retention) = daily_stats_retention_days {
-        queries::prune_daily_stats(pool, retention).await?
-    } else {
-        0
-    };
+    let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
 
     metrics::gauge!(common::metrics::metric_name("aggregator_lines_total")).set(reports.len() as f64);
     metrics::gauge!(common::metrics::metric_name("aggregator_incidents_loaded")).set(incidents.len() as f64);

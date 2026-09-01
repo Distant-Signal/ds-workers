@@ -54,16 +54,19 @@ pub struct Config {
     pub history_retention_days: i64,
 
     /// How long to keep `line_status_daily_stats` rows before pruning them.
-    /// Deliberately `Option`, defaulting to `None` (no pruning at all) --
-    /// unlike `history_retention_days`, this rollup exists specifically to
-    /// answer "how has this line trended over weeks/months," and the real
-    /// retention ceiling is an unresolved product decision, not a technical
-    /// one (storage is trivial at daily granularity either way -- see
-    /// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md,
-    /// Open question 1). Set this via CLI/env once that's decided; until
-    /// then rows accumulate indefinitely.
-    #[arg(long, env)]
-    pub daily_stats_retention_days: Option<i64>,
+    /// `line_status_daily_stats` is fed by LDBWS-derived `StationSample`
+    /// data (see `common::SampleStats`'s doc comment), and RDM's Live
+    /// Departure Board licence (Schedule 1 §9) requires deleting all data
+    /// received within 1 year. 300 leaves real margin under that 365-day
+    /// ceiling to comfortably absorb poll/prune cadence, mirroring
+    /// `history_retention_days`'s shape exactly. See
+    /// docs/superpowers/plans/2026-09-01-ldbws-data-retention.md (Task 2)
+    /// for the full finding and remediation plan -- the exact number below
+    /// 365 remains a product/UX call (how far back the Trends tab should
+    /// let a user scroll, docs/superpowers/specs/2026-08-31-line-history-graphics-design.md,
+    /// Open question 1), this default just guarantees a ceiling exists.
+    #[arg(long, env, default_value_t = 300)]
+    pub daily_stats_retention_days: i64,
 
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
