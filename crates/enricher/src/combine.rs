@@ -150,6 +150,7 @@ pub fn combine_periods(
                 schedule_window: period.schedule_window.clone(),
                 resolution_status,
                 apparent_severity,
+                impact_type: period.impact_type.clone(),
                 resolution_status_confidence,
                 severity_confidence,
             })
@@ -219,12 +220,22 @@ mod tests {
     }
 
     fn period(scope: Option<&str>, resolution_status: &str, apparent_severity: &str) -> ExtractionPeriod {
+        period_with_impact(scope, resolution_status, apparent_severity, None)
+    }
+
+    fn period_with_impact(
+        scope: Option<&str>,
+        resolution_status: &str,
+        apparent_severity: &str,
+        impact_type: Option<&str>,
+    ) -> ExtractionPeriod {
         ExtractionPeriod {
             scope_description: scope.map(str::to_string),
             date_range: None,
             schedule_window: None,
             resolution_status: resolution_status.to_string(),
             apparent_severity: apparent_severity.to_string(),
+            impact_type: impact_type.map(str::to_string),
             resolution_status_confidence: String::new(),
             severity_confidence: String::new(),
         }
@@ -259,6 +270,28 @@ mod tests {
         // Period 1: severe primary + milder adversarial -> low confidence.
         assert_eq!(result[1].apparent_severity, "severe_disruption");
         assert_eq!(result[1].severity_confidence, "low");
+    }
+
+    #[test]
+    fn combine_periods_copies_impact_type_through_unchanged() {
+        let primary = vec![period_with_impact(None, "ongoing", "normal", Some("rail_replacement_bus"))];
+        let resolution = vec![resolution_verdict(0, None, "ongoing")];
+        let severity = vec![severity_verdict(0, None, "normal")];
+
+        let result = combine_periods(&primary, &resolution, &severity).unwrap();
+
+        assert_eq!(result[0].impact_type.as_deref(), Some("rail_replacement_bus"));
+    }
+
+    #[test]
+    fn combine_periods_copies_a_null_impact_type_through_unchanged() {
+        let primary = vec![period(None, "ongoing", "normal")]; // impact_type: None
+        let resolution = vec![resolution_verdict(0, None, "ongoing")];
+        let severity = vec![severity_verdict(0, None, "normal")];
+
+        let result = combine_periods(&primary, &resolution, &severity).unwrap();
+
+        assert_eq!(result[0].impact_type, None);
     }
 
     #[test]

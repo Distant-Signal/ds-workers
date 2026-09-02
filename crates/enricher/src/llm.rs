@@ -66,6 +66,15 @@ pub struct ExtractionPeriod {
     /// `normal` | `moderate_disruption` | `severe_disruption` |
     /// `blocked_or_suspended`.
     pub apparent_severity: String,
+    /// `rail_replacement_bus` | `no_scheduled_service` | `diversion` | `null`.
+    /// Primary-pass-only, like `scope_description` -- no adversarial check
+    /// exists for this field (design doc Decision 2), so it is copied
+    /// through `combine::combine_periods` unchanged. Deliberately has NO
+    /// `#[serde(default)]` -- every sibling field in this struct is
+    /// required in the real schema, and this one follows the same
+    /// contract (see the aggregator's own mirror struct for the opposite,
+    /// backward-compat-driven choice).
+    pub impact_type: Option<String>,
     /// NOT part of the primary pass's JSON schema -- the model never
     /// asserts its own confidence, exactly as in the original design.
     /// Populated by `combine::combine_periods` once the adversarial passes
@@ -221,9 +230,13 @@ fn primary_schema() -> serde_json::Value {
                             "required": ["days_of_week", "start_time", "end_time"]
                         },
                         "resolution_status": { "type": "string", "enum": ["ongoing", "residual", "resolved"] },
-                        "apparent_severity": { "type": "string", "enum": ["normal", "moderate_disruption", "severe_disruption", "blocked_or_suspended"] }
+                        "apparent_severity": { "type": "string", "enum": ["normal", "moderate_disruption", "severe_disruption", "blocked_or_suspended"] },
+                        "impact_type": {
+                            "type": ["string", "null"],
+                            "enum": ["rail_replacement_bus", "no_scheduled_service", "diversion", null]
+                        }
                     },
-                    "required": ["scope_description", "date_range", "schedule_window", "resolution_status", "apparent_severity"]
+                    "required": ["scope_description", "date_range", "schedule_window", "resolution_status", "apparent_severity", "impact_type"]
                 }
             }
         },
@@ -310,7 +323,27 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     not the same fact restated). Note periods 2 and 3 are NOT merged despite sharing both the date range \
     and the same underlying Kilmarnock-Ayr/Stranraer leg -- the text states two different treatments for \
     different days, which is exactly the case that must still split even though 'several things under one \
-    shared date range' would otherwise argue for merging.";
+    shared date range' would otherwise argue for merging. \
+    `impact_type` is `rail_replacement_bus` if that period states that buses (or another road vehicle) \
+    replace, substitute for, or operate in place of trains for some or all of the affected journey -- \
+    regardless of the exact phrasing used (\"buses replace trains,\" \"a replacement bus service,\" \"buses \
+    will operate between X and Y\"). It is `no_scheduled_service` if that period states plainly that no \
+    trains (and no replacement service) run at all -- do not use `rail_replacement_bus` for this; a \
+    withdrawn service and a substitute service are different facts even when both are severe. It is \
+    `diversion` if that period states trains are running via a different route than usual, without a bus \
+    substitute. Use `null` for any period that does not state one of these three specific facts -- an \
+    ordinary delay or cancellation notice with no stated substitute-service arrangement is `null`, not a \
+    forced guess. \
+    Worked example, reference date 2026-08-01T00:00:00Z: input \"Buses operate between Kilmarnock and Troon, \
+    where passengers can connect with trains to / from Ayr, Saturdays 29 August to 12 September. No \
+    scheduled services operate between Kilmarnock and Ayr / Stranraer on Sundays 30 August to 13 September.\" \
+    segments into two periods, each with its own `schedule_window` restricting it to the stated day -- period \
+    1: `scope_description` \"Saturday bus, Kilmarnock-Troon\", `schedule_window` restricted to Saturday, \
+    `impact_type: \"rail_replacement_bus\"`; period 2: `scope_description` \"Sunday no service, \
+    Kilmarnock-Ayr/Stranraer\", `schedule_window` restricted to Sunday, `impact_type: \"no_scheduled_service\"`. \
+    Note these are two periods with two different `impact_type` values, not one merged period and not the \
+    same tag applied to both -- a substitute bus service and a full withdrawal are different facts even on \
+    immediately adjacent days of the same date range.";
 
 const ADVERSARIAL_SCHEMA_NAME: &str = "adversarial_resolution_check";
 
@@ -600,7 +633,8 @@ mod tests {
                                 "date_range": null,
                                 "schedule_window": null,
                                 "resolution_status": "resolved",
-                                "apparent_severity": "normal"
+                                "apparent_severity": "normal",
+                                "impact_type": null
                             }]
                         }).to_string()
                     }
@@ -625,6 +659,71 @@ mod tests {
         // must fill them in rather than fail to deserialize.
         assert_eq!(result.periods[0].resolution_status_confidence, "");
         assert_eq!(result.periods[0].severity_confidence, "");
+    }
+
+    #[tokio::test]
+    async fn extract_primary_parses_a_non_null_impact_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({
+                            "category": "engineering_works",
+                            "periods": [{
+                                "scope_description": null,
+                                "date_range": null,
+                                "schedule_window": null,
+                                "resolution_status": "ongoing",
+                                "apparent_severity": "severe_disruption",
+                                "impact_type": "rail_replacement_bus"
+                            }]
+                        }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let result = client
+            .extract_primary("Buses replace trains", "Engineering works", reference_date())
+            .await
+            .unwrap();
+
+        assert_eq!(result.periods[0].impact_type.as_deref(), Some("rail_replacement_bus"));
+    }
+
+    #[tokio::test]
+    async fn extract_primary_parses_a_null_impact_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({
+                            "category": "signal_failure",
+                            "periods": [{
+                                "scope_description": null,
+                                "date_range": null,
+                                "schedule_window": null,
+                                "resolution_status": "ongoing",
+                                "apparent_severity": "normal",
+                                "impact_type": null
+                            }]
+                        }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await.unwrap();
+
+        assert_eq!(result.periods[0].impact_type, None);
     }
 
     #[tokio::test]
@@ -653,7 +752,8 @@ mod tests {
                                         "end_time": "14:00"
                                     },
                                     "resolution_status": "ongoing",
-                                    "apparent_severity": "moderate_disruption"
+                                    "apparent_severity": "moderate_disruption",
+                                    "impact_type": null
                                 },
                                 {
                                     "scope_description": "platform 3 closed, calls at platform 4",
@@ -667,7 +767,8 @@ mod tests {
                                         "end_time": "14:00"
                                     },
                                     "resolution_status": "ongoing",
-                                    "apparent_severity": "moderate_disruption"
+                                    "apparent_severity": "moderate_disruption",
+                                    "impact_type": null
                                 }
                             ]
                         }).to_string()
@@ -737,6 +838,7 @@ mod tests {
                     "schedule_window": null,
                     "resolution_status": "ongoing",
                     "apparent_severity": severity,
+                    "impact_type": null
                 })
             })
             .collect();
@@ -780,6 +882,7 @@ mod tests {
                     "schedule_window": null,
                     "resolution_status": "ongoing",
                     "apparent_severity": "blocked_or_suspended",
+                    "impact_type": null
                 })
             })
             .collect();
@@ -793,6 +896,7 @@ mod tests {
             "schedule_window": null,
             "resolution_status": "ongoing",
             "apparent_severity": "moderate_disruption",
+            "impact_type": null
         }));
         periods.push(serde_json::json!({
             "scope_description": "candidate_some_date",
@@ -800,6 +904,7 @@ mod tests {
             "schedule_window": null,
             "resolution_status": "ongoing",
             "apparent_severity": "moderate_disruption",
+            "impact_type": null
         }));
 
         Mock::given(method("POST"))
@@ -835,7 +940,8 @@ mod tests {
             "date_range": null,
             "schedule_window": null,
             "resolution_status": "ongoing",
-            "apparent_severity": "normal"
+            "apparent_severity": "normal",
+            "impact_type": null
         });
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -876,7 +982,8 @@ mod tests {
                                 "date_range": null,
                                 "schedule_window": null,
                                 "resolution_status": "ongoing",
-                                "apparent_severity": "normal"
+                                "apparent_severity": "normal",
+                                "impact_type": null
                             }]
                         }).to_string()
                     }
@@ -922,6 +1029,7 @@ mod tests {
                 schedule_window: None,
                 resolution_status: "resolved".to_string(),
                 apparent_severity: "normal".to_string(),
+                impact_type: None,
                 resolution_status_confidence: String::new(),
                 severity_confidence: String::new(),
             },
@@ -931,6 +1039,7 @@ mod tests {
                 schedule_window: None,
                 resolution_status: "resolved".to_string(),
                 apparent_severity: "normal".to_string(),
+                impact_type: None,
                 resolution_status_confidence: String::new(),
                 severity_confidence: String::new(),
             },
@@ -972,6 +1081,7 @@ mod tests {
             schedule_window: None,
             resolution_status: "ongoing".to_string(),
             apparent_severity: "severe_disruption".to_string(),
+            impact_type: None,
             resolution_status_confidence: String::new(),
             severity_confidence: String::new(),
         }];
@@ -1131,6 +1241,26 @@ mod tests {
         between the affected stations via Norwood Junction. Some trains will be diverted via an alternative \
         route.";
 
+    // Example 1 from docs/superpowers/specs/2026-09-01-disruption-type-extraction-research.md:
+    // a Saturday rail-replacement-bus leg immediately adjacent to a Sunday
+    // no-scheduled-service leg within the same overarching date range --
+    // the case design doc Decision 4's governing_impact_type collapsing
+    // rule (schedule-window disambiguation) is built to handle.
+    const IMPACT_BUS_NOSERVICE_SUMMARY: &str = "Buses replace trains between Kilmarnock and Ayr";
+    const IMPACT_BUS_NOSERVICE_DESCRIPTION: &str = "From Saturday 29 August to Sunday 13 September, \
+        engineering work is taking place between Kilmarnock and Ayr. Buses operate between Kilmarnock and \
+        Troon, where passengers can connect with trains to / from Ayr, on Saturdays. No scheduled services \
+        operate between Kilmarnock and Ayr / Stranraer on Sundays.";
+
+    // Example 2: a rail-replacement-bus paragraph and a separately-worded
+    // diversion clause with no date/scope boundary of its own -- the
+    // segmentation ambiguity design doc's Open questions/risks item 1
+    // (and the research doc's Open question 1) name as unresolved.
+    const IMPACT_DIVERSION_SUMMARY: &str = "Rail replacement buses and diversions between London Bridge and Croydon";
+    const IMPACT_DIVERSION_DESCRIPTION: &str = "Monday to Thursday nights, buses will replace trains between \
+        London Bridge and East / West Croydon while overnight engineering work takes place. Some trains will \
+        be diverted via an alternative route.";
+
     fn eval_reference_date() -> DateTime<Utc> {
         "2026-04-01T00:00:00Z".parse().unwrap()
     }
@@ -1153,8 +1283,8 @@ mod tests {
                 for (i, p) in primary.periods.iter().enumerate() {
                     eprintln!(
                         "  BATTERY fixture={label} attempt={attempt} period[{i}] scope={:?} date_range={:?} \
-                         schedule_window={:?} resolution_status={:?} apparent_severity={:?}",
-                        p.scope_description, p.date_range, p.schedule_window, p.resolution_status, p.apparent_severity
+                         schedule_window={:?} resolution_status={:?} apparent_severity={:?} impact_type={:?}",
+                        p.scope_description, p.date_range, p.schedule_window, p.resolution_status, p.apparent_severity, p.impact_type
                     );
                 }
             }
@@ -1187,6 +1317,12 @@ mod tests {
         }
         for attempt in 1..=repeats.min(2) {
             run_battery_attempt(&client, "undated_aside", attempt, NORWOOD_JUNCTION_SUMMARY, NORWOOD_JUNCTION_DESCRIPTION).await;
+        }
+        for attempt in 1..=repeats.min(2) {
+            run_battery_attempt(&client, "impact_bus_noservice", attempt, IMPACT_BUS_NOSERVICE_SUMMARY, IMPACT_BUS_NOSERVICE_DESCRIPTION).await;
+        }
+        for attempt in 1..=repeats.min(2) {
+            run_battery_attempt(&client, "impact_diversion", attempt, IMPACT_DIVERSION_SUMMARY, IMPACT_DIVERSION_DESCRIPTION).await;
         }
     }
 

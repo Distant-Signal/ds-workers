@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         config.llm_model.clone(),
         Duration::from_secs(config.llm_request_timeout_secs),
     ));
-    let model_version = format!("{}@periods-v1", config.llm_model);
+    let model_version = format!("{}@periods-v2", config.llm_model);
 
     let mismatch_tracker = Arc::new(MismatchTracker::default());
 
@@ -482,6 +482,7 @@ mod tests {
                     "schedule_window": null,
                     "resolution_status": "ongoing",
                     "apparent_severity": "moderate_disruption",
+                    "impact_type": null
                 })
             })
             .collect();

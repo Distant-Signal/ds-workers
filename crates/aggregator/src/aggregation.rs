@@ -142,6 +142,7 @@ fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) 
         affected_stops: affected_stations,
         affected_routes,
         source: Some(format!("knowledgebase-incident-{}", incident.incident_id)),
+        impact_type: governing_impact_type(loaded, now),
     };
 
     LineStatus {
@@ -345,6 +346,12 @@ struct ExtractionPeriod {
     resolution_status_confidence: String,
     #[serde(default)]
     severity_confidence: String,
+    /// `#[serde(default)]` is load-bearing here for the identical reason
+    /// as the two confidence fields above: a row written by an `enricher`
+    /// process older than this field must still parse, degrading to
+    /// `None` rather than failing the whole `extracted_periods` parse.
+    #[serde(default)]
+    impact_type: Option<String>,
 }
 
 /// Whether a period is currently relevant to `now`, and if not, *why* --
@@ -658,6 +665,37 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
     (demoted, Some(annotations.join("; ")))
 }
 
+/// Picks the `impact_type` to attach to `common::Disruption` from among an
+/// incident's currently-relevant periods -- see
+/// docs/superpowers/specs/2026-09-01-disruption-impact-type-design.md
+/// Decision 4. Filters to `Active` periods (matching `apply_extraction`'s
+/// own definition of "currently relevant"), then to periods that actually
+/// state an `impact_type`, then prefers one whose `schedule_window` is
+/// either absent or currently matching `now` -- the same real-time
+/// refinement `apply_extraction`'s own schedule-window demotion check
+/// already applies, reused here as a filter rather than a demotion
+/// trigger. Resolves the Saturday-bus/Sunday-no-service case: on a
+/// Saturday only the bus period's window matches; on a Sunday only the
+/// no-service period's does; on a weekday matching neither, this returns
+/// `None`, correctly reflecting that neither stated fact currently
+/// applies. Takes the FIRST (array/text order) remaining candidate --
+/// deliberately not a severity-like ranking across the three values (see
+/// Decision 4's "Alternative considered and rejected"); a real, named,
+/// unresolved tie-break gap for two simultaneously-eligible periods with
+/// no `schedule_window` to disambiguate them (design doc Open
+/// questions/risks item 1).
+fn governing_impact_type(loaded: &LoadedIncident, now: DateTime<Utc>) -> Option<String> {
+    parse_periods(loaded)
+        .into_iter()
+        .filter(|period| period_phase(period, now) == PeriodPhase::Active)
+        .filter(|period| period.impact_type.is_some())
+        .find(|period| match &period.schedule_window {
+            None => true,
+            Some(window) => now_within_window(window, now),
+        })
+        .and_then(|period| period.impact_type)
+}
+
 fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<AffectedRoute> {
     if stations.len() < 2 {
         return vec![];
@@ -829,6 +867,7 @@ fn infer_from_samples(
             affected_stops,
             affected_routes: vec![],
             source: Some("ldbws-sampling".to_string()),
+            impact_type: None, // LDBWS sampling never runs the enricher's extraction pipeline
         }),
         data_quality: DataQuality::LdbwsInferred,
         sample_stats: Some(stats),
@@ -2631,5 +2670,186 @@ mod tests {
             !is_active(&loaded, now),
             "an elapsed recurring-schedule period must not exempt an incident from the rail-day cutoff"
         );
+    }
+
+    #[test]
+    fn governing_impact_type_returns_none_with_no_periods() {
+        let loaded = LoadedIncident {
+            message: incident("GIT1", "Signal failure", "Delays", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: None,
+        };
+        assert_eq!(governing_impact_type(&loaded, Utc::now()), None);
+    }
+
+    #[test]
+    fn governing_impact_type_returns_none_when_the_active_periods_impact_type_is_null() {
+        let periods = serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "",
+            "impact_type": null
+        }]);
+        let loaded = LoadedIncident {
+            message: incident("GIT2", "Signal failure", "Delays", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        assert_eq!(governing_impact_type(&loaded, Utc::now()), None);
+    }
+
+    #[test]
+    fn governing_impact_type_returns_the_single_active_periods_value() {
+        let periods = serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "severe_disruption",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "high",
+            "impact_type": "rail_replacement_bus"
+        }]);
+        let loaded = LoadedIncident {
+            message: incident("GIT3", "Buses replace trains", "Engineering works", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        assert_eq!(governing_impact_type(&loaded, Utc::now()), Some("rail_replacement_bus".to_string()));
+    }
+
+    #[test]
+    fn governing_impact_type_ignores_a_pre_change_period_missing_the_key_entirely() {
+        // Proves the aggregator mirror's #[serde(default)] backward-compat.
+        let periods = serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": ""
+        }]);
+        let loaded = LoadedIncident {
+            message: incident("GIT4", "Signal failure", "Delays", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        assert_eq!(governing_impact_type(&loaded, Utc::now()), None);
+    }
+
+    #[test]
+    fn governing_impact_type_never_uses_an_elapsed_or_not_started_periods_value() {
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let periods = serde_json::json!([
+            {
+                "scope_description": "already over",
+                "date_range": { "from_date": null, "to_date": (now - Duration::hours(1)).to_rfc3339() },
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "normal",
+                "resolution_status_confidence": "high",
+                "severity_confidence": "",
+                "impact_type": "rail_replacement_bus"
+            },
+            {
+                "scope_description": "not yet started",
+                "date_range": { "from_date": (now + Duration::hours(1)).to_rfc3339(), "to_date": null },
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "normal",
+                "resolution_status_confidence": "high",
+                "severity_confidence": "",
+                "impact_type": "diversion"
+            }
+        ]);
+        let loaded = LoadedIncident {
+            message: incident("GIT5", "Engineering works", "Various", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        assert_eq!(governing_impact_type(&loaded, now), None);
+    }
+
+    #[test]
+    fn governing_impact_type_saturday_sunday_case_picks_the_period_whose_window_matches_now() {
+        // The exact Example 1 shape: one shared date_range, two periods
+        // with different schedule_windows and different impact_types.
+        let periods = serde_json::json!([
+            {
+                "scope_description": "Saturday bus",
+                "date_range": null,
+                "schedule_window": { "days_of_week": [6], "start_time": "00:00", "end_time": "23:59" },
+                "resolution_status": "ongoing",
+                "apparent_severity": "moderate_disruption",
+                "resolution_status_confidence": "high",
+                "severity_confidence": "",
+                "impact_type": "rail_replacement_bus"
+            },
+            {
+                "scope_description": "Sunday no service",
+                "date_range": null,
+                "schedule_window": { "days_of_week": [7], "start_time": "00:00", "end_time": "23:59" },
+                "resolution_status": "ongoing",
+                "apparent_severity": "blocked_or_suspended",
+                "resolution_status_confidence": "high",
+                "severity_confidence": "",
+                "impact_type": "no_scheduled_service"
+            }
+        ]);
+        let loaded = LoadedIncident {
+            message: incident("GIT6", "Buses replace trains", "Weekend engineering works", &[], &[]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+
+        let saturday_noon: DateTime<Utc> = "2026-06-13T12:00:00Z".parse().unwrap(); // a Saturday
+        assert_eq!(governing_impact_type(&loaded, saturday_noon), Some("rail_replacement_bus".to_string()));
+
+        let sunday_noon: DateTime<Utc> = "2026-06-14T12:00:00Z".parse().unwrap(); // a Sunday
+        assert_eq!(governing_impact_type(&loaded, sunday_noon), Some("no_scheduled_service".to_string()));
+
+        let monday_noon: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // neither window matches
+        assert_eq!(governing_impact_type(&loaded, monday_noon), None);
+    }
+
+    #[test]
+    fn status_from_incident_threads_governing_impact_type_into_the_disruption() {
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
+        let periods = serde_json::json!([{
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "",
+            "impact_type": "rail_replacement_bus"
+        }]);
+        let loaded = LoadedIncident {
+            message: incident("GIT7", "Engineering works", "Buses replace trains", &["SW"], &["AHT"]),
+            first_seen_at: Utc::now(),
+            extracted_periods: Some(periods),
+        };
+        let m = crate::matcher::Match {
+            line: alton,
+            scope: MatchScope::ExclusiveSegment,
+            evidence: crate::matcher::Evidence {
+                stations: vec!["AHT".to_string()],
+                segments: vec![],
+                operators: vec![],
+                keywords: vec![],
+            },
+        };
+
+        let status = status_from_incident(&m, &loaded, now);
+
+        assert_eq!(status.disruption.unwrap().impact_type.as_deref(), Some("rail_replacement_bus"));
     }
 }
