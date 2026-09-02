@@ -50,7 +50,12 @@ pub async fn read_one(conn: &mut ConnectionManager) -> anyhow::Result<Option<(St
     // `count(1)` means at most one entry is ever returned, so this flattens
     // to a single `Option` rather than nesting nested loops that would only
     // ever run their body once (which trips clippy::never_loop).
-    let Some(entry) = reply.keys.into_iter().flat_map(|stream_key| stream_key.ids).next() else {
+    let Some(entry) = reply
+        .keys
+        .into_iter()
+        .flat_map(|stream_key| stream_key.ids)
+        .next()
+    else {
         return Ok(None);
     };
 
@@ -80,7 +85,10 @@ pub async fn ack(conn: &mut ConnectionManager, entry_id: &str) -> anyhow::Result
 /// cursor for continuing the scan, which is followed until it reports
 /// `"0-0"` (fully scanned) rather than stopping after one call's worth of
 /// entries.
-pub async fn claim_stale(conn: &mut ConnectionManager, min_idle: Duration) -> anyhow::Result<Vec<(String, String)>> {
+pub async fn claim_stale(
+    conn: &mut ConnectionManager,
+    min_idle: Duration,
+) -> anyhow::Result<Vec<(String, String)>> {
     let mut claimed = Vec::new();
     let mut cursor = "0-0".to_string();
     loop {
@@ -96,9 +104,16 @@ pub async fn claim_stale(conn: &mut ConnectionManager, min_idle: Duration) -> an
             .await?;
 
         for entry in reply.claimed {
-            match entry.map.get("incident_id").and_then(|v| redis::from_redis_value::<String>(v).ok()) {
+            match entry
+                .map
+                .get("incident_id")
+                .and_then(|v| redis::from_redis_value::<String>(v).ok())
+            {
                 Some(incident_id) => claimed.push((entry.id, incident_id)),
-                None => tracing::warn!(entry_id = entry.id, "reclaimed stream entry missing incident_id field; skipping"),
+                None => tracing::warn!(
+                    entry_id = entry.id,
+                    "reclaimed stream entry missing incident_id field; skipping"
+                ),
             }
         }
 
@@ -121,10 +136,16 @@ pub async fn claim_stale(conn: &mut ConnectionManager, min_idle: Duration) -> an
 /// deployments always run Redis 7, but a self-managed external Redis might
 /// not be).
 pub async fn group_lag(conn: &mut ConnectionManager) -> anyhow::Result<Option<i64>> {
-    let reply: Vec<redis::Value> = redis::cmd("XINFO").arg("GROUPS").arg(STREAM).query_async(conn).await?;
+    let reply: Vec<redis::Value> = redis::cmd("XINFO")
+        .arg("GROUPS")
+        .arg(STREAM)
+        .query_async(conn)
+        .await?;
 
     for group in reply {
-        let redis::Value::Array(fields) = group else { continue };
+        let redis::Value::Array(fields) = group else {
+            continue;
+        };
         let mut name: Option<String> = None;
         let mut lag: Option<i64> = None;
         let mut iter = fields.into_iter();

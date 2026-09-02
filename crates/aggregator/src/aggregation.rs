@@ -89,7 +89,9 @@ pub fn aggregate(
     for line in lines.values() {
         let report = reports.get_mut(&line.id).unwrap();
         if report.statuses.is_empty() {
-            report.statuses.push(infer_from_samples(line, samples, defaults));
+            report
+                .statuses
+                .push(infer_from_samples(line, samples, defaults));
             continue;
         }
         let availability = compute_sample_availability(line, samples, defaults);
@@ -99,7 +101,8 @@ pub fn aggregate(
         if let Some(stats) = availability.sample_stats() {
             let thresholds = thresholds_for(defaults, &line.severity_overrides);
             for status in &mut report.statuses {
-                let (escalated, annotation) = escalate_from_sample_stats(status.severity, &stats, &thresholds);
+                let (escalated, annotation) =
+                    escalate_from_sample_stats(status.severity, &stats, &thresholds);
                 status.severity = escalated;
                 if let Some(annotation) = annotation {
                     status.reason.push_str(&format!(" ({annotation})"));
@@ -137,8 +140,17 @@ fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) 
     }
 
     let disruption = Disruption {
-        category: if incident.is_planned { "PlannedWork" } else { "RealTime" }.to_string(),
-        description: if incident.description.is_empty() { incident.summary.clone() } else { incident.description.clone() },
+        category: if incident.is_planned {
+            "PlannedWork"
+        } else {
+            "RealTime"
+        }
+        .to_string(),
+        description: if incident.description.is_empty() {
+            incident.summary.clone()
+        } else {
+            incident.description.clone()
+        },
         affected_stops: affected_stations,
         affected_routes,
         source: Some(format!("knowledgebase-incident-{}", incident.incident_id)),
@@ -150,7 +162,11 @@ fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) 
         reason,
         validity: validity_for_output(&incident.validity),
         disruption: Some(disruption),
-        data_quality: if incident.is_planned { DataQuality::Planned } else { DataQuality::Knowledgebase },
+        data_quality: if incident.is_planned {
+            DataQuality::Planned
+        } else {
+            DataQuality::Knowledgebase
+        },
         sample_stats: None,
         sample_availability: SampleAvailability::NoCoverage, // always overwritten by aggregate()'s Layer 2, immediately after construction
     }
@@ -162,7 +178,11 @@ fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) 
 /// the output type doesn't.
 fn validity_for_output(periods: &[ValidityPeriod]) -> ValidityPeriod {
     if periods.is_empty() {
-        return ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true };
+        return ValidityPeriod {
+            from_date: Utc::now(),
+            to_date: None,
+            is_now: true,
+        };
     }
     let now = Utc::now();
     periods
@@ -219,8 +239,8 @@ fn period_covers_now(period: &ValidityPeriod, now: DateTime<Utc>) -> bool {
 /// incident reaches this function it's already known not to be cleared.
 fn is_active(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
     let incident = &loaded.message;
-    let validity_ok = incident.validity.is_empty()
-        || incident.validity.iter().any(|p| period_covers_now(p, now));
+    let validity_ok =
+        incident.validity.is_empty() || incident.validity.iter().any(|p| period_covers_now(p, now));
     let age_ok = incident.is_planned
         || has_recurring_schedule(loaded, now)
         || now < next_rail_day_boundary(loaded.first_seen_at);
@@ -293,7 +313,9 @@ fn severity_from_incident(incident: &IncidentMessage) -> Severity {
 /// whichever of (severity, floor) sorts later (higher number = milder).
 fn demote_for_scope(severity: Severity, scope: MatchScope) -> Severity {
     match scope {
-        MatchScope::ExclusiveSegment | MatchScope::StationHit | MatchScope::SharedSegment => severity,
+        MatchScope::ExclusiveSegment | MatchScope::StationHit | MatchScope::SharedSegment => {
+            severity
+        }
         MatchScope::KeywordOnly => severity.max(Severity::SevereDelays),
         MatchScope::OperatorOnly => severity.max(Severity::MinorDelays),
     }
@@ -379,7 +401,9 @@ enum PeriodPhase {
 /// existing "malformed -> assume inside, no forced outcome" fail-safe
 /// shape.
 fn period_phase(period: &ExtractionPeriod, now: DateTime<Utc>) -> PeriodPhase {
-    let Some(range) = &period.date_range else { return PeriodPhase::Active };
+    let Some(range) = &period.date_range else {
+        return PeriodPhase::Active;
+    };
 
     let parse = |raw: &Option<String>| -> Result<Option<DateTime<Utc>>, ()> {
         match raw {
@@ -447,7 +471,12 @@ fn elapsed_annotation(period: &ExtractionPeriod) -> String {
         .as_ref()
         .and_then(|range| range.to_date.as_deref())
         .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|dt| format!("expected to end by {}", dt.with_timezone(&chrono_tz::Europe::London).format("%H:%M")))
+        .map(|dt| {
+            format!(
+                "expected to end by {}",
+                dt.with_timezone(&chrono_tz::Europe::London).format("%H:%M")
+            )
+        })
         .unwrap_or_else(|| "reported period has ended".to_string());
     scope_qualify(period, text)
 }
@@ -471,8 +500,12 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
         return true;
     }
     let local = now.with_timezone(&chrono_tz::Europe::London);
-    let Ok(start) = NaiveTime::parse_from_str(&window.start_time, "%H:%M") else { return true };
-    let Ok(end) = NaiveTime::parse_from_str(&window.end_time, "%H:%M") else { return true };
+    let Ok(start) = NaiveTime::parse_from_str(&window.start_time, "%H:%M") else {
+        return true;
+    };
+    let Ok(end) = NaiveTime::parse_from_str(&window.end_time, "%H:%M") else {
+        return true;
+    };
     let now_time = local.time();
 
     // Which calendar day did the window instance covering `now` START on?
@@ -561,7 +594,11 @@ fn escalation_ceiling(hint: &str) -> Option<Severity> {
 /// `severity.max(floor)` left them completely undemoted while still
 /// appending a "reported resolved" annotation -- a passenger shown a severe
 /// status whose own reason text says it is over. See `severity_rank`'s docs.
-fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<Utc>) -> (Severity, Option<String>) {
+fn apply_extraction(
+    severity: Severity,
+    loaded: &LoadedIncident,
+    now: DateTime<Utc>,
+) -> (Severity, Option<String>) {
     let periods = parse_periods(loaded);
 
     // Escalation candidates: one per `Active` period at high
@@ -583,7 +620,10 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
             }
             let annotation = scope_qualify(
                 period,
-                format!("reported more severe than automatically classified: {}", ceiling.description().to_lowercase()),
+                format!(
+                    "reported more severe than automatically classified: {}",
+                    ceiling.description().to_lowercase()
+                ),
             );
             Some((ceiling, annotation))
         })
@@ -592,7 +632,9 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
     let (severity, escalation_annotation) = escalation_candidates
         .into_iter()
         .max_by_key(|(ceiling, _)| (severity_rank(*ceiling), std::cmp::Reverse(*ceiling)))
-        .map_or((severity, None), |(ceiling, annotation)| (ceiling, Some(annotation)));
+        .map_or((severity, None), |(ceiling, annotation)| {
+            (ceiling, Some(annotation))
+        });
 
     let mut floors: Vec<Severity> = Vec::new();
     let mut annotations: Vec<String> = escalation_annotation.into_iter().collect();
@@ -613,11 +655,17 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
                 match period.resolution_status.as_str() {
                     "resolved" => {
                         floors.push(Severity::MinorDelays);
-                        annotations.push(scope_qualify(period, "reported resolved — showing residual impact".to_string()));
+                        annotations.push(scope_qualify(
+                            period,
+                            "reported resolved — showing residual impact".to_string(),
+                        ));
                     }
                     "residual" => {
                         floors.push(Severity::Recovering);
-                        annotations.push(scope_qualify(period, "reported as residual delays only".to_string()));
+                        annotations.push(scope_qualify(
+                            period,
+                            "reported as residual delays only".to_string(),
+                        ));
                     }
                     _ => {}
                 }
@@ -627,7 +675,10 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
                     floors.push(Severity::MinorDelays);
                     annotations.push(scope_qualify(
                         period,
-                        format!("reported active {}-{} only", window.start_time, window.end_time),
+                        format!(
+                            "reported active {}-{} only",
+                            window.start_time, window.end_time
+                        ),
                     ));
                 }
             }
@@ -643,7 +694,14 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
         .iter()
         .max_by_key(|floor| (severity_rank(**floor), std::cmp::Reverse(**floor)))
     else {
-        return (severity, if annotations.is_empty() { None } else { Some(annotations.join("; ")) });
+        return (
+            severity,
+            if annotations.is_empty() {
+                None
+            } else {
+                Some(annotations.join("; "))
+            },
+        );
     };
 
     // Demote-only, on the rank scale: if the current (possibly escalated)
@@ -660,7 +718,11 @@ fn apply_extraction(severity: Severity, loaded: &LoadedIncident, now: DateTime<U
     // annotation wasn't actually written for. Never raises the rank, exactly
     // the intent the old `severity.max(floor)` had before the non-monotonic
     // discriminants broke it for Diverted/PartClosed.
-    let demoted = if severity_rank(severity) < severity_rank(binding_floor) { severity } else { binding_floor };
+    let demoted = if severity_rank(severity) < severity_rank(binding_floor) {
+        severity
+    } else {
+        binding_floor
+    };
 
     (demoted, Some(annotations.join("; ")))
 }
@@ -702,8 +764,16 @@ fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<Affec
     }
     let line_order: Vec<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
     let mut in_order: Vec<&String> = stations.iter().collect();
-    in_order.sort_by_key(|c| line_order.iter().position(|o| *o == c.as_str()).unwrap_or(999));
-    vec![AffectedRoute { from_crs: in_order[0].clone(), to_crs: in_order[in_order.len() - 1].clone() }]
+    in_order.sort_by_key(|c| {
+        line_order
+            .iter()
+            .position(|o| *o == c.as_str())
+            .unwrap_or(999)
+    });
+    vec![AffectedRoute {
+        from_crs: in_order[0].clone(),
+        to_crs: in_order[in_order.len() - 1].clone(),
+    }]
 }
 
 // --- Inference path ---
@@ -757,7 +827,12 @@ pub(crate) fn stats_from_departures(
     let line_stations: HashSet<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
     let skipped = departures
         .iter()
-        .filter(|d| !d.is_cancelled && d.skipped_stations.iter().any(|crs| line_stations.contains(crs.as_str())))
+        .filter(|d| {
+            !d.is_cancelled
+                && d.skipped_stations
+                    .iter()
+                    .any(|crs| line_stations.contains(crs.as_str()))
+        })
         .count();
     let running: Vec<&&StationDeparture> = departures.iter().filter(|d| !d.is_cancelled).collect();
     let avg_delay_minutes = if running.is_empty() {
@@ -766,7 +841,13 @@ pub(crate) fn stats_from_departures(
         running.iter().map(|d| d.delay_minutes as f64).sum::<f64>() / running.len() as f64
     };
 
-    SampleStats { total, delayed, cancelled, skipped, avg_delay_minutes }
+    SampleStats {
+        total,
+        delayed,
+        cancelled,
+        skipped,
+        avg_delay_minutes,
+    }
 }
 
 /// `has_any_row` is deliberately not folded into `relevant_departures`
@@ -781,7 +862,10 @@ fn compute_sample_availability(
     defaults: &Defaults,
 ) -> common::SampleAvailability {
     let thresholds = thresholds_for(defaults, &line.severity_overrides);
-    let has_any_row = line.sample_stations.iter().any(|crs| samples.contains_key(crs));
+    let has_any_row = line
+        .sample_stations
+        .iter()
+        .any(|crs| samples.contains_key(crs));
     if !has_any_row {
         return common::SampleAvailability::NoCoverage;
     }
@@ -819,14 +903,16 @@ fn infer_from_samples(
     let skip_rate = stats.skipped as f64 / stats.total as f64;
 
     let (severity, mut reason) = classify(
-        cancel_rate,
-        delay_rate,
-        skip_rate,
+        ClassifyCounts {
+            cancel_rate,
+            delay_rate,
+            skip_rate,
+            total: stats.total,
+            cancelled: stats.cancelled,
+            delayed: stats.delayed,
+            skipped: stats.skipped,
+        },
         &thresholds,
-        stats.total,
-        stats.cancelled,
-        stats.delayed,
-        stats.skipped,
     );
     if severity == Severity::GoodService {
         let mut status = good_service();
@@ -860,7 +946,11 @@ fn infer_from_samples(
     LineStatus {
         severity,
         reason: reason.clone(),
-        validity: ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+        validity: ValidityPeriod {
+            from_date: Utc::now(),
+            to_date: None,
+            is_now: true,
+        },
         disruption: Some(Disruption {
             category: "RealTime".to_string(),
             description: reason,
@@ -881,33 +971,63 @@ fn belongs_to_line(dep: &StationDeparture, line: &LineDefinition) -> bool {
     if !line.operators.contains(&dep.operator) {
         return false;
     }
-    if !line.destination_crs_filter.is_empty() && !line.destination_crs_filter.contains(&dep.destination_crs) {
+    if !line.destination_crs_filter.is_empty()
+        && !line.destination_crs_filter.contains(&dep.destination_crs)
+    {
         return false;
     }
     if !line.headcode_prefixes.is_empty() {
-        let Some(headcode) = &dep.headcode else { return false };
-        if !line.headcode_prefixes.iter().any(|p| headcode.starts_with(p.as_str())) {
+        let Some(headcode) = &dep.headcode else {
+            return false;
+        };
+        if !line
+            .headcode_prefixes
+            .iter()
+            .any(|p| headcode.starts_with(p.as_str()))
+        {
             return false;
         }
     }
     true
 }
 
-fn classify(
+/// Bundles `classify`'s rate/count inputs so the function itself stays
+/// under clippy's `too_many_arguments` threshold. Rates and counts are kept
+/// as separate fields (not re-derived from `cancelled/total` etc. inside
+/// `classify`) so tests can exercise the threshold logic with rates that
+/// don't have to arithmetically match the counts used in the reason
+/// string -- see e.g. `classify_prefers_delay_when_more_severe_than_skip`.
+struct ClassifyCounts {
     cancel_rate: f64,
     delay_rate: f64,
     skip_rate: f64,
-    thresholds: &Defaults,
     total: usize,
     cancelled: usize,
     delayed: usize,
     skipped: usize,
-) -> (Severity, String) {
+}
+
+fn classify(counts: ClassifyCounts, thresholds: &Defaults) -> (Severity, String) {
+    let ClassifyCounts {
+        cancel_rate,
+        delay_rate,
+        skip_rate,
+        total,
+        cancelled,
+        delayed,
+        skipped,
+    } = counts;
     if cancel_rate >= thresholds.part_suspended_pct {
-        return (Severity::PartSuspended, format!("{cancelled} of {total} sampled services cancelled."));
+        return (
+            Severity::PartSuspended,
+            format!("{cancelled} of {total} sampled services cancelled."),
+        );
     }
     if cancel_rate >= thresholds.reduced_service_pct {
-        return (Severity::ReducedService, format!("{cancelled} of {total} sampled services cancelled."));
+        return (
+            Severity::ReducedService,
+            format!("{cancelled} of {total} sampled services cancelled."),
+        );
     }
 
     let delay_severity = if delay_rate >= thresholds.severe_delays_pct {
@@ -932,10 +1052,18 @@ fn classify(
                 "{delayed} of {total} sampled services delayed, {skipped} of {total} sampled services skipping a scheduled stop."
             ),
         ),
-        (Some(d), Some(s)) if d < s => (d, format!("{delayed} of {total} sampled services delayed.")),
-        (Some(_), Some(s)) => (s, format!("{skipped} of {total} sampled services skipping a scheduled stop.")),
+        (Some(d), Some(s)) if d < s => {
+            (d, format!("{delayed} of {total} sampled services delayed."))
+        }
+        (Some(_), Some(s)) => (
+            s,
+            format!("{skipped} of {total} sampled services skipping a scheduled stop."),
+        ),
         (Some(d), None) => (d, format!("{delayed} of {total} sampled services delayed.")),
-        (None, Some(s)) => (s, format!("{skipped} of {total} sampled services skipping a scheduled stop.")),
+        (None, Some(s)) => (
+            s,
+            format!("{skipped} of {total} sampled services skipping a scheduled stop."),
+        ),
         (None, None) => (Severity::GoodService, "Good Service".to_string()),
     }
 }
@@ -954,27 +1082,48 @@ fn classify(
 /// already carries, same tie-break rule as the severity-hint escalation --
 /// at an equal or lower rank this is a no-op, so a status already at least
 /// as severe as what the samples imply is left untouched.
-fn escalate_from_sample_stats(severity: Severity, stats: &SampleStats, thresholds: &Defaults) -> (Severity, Option<String>) {
+fn escalate_from_sample_stats(
+    severity: Severity,
+    stats: &SampleStats,
+    thresholds: &Defaults,
+) -> (Severity, Option<String>) {
     if stats.total == 0 {
         return (severity, None);
     }
     let cancel_rate = stats.cancelled as f64 / stats.total as f64;
     let delay_rate = stats.delayed as f64 / stats.total as f64;
     let skip_rate = stats.skipped as f64 / stats.total as f64;
-    let (sample_severity, reason) =
-        classify(cancel_rate, delay_rate, skip_rate, thresholds, stats.total, stats.cancelled, stats.delayed, stats.skipped);
+    let (sample_severity, reason) = classify(
+        ClassifyCounts {
+            cancel_rate,
+            delay_rate,
+            skip_rate,
+            total: stats.total,
+            cancelled: stats.cancelled,
+            delayed: stats.delayed,
+            skipped: stats.skipped,
+        },
+        thresholds,
+    );
 
     if severity_rank(sample_severity) <= severity_rank(severity) {
         return (severity, None);
     }
-    (sample_severity, Some(format!("live samples show: {reason}")))
+    (
+        sample_severity,
+        Some(format!("live samples show: {reason}")),
+    )
 }
 
 fn good_service() -> LineStatus {
     LineStatus {
         severity: Severity::GoodService,
         reason: "Good Service".to_string(),
-        validity: ValidityPeriod { from_date: Utc::now(), to_date: None, is_now: true },
+        validity: ValidityPeriod {
+            from_date: Utc::now(),
+            to_date: None,
+            is_now: true,
+        },
         disruption: None,
         data_quality: DataQuality::LdbwsInferred,
         sample_stats: None,
@@ -993,7 +1142,10 @@ fn most_common<'a>(items: &[&'a str]) -> Option<&'a str> {
     // alphabetically by the reason string itself makes the result
     // deterministic (same input -> same output every time), which is what
     // `normalize_for_diff` needs to avoid spurious history rows.
-    counts.into_iter().max_by_key(|(reason, count)| (*count, *reason)).map(|(item, _)| item)
+    counts
+        .into_iter()
+        .max_by_key(|(reason, count)| (*count, *reason))
+        .map(|(item, _)| item)
 }
 
 #[cfg(test)]
@@ -1010,7 +1162,13 @@ mod tests {
             .collect()
     }
 
-    fn incident(id: &str, summary: &str, description: &str, operators: &[&str], affected_stations: &[&str]) -> IncidentMessage {
+    fn incident(
+        id: &str,
+        summary: &str,
+        description: &str,
+        operators: &[&str],
+        affected_stations: &[&str],
+    ) -> IncidentMessage {
         IncidentMessage {
             incident_id: id.to_string(),
             summary: summary.to_string(),
@@ -1081,8 +1239,14 @@ mod tests {
         );
         let reports = aggregate_with_defaults(&lines, &[inc]);
         assert_eq!(reports["swr-alton"].worst_severity(), Severity::MinorDelays);
-        assert_eq!(reports["swr-south-west-main"].worst_severity(), Severity::GoodService);
-        assert_eq!(reports["swr-portsmouth-direct"].worst_severity(), Severity::GoodService);
+        assert_eq!(
+            reports["swr-south-west-main"].worst_severity(),
+            Severity::GoodService
+        );
+        assert_eq!(
+            reports["swr-portsmouth-direct"].worst_severity(),
+            Severity::GoodService
+        );
     }
 
     #[test]
@@ -1159,7 +1323,11 @@ mod tests {
     // logic that was faithfully ported but never had test coverage
     // upstream. Found and added during this plan's self-review.
 
-    fn departure(destination_crs: &str, delay_minutes: i32, is_cancelled: bool) -> StationDeparture {
+    fn departure(
+        destination_crs: &str,
+        delay_minutes: i32,
+        is_cancelled: bool,
+    ) -> StationDeparture {
         StationDeparture {
             service_id: "svc".to_string(),
             operator: "SW".to_string(),
@@ -1168,8 +1336,16 @@ mod tests {
             estimated: "10:00".to_string(),
             is_cancelled,
             delay_minutes,
-            cancel_reason: if is_cancelled { Some("fault".to_string()) } else { None },
-            delay_reason: if !is_cancelled && delay_minutes > 0 { Some("signal failure".to_string()) } else { None },
+            cancel_reason: if is_cancelled {
+                Some("fault".to_string())
+            } else {
+                None
+            },
+            delay_reason: if !is_cancelled && delay_minutes > 0 {
+                Some("signal failure".to_string())
+            } else {
+                None
+            },
             headcode: None,
             skipped_stations: vec![],
         }
@@ -1180,7 +1356,10 @@ mod tests {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let matching = departure("AON", 0, false);
-        let wrong_operator = StationDeparture { operator: "XX".to_string(), ..matching.clone() };
+        let wrong_operator = StationDeparture {
+            operator: "XX".to_string(),
+            ..matching.clone()
+        };
         assert!(belongs_to_line(&matching, alton));
         assert!(!belongs_to_line(&wrong_operator, alton));
     }
@@ -1191,7 +1370,10 @@ mod tests {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let matching = departure("AON", 0, false);
-        let wrong_destination = StationDeparture { destination_crs: "WOK".to_string(), ..matching.clone() };
+        let wrong_destination = StationDeparture {
+            destination_crs: "WOK".to_string(),
+            ..matching.clone()
+        };
         assert!(belongs_to_line(&matching, alton));
         assert!(!belongs_to_line(&wrong_destination, alton));
     }
@@ -1217,9 +1399,18 @@ mod tests {
         // fixtures above), so it's overridden explicitly for both cases
         // exercised here instead of relying on the helper's default.
         let base = departure("BTN", 0, false);
-        let southern = StationDeparture { operator: "SN".to_string(), ..base.clone() };
-        let gatwick_express = StationDeparture { operator: "GX".to_string(), ..base.clone() };
-        let wrong_operator = StationDeparture { operator: "XX".to_string(), ..base };
+        let southern = StationDeparture {
+            operator: "SN".to_string(),
+            ..base.clone()
+        };
+        let gatwick_express = StationDeparture {
+            operator: "GX".to_string(),
+            ..base.clone()
+        };
+        let wrong_operator = StationDeparture {
+            operator: "XX".to_string(),
+            ..base
+        };
         assert!(belongs_to_line(&southern, bml));
         assert!(belongs_to_line(&gatwick_express, bml));
         assert!(!belongs_to_line(&wrong_operator, bml));
@@ -1242,8 +1433,18 @@ mod tests {
             },
         );
         let status = infer_from_samples(alton, &samples, &defaults);
-        assert_eq!(status.severity, Severity::GoodService, "severity behavior is unchanged by this plan");
-        assert_eq!(status.sample_availability, SampleAvailability::BelowThreshold { observed: 2, required: 3 });
+        assert_eq!(
+            status.severity,
+            Severity::GoodService,
+            "severity behavior is unchanged by this plan"
+        );
+        assert_eq!(
+            status.sample_availability,
+            SampleAvailability::BelowThreshold {
+                observed: 2,
+                required: 3
+            }
+        );
         assert_eq!(status.sample_stats, None);
     }
 
@@ -1260,7 +1461,8 @@ mod tests {
     }
 
     #[test]
-    fn infer_from_samples_at_or_above_threshold_yields_available_matching_compute_sample_stats_today() {
+    fn infer_from_samples_at_or_above_threshold_yields_available_matching_compute_sample_stats_today()
+     {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let defaults = Defaults::default();
@@ -1270,7 +1472,11 @@ mod tests {
             StationSample {
                 crs: "AHT".to_string(),
                 polled_at: Utc::now(),
-                departures: vec![departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
+                departures: vec![
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                ],
             },
         );
         let status = infer_from_samples(alton, &samples, &defaults);
@@ -1288,7 +1494,9 @@ mod tests {
         // default of 3.
         let lines = load_all_lines();
         let mut alton = lines["swr-alton"].clone();
-        alton.severity_overrides.insert("min_sample_size".to_string(), 5.0);
+        alton
+            .severity_overrides
+            .insert("min_sample_size".to_string(), 5.0);
         let defaults = Defaults::default();
         let mut samples = HashMap::new();
         samples.insert(
@@ -1305,7 +1513,13 @@ mod tests {
             },
         );
         let availability = compute_sample_availability(&alton, &samples, &defaults);
-        assert_eq!(availability, SampleAvailability::BelowThreshold { observed: 4, required: 5 });
+        assert_eq!(
+            availability,
+            SampleAvailability::BelowThreshold {
+                observed: 4,
+                required: 5
+            }
+        );
     }
 
     #[test]
@@ -1361,7 +1575,10 @@ mod tests {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let defaults = Defaults::default();
-        let skipping = StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("AON", 0, false) };
+        let skipping = StationDeparture {
+            skipped_stations: vec!["WOK".to_string()],
+            ..departure("AON", 0, false)
+        };
         let mut samples = HashMap::new();
         // 3 of 4 skip WOK -> 75% skip rate, above the default
         // severe_delays_skip_pct of 0.50, with delay_rate at 0%.
@@ -1370,7 +1587,12 @@ mod tests {
             StationSample {
                 crs: "AHT".to_string(),
                 polled_at: Utc::now(),
-                departures: vec![skipping.clone(), skipping.clone(), skipping, departure("AON", 0, false)],
+                departures: vec![
+                    skipping.clone(),
+                    skipping.clone(),
+                    skipping,
+                    departure("AON", 0, false),
+                ],
             },
         );
         let status = infer_from_samples(alton, &samples, &defaults);
@@ -1384,7 +1606,10 @@ mod tests {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let defaults = Defaults::default();
-        let skipping = StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("AON", 0, false) };
+        let skipping = StationDeparture {
+            skipped_stations: vec!["WOK".to_string()],
+            ..departure("AON", 0, false)
+        };
         let mut samples = HashMap::new();
         // 1 of 4 skips WOK -> 25% skip rate, exactly at the default
         // minor_delays_skip_pct of 0.25.
@@ -1393,7 +1618,12 @@ mod tests {
             StationSample {
                 crs: "AHT".to_string(),
                 polled_at: Utc::now(),
-                departures: vec![skipping, departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
+                departures: vec![
+                    skipping,
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                ],
             },
         );
         let status = infer_from_samples(alton, &samples, &defaults);
@@ -1407,7 +1637,10 @@ mod tests {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let defaults = Defaults::default();
-        let skipping_unrelated = StationDeparture { skipped_stations: vec!["ZZZ".to_string()], ..departure("AON", 0, false) };
+        let skipping_unrelated = StationDeparture {
+            skipped_stations: vec!["ZZZ".to_string()],
+            ..departure("AON", 0, false)
+        };
         let mut samples = HashMap::new();
         samples.insert(
             "AHT".to_string(),
@@ -1438,8 +1671,10 @@ mod tests {
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
         let defaults = Defaults::default();
-        let cancelled_with_skips =
-            StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("AON", 0, true) };
+        let cancelled_with_skips = StationDeparture {
+            skipped_stations: vec!["WOK".to_string()],
+            ..departure("AON", 0, true)
+        };
         let mut samples = HashMap::new();
         samples.insert(
             "AHT".to_string(),
@@ -1466,7 +1701,18 @@ mod tests {
         // than delay_rate (25%, only >= minor_delays_pct 0.25) -> the
         // overall severity must be the skip candidate's SevereDelays, not
         // the delay candidate's MinorDelays.
-        let (severity, reason) = classify(0.0, 0.25, 0.75, &Defaults::default(), 4, 0, 1, 3);
+        let (severity, reason) = classify(
+            ClassifyCounts {
+                cancel_rate: 0.0,
+                delay_rate: 0.25,
+                skip_rate: 0.75,
+                total: 4,
+                cancelled: 0,
+                delayed: 1,
+                skipped: 3,
+            },
+            &Defaults::default(),
+        );
         assert_eq!(severity, Severity::SevereDelays);
         assert!(reason.contains("skipping"), "reason was: {reason}");
     }
@@ -1477,7 +1723,18 @@ mod tests {
         // skip_rate (30%, >= minor_delays_skip_pct 0.25 but < severe_delays_skip_pct
         // 0.50) -> the overall severity must be the delay candidate's
         // SevereDelays, not the skip candidate's MinorDelays.
-        let (severity, reason) = classify(0.0, 0.75, 0.30, &Defaults::default(), 4, 0, 3, 1);
+        let (severity, reason) = classify(
+            ClassifyCounts {
+                cancel_rate: 0.0,
+                delay_rate: 0.75,
+                skip_rate: 0.30,
+                total: 4,
+                cancelled: 0,
+                delayed: 3,
+                skipped: 1,
+            },
+            &Defaults::default(),
+        );
         assert_eq!(severity, Severity::SevereDelays);
         assert!(reason.contains("delayed"), "reason was: {reason}");
         assert!(!reason.contains("skipping"), "reason was: {reason}");
@@ -1488,7 +1745,18 @@ mod tests {
         // Both candidates land on MinorDelays (delay_rate 30% >= 0.25,
         // skip_rate 30% >= 0.25, neither >= their severe threshold) ->
         // combined message naming both counts.
-        let (severity, reason) = classify(0.0, 0.30, 0.30, &Defaults::default(), 10, 0, 3, 3);
+        let (severity, reason) = classify(
+            ClassifyCounts {
+                cancel_rate: 0.0,
+                delay_rate: 0.30,
+                skip_rate: 0.30,
+                total: 10,
+                cancelled: 0,
+                delayed: 3,
+                skipped: 3,
+            },
+            &Defaults::default(),
+        );
         assert_eq!(severity, Severity::MinorDelays);
         assert!(reason.contains("delayed"), "reason was: {reason}");
         assert!(reason.contains("skipping"), "reason was: {reason}");
@@ -1499,7 +1767,18 @@ mod tests {
         // cancel_rate alone (70%, >= part_suspended_pct 0.60) must win
         // even though skip_rate and delay_rate would also qualify for a
         // milder tier on their own.
-        let (severity, _) = classify(0.70, 0.75, 0.75, &Defaults::default(), 10, 7, 7, 7);
+        let (severity, _) = classify(
+            ClassifyCounts {
+                cancel_rate: 0.70,
+                delay_rate: 0.75,
+                skip_rate: 0.75,
+                total: 10,
+                cancelled: 7,
+                delayed: 7,
+                skipped: 7,
+            },
+            &Defaults::default(),
+        );
         assert_eq!(severity, Severity::PartSuspended);
     }
 
@@ -1513,7 +1792,11 @@ mod tests {
         let items = ["a", "b", "b", "a"];
         let first = most_common(&items);
         for _ in 0..10 {
-            assert_eq!(most_common(&items), first, "most_common must be deterministic across calls");
+            assert_eq!(
+                most_common(&items),
+                first,
+                "most_common must be deterministic across calls"
+            );
         }
         assert_eq!(first, Some("b"));
     }
@@ -1536,16 +1819,31 @@ mod tests {
         let mut samples = HashMap::new();
         samples.insert(
             "FRM".to_string(),
-            StationSample { crs: "FRM".to_string(), polled_at: Utc::now(), departures: severe.clone() },
+            StationSample {
+                crs: "FRM".to_string(),
+                polled_at: Utc::now(),
+                departures: severe.clone(),
+            },
         );
         samples.insert(
             "AHT".to_string(),
-            StationSample { crs: "AHT".to_string(), polled_at: Utc::now(), departures: severe },
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: severe,
+            },
         );
 
         let status = infer_from_samples(alton, &samples, &defaults);
-        let stops = status.disruption.expect("severe delays should produce a disruption").affected_stops;
-        assert_eq!(stops, vec!["AHT".to_string(), "FRM".to_string()], "affected_stops must be sorted alphabetically");
+        let stops = status
+            .disruption
+            .expect("severe delays should produce a disruption")
+            .affected_stops;
+        assert_eq!(
+            stops,
+            vec!["AHT".to_string(), "FRM".to_string()],
+            "affected_stops must be sorted alphabetically"
+        );
     }
 
     #[test]
@@ -1559,7 +1857,11 @@ mod tests {
             StationSample {
                 crs: "AHT".to_string(),
                 polled_at: Utc::now(),
-                departures: vec![departure("AON", 0, false), departure("AON", 0, false), departure("AON", 0, false)],
+                departures: vec![
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                    departure("AON", 0, false),
+                ],
             },
         );
         let status = infer_from_samples(alton, &samples, &defaults);
@@ -1687,7 +1989,10 @@ mod tests {
         // boundary is 2026-07-16 02:00 BST = 2026-07-16 01:00 UTC.
         let first_seen_at: DateTime<Utc> = "2026-07-15T13:00:00Z".parse().unwrap();
         let boundary = next_rail_day_boundary(first_seen_at);
-        assert_eq!(boundary, "2026-07-16T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            boundary,
+            "2026-07-16T01:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1697,7 +2002,10 @@ mod tests {
         // local minutes away: 2026-07-16 02:00 BST = 2026-07-16 01:00 UTC.
         let first_seen_at: DateTime<Utc> = "2026-07-16T00:30:00Z".parse().unwrap();
         let boundary = next_rail_day_boundary(first_seen_at);
-        assert_eq!(boundary, "2026-07-16T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            boundary,
+            "2026-07-16T01:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1707,7 +2015,10 @@ mod tests {
         // boundary is a full rail day away: 2026-07-17 02:00 BST = 01:00 UTC.
         let first_seen_at: DateTime<Utc> = "2026-07-16T01:05:00Z".parse().unwrap();
         let boundary = next_rail_day_boundary(first_seen_at);
-        assert_eq!(boundary, "2026-07-17T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            boundary,
+            "2026-07-17T01:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1720,7 +2031,10 @@ mod tests {
         // BST: 2026-03-29 02:00 BST = 2026-03-29 01:00 UTC.
         let first_seen_at: DateTime<Utc> = "2026-03-29T00:30:00Z".parse().unwrap();
         let boundary = next_rail_day_boundary(first_seen_at);
-        assert_eq!(boundary, "2026-03-29T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            boundary,
+            "2026-03-29T01:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1732,20 +2046,31 @@ mod tests {
         // 02:00 GMT = 2026-10-25 02:00 UTC.
         let first_seen_at: DateTime<Utc> = "2026-10-25T00:30:00Z".parse().unwrap();
         let boundary = next_rail_day_boundary(first_seen_at);
-        assert_eq!(boundary, "2026-10-25T02:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            boundary,
+            "2026-10-25T02:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
     fn period_covers_now_true_when_now_falls_inside_the_period() {
         let now = Utc::now();
-        let period = ValidityPeriod { from_date: now - Duration::hours(1), to_date: Some(now + Duration::hours(1)), is_now: true };
+        let period = ValidityPeriod {
+            from_date: now - Duration::hours(1),
+            to_date: Some(now + Duration::hours(1)),
+            is_now: true,
+        };
         assert!(period_covers_now(&period, now));
     }
 
     #[test]
     fn period_covers_now_false_once_to_date_has_passed() {
         let now = Utc::now();
-        let period = ValidityPeriod { from_date: now - Duration::days(2), to_date: Some(now - Duration::days(1)), is_now: false };
+        let period = ValidityPeriod {
+            from_date: now - Duration::days(2),
+            to_date: Some(now - Duration::days(1)),
+            is_now: false,
+        };
         assert!(!period_covers_now(&period, now));
     }
 
@@ -1780,7 +2105,11 @@ mod tests {
     fn is_active_true_when_a_validity_period_covers_now() {
         let mut inc = incident("T3", "Delay", "Delay description", &[], &[]);
         let now = Utc::now();
-        inc.validity = vec![ValidityPeriod { from_date: now - Duration::hours(1), to_date: None, is_now: true }];
+        inc.validity = vec![ValidityPeriod {
+            from_date: now - Duration::hours(1),
+            to_date: None,
+            is_now: true,
+        }];
         assert!(is_active(&loaded_at(inc, now - Duration::hours(1)), now));
     }
 
@@ -1794,7 +2123,13 @@ mod tests {
 
     #[test]
     fn is_active_true_for_planned_incident_aged_past_the_rail_day_boundary() {
-        let mut inc = incident("T5", "Engineering work", "Planned engineering work", &[], &[]);
+        let mut inc = incident(
+            "T5",
+            "Engineering work",
+            "Planned engineering work",
+            &[],
+            &[],
+        );
         inc.is_planned = true;
         let now = Utc::now();
         let first_seen_at = now - Duration::days(2);
@@ -1808,8 +2143,16 @@ mod tests {
         let mut inc = incident("T6", "Delay", "Delay description", &[], &[]);
         let now = Utc::now();
         inc.validity = vec![
-            ValidityPeriod { from_date: now - Duration::days(2), to_date: Some(now - Duration::days(1)), is_now: false },
-            ValidityPeriod { from_date: now - Duration::hours(1), to_date: None, is_now: true },
+            ValidityPeriod {
+                from_date: now - Duration::days(2),
+                to_date: Some(now - Duration::days(1)),
+                is_now: false,
+            },
+            ValidityPeriod {
+                from_date: now - Duration::hours(1),
+                to_date: None,
+                is_now: true,
+            },
         ];
         assert!(is_active(&loaded_at(inc, now), now));
     }
@@ -1820,7 +2163,13 @@ mod tests {
         // validity-window check -- a planned closure whose own stated
         // window has already ended should still be excluded, the same as
         // any other incident with expired validity.
-        let mut inc = incident("T7", "Engineering work", "Planned engineering work", &[], &[]);
+        let mut inc = incident(
+            "T7",
+            "Engineering work",
+            "Planned engineering work",
+            &[],
+            &[],
+        );
         inc.is_planned = true;
         let now = Utc::now();
         inc.validity = vec![ValidityPeriod {
@@ -1832,11 +2181,18 @@ mod tests {
     }
 
     #[test]
-    fn is_active_true_for_non_planned_incident_aged_past_the_boundary_with_high_confidence_schedule_window() {
+    fn is_active_true_for_non_planned_incident_aged_past_the_boundary_with_high_confidence_schedule_window()
+     {
         // The nightly-rail-replacement case: not `is_planned`, but the
         // extraction found a genuine recurring schedule, so it's exempted
         // from the age cutoff the same way `is_planned` already is.
-        let inc = incident("T8", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
+        let inc = incident(
+            "T8",
+            "Signal fault",
+            "Rail replacement 23:00-05:00 nightly",
+            &[],
+            &[],
+        );
         let now = Utc::now();
         let mut loaded = loaded_at(inc, now - Duration::days(10));
         loaded.extracted_periods = Some(serde_json::json!([{
@@ -1856,7 +2212,13 @@ mod tests {
         // A schedule window extracted at low confidence isn't trustworthy
         // enough to grant the age-cutoff exemption -- same confidence bar
         // `apply_extraction` already holds every other signal to.
-        let inc = incident("T9", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
+        let inc = incident(
+            "T9",
+            "Signal fault",
+            "Rail replacement 23:00-05:00 nightly",
+            &[],
+            &[],
+        );
         let now = Utc::now();
         let mut loaded = loaded_at(inc, now - Duration::days(10));
         loaded.extracted_periods = Some(serde_json::json!([{
@@ -1937,7 +2299,8 @@ mod tests {
         schedule_window: Option<serde_json::Value>,
         eta: Option<DateTime<Utc>>,
     ) -> LoadedIncident {
-        let date_range = eta.map(|eta| serde_json::json!({ "from_date": null, "to_date": eta.to_rfc3339() }));
+        let date_range =
+            eta.map(|eta| serde_json::json!({ "from_date": null, "to_date": eta.to_rfc3339() }));
         let period = serde_json::json!({
             "scope_description": null,
             "date_range": date_range,
@@ -2044,7 +2407,8 @@ mod tests {
         // otherwise the "reported resolved" annotation ends up stapled to a
         // ReducedService status whose own text never claims resolution.
         let loaded = loaded_with_extraction(Some("resolved"), Some("high"), None, None);
-        let (severity, annotation) = apply_extraction(Severity::ReducedService, &loaded, Utc::now());
+        let (severity, annotation) =
+            apply_extraction(Severity::ReducedService, &loaded, Utc::now());
         assert_eq!(severity, Severity::MinorDelays);
         assert!(annotation.unwrap().contains("resolved"));
     }
@@ -2250,7 +2614,10 @@ mod tests {
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::MinorDelays);
         let annotation = annotation.unwrap();
-        assert!(annotation.contains("residual"), "annotation was: {annotation}");
+        assert!(
+            annotation.contains("residual"),
+            "annotation was: {annotation}"
+        );
         assert!(annotation.contains("22:00"), "annotation was: {annotation}");
     }
 
@@ -2262,7 +2629,8 @@ mod tests {
         // same direction as an unparsable start_time/end_time: never
         // manufacture a demotion out of malformed data.
         let now: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap();
-        let window = serde_json::json!({ "days_of_week": [], "start_time": "22:00", "end_time": "06:00" });
+        let window =
+            serde_json::json!({ "days_of_week": [], "start_time": "22:00", "end_time": "06:00" });
         let loaded = loaded_with_extraction(None, Some("high"), Some(window), None);
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
         assert_eq!(severity, Severity::Suspended);
@@ -2352,8 +2720,14 @@ mod tests {
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::MinorDelays);
         let annotation = annotation.unwrap();
-        assert!(annotation.contains("more severe"), "escalation annotation missing: {annotation}");
-        assert!(annotation.contains("reported resolved"), "demotion annotation missing: {annotation}");
+        assert!(
+            annotation.contains("more severe"),
+            "escalation annotation missing: {annotation}"
+        );
+        assert!(
+            annotation.contains("reported resolved"),
+            "demotion annotation missing: {annotation}"
+        );
     }
 
     #[test]
@@ -2375,7 +2749,10 @@ mod tests {
             extracted_periods: None,
         };
         let reports = aggregate(&lines, &[loaded], &HashMap::new(), &registry, &defaults);
-        assert_eq!(reports["swr-alton"].worst_severity(), Severity::PlannedClosure);
+        assert_eq!(
+            reports["swr-alton"].worst_severity(),
+            Severity::PlannedClosure
+        );
     }
 
     // --- Multi-period extraction tests ---
@@ -2514,9 +2891,18 @@ mod tests {
         // single-period case picks MinorDelays.
         assert_eq!(severity, Severity::MinorDelays);
         let annotation = annotation.unwrap();
-        assert!(annotation.contains("platform 2 closed"), "annotation was: {annotation}");
-        assert!(annotation.contains("platform 3 closed"), "annotation was: {annotation}");
-        assert!(annotation.contains("residual"), "annotation was: {annotation}");
+        assert!(
+            annotation.contains("platform 2 closed"),
+            "annotation was: {annotation}"
+        );
+        assert!(
+            annotation.contains("platform 3 closed"),
+            "annotation was: {annotation}"
+        );
+        assert!(
+            annotation.contains("residual"),
+            "annotation was: {annotation}"
+        );
         assert!(annotation.contains("22:00"), "annotation was: {annotation}");
     }
 
@@ -2557,10 +2943,22 @@ mod tests {
         // floor = Recovering (rank 3) -- tie-break picks MinorDelays.
         assert_eq!(severity, Severity::MinorDelays);
         let annotation = annotation.unwrap();
-        assert!(annotation.contains("phase 1"), "annotation was: {annotation}");
-        assert!(annotation.contains("expected to end by"), "annotation was: {annotation}");
-        assert!(annotation.contains("phase 2"), "annotation was: {annotation}");
-        assert!(annotation.contains("residual"), "annotation was: {annotation}");
+        assert!(
+            annotation.contains("phase 1"),
+            "annotation was: {annotation}"
+        );
+        assert!(
+            annotation.contains("expected to end by"),
+            "annotation was: {annotation}"
+        );
+        assert!(
+            annotation.contains("phase 2"),
+            "annotation was: {annotation}"
+        );
+        assert!(
+            annotation.contains("residual"),
+            "annotation was: {annotation}"
+        );
         assert!(
             !annotation.contains("more severe"),
             "an Elapsed period's apparent_severity must never escalate, even at high severity_confidence: {annotation}"
@@ -2590,7 +2988,10 @@ mod tests {
             };
             let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
             assert_eq!(severity, Severity::MinorDelays, "claim {claim}");
-            assert!(annotation.unwrap().contains("expected to end"), "claim {claim}");
+            assert!(
+                annotation.unwrap().contains("expected to end"),
+                "claim {claim}"
+            );
         }
     }
 
@@ -2654,7 +3055,13 @@ mod tests {
         // recurring-schedule period has already elapsed must NOT keep
         // exempting itself from the rail-day cutoff -- exactly the "SWR
         // forgot about it" failure mode that cutoff exists to catch.
-        let inc = incident("T11", "Signal fault", "Rail replacement 23:00-05:00 nightly", &[], &[]);
+        let inc = incident(
+            "T11",
+            "Signal fault",
+            "Rail replacement 23:00-05:00 nightly",
+            &[],
+            &[],
+        );
         let now = Utc::now();
         let mut loaded = loaded_at(inc, now - Duration::days(10));
         loaded.extracted_periods = Some(serde_json::json!([{
@@ -2715,11 +3122,20 @@ mod tests {
             "impact_type": "rail_replacement_bus"
         }]);
         let loaded = LoadedIncident {
-            message: incident("GIT3", "Buses replace trains", "Engineering works", &[], &[]),
+            message: incident(
+                "GIT3",
+                "Buses replace trains",
+                "Engineering works",
+                &[],
+                &[],
+            ),
             first_seen_at: Utc::now(),
             extracted_periods: Some(periods),
         };
-        assert_eq!(governing_impact_type(&loaded, Utc::now()), Some("rail_replacement_bus".to_string()));
+        assert_eq!(
+            governing_impact_type(&loaded, Utc::now()),
+            Some("rail_replacement_bus".to_string())
+        );
     }
 
     #[test]
@@ -2802,16 +3218,28 @@ mod tests {
             }
         ]);
         let loaded = LoadedIncident {
-            message: incident("GIT6", "Buses replace trains", "Weekend engineering works", &[], &[]),
+            message: incident(
+                "GIT6",
+                "Buses replace trains",
+                "Weekend engineering works",
+                &[],
+                &[],
+            ),
             first_seen_at: Utc::now(),
             extracted_periods: Some(periods),
         };
 
         let saturday_noon: DateTime<Utc> = "2026-06-13T12:00:00Z".parse().unwrap(); // a Saturday
-        assert_eq!(governing_impact_type(&loaded, saturday_noon), Some("rail_replacement_bus".to_string()));
+        assert_eq!(
+            governing_impact_type(&loaded, saturday_noon),
+            Some("rail_replacement_bus".to_string())
+        );
 
         let sunday_noon: DateTime<Utc> = "2026-06-14T12:00:00Z".parse().unwrap(); // a Sunday
-        assert_eq!(governing_impact_type(&loaded, sunday_noon), Some("no_scheduled_service".to_string()));
+        assert_eq!(
+            governing_impact_type(&loaded, sunday_noon),
+            Some("no_scheduled_service".to_string())
+        );
 
         let monday_noon: DateTime<Utc> = "2026-06-15T12:00:00Z".parse().unwrap(); // neither window matches
         assert_eq!(governing_impact_type(&loaded, monday_noon), None);
@@ -2833,7 +3261,13 @@ mod tests {
             "impact_type": "rail_replacement_bus"
         }]);
         let loaded = LoadedIncident {
-            message: incident("GIT7", "Engineering works", "Buses replace trains", &["SW"], &["AHT"]),
+            message: incident(
+                "GIT7",
+                "Engineering works",
+                "Buses replace trains",
+                &["SW"],
+                &["AHT"],
+            ),
             first_seen_at: Utc::now(),
             extracted_periods: Some(periods),
         };
@@ -2850,6 +3284,9 @@ mod tests {
 
         let status = status_from_incident(&m, &loaded, now);
 
-        assert_eq!(status.disruption.unwrap().impact_type.as_deref(), Some("rail_replacement_bus"));
+        assert_eq!(
+            status.disruption.unwrap().impact_type.as_deref(),
+            Some("rail_replacement_bus")
+        );
     }
 }

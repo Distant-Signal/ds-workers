@@ -78,19 +78,30 @@ pub fn combine_severity(primary_severity: &str, adversarial_severity: &str) -> (
 pub enum CombineError {
     /// An adversarial array's length didn't match the primary pass's
     /// `periods` length.
-    LengthMismatch { primary_periods: usize, resolution_adversarial: usize, severity_adversarial: usize },
+    LengthMismatch {
+        primary_periods: usize,
+        resolution_adversarial: usize,
+        severity_adversarial: usize,
+    },
     /// An adversarial array element's echoed `period_index` and/or
     /// `scope_description` didn't match what was sent to it at that
     /// position -- a length-preserving but reordered (or otherwise
     /// misaligned) response, the silent-failure risk design §7 item 4
     /// specifically calls out as harder to catch than a length mismatch.
-    AlignmentMismatch { pass: &'static str, period_index: usize },
+    AlignmentMismatch {
+        pass: &'static str,
+        period_index: usize,
+    },
 }
 
 impl fmt::Display for CombineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CombineError::LengthMismatch { primary_periods, resolution_adversarial, severity_adversarial } => write!(
+            CombineError::LengthMismatch {
+                primary_periods,
+                resolution_adversarial,
+                severity_adversarial,
+            } => write!(
                 f,
                 "adversarial period-array length mismatch: primary={primary_periods} \
                  resolution_adversarial={resolution_adversarial} severity_adversarial={severity_adversarial}"
@@ -120,7 +131,9 @@ pub fn combine_periods(
     resolution_adversarial: &[AdversarialPeriodVerdict],
     severity_adversarial: &[SeverityAdversarialPeriodVerdict],
 ) -> Result<Vec<ExtractionPeriod>, CombineError> {
-    if resolution_adversarial.len() != primary_periods.len() || severity_adversarial.len() != primary_periods.len() {
+    if resolution_adversarial.len() != primary_periods.len()
+        || severity_adversarial.len() != primary_periods.len()
+    {
         return Err(CombineError::LengthMismatch {
             primary_periods: primary_periods.len(),
             resolution_adversarial: resolution_adversarial.len(),
@@ -133,16 +146,32 @@ pub fn combine_periods(
         .enumerate()
         .map(|(index, period)| {
             let resolution_verdict = &resolution_adversarial[index];
-            if resolution_verdict.period_index != index || resolution_verdict.scope_description != period.scope_description {
-                return Err(CombineError::AlignmentMismatch { pass: "resolution", period_index: index });
+            if resolution_verdict.period_index != index
+                || resolution_verdict.scope_description != period.scope_description
+            {
+                return Err(CombineError::AlignmentMismatch {
+                    pass: "resolution",
+                    period_index: index,
+                });
             }
             let severity_verdict = &severity_adversarial[index];
-            if severity_verdict.period_index != index || severity_verdict.scope_description != period.scope_description {
-                return Err(CombineError::AlignmentMismatch { pass: "severity", period_index: index });
+            if severity_verdict.period_index != index
+                || severity_verdict.scope_description != period.scope_description
+            {
+                return Err(CombineError::AlignmentMismatch {
+                    pass: "severity",
+                    period_index: index,
+                });
             }
 
-            let (resolution_status, resolution_status_confidence) = combine(&period.resolution_status, &resolution_verdict.resolution_status);
-            let (apparent_severity, severity_confidence) = combine_severity(&period.apparent_severity, &severity_verdict.apparent_severity);
+            let (resolution_status, resolution_status_confidence) = combine(
+                &period.resolution_status,
+                &resolution_verdict.resolution_status,
+            );
+            let (apparent_severity, severity_confidence) = combine_severity(
+                &period.apparent_severity,
+                &severity_verdict.apparent_severity,
+            );
 
             Ok(ExtractionPeriod {
                 scope_description: period.scope_description.clone(),
@@ -164,35 +193,62 @@ mod tests {
 
     #[test]
     fn primary_ongoing_is_always_high_confidence() {
-        assert_eq!(combine("ongoing", "ongoing"), ("ongoing".to_string(), "high".to_string()));
-        assert_eq!(combine("ongoing", "resolved"), ("ongoing".to_string(), "high".to_string()));
+        assert_eq!(
+            combine("ongoing", "ongoing"),
+            ("ongoing".to_string(), "high".to_string())
+        );
+        assert_eq!(
+            combine("ongoing", "resolved"),
+            ("ongoing".to_string(), "high".to_string())
+        );
     }
 
     #[test]
     fn primary_resolved_agreeing_adversarial_is_high_confidence() {
-        assert_eq!(combine("resolved", "residual"), ("resolved".to_string(), "high".to_string()));
-        assert_eq!(combine("resolved", "resolved"), ("resolved".to_string(), "high".to_string()));
+        assert_eq!(
+            combine("resolved", "residual"),
+            ("resolved".to_string(), "high".to_string())
+        );
+        assert_eq!(
+            combine("resolved", "resolved"),
+            ("resolved".to_string(), "high".to_string())
+        );
     }
 
     #[test]
     fn primary_resolved_disagreeing_adversarial_is_low_confidence() {
-        assert_eq!(combine("resolved", "ongoing"), ("resolved".to_string(), "low".to_string()));
+        assert_eq!(
+            combine("resolved", "ongoing"),
+            ("resolved".to_string(), "low".to_string())
+        );
     }
 
     #[test]
     fn primary_residual_disagreeing_adversarial_is_low_confidence() {
-        assert_eq!(combine("residual", "ongoing"), ("residual".to_string(), "low".to_string()));
+        assert_eq!(
+            combine("residual", "ongoing"),
+            ("residual".to_string(), "low".to_string())
+        );
     }
 
     #[test]
     fn primary_residual_agreeing_adversarial_is_high_confidence() {
-        assert_eq!(combine("residual", "resolved"), ("residual".to_string(), "high".to_string()));
+        assert_eq!(
+            combine("residual", "resolved"),
+            ("residual".to_string(), "high".to_string())
+        );
     }
 
     #[test]
     fn primary_normal_severity_is_always_high_confidence() {
-        assert_eq!(combine_severity("normal", "normal"), ("normal".to_string(), "high".to_string()));
-        assert_eq!(combine_severity("normal", "blocked_or_suspended"), ("normal".to_string(), "high".to_string()));
+        assert_eq!(
+            combine_severity("normal", "normal"),
+            ("normal".to_string(), "high".to_string())
+        );
+        assert_eq!(
+            combine_severity("normal", "blocked_or_suspended"),
+            ("normal".to_string(), "high".to_string())
+        );
     }
 
     #[test]
@@ -219,7 +275,11 @@ mod tests {
         );
     }
 
-    fn period(scope: Option<&str>, resolution_status: &str, apparent_severity: &str) -> ExtractionPeriod {
+    fn period(
+        scope: Option<&str>,
+        resolution_status: &str,
+        apparent_severity: &str,
+    ) -> ExtractionPeriod {
         period_with_impact(scope, resolution_status, apparent_severity, None)
     }
 
@@ -241,19 +301,44 @@ mod tests {
         }
     }
 
-    fn resolution_verdict(index: usize, scope: Option<&str>, status: &str) -> AdversarialPeriodVerdict {
-        AdversarialPeriodVerdict { period_index: index, scope_description: scope.map(str::to_string), resolution_status: status.to_string() }
+    fn resolution_verdict(
+        index: usize,
+        scope: Option<&str>,
+        status: &str,
+    ) -> AdversarialPeriodVerdict {
+        AdversarialPeriodVerdict {
+            period_index: index,
+            scope_description: scope.map(str::to_string),
+            resolution_status: status.to_string(),
+        }
     }
 
-    fn severity_verdict(index: usize, scope: Option<&str>, severity: &str) -> SeverityAdversarialPeriodVerdict {
-        SeverityAdversarialPeriodVerdict { period_index: index, scope_description: scope.map(str::to_string), apparent_severity: severity.to_string() }
+    fn severity_verdict(
+        index: usize,
+        scope: Option<&str>,
+        severity: &str,
+    ) -> SeverityAdversarialPeriodVerdict {
+        SeverityAdversarialPeriodVerdict {
+            period_index: index,
+            scope_description: scope.map(str::to_string),
+            apparent_severity: severity.to_string(),
+        }
     }
 
     #[test]
     fn combine_periods_combines_each_index_independently() {
-        let primary = vec![period(None, "resolved", "normal"), period(Some("phase 2"), "ongoing", "severe_disruption")];
-        let resolution = vec![resolution_verdict(0, None, "ongoing"), resolution_verdict(1, Some("phase 2"), "resolved")];
-        let severity = vec![severity_verdict(0, None, "normal"), severity_verdict(1, Some("phase 2"), "moderate_disruption")];
+        let primary = vec![
+            period(None, "resolved", "normal"),
+            period(Some("phase 2"), "ongoing", "severe_disruption"),
+        ];
+        let resolution = vec![
+            resolution_verdict(0, None, "ongoing"),
+            resolution_verdict(1, Some("phase 2"), "resolved"),
+        ];
+        let severity = vec![
+            severity_verdict(0, None, "normal"),
+            severity_verdict(1, Some("phase 2"), "moderate_disruption"),
+        ];
 
         let result = combine_periods(&primary, &resolution, &severity).unwrap();
 
@@ -274,13 +359,21 @@ mod tests {
 
     #[test]
     fn combine_periods_copies_impact_type_through_unchanged() {
-        let primary = vec![period_with_impact(None, "ongoing", "normal", Some("rail_replacement_bus"))];
+        let primary = vec![period_with_impact(
+            None,
+            "ongoing",
+            "normal",
+            Some("rail_replacement_bus"),
+        )];
         let resolution = vec![resolution_verdict(0, None, "ongoing")];
         let severity = vec![severity_verdict(0, None, "normal")];
 
         let result = combine_periods(&primary, &resolution, &severity).unwrap();
 
-        assert_eq!(result[0].impact_type.as_deref(), Some("rail_replacement_bus"));
+        assert_eq!(
+            result[0].impact_type.as_deref(),
+            Some("rail_replacement_bus")
+        );
     }
 
     #[test]
@@ -296,12 +389,21 @@ mod tests {
 
     #[test]
     fn combine_periods_fails_on_resolution_length_mismatch() {
-        let primary = vec![period(None, "ongoing", "normal"), period(None, "ongoing", "normal")];
+        let primary = vec![
+            period(None, "ongoing", "normal"),
+            period(None, "ongoing", "normal"),
+        ];
         let resolution = vec![resolution_verdict(0, None, "ongoing")]; // only one, primary has two
-        let severity = vec![severity_verdict(0, None, "normal"), severity_verdict(1, None, "normal")];
+        let severity = vec![
+            severity_verdict(0, None, "normal"),
+            severity_verdict(1, None, "normal"),
+        ];
 
         let err = combine_periods(&primary, &resolution, &severity).unwrap_err();
-        assert!(matches!(err, CombineError::LengthMismatch { .. }), "expected a length mismatch, got {err:?}");
+        assert!(
+            matches!(err, CombineError::LengthMismatch { .. }),
+            "expected a length mismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -311,7 +413,10 @@ mod tests {
         let severity = vec![]; // empty, primary has one
 
         let err = combine_periods(&primary, &resolution, &severity).unwrap_err();
-        assert!(matches!(err, CombineError::LengthMismatch { .. }), "expected a length mismatch, got {err:?}");
+        assert!(
+            matches!(err, CombineError::LengthMismatch { .. }),
+            "expected a length mismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -319,12 +424,30 @@ mod tests {
         // Length-preserving, but period_index 1's verdict was actually meant
         // for period 0 (its scope_description doesn't match what period 0
         // was sent) -- the reordering risk design §7 item 4 warns about.
-        let primary = vec![period(Some("a"), "ongoing", "normal"), period(Some("b"), "ongoing", "normal")];
-        let resolution = vec![resolution_verdict(0, Some("b"), "ongoing"), resolution_verdict(1, Some("a"), "ongoing")];
-        let severity = vec![severity_verdict(0, Some("a"), "normal"), severity_verdict(1, Some("b"), "normal")];
+        let primary = vec![
+            period(Some("a"), "ongoing", "normal"),
+            period(Some("b"), "ongoing", "normal"),
+        ];
+        let resolution = vec![
+            resolution_verdict(0, Some("b"), "ongoing"),
+            resolution_verdict(1, Some("a"), "ongoing"),
+        ];
+        let severity = vec![
+            severity_verdict(0, Some("a"), "normal"),
+            severity_verdict(1, Some("b"), "normal"),
+        ];
 
         let err = combine_periods(&primary, &resolution, &severity).unwrap_err();
-        assert!(matches!(err, CombineError::AlignmentMismatch { pass: "resolution", period_index: 0 }), "expected an alignment mismatch, got {err:?}");
+        assert!(
+            matches!(
+                err,
+                CombineError::AlignmentMismatch {
+                    pass: "resolution",
+                    period_index: 0
+                }
+            ),
+            "expected an alignment mismatch, got {err:?}"
+        );
     }
 
     #[test]
@@ -332,20 +455,51 @@ mod tests {
         // scope_description matches by coincidence but the echoed
         // period_index is wrong -- still must be caught.
         let primary = vec![period(None, "ongoing", "normal")];
-        let resolution = vec![AdversarialPeriodVerdict { period_index: 5, scope_description: None, resolution_status: "ongoing".to_string() }];
+        let resolution = vec![AdversarialPeriodVerdict {
+            period_index: 5,
+            scope_description: None,
+            resolution_status: "ongoing".to_string(),
+        }];
         let severity = vec![severity_verdict(0, None, "normal")];
 
         let err = combine_periods(&primary, &resolution, &severity).unwrap_err();
-        assert!(matches!(err, CombineError::AlignmentMismatch { pass: "resolution", period_index: 0 }), "expected an alignment mismatch, got {err:?}");
+        assert!(
+            matches!(
+                err,
+                CombineError::AlignmentMismatch {
+                    pass: "resolution",
+                    period_index: 0
+                }
+            ),
+            "expected an alignment mismatch, got {err:?}"
+        );
     }
 
     #[test]
     fn combine_periods_fails_on_reordered_severity_response() {
-        let primary = vec![period(Some("a"), "ongoing", "normal"), period(Some("b"), "ongoing", "severe_disruption")];
-        let resolution = vec![resolution_verdict(0, Some("a"), "ongoing"), resolution_verdict(1, Some("b"), "ongoing")];
-        let severity = vec![severity_verdict(0, Some("b"), "normal"), severity_verdict(1, Some("a"), "severe_disruption")];
+        let primary = vec![
+            period(Some("a"), "ongoing", "normal"),
+            period(Some("b"), "ongoing", "severe_disruption"),
+        ];
+        let resolution = vec![
+            resolution_verdict(0, Some("a"), "ongoing"),
+            resolution_verdict(1, Some("b"), "ongoing"),
+        ];
+        let severity = vec![
+            severity_verdict(0, Some("b"), "normal"),
+            severity_verdict(1, Some("a"), "severe_disruption"),
+        ];
 
         let err = combine_periods(&primary, &resolution, &severity).unwrap_err();
-        assert!(matches!(err, CombineError::AlignmentMismatch { pass: "severity", period_index: 0 }), "expected an alignment mismatch, got {err:?}");
+        assert!(
+            matches!(
+                err,
+                CombineError::AlignmentMismatch {
+                    pass: "severity",
+                    period_index: 0
+                }
+            ),
+            "expected an alignment mismatch, got {err:?}"
+        );
     }
 }

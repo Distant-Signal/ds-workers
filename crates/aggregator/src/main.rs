@@ -40,8 +40,11 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
 
-    let static_lines: HashMap<String, LineDefinition> =
-        config.lines.iter().map(|l| (l.id.clone(), l.clone())).collect();
+    let static_lines: HashMap<String, LineDefinition> = config
+        .lines
+        .iter()
+        .map(|l| (l.id.clone(), l.clone()))
+        .collect();
     tracing::info!(count = static_lines.len(), "loaded static line catalogue");
 
     let defaults = Defaults::default();
@@ -69,8 +72,10 @@ async fn main() -> anyhow::Result<()> {
             &mut dedup_ledger,
         )
         .await;
-        metrics::histogram!(common::metrics::metric_name("aggregator_cycle_duration_seconds"))
-            .record(cycle_start.elapsed().as_secs_f64());
+        metrics::histogram!(common::metrics::metric_name(
+            "aggregator_cycle_duration_seconds"
+        ))
+        .record(cycle_start.elapsed().as_secs_f64());
 
         if let Err(err) = result {
             tracing::error!(error = ?err, "aggregation cycle failed; will retry next interval");
@@ -118,7 +123,8 @@ async fn run_cycle(
     let mut new_services_this_cycle: u64 = 0;
     let mut daily_stats_recorded = 0u64;
     for (line_id, line) in lines_with_sample_coverage(&reports, &lines) {
-        let deduped = dedup::dedup_new_sample_stats(dedup_ledger, line_id, today, line, &samples, defaults);
+        let deduped =
+            dedup::dedup_new_sample_stats(dedup_ledger, line_id, today, line, &samples, defaults);
         if let Some(ref stats) = deduped {
             new_services_this_cycle += stats.total as u64;
         }
@@ -129,15 +135,26 @@ async fn run_cycle(
 
     let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
 
-    metrics::gauge!(common::metrics::metric_name("aggregator_lines_total")).set(reports.len() as f64);
-    metrics::gauge!(common::metrics::metric_name("aggregator_incidents_loaded")).set(incidents.len() as f64);
-    metrics::counter!(common::metrics::metric_name("aggregator_history_rows_pruned_total")).increment(pruned);
-    metrics::counter!(common::metrics::metric_name("aggregator_deduped_new_services_total"))
-        .increment(new_services_this_cycle);
-    metrics::counter!(common::metrics::metric_name("aggregator_daily_stats_recorded_total"))
-        .increment(daily_stats_recorded);
-    metrics::counter!(common::metrics::metric_name("aggregator_daily_stats_pruned_total"))
-        .increment(daily_stats_pruned);
+    metrics::gauge!(common::metrics::metric_name("aggregator_lines_total"))
+        .set(reports.len() as f64);
+    metrics::gauge!(common::metrics::metric_name("aggregator_incidents_loaded"))
+        .set(incidents.len() as f64);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_history_rows_pruned_total"
+    ))
+    .increment(pruned);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_deduped_new_services_total"
+    ))
+    .increment(new_services_this_cycle);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_daily_stats_recorded_total"
+    ))
+    .increment(daily_stats_recorded);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_daily_stats_pruned_total"
+    ))
+    .increment(daily_stats_pruned);
 
     tracing::info!(
         lines = reports.len(),
@@ -174,7 +191,13 @@ fn lines_with_sample_coverage<'a>(
 ) -> Vec<(&'a str, &'a LineDefinition)> {
     reports
         .values()
-        .filter(|report| report.statuses.first().and_then(|s| s.sample_stats.as_ref()).is_some())
+        .filter(|report| {
+            report
+                .statuses
+                .first()
+                .and_then(|s| s.sample_stats.as_ref())
+                .is_some()
+        })
         .filter_map(|report| lines.get_key_value(report.id.as_str()))
         .map(|(id, line)| (id.as_str(), line))
         .collect()
@@ -182,7 +205,9 @@ fn lines_with_sample_coverage<'a>(
 
 #[cfg(test)]
 mod tests {
-    use common::{DataQuality, LineStatus, SampleAvailability, SampleStats, Severity, ValidityPeriod};
+    use common::{
+        DataQuality, LineStatus, SampleAvailability, SampleStats, Severity, ValidityPeriod,
+    };
 
     use super::*;
 
@@ -208,7 +233,11 @@ mod tests {
         LineStatus {
             severity: Severity::GoodService,
             reason: "Good Service".to_string(),
-            validity: ValidityPeriod { from_date: chrono::Utc::now(), to_date: None, is_now: true },
+            validity: ValidityPeriod {
+                from_date: chrono::Utc::now(),
+                to_date: None,
+                is_now: true,
+            },
             disruption: None,
             data_quality: DataQuality::default(),
             sample_stats: stats,
@@ -217,12 +246,19 @@ mod tests {
     }
 
     fn sample_stats() -> SampleStats {
-        SampleStats { total: 10, delayed: 2, cancelled: 1, skipped: 0, avg_delay_minutes: 3.5 }
+        SampleStats {
+            total: 10,
+            delayed: 2,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 3.5,
+        }
     }
 
     #[test]
     fn counts_a_line_with_two_concurrent_incidents_exactly_once() {
-        let lines: HashMap<String, LineDefinition> = [("central".to_string(), line_def("central"))].into();
+        let lines: HashMap<String, LineDefinition> =
+            [("central".to_string(), line_def("central"))].into();
         let reports: HashMap<String, LineStatusReport> = [(
             "central".to_string(),
             LineStatusReport {
@@ -243,13 +279,18 @@ mod tests {
 
         let selected = lines_with_sample_coverage(&reports, &lines);
 
-        assert_eq!(selected.len(), 1, "expected exactly one entry per line regardless of status count");
+        assert_eq!(
+            selected.len(),
+            1,
+            "expected exactly one entry per line regardless of status count"
+        );
         assert_eq!(selected[0].0, "central");
     }
 
     #[test]
     fn excludes_a_line_with_no_sample_stats_on_any_status() {
-        let lines: HashMap<String, LineDefinition> = [("victoria".to_string(), line_def("victoria"))].into();
+        let lines: HashMap<String, LineDefinition> =
+            [("victoria".to_string(), line_def("victoria"))].into();
         let reports: HashMap<String, LineStatusReport> = [(
             "victoria".to_string(),
             LineStatusReport {
@@ -292,7 +333,8 @@ mod tests {
 
     #[test]
     fn handles_empty_reports_without_panicking() {
-        let lines: HashMap<String, LineDefinition> = [("bakerloo".to_string(), line_def("bakerloo"))].into();
+        let lines: HashMap<String, LineDefinition> =
+            [("bakerloo".to_string(), line_def("bakerloo"))].into();
         let reports: HashMap<String, LineStatusReport> = HashMap::new();
 
         let selected = lines_with_sample_coverage(&reports, &lines);

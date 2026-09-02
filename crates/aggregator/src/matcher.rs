@@ -99,13 +99,29 @@ fn match_one<'a>(
             keywords: keyword_hits,
         };
 
-        if !segments.is_empty() && segments.iter().all(|s| registry.is_exclusive_to(s, &line.id)) {
-            return Some(Match { line, scope: MatchScope::ExclusiveSegment, evidence });
+        if !segments.is_empty()
+            && segments
+                .iter()
+                .all(|s| registry.is_exclusive_to(s, &line.id))
+        {
+            return Some(Match {
+                line,
+                scope: MatchScope::ExclusiveSegment,
+                evidence,
+            });
         }
         if !segments.is_empty() && segments.iter().any(|s| registry.is_shared(s)) {
-            return Some(Match { line, scope: MatchScope::SharedSegment, evidence });
+            return Some(Match {
+                line,
+                scope: MatchScope::SharedSegment,
+                evidence,
+            });
         }
-        return Some(Match { line, scope: MatchScope::StationHit, evidence });
+        return Some(Match {
+            line,
+            scope: MatchScope::StationHit,
+            evidence,
+        });
     }
 
     // Tier 2: keyword match.
@@ -113,7 +129,12 @@ fn match_one<'a>(
         return Some(Match {
             line,
             scope: MatchScope::KeywordOnly,
-            evidence: Evidence { stations: vec![], segments: vec![], operators: operator_overlap, keywords: keyword_hits },
+            evidence: Evidence {
+                stations: vec![],
+                segments: vec![],
+                operators: operator_overlap,
+                keywords: keyword_hits,
+            },
         });
     }
 
@@ -122,7 +143,12 @@ fn match_one<'a>(
         return Some(Match {
             line,
             scope: MatchScope::OperatorOnly,
-            evidence: Evidence { stations: vec![], segments: vec![], operators: operator_overlap, keywords: vec![] },
+            evidence: Evidence {
+                stations: vec![],
+                segments: vec![],
+                operators: operator_overlap,
+                keywords: vec![],
+            },
         });
     }
 
@@ -130,7 +156,9 @@ fn match_one<'a>(
 }
 
 fn is_excluded(line: &LineDefinition, haystack: &str) -> bool {
-    line.excluded_keywords.iter().any(|kw| haystack.contains(&kw.to_lowercase()))
+    line.excluded_keywords
+        .iter()
+        .any(|kw| haystack.contains(&kw.to_lowercase()))
 }
 
 #[cfg(test)]
@@ -156,7 +184,13 @@ mod tests {
             .collect()
     }
 
-    fn incident(id: &str, summary: &str, description: &str, operators: &[&str], affected_stations: &[&str]) -> IncidentMessage {
+    fn incident(
+        id: &str,
+        summary: &str,
+        description: &str,
+        operators: &[&str],
+        affected_stations: &[&str],
+    ) -> IncidentMessage {
         IncidentMessage {
             incident_id: id.to_string(),
             summary: summary.to_string(),
@@ -179,15 +213,27 @@ mod tests {
         // sourcing behind this fix.
         let lines = load_line("wcml");
         let wcml = lines.get("wcml").expect("wcml line should exist");
-        assert!(wcml.operators.iter().any(|op| op == "VT"), "wcml operators should contain VT (Avanti West Coast)");
-        assert!(!wcml.operators.iter().any(|op| op == "AW"), "wcml operators should not contain AW (Transport for Wales)");
+        assert!(
+            wcml.operators.iter().any(|op| op == "VT"),
+            "wcml operators should contain VT (Avanti West Coast)"
+        );
+        assert!(
+            !wcml.operators.iter().any(|op| op == "AW"),
+            "wcml operators should not contain AW (Transport for Wales)"
+        );
     }
 
     #[test]
     fn excluded_keyword_vetoes_match() {
         let lines = load_line("wcml");
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("T1", "Cross Country delays", "Cross Country services are delayed at Rugby.", &[], &["RUG"]);
+        let inc = incident(
+            "T1",
+            "Cross Country delays",
+            "Cross Country services are delayed at Rugby.",
+            &[],
+            &["RUG"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         assert!(matches.is_empty(), "excluded keyword should veto match");
     }
@@ -196,7 +242,13 @@ mod tests {
     fn keyword_only_match() {
         let lines = load_line("wcml");
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("T2", "WCML engineering", "Overnight engineering work on the West Coast Main Line.", &[], &[]);
+        let inc = incident(
+            "T2",
+            "WCML engineering",
+            "Overnight engineering work on the West Coast Main Line.",
+            &[],
+            &[],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].scope, MatchScope::KeywordOnly);
@@ -206,7 +258,13 @@ mod tests {
     fn swr_shared_trunk_incident_propagates() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("SWR-1", "Signal failure at Woking", "Signal failure causing delays to SWR services.", &["SW"], &["WOK"]);
+        let inc = incident(
+            "SWR-1",
+            "Signal failure at Woking",
+            "Signal failure causing delays to SWR services.",
+            &["SW"],
+            &["WOK"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert!(matched_ids.contains("swr-south-west-main"));
@@ -214,7 +272,12 @@ mod tests {
         assert!(matched_ids.contains("swr-alton"));
         for m in &matches {
             if m.line.id.starts_with("swr-") {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -242,7 +305,13 @@ mod tests {
         // this incident, still ExclusiveSegment.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("XC-1", "Signal failure at Birmingham New Street", "Services are delayed.", &["XC"], &["BHM"]);
+        let inc = incident(
+            "XC-1",
+            "Signal failure at Birmingham New Street",
+            "Services are delayed.",
+            &["XC"],
+            &["BHM"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -259,10 +328,23 @@ mod tests {
             ])
         );
         for m in &matches {
-            if m.line.id == "wcml-birmingham" || m.line.id == "wmr-cross-city" || m.line.id == "lnwr-birmingham-crewe" {
-                assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            if m.line.id == "wcml-birmingham"
+                || m.line.id == "wmr-cross-city"
+                || m.line.id == "lnwr-birmingham-crewe"
+            {
+                assert_eq!(
+                    m.scope,
+                    MatchScope::ExclusiveSegment,
+                    "{} should be ExclusiveSegment",
+                    m.line.id
+                );
             } else {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -280,15 +362,29 @@ mod tests {
         // branches.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("XR-1", "Trespass at Shenfield", "Trespass incident causing delays.", &["XR"], &["SNF"]);
+        let inc = incident(
+            "XR-1",
+            "Trespass at Shenfield",
+            "Trespass incident causing delays.",
+            &["XR"],
+            &["SNF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["elizabeth-shenfield".to_string(), "greater-anglia-main-line".to_string()])
+            HashSet::from([
+                "elizabeth-shenfield".to_string(),
+                "greater-anglia-main-line".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -309,7 +405,13 @@ mod tests {
         // independent ExclusiveSegment match, not a shared trunk.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LE-1", "Points failure at Romford", "Points failure causing delays.", &["LE"], &["RMF"]);
+        let inc = incident(
+            "LE-1",
+            "Points failure at Romford",
+            "Points failure causing delays.",
+            &["LE"],
+            &["RMF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -321,7 +423,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -339,10 +446,19 @@ mod tests {
         // greater-anglia-main-line only.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LE-2", "Signal failure at Diss", "Signal failure causing delays.", &["LE"], &["DIS"]);
+        let inc = incident(
+            "LE-2",
+            "Signal failure at Diss",
+            "Signal failure causing delays.",
+            &["LE"],
+            &["DIS"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["greater-anglia-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["greater-anglia-main-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -350,7 +466,13 @@ mod tests {
     fn swr_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("SWR-2", "Power supply issue at Alton", "Power supply problem causing delays at Alton.", &["SW"], &["AON"]);
+        let inc = incident(
+            "SWR-2",
+            "Power supply issue at Alton",
+            "Power supply problem causing delays at Alton.",
+            &["SW"],
+            &["AON"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["swr-alton".to_string()]));
@@ -367,7 +489,13 @@ mod tests {
     fn overground_liberty_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-1", "Signal failure at Upminster", "Signal failure causing delays at Upminster.", &["LO"], &["UPM"]);
+        let inc = incident(
+            "LO-1",
+            "Signal failure at Upminster",
+            "Signal failure causing delays at Upminster.",
+            &["LO"],
+            &["UPM"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         // Upminster is also c2c's own Ockendon-loop junction (lines/c2c.toml,
@@ -380,7 +508,12 @@ mod tests {
             HashSet::from(["overground-liberty".to_string(), "c2c".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -399,10 +532,19 @@ mod tests {
     fn overground_lioness_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-2", "Points failure at Bushey", "Points failure causing delays at Bushey.", &["LO"], &["BSH"]);
+        let inc = incident(
+            "LO-2",
+            "Points failure at Bushey",
+            "Points failure causing delays at Bushey.",
+            &["LO"],
+            &["BSH"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["overground-lioness".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["overground-lioness".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -421,10 +563,19 @@ mod tests {
     fn overground_mildmay_exclusive_segment_incident_stays_on_its_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-3", "Trespass at Richmond", "Trespass incident causing delays at Richmond.", &["LO"], &["RMD"]);
+        let inc = incident(
+            "LO-3",
+            "Trespass at Richmond",
+            "Trespass incident causing delays at Richmond.",
+            &["LO"],
+            &["RMD"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["overground-mildmay".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["overground-mildmay".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -440,10 +591,19 @@ mod tests {
     fn overground_suffragette_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-4", "Points failure at Barking Riverside", "Points failure causing delays at Barking Riverside.", &["LO"], &["BGV"]);
+        let inc = incident(
+            "LO-4",
+            "Points failure at Barking Riverside",
+            "Points failure causing delays at Barking Riverside.",
+            &["LO"],
+            &["BGV"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["overground-suffragette".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["overground-suffragette".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -458,10 +618,19 @@ mod tests {
     fn overground_weaver_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-5", "Signal failure at Chingford", "Signal failure causing delays at Chingford.", &["LO"], &["CHI"]);
+        let inc = incident(
+            "LO-5",
+            "Signal failure at Chingford",
+            "Signal failure causing delays at Chingford.",
+            &["LO"],
+            &["CHI"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["overground-weaver".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["overground-weaver".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -472,10 +641,19 @@ mod tests {
     fn overground_windrush_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-6", "Signal failure at West Croydon", "Signal failure causing delays at West Croydon.", &["LO"], &["WCY"]);
+        let inc = incident(
+            "LO-6",
+            "Signal failure at West Croydon",
+            "Signal failure causing delays at West Croydon.",
+            &["LO"],
+            &["WCY"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["overground-windrush".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["overground-windrush".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -490,15 +668,29 @@ mod tests {
     fn overground_canonbury_curve_incident_propagates_to_mildmay_and_windrush() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LO-7", "Signal failure at Canonbury", "Signal failure causing delays at Canonbury.", &["LO"], &["CNN"]);
+        let inc = incident(
+            "LO-7",
+            "Signal failure at Canonbury",
+            "Signal failure causing delays at Canonbury.",
+            &["LO"],
+            &["CNN"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["overground-mildmay".to_string(), "overground-windrush".to_string()])
+            HashSet::from([
+                "overground-mildmay".to_string(),
+                "overground-windrush".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -512,10 +704,19 @@ mod tests {
     fn emr_nottingham_spur_incident_stays_on_its_branch() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMR-1", "Points failure at Beeston", "Points failure causing delays to services at Beeston.", &["EM"], &["BEE"]);
+        let inc = incident(
+            "EMR-1",
+            "Points failure at Beeston",
+            "Points failure causing delays to services at Beeston.",
+            &["EM"],
+            &["BEE"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["emr-midland-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["emr-midland-main-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -527,7 +728,13 @@ mod tests {
     fn emr_regional_erewash_incident_stays_on_its_own_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRR-1", "Signal failure at Alfreton", "Signal failure causing delays to services at Alfreton.", &["EM"], &["ALF"]);
+        let inc = incident(
+            "EMRR-1",
+            "Signal failure at Alfreton",
+            "Signal failure causing delays to services at Alfreton.",
+            &["EM"],
+            &["ALF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["emr-regional".to_string()]));
@@ -546,11 +753,23 @@ mod tests {
     fn emr_regional_chesterfield_incident_shared_with_midland_main_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRR-2", "Points failure at Chesterfield", "Points failure causing delays to services at Chesterfield.", &["EM"], &["CHD"]);
+        let inc = incident(
+            "EMRR-2",
+            "Points failure at Chesterfield",
+            "Points failure causing delays to services at Chesterfield.",
+            &["EM"],
+            &["CHD"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
         assert_eq!(by_id.get("emr-regional"), Some(&MatchScope::SharedSegment));
-        assert_eq!(by_id.get("emr-midland-main-line"), Some(&MatchScope::SharedSegment));
+        assert_eq!(
+            by_id.get("emr-midland-main-line"),
+            Some(&MatchScope::SharedSegment)
+        );
     }
 
     // Same file, Ruling 1 (revised after final review): Manchester
@@ -572,11 +791,26 @@ mod tests {
     fn emr_regional_stockport_and_hope_valley_both_match_without_over_propagating() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRR-3", "Overhead line damage at Stockport", "Overhead line damage causing delays to services at Stockport.", &["EM"], &["SPT"]);
+        let inc = incident(
+            "EMRR-3",
+            "Overhead line damage at Stockport",
+            "Overhead line damage causing delays to services at Stockport.",
+            &["EM"],
+            &["SPT"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
-        assert_eq!(by_id.get("emr-regional"), Some(&MatchScope::ExclusiveSegment));
-        assert_eq!(by_id.get("northern-hope-valley"), Some(&MatchScope::ExclusiveSegment));
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
+        assert_eq!(
+            by_id.get("emr-regional"),
+            Some(&MatchScope::ExclusiveSegment)
+        );
+        assert_eq!(
+            by_id.get("northern-hope-valley"),
+            Some(&MatchScope::ExclusiveSegment)
+        );
     }
 
     // `lines/emr-connect.toml` (Batch 7, Task 7.3): the real EMR Connect
@@ -590,11 +824,23 @@ mod tests {
     fn emr_connect_shared_trunk_incident_propagates() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMC-1", "Signal failure at Wellingborough", "Signal failure causing delays to services at Wellingborough.", &["EM"], &["WEL"]);
+        let inc = incident(
+            "EMC-1",
+            "Signal failure at Wellingborough",
+            "Signal failure causing delays to services at Wellingborough.",
+            &["EM"],
+            &["WEL"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
         assert_eq!(by_id.get("emr-connect"), Some(&MatchScope::SharedSegment));
-        assert_eq!(by_id.get("emr-midland-main-line"), Some(&MatchScope::SharedSegment));
+        assert_eq!(
+            by_id.get("emr-midland-main-line"),
+            Some(&MatchScope::SharedSegment)
+        );
     }
 
     // Same file: Corby is this line's only exclusive station (not on the
@@ -606,7 +852,13 @@ mod tests {
     fn emr_connect_corby_incident_stays_on_its_own_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMC-2", "Points failure at Corby", "Points failure causing delays to services at Corby.", &["EM"], &["COR"]);
+        let inc = incident(
+            "EMC-2",
+            "Points failure at Corby",
+            "Points failure causing delays to services at Corby.",
+            &["EM"],
+            &["COR"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["emr-connect".to_string()]));
@@ -622,10 +874,19 @@ mod tests {
     fn emr_rural_branches_worksop_incident_stays_on_its_own_branch() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRB-1", "Signal failure at Worksop", "Signal failure causing delays to services at Worksop.", &["EM"], &["WRK"]);
+        let inc = incident(
+            "EMRB-1",
+            "Signal failure at Worksop",
+            "Signal failure causing delays to services at Worksop.",
+            &["EM"],
+            &["WRK"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["emr-rural-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["emr-rural-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -650,14 +911,30 @@ mod tests {
     // `emr-regional` as ExclusiveSegment on its own `emr-regional-east`
     // segment - neither reports SharedSegment for the other).
     #[test]
-    fn emr_rural_branches_poacher_line_and_emr_regional_both_match_grantham_without_over_propagating() {
+    fn emr_rural_branches_poacher_line_and_emr_regional_both_match_grantham_without_over_propagating()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRB-2", "Points failure at Grantham", "Points failure causing delays to services at Grantham.", &["EM"], &["GRA"]);
+        let inc = incident(
+            "EMRB-2",
+            "Points failure at Grantham",
+            "Points failure causing delays to services at Grantham.",
+            &["EM"],
+            &["GRA"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
-        assert_eq!(by_id.get("emr-rural-branches"), Some(&MatchScope::ExclusiveSegment));
-        assert_eq!(by_id.get("emr-regional"), Some(&MatchScope::ExclusiveSegment));
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
+        assert_eq!(
+            by_id.get("emr-rural-branches"),
+            Some(&MatchScope::ExclusiveSegment)
+        );
+        assert_eq!(
+            by_id.get("emr-regional"),
+            Some(&MatchScope::ExclusiveSegment)
+        );
     }
 
     // Same file: the second confirmed shared-trunk exception, and this one
@@ -677,11 +954,26 @@ mod tests {
     fn emr_rural_branches_matlock_branch_shared_with_midland_main_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRB-3", "Overhead line damage at Derby", "Overhead line damage causing delays to services at Derby.", &["EM"], &["DBY"]);
+        let inc = incident(
+            "EMRB-3",
+            "Overhead line damage at Derby",
+            "Overhead line damage causing delays to services at Derby.",
+            &["EM"],
+            &["DBY"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
-        assert_eq!(by_id.get("emr-rural-branches"), Some(&MatchScope::SharedSegment));
-        assert_eq!(by_id.get("emr-midland-main-line"), Some(&MatchScope::SharedSegment));
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
+        assert_eq!(
+            by_id.get("emr-rural-branches"),
+            Some(&MatchScope::SharedSegment)
+        );
+        assert_eq!(
+            by_id.get("emr-midland-main-line"),
+            Some(&MatchScope::SharedSegment)
+        );
     }
 
     // Same file: Matlock itself is this branch's terminus, on the exclusive
@@ -692,10 +984,19 @@ mod tests {
     fn emr_rural_branches_matlock_incident_stays_on_its_own_branch() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRB-4", "Trespass at Matlock", "Trespass incident causing delays at Matlock.", &["EM"], &["MAT"]);
+        let inc = incident(
+            "EMRB-4",
+            "Trespass at Matlock",
+            "Trespass incident causing delays at Matlock.",
+            &["EM"],
+            &["MAT"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["emr-rural-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["emr-rural-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -719,9 +1020,14 @@ mod tests {
     #[test]
     fn emr_rural_branches_poacher_line_infill_stations_present() {
         let lines = load_line("emr-rural-branches");
-        let line = lines.get("emr-rural-branches").expect("emr-rural-branches line should exist");
+        let line = lines
+            .get("emr-rural-branches")
+            .expect("emr-rural-branches line should exist");
         for crs in ["NET", "RDF", "ALK", "ELO", "BTF"] {
-            assert!(line.has_station(crs), "emr-rural-branches should now list {crs}");
+            assert!(
+                line.has_station(crs),
+                "emr-rural-branches should now list {crs}"
+            );
         }
     }
 
@@ -733,10 +1039,19 @@ mod tests {
     fn emr_rural_branches_bottesford_incident_stays_on_its_own_branch() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("EMRB-5", "Signal failure at Bottesford", "Signal failure causing delays to services at Bottesford.", &["EM"], &["BTF"]);
+        let inc = incident(
+            "EMRB-5",
+            "Signal failure at Bottesford",
+            "Signal failure causing delays to services at Bottesford.",
+            &["EM"],
+            &["BTF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["emr-rural-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["emr-rural-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -744,10 +1059,19 @@ mod tests {
     fn cumbrian_coast_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("NT-1", "Signal failure at Whitehaven", "Signal failure causing delays on the Cumbrian Coast.", &["NT"], &["WTH"]);
+        let inc = incident(
+            "NT-1",
+            "Signal failure at Whitehaven",
+            "Signal failure causing delays on the Cumbrian Coast.",
+            &["NT"],
+            &["WTH"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-cumbrian-coast".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-cumbrian-coast".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -755,14 +1079,25 @@ mod tests {
     fn cumbrian_coast_shared_trunk_incident_propagates_to_furness() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("NT-2", "Points failure at Barrow-in-Furness", "Points failure causing delays at Barrow.", &["NT"], &["BIF"]);
+        let inc = incident(
+            "NT-2",
+            "Points failure at Barrow-in-Furness",
+            "Points failure causing delays at Barrow.",
+            &["NT"],
+            &["BIF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert!(matched_ids.contains("northern-cumbrian-coast"));
         assert!(matched_ids.contains("northern-furness"));
         for m in &matches {
             if m.line.id == "northern-cumbrian-coast" || m.line.id == "northern-furness" {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -779,7 +1114,13 @@ mod tests {
     fn furness_branch_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("NT-FUR", "Signal failure at Ulverston", "Signal failure causing delays at Ulverston.", &["NT"], &["ULV"]);
+        let inc = incident(
+            "NT-FUR",
+            "Signal failure at Ulverston",
+            "Signal failure causing delays at Ulverston.",
+            &["NT"],
+            &["ULV"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["northern-furness".to_string()]));
@@ -799,7 +1140,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-calder-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-calder-valley".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -816,7 +1160,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-airedale".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-airedale".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -833,7 +1180,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-wharfedale".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-wharfedale".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -858,7 +1208,12 @@ mod tests {
         assert!(matched_ids.contains("northern-wharfedale"));
         for m in &matches {
             if m.line.id == "northern-airedale" || m.line.id == "northern-wharfedale" {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -876,14 +1231,27 @@ mod tests {
     #[test]
     fn airedale_and_wharfedale_frizinghall_has_station_and_is_shared_trunk() {
         let lines = load_line("northern-airedale");
-        let airedale = lines.get("northern-airedale").expect("northern-airedale should load");
-        assert!(airedale.has_station("FZH"), "northern-airedale should now list Frizinghall (FZH)");
+        let airedale = lines
+            .get("northern-airedale")
+            .expect("northern-airedale should load");
+        assert!(
+            airedale.has_station("FZH"),
+            "northern-airedale should now list Frizinghall (FZH)"
+        );
         assert_eq!(airedale.segment_for("FZH"), Some("northern-shipley-trunk"));
 
         let all_lines = load_all_lines();
-        let wharfedale = all_lines.get("northern-wharfedale").expect("northern-wharfedale should load");
-        assert!(wharfedale.has_station("FZH"), "northern-wharfedale should now list Frizinghall (FZH)");
-        assert_eq!(wharfedale.segment_for("FZH"), Some("northern-shipley-trunk"));
+        let wharfedale = all_lines
+            .get("northern-wharfedale")
+            .expect("northern-wharfedale should load");
+        assert!(
+            wharfedale.has_station("FZH"),
+            "northern-wharfedale should now list Frizinghall (FZH)"
+        );
+        assert_eq!(
+            wharfedale.segment_for("FZH"),
+            Some("northern-shipley-trunk")
+        );
 
         let registry = SegmentRegistry::new(&all_lines);
         assert!(
@@ -898,9 +1266,18 @@ mod tests {
             &["FZH"],
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
-        assert_eq!(by_id.get("northern-airedale"), Some(&MatchScope::SharedSegment));
-        assert_eq!(by_id.get("northern-wharfedale"), Some(&MatchScope::SharedSegment));
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
+        assert_eq!(
+            by_id.get("northern-airedale"),
+            Some(&MatchScope::SharedSegment)
+        );
+        assert_eq!(
+            by_id.get("northern-wharfedale"),
+            Some(&MatchScope::SharedSegment)
+        );
     }
 
     // Task 2.1: SAE (Saltaire), by contrast, is the first station on this
@@ -910,8 +1287,13 @@ mod tests {
     #[test]
     fn airedale_saltaire_has_station_and_stays_exclusive() {
         let lines = load_line("northern-airedale");
-        let airedale = lines.get("northern-airedale").expect("northern-airedale should load");
-        assert!(airedale.has_station("SAE"), "northern-airedale should now list Saltaire (SAE)");
+        let airedale = lines
+            .get("northern-airedale")
+            .expect("northern-airedale should load");
+        assert!(
+            airedale.has_station("SAE"),
+            "northern-airedale should now list Saltaire (SAE)"
+        );
         assert_eq!(airedale.segment_for("SAE"), Some("northern-airedale"));
 
         let all_lines = load_all_lines();
@@ -925,7 +1307,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-airedale".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-airedale".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -947,7 +1332,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-esk-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-esk-valley".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -964,7 +1352,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-clitheroe".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-clitheroe".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -991,8 +1382,16 @@ mod tests {
         assert!(matched_ids.contains("northern-blackpool"));
         assert!(matched_ids.contains("northern-clitheroe"));
         for m in &matches {
-            if m.line.id == "northern" || m.line.id == "northern-blackpool" || m.line.id == "northern-clitheroe" {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            if m.line.id == "northern"
+                || m.line.id == "northern-blackpool"
+                || m.line.id == "northern-clitheroe"
+            {
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
         // `northern-calder-valley.toml` also has an MCV entry, but tagged
@@ -1002,7 +1401,10 @@ mod tests {
         // regression where Calder Valley's MCV entry gets accidentally
         // merged into the shared `northern-manchester` segment.
         if matched_ids.contains("northern-calder-valley") {
-            let calder_valley_match = matches.iter().find(|m| m.line.id == "northern-calder-valley").unwrap();
+            let calder_valley_match = matches
+                .iter()
+                .find(|m| m.line.id == "northern-calder-valley")
+                .unwrap();
             assert_eq!(
                 calder_valley_match.scope,
                 MatchScope::ExclusiveSegment,
@@ -1022,8 +1424,13 @@ mod tests {
     #[test]
     fn northern_blackpool_chorley_has_station_and_stays_exclusive() {
         let lines = load_line("northern-blackpool");
-        let blackpool = lines.get("northern-blackpool").expect("northern-blackpool should load");
-        assert!(blackpool.has_station("CRL"), "northern-blackpool should now list Chorley (CRL)");
+        let blackpool = lines
+            .get("northern-blackpool")
+            .expect("northern-blackpool should load");
+        assert!(
+            blackpool.has_station("CRL"),
+            "northern-blackpool should now list Chorley (CRL)"
+        );
         assert_eq!(blackpool.segment_for("CRL"), Some("northern-blackpool"));
 
         let all_lines = load_all_lines();
@@ -1037,7 +1444,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-blackpool".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-blackpool".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -1055,15 +1465,29 @@ mod tests {
         // (merged separately, Batch 10), on its exclusive
         // `scotrail-aberdeen-inverness` segment -- station-level overlap,
         // distinct segment names, both stay ExclusiveSegment.
-        let inc = incident("LNER-1", "Points failure at Aberdeen", "Points failure causing delays at Aberdeen.", &["GR"], &["ABD"]);
+        let inc = incident(
+            "LNER-1",
+            "Points failure at Aberdeen",
+            "Points failure causing delays at Aberdeen.",
+            &["GR"],
+            &["ABD"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["lner-ecml".to_string(), "scotrail-aberdeen-inverness".to_string()])
+            HashSet::from([
+                "lner-ecml".to_string(),
+                "scotrail-aberdeen-inverness".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -1109,7 +1533,12 @@ mod tests {
         assert!(matched_ids.contains("lner-leeds"));
         for m in &matches {
             if m.line.id.starts_with("lner-") {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -1145,9 +1574,17 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["lner-hull".to_string(), "hull-trains".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["lner-hull".to_string(), "hull-trains".to_string()])
+        );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -1175,7 +1612,12 @@ mod tests {
         assert!(matched_ids.contains("lner-hull"));
         for m in &matches {
             if m.line.id.starts_with("lner-") {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -1238,7 +1680,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -1306,7 +1753,9 @@ mod tests {
                 "lner-leeds" | "northern-wharfedale" | "northern-calder-valley" | "tpe-north" => {
                     MatchScope::ExclusiveSegment
                 }
-                "northern" | "northern-yorkshire-coast" | "northern-airedale" => MatchScope::SharedSegment,
+                "northern" | "northern-yorkshire-coast" | "northern-airedale" => {
+                    MatchScope::SharedSegment
+                }
                 other => panic!("unexpected line in Leeds overlap test: {other}"),
             };
             assert_eq!(m.scope, expected, "{} scope mismatch", m.line.id);
@@ -1365,7 +1814,12 @@ mod tests {
         assert!(matched_ids.contains("grand-central-bradford"));
         for m in &matches {
             if m.line.id.starts_with("grand-central") {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -1391,9 +1845,20 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["grand-central-bradford".to_string(), "northern-calder-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "grand-central-bradford".to_string(),
+                "northern-calder-valley".to_string()
+            ])
+        );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -1416,8 +1881,14 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert!(!matched_ids.contains("grand-central"), "shopping-centre mention should still veto grand-central");
-        assert!(!matched_ids.contains("grand-central-bradford"), "shopping-centre mention should still veto grand-central-bradford");
+        assert!(
+            !matched_ids.contains("grand-central"),
+            "shopping-centre mention should still veto grand-central"
+        );
+        assert!(
+            !matched_ids.contains("grand-central-bradford"),
+            "shopping-centre mention should still veto grand-central-bradford"
+        );
     }
 
     #[test]
@@ -1439,11 +1910,22 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert!(matched_ids.contains("grand-central"), "unrelated Birmingham mention should not veto grand-central");
-        assert!(matched_ids.contains("grand-central-bradford"), "unrelated Birmingham mention should not veto grand-central-bradford");
+        assert!(
+            matched_ids.contains("grand-central"),
+            "unrelated Birmingham mention should not veto grand-central"
+        );
+        assert!(
+            matched_ids.contains("grand-central-bradford"),
+            "unrelated Birmingham mention should not veto grand-central-bradford"
+        );
         for m in &matches {
             if m.line.id.starts_with("grand-central") {
-                assert_eq!(m.scope, MatchScope::KeywordOnly, "{} should match via keyword only", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::KeywordOnly,
+                    "{} should match via keyword only",
+                    m.line.id
+                );
             }
         }
     }
@@ -1513,10 +1995,14 @@ mod tests {
             HashSet::from(["lumo".to_string(), "scotrail-central-belt".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
-
 
     // No shared-segment-propagation test for tpe-anglo-scottish: per the
     // batch's pre-flight scan it only overlaps sibling TPE lines at
@@ -1544,10 +2030,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["tpe-anglo-scottish".to_string(), "scotrail-glasgow-suburban".to_string()])
+            HashSet::from([
+                "tpe-anglo-scottish".to_string(),
+                "scotrail-glasgow-suburban".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -1563,9 +2057,14 @@ mod tests {
     #[test]
     fn tpe_anglo_scottish_batch8_infill_stations_present() {
         let lines = load_line("tpe-anglo-scottish");
-        let line = lines.get("tpe-anglo-scottish").expect("tpe-anglo-scottish line should exist");
+        let line = lines
+            .get("tpe-anglo-scottish")
+            .expect("tpe-anglo-scottish line should exist");
         for crs in ["SNH", "WGN", "MCO", "BON", "CRS"] {
-            assert!(line.has_station(crs), "tpe-anglo-scottish should now list {crs}");
+            assert!(
+                line.has_station(crs),
+                "tpe-anglo-scottish should now list {crs}"
+            );
         }
     }
 
@@ -1595,7 +2094,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tpe-anglo-scottish".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tpe-anglo-scottish".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -1639,7 +2141,9 @@ mod tests {
     fn tpe_south_batch8_infill_stations_present() {
         let lines = load_line("tpe-south");
         let line = lines.get("tpe-south").expect("tpe-south line should exist");
-        for crs in ["LPY", "WAW", "WAC", "BWD", "IRL", "URM", "MCO", "MHS", "BTB", "HAB"] {
+        for crs in [
+            "LPY", "WAW", "WAC", "BWD", "IRL", "URM", "MCO", "MHS", "BTB", "HAB",
+        ] {
             assert!(line.has_station(crs), "tpe-south should now list {crs}");
         }
     }
@@ -1676,7 +2180,12 @@ mod tests {
             HashSet::from(["tpe-borders".to_string(), "lner-ecml".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -1693,7 +2202,9 @@ mod tests {
     #[test]
     fn tpe_borders_batch8_infill_stations_present() {
         let lines = load_line("tpe-borders");
-        let line = lines.get("tpe-borders").expect("tpe-borders line should exist");
+        let line = lines
+            .get("tpe-borders")
+            .expect("tpe-borders line should exist");
         for crs in ["CRM", "ELT"] {
             assert!(line.has_station(crs), "tpe-borders should now list {crs}");
         }
@@ -1797,9 +2308,16 @@ mod tests {
         // an incident at Birmingham New Street (XC's hub) must not match
         // this line, and this line's Birmingham approach (Snow Hill/Moor
         // Street) is a different station entirely.
-        let bhm_inc = incident("XC-BHM", "Points failure at Birmingham New Street", "Points failure causing delays.", &["XC"], &["BHM"]);
+        let bhm_inc = incident(
+            "XC-BHM",
+            "Points failure at Birmingham New Street",
+            "Points failure causing delays.",
+            &["XC"],
+            &["BHM"],
+        );
         let bhm_matches = lines_affected_by(&bhm_inc, &lines, &registry);
-        let bhm_matched_ids: HashSet<String> = bhm_matches.iter().map(|m| m.line.id.clone()).collect();
+        let bhm_matched_ids: HashSet<String> =
+            bhm_matches.iter().map(|m| m.line.id.clone()).collect();
         assert!(!bhm_matched_ids.contains("chiltern-main-line"));
     }
 
@@ -1812,13 +2330,24 @@ mod tests {
         // station, each classified against its own (exclusive) segment.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("CH-3", "Overhead line damage at Banbury", "Overhead line damage causing delays.", &[], &["BAN"]);
+        let inc = incident(
+            "CH-3",
+            "Overhead line damage at Banbury",
+            "Overhead line damage causing delays.",
+            &[],
+            &["BAN"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert!(matched_ids.contains("chiltern-main-line"));
         assert!(matched_ids.contains("xc-south-coast"));
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment (station overlap, not segment-sharing)", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment (station overlap, not segment-sharing)",
+                m.line.id
+            );
         }
     }
 
@@ -1843,7 +2372,12 @@ mod tests {
         assert!(matched_ids.contains("chiltern-aylesbury"));
         for m in &matches {
             if m.line.id.starts_with("chiltern-") {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -1861,7 +2395,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["chiltern-aylesbury".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["chiltern-aylesbury".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -1885,7 +2422,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["chiltern-aylesbury".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["chiltern-aylesbury".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -1921,11 +2461,17 @@ mod tests {
         let lines = load_line("c2c");
         let c2c = lines.get("c2c").expect("c2c line should exist");
         for crs in ["DDK", "RNM", "PFL"] {
-            assert!(c2c.has_station(crs), "c2c should include {crs} on the Rainham branch");
+            assert!(
+                c2c.has_station(crs),
+                "c2c should include {crs} on the Rainham branch"
+            );
         }
         // Rainham (Essex) is RNM; RAI is Rainham (Kent) on Southeastern's
         // Chatham main line and must never appear here.
-        assert!(!c2c.has_station("RAI"), "RAI is Rainham (Kent), not c2c's Rainham (Essex)");
+        assert!(
+            !c2c.has_station("RAI"),
+            "RAI is Rainham (Kent), not c2c's Rainham (Essex)"
+        );
     }
 
     #[test]
@@ -1971,7 +2517,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["merseyrail-northern".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["merseyrail-northern".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -1993,7 +2542,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["merseyrail-wirral".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["merseyrail-wirral".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2023,7 +2575,12 @@ mod tests {
         assert!(matched_ids.contains("merseyrail-northern"));
         assert!(matched_ids.contains("merseyrail-wirral"));
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment (station overlap, not segment-sharing)", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment (station overlap, not segment-sharing)",
+                m.line.id
+            );
         }
     }
     #[test]
@@ -2066,10 +2623,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-west-anglia".to_string(), "xc-stansted".to_string()])
+            HashSet::from([
+                "greater-anglia-west-anglia".to_string(),
+                "xc-stansted".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should stay ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should stay ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2095,10 +2660,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-west-anglia".to_string(), "greater-anglia-stansted-express".to_string()])
+            HashSet::from([
+                "greater-anglia-west-anglia".to_string(),
+                "greater-anglia-stansted-express".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2128,10 +2701,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-stansted-express".to_string(), "xc-stansted".to_string()])
+            HashSet::from([
+                "greater-anglia-stansted-express".to_string(),
+                "xc-stansted".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2160,7 +2741,13 @@ mod tests {
         // independent ExclusiveSegment matches by the same pattern.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("LE-4", "Points failure at Cambridge", "Points failure causing delays.", &["LE"], &["CBG"]);
+        let inc = incident(
+            "LE-4",
+            "Points failure at Cambridge",
+            "Points failure causing delays.",
+            &["LE"],
+            &["CBG"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -2174,7 +2761,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2196,7 +2788,10 @@ mod tests {
             "WTO", "CEH", "HNK", "NBR", "SWS", "MMO", "OKM", "SMD", "WLE", "MCH", "MNE", "CMS",
             "SED", "WLF", "GRC", "AUD", "NWE", "ESM", "SST",
         ] {
-            assert!(line.has_station(crs), "{crs} should now be recognised on xc-stansted");
+            assert!(
+                line.has_station(crs),
+                "{crs} should now be recognised on xc-stansted"
+            );
         }
     }
 
@@ -2220,10 +2815,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-west-anglia".to_string(), "xc-stansted".to_string()])
+            HashSet::from([
+                "greater-anglia-west-anglia".to_string(),
+                "xc-stansted".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should stay ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should stay ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2255,10 +2858,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-main-line".to_string(), "greater-anglia-essex-branches".to_string()])
+            HashSet::from([
+                "greater-anglia-main-line".to_string(),
+                "greater-anglia-essex-branches".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2283,10 +2894,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-main-line".to_string(), "greater-anglia-essex-branches".to_string()])
+            HashSet::from([
+                "greater-anglia-main-line".to_string(),
+                "greater-anglia-essex-branches".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2310,7 +2929,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["greater-anglia-essex-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["greater-anglia-essex-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2331,7 +2953,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["greater-anglia-suffolk-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["greater-anglia-suffolk-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2362,10 +2987,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-main-line".to_string(), "greater-anglia-suffolk-branches".to_string()])
+            HashSet::from([
+                "greater-anglia-main-line".to_string(),
+                "greater-anglia-suffolk-branches".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2391,10 +3024,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-main-line".to_string(), "greater-anglia-suffolk-branches".to_string()])
+            HashSet::from([
+                "greater-anglia-main-line".to_string(),
+                "greater-anglia-suffolk-branches".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2419,10 +3060,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["greater-anglia-main-line".to_string(), "greater-anglia-suffolk-branches".to_string()])
+            HashSet::from([
+                "greater-anglia-main-line".to_string(),
+                "greater-anglia-suffolk-branches".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2443,7 +3092,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["greater-anglia-norfolk-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["greater-anglia-norfolk-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2467,7 +3119,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["greater-anglia-norfolk-branches".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["greater-anglia-norfolk-branches".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2515,7 +3170,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2565,7 +3225,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -2592,10 +3257,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["wcml-birmingham".to_string(), "lnwr-birmingham-crewe".to_string()])
+            HashSet::from([
+                "wcml-birmingham".to_string(),
+                "lnwr-birmingham-crewe".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2624,8 +3297,13 @@ mod tests {
         // that file's Task 9.2 note.) So per this task's testing convention,
         // there's no sibling `MatchScope` assertion to add here; skipped.
         let lines = load_line("wcml-birmingham");
-        let line = lines.get("wcml-birmingham").expect("wcml-birmingham line should exist");
-        assert!(line.has_station("MGN"), "wcml-birmingham should now include Marston Green (MGN)");
+        let line = lines
+            .get("wcml-birmingham")
+            .expect("wcml-birmingham line should exist");
+        assert!(
+            line.has_station("MGN"),
+            "wcml-birmingham should now include Marston Green (MGN)"
+        );
     }
 
     #[test]
@@ -2684,9 +3362,19 @@ mod tests {
         );
         for m in &matches {
             if m.line.id == "lnwr-birmingham-crewe" {
-                assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::ExclusiveSegment,
+                    "{} should be ExclusiveSegment",
+                    m.line.id
+                );
             } else {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -2764,10 +3452,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["wcml-north-wales".to_string(), "tfw-north-wales-coast".to_string()])
+            HashSet::from([
+                "wcml-north-wales".to_string(),
+                "tfw-north-wales-coast".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2795,10 +3491,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["wmr-snow-hill".to_string(), "chiltern-main-line".to_string()])
+            HashSet::from([
+                "wmr-snow-hill".to_string(),
+                "chiltern-main-line".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2826,10 +3530,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["wmr-snow-hill".to_string(), "chiltern-main-line".to_string()])
+            HashSet::from([
+                "wmr-snow-hill".to_string(),
+                "chiltern-main-line".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2905,7 +3617,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["lnwr-birmingham-crewe".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["lnwr-birmingham-crewe".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2931,7 +3646,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["lnwr-birmingham-crewe".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["lnwr-birmingham-crewe".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -2965,10 +3683,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["lnwr-birmingham-crewe".to_string(), "wcml-birmingham".to_string()])
+            HashSet::from([
+                "lnwr-birmingham-crewe".to_string(),
+                "wcml-birmingham".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -2984,7 +3710,13 @@ mod tests {
     fn gwr_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-1", "Points failure at Chippenham", "Points failure causing delays at Chippenham.", &["GW"], &["CPM"]);
+        let inc = incident(
+            "GW-1",
+            "Points failure at Chippenham",
+            "Points failure causing delays at Chippenham.",
+            &["GW"],
+            &["CPM"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["gwr-main-line".to_string()]));
@@ -3001,7 +3733,13 @@ mod tests {
     fn gwr_cotswold_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-2", "Signal failure at Moreton-in-Marsh", "Signal failure causing delays at Moreton-in-Marsh.", &["GW"], &["MIM"]);
+        let inc = incident(
+            "GW-2",
+            "Signal failure at Moreton-in-Marsh",
+            "Signal failure causing delays at Moreton-in-Marsh.",
+            &["GW"],
+            &["MIM"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["gwr-cotswold".to_string()]));
@@ -3019,7 +3757,9 @@ mod tests {
     #[test]
     fn gwr_cotswold_minor_halts_infill_stations_present() {
         let lines = load_line("gwr-cotswold");
-        let line = lines.get("gwr-cotswold").expect("gwr-cotswold line should exist");
+        let line = lines
+            .get("gwr-cotswold")
+            .expect("gwr-cotswold line should exist");
         for crs in ["HND", "CME", "FIN", "AUW", "SIP"] {
             assert!(line.has_station(crs), "gwr-cotswold should now list {crs}");
         }
@@ -3039,7 +3779,13 @@ mod tests {
     fn gwr_cotswold_hanborough_incident_stays_on_its_own_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-18", "Signal failure at Hanborough", "Signal failure causing delays at Hanborough.", &["GW"], &["HND"]);
+        let inc = incident(
+            "GW-18",
+            "Signal failure at Hanborough",
+            "Signal failure causing delays at Hanborough.",
+            &["GW"],
+            &["HND"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["gwr-cotswold".to_string()]));
@@ -3061,14 +3807,25 @@ mod tests {
     fn gwr_trunk_paddington_incident_propagates_to_cotswold() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-3", "Signal failure at Didcot Parkway", "Signal failure causing delays to GWR services.", &["GW"], &["DID"]);
+        let inc = incident(
+            "GW-3",
+            "Signal failure at Didcot Parkway",
+            "Signal failure causing delays to GWR services.",
+            &["GW"],
+            &["DID"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert!(matched_ids.contains("gwr-main-line"));
         assert!(matched_ids.contains("gwr-cotswold"));
         for m in &matches {
             if m.line.id.starts_with("gwr-") && m.line.id != "gwr-thames-valley" {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -3088,7 +3845,13 @@ mod tests {
     fn gwr_south_wales_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-4", "Overhead line damage at Bridgend", "Overhead line damage causing delays at Bridgend.", &["GW"], &["BGN"]);
+        let inc = incident(
+            "GW-4",
+            "Overhead line damage at Bridgend",
+            "Overhead line damage causing delays at Bridgend.",
+            &["GW"],
+            &["BGN"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(matched_ids, HashSet::from(["gwr-south-wales".to_string()]));
@@ -3103,9 +3866,14 @@ mod tests {
     #[test]
     fn gwr_south_wales_infill_stations_present() {
         let lines = load_line("gwr-south-wales");
-        let line = lines.get("gwr-south-wales").expect("gwr-south-wales line should exist");
+        let line = lines
+            .get("gwr-south-wales")
+            .expect("gwr-south-wales line should exist");
         for crs in ["PWY", "PIL", "STJ"] {
-            assert!(line.has_station(crs), "gwr-south-wales should now list {crs}");
+            assert!(
+                line.has_station(crs),
+                "gwr-south-wales should now list {crs}"
+            );
         }
     }
 
@@ -3147,7 +3915,12 @@ mod tests {
             HashSet::from(["gwr-south-wales".to_string(), "xc-cardiff".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -3185,7 +3958,13 @@ mod tests {
     fn gwr_trunk_paddington_incident_propagates_to_south_wales() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-5", "Signal failure at Didcot Parkway", "Signal failure causing delays to GWR services.", &["GW"], &["DID"]);
+        let inc = incident(
+            "GW-5",
+            "Signal failure at Didcot Parkway",
+            "Signal failure causing delays to GWR services.",
+            &["GW"],
+            &["DID"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -3200,9 +3979,19 @@ mod tests {
         );
         for m in &matches {
             if m.line.id == "gwr-thames-valley" || m.line.id == "xc-south-coast" {
-                assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should stay ExclusiveSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::ExclusiveSegment,
+                    "{} should stay ExclusiveSegment",
+                    m.line.id
+                );
             } else {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -3236,7 +4025,13 @@ mod tests {
         // station-overlap-only pattern as this test already established.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-6", "Points failure at Cardiff Central", "Points failure causing delays at Cardiff Central.", &["GW"], &["CDF"]);
+        let inc = incident(
+            "GW-6",
+            "Points failure at Cardiff Central",
+            "Points failure causing delays at Cardiff Central.",
+            &["GW"],
+            &["CDF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -3272,9 +4067,17 @@ mod tests {
     #[test]
     fn xc_cardiff_has_station_severn_tunnel_junction() {
         let lines = load_line("xc-cardiff");
-        let xc_cardiff = lines.get("xc-cardiff").expect("xc-cardiff line should exist");
-        assert!(xc_cardiff.has_station("STJ"), "xc-cardiff should now recognise Severn Tunnel Junction (STJ)");
-        assert!(xc_cardiff.has_station("CDT"), "xc-cardiff should now recognise Caldicot (CDT)");
+        let xc_cardiff = lines
+            .get("xc-cardiff")
+            .expect("xc-cardiff line should exist");
+        assert!(
+            xc_cardiff.has_station("STJ"),
+            "xc-cardiff should now recognise Severn Tunnel Junction (STJ)"
+        );
+        assert!(
+            xc_cardiff.has_station("CDT"),
+            "xc-cardiff should now recognise Caldicot (CDT)"
+        );
     }
 
     // Task 9.5 (2026-09-01) fresh route-diagram pass on `xc-manchester.toml`
@@ -3295,12 +4098,17 @@ mod tests {
     #[test]
     fn xc_manchester_recognises_newly_added_stations() {
         let lines = load_line("xc-manchester");
-        let line = lines.get("xc-manchester").expect("xc-manchester should load");
+        let line = lines
+            .get("xc-manchester")
+            .expect("xc-manchester should load");
         for crs in [
             "LVM", "HTC", "CHU", "HTH", "ALD", "CEL", "GTR", "HCH", "SDB", "PKG", "CSY", "TIP",
             "DDP", "SAD", "SGB", "SMR",
         ] {
-            assert!(line.has_station(crs), "{crs} should now be recognised on xc-manchester");
+            assert!(
+                line.has_station(crs),
+                "{crs} should now be recognised on xc-manchester"
+            );
         }
     }
 
@@ -3330,7 +4138,12 @@ mod tests {
             HashSet::from(["xc-manchester".to_string(), "wmr-snow-hill".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} scope mismatch", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} scope mismatch",
+                m.line.id
+            );
         }
     }
 
@@ -3369,10 +4182,19 @@ mod tests {
     fn gwr_cornish_main_line_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-8", "Signal failure at Truro", "Signal failure causing delays at Truro.", &["GW"], &["TRU"]);
+        let inc = incident(
+            "GW-8",
+            "Signal failure at Truro",
+            "Signal failure causing delays at Truro.",
+            &["GW"],
+            &["TRU"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-cornish-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["gwr-cornish-main-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -3385,9 +4207,14 @@ mod tests {
     #[test]
     fn gwr_cornish_main_line_plymouth_area_infill_stations_present() {
         let lines = load_line("gwr-cornish-main-line");
-        let line = lines.get("gwr-cornish-main-line").expect("gwr-cornish-main-line line should exist");
+        let line = lines
+            .get("gwr-cornish-main-line")
+            .expect("gwr-cornish-main-line line should exist");
         for crs in ["DPT", "DOC", "KEY", "SBF", "STS", "SGM", "MEN"] {
-            assert!(line.has_station(crs), "gwr-cornish-main-line should now list {crs}");
+            assert!(
+                line.has_station(crs),
+                "gwr-cornish-main-line should now list {crs}"
+            );
         }
     }
 
@@ -3403,10 +4230,19 @@ mod tests {
     fn gwr_cornish_main_line_saltash_incident_stays_on_its_own_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-10", "Points failure at Saltash", "Points failure causing delays at Saltash.", &["GW"], &["STS"]);
+        let inc = incident(
+            "GW-10",
+            "Points failure at Saltash",
+            "Points failure causing delays at Saltash.",
+            &["GW"],
+            &["STS"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-cornish-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["gwr-cornish-main-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -3427,7 +4263,13 @@ mod tests {
     fn gwr_trunk_xc_south_west_incident_propagates_across_west_of_england_and_cornish_main_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-9", "Flooding at Exeter St Davids", "Flooding causing delays to GWR and CrossCountry services.", &["GW"], &["EXD"]);
+        let inc = incident(
+            "GW-9",
+            "Flooding at Exeter St Davids",
+            "Flooding causing delays to GWR and CrossCountry services.",
+            &["GW"],
+            &["EXD"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -3439,7 +4281,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -3466,15 +4313,29 @@ mod tests {
     fn gwr_thames_valley_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-10", "Signal failure at Culham", "Signal failure causing delays at Culham.", &["GW"], &["CUM"]);
+        let inc = incident(
+            "GW-10",
+            "Signal failure at Culham",
+            "Signal failure causing delays at Culham.",
+            &["GW"],
+            &["CUM"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["gwr-thames-valley".to_string(), "xc-south-coast".to_string()])
+            HashSet::from([
+                "gwr-thames-valley".to_string(),
+                "xc-south-coast".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should stay ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should stay ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -3489,13 +4350,18 @@ mod tests {
     #[test]
     fn xc_south_coast_recognises_newly_added_stations() {
         let lines = load_line("xc-south-coast");
-        let line = lines.get("xc-south-coast").expect("xc-south-coast should load");
+        let line = lines
+            .get("xc-south-coast")
+            .expect("xc-south-coast should load");
         for crs in [
             "KNW", "KGS", "HYD", "TAC", "RAD", "APF", "CHO", "GOR", "PAN", "TLH", "RDW", "RGP",
             "MOR", "BMY", "MIC", "SHW", "ESL", "SOA", "SWG", "SDN", "MBK", "RDB", "TTN", "ANF",
             "BEU", "BCU", "SWY", "NWM", "HNA", "CHR", "POK",
         ] {
-            assert!(line.has_station(crs), "{crs} should now be recognised on xc-south-coast");
+            assert!(
+                line.has_station(crs),
+                "{crs} should now be recognised on xc-south-coast"
+            );
         }
     }
 
@@ -3506,7 +4372,8 @@ mod tests {
     // reusing RDW's CRS/TIPLOC verbatim. Station-level overlap only, no
     // segment shared, so both lines should stay ExclusiveSegment.
     #[test]
-    fn xc_south_coast_station_overlap_with_gwr_thames_valley_at_reading_west_stays_exclusive_each_line() {
+    fn xc_south_coast_station_overlap_with_gwr_thames_valley_at_reading_west_stays_exclusive_each_line()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -3520,10 +4387,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["gwr-thames-valley".to_string(), "xc-south-coast".to_string()])
+            HashSet::from([
+                "gwr-thames-valley".to_string(),
+                "xc-south-coast".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should stay ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should stay ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -3543,10 +4418,22 @@ mod tests {
     fn gwr_thames_valley_station_overlap_with_elizabeth_west_stays_exclusive_each_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-11", "Points failure at Maidenhead", "Points failure causing delays at Maidenhead.", &["GW"], &["MAI"]);
+        let inc = incident(
+            "GW-11",
+            "Points failure at Maidenhead",
+            "Points failure causing delays at Maidenhead.",
+            &["GW"],
+            &["MAI"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-thames-valley".to_string(), "elizabeth-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "gwr-thames-valley".to_string(),
+                "elizabeth-line".to_string()
+            ])
+        );
         for m in &matches {
             assert_eq!(
                 m.scope,
@@ -3576,7 +4463,13 @@ mod tests {
         // station-overlap pattern the other three already establish.
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-12", "Overhead line damage at Oxford", "Overhead line damage causing delays at Oxford.", &["GW"], &["OXF"]);
+        let inc = incident(
+            "GW-12",
+            "Overhead line damage at Oxford",
+            "Overhead line damage causing delays at Oxford.",
+            &["GW"],
+            &["OXF"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
@@ -3620,10 +4513,22 @@ mod tests {
     fn gwr_thames_valley_station_overlap_with_gwr_west_of_england_stays_exclusive_each_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-13", "Points failure at Newbury", "Points failure causing delays at Newbury.", &["GW"], &["NBY"]);
+        let inc = incident(
+            "GW-13",
+            "Points failure at Newbury",
+            "Points failure causing delays at Newbury.",
+            &["GW"],
+            &["NBY"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-thames-valley".to_string(), "gwr-west-of-england".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "gwr-thames-valley".to_string(),
+                "gwr-west-of-england".to_string()
+            ])
+        );
         for m in &matches {
             assert_eq!(
                 m.scope,
@@ -3647,9 +4552,14 @@ mod tests {
     #[test]
     fn gwr_thames_valley_paddington_area_infill_stations_present() {
         let lines = load_line("gwr-thames-valley");
-        let line = lines.get("gwr-thames-valley").expect("gwr-thames-valley line should exist");
+        let line = lines
+            .get("gwr-thames-valley")
+            .expect("gwr-thames-valley line should exist");
         for crs in ["STL", "HAY", "WDT", "IVR", "LNY", "BNM", "TAP"] {
-            assert!(line.has_station(crs), "gwr-thames-valley should now list {crs}");
+            assert!(
+                line.has_station(crs),
+                "gwr-thames-valley should now list {crs}"
+            );
         }
         assert!(
             !line.has_station("EAL"),
@@ -3673,19 +4583,36 @@ mod tests {
     fn gwr_thames_valley_station_overlap_with_elizabeth_trunk_west_stays_exclusive_each_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-20", "Signal failure at Southall", "Signal failure causing delays at Southall.", &["GW"], &["STL"]);
+        let inc = incident(
+            "GW-20",
+            "Signal failure at Southall",
+            "Signal failure causing delays at Southall.",
+            &["GW"],
+            &["STL"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
         assert_eq!(
             by_id.keys().cloned().collect::<HashSet<_>>(),
-            HashSet::from(["gwr-thames-valley".to_string(), "elizabeth-line".to_string(), "elizabeth-heathrow".to_string()])
+            HashSet::from([
+                "gwr-thames-valley".to_string(),
+                "elizabeth-line".to_string(),
+                "elizabeth-heathrow".to_string()
+            ])
         );
         assert_eq!(
             by_id.get("gwr-thames-valley"),
             Some(&MatchScope::ExclusiveSegment),
             "gwr-thames-valley should stay ExclusiveSegment (station overlap only, not a shared segment, for its own segment)"
         );
-        assert_eq!(by_id.get("elizabeth-line"), Some(&MatchScope::SharedSegment), "elizabeth-line should be SharedSegment (elizabeth-trunk-west)");
+        assert_eq!(
+            by_id.get("elizabeth-line"),
+            Some(&MatchScope::SharedSegment),
+            "elizabeth-line should be SharedSegment (elizabeth-trunk-west)"
+        );
         assert_eq!(
             by_id.get("elizabeth-heathrow"),
             Some(&MatchScope::SharedSegment),
@@ -3702,10 +4629,19 @@ mod tests {
     fn gwr_thames_valley_iver_incident_stays_on_its_own_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-21", "Points failure at Iver", "Points failure causing delays at Iver.", &["GW"], &["IVR"]);
+        let inc = incident(
+            "GW-21",
+            "Points failure at Iver",
+            "Points failure causing delays at Iver.",
+            &["GW"],
+            &["IVR"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-thames-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["gwr-thames-valley".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -3734,9 +4670,14 @@ mod tests {
     #[test]
     fn gwr_west_of_england_berks_and_hants_infill_stations_present() {
         let lines = load_line("gwr-west-of-england");
-        let line = lines.get("gwr-west-of-england").expect("gwr-west-of-england line should exist");
+        let line = lines
+            .get("gwr-west-of-england")
+            .expect("gwr-west-of-england line should exist");
         for crs in ["KIT", "HGD", "BDW", "PEW"] {
-            assert!(line.has_station(crs), "gwr-west-of-england should now list {crs}");
+            assert!(
+                line.has_station(crs),
+                "gwr-west-of-england should now list {crs}"
+            );
         }
         for crs in ["RDW", "THE", "AMT", "MDG", "THA", "NRC", "FRO"] {
             assert!(
@@ -3758,10 +4699,19 @@ mod tests {
     fn gwr_west_of_england_kintbury_incident_stays_on_its_own_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-22", "Signal failure at Kintbury", "Signal failure causing delays at Kintbury.", &["GW"], &["KIT"]);
+        let inc = incident(
+            "GW-22",
+            "Signal failure at Kintbury",
+            "Signal failure causing delays at Kintbury.",
+            &["GW"],
+            &["KIT"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-west-of-england".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["gwr-west-of-england".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -3774,10 +4724,19 @@ mod tests {
     fn gwr_bristol_suburban_severn_beach_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-14", "Trespass incident at Severn Beach", "Trespass incident causing delays at Severn Beach.", &["GW"], &["SVB"]);
+        let inc = incident(
+            "GW-14",
+            "Trespass incident at Severn Beach",
+            "Trespass incident causing delays at Severn Beach.",
+            &["GW"],
+            &["SVB"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-bristol-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["gwr-bristol-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -3803,15 +4762,29 @@ mod tests {
     fn gwr_westbury_castle_cary_trunk_incident_propagates_to_bristol_suburban() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-15", "Points failure at Westbury", "Points failure causing delays at Westbury.", &["GW"], &["WSB"]);
+        let inc = incident(
+            "GW-15",
+            "Points failure at Westbury",
+            "Points failure causing delays at Westbury.",
+            &["GW"],
+            &["WSB"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["gwr-west-of-england".to_string(), "gwr-bristol-suburban".to_string()])
+            HashSet::from([
+                "gwr-west-of-england".to_string(),
+                "gwr-bristol-suburban".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -3832,10 +4805,22 @@ mod tests {
     fn gwr_bristol_suburban_station_overlap_with_gwr_main_line_stays_exclusive_each_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-16", "Overhead line damage at Bath Spa", "Overhead line damage causing delays at Bath Spa.", &["GW"], &["BTH"]);
+        let inc = incident(
+            "GW-16",
+            "Overhead line damage at Bath Spa",
+            "Overhead line damage causing delays at Bath Spa.",
+            &["GW"],
+            &["BTH"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-bristol-suburban".to_string(), "gwr-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "gwr-bristol-suburban".to_string(),
+                "gwr-main-line".to_string()
+            ])
+        );
         for m in &matches {
             assert_eq!(
                 m.scope,
@@ -3862,10 +4847,22 @@ mod tests {
     fn gwr_bristol_suburban_station_overlap_with_swr_south_west_main_stays_exclusive_each_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("GW-17", "Flooding at Weymouth", "Flooding causing delays at Weymouth.", &["GW"], &["WEY"]);
+        let inc = incident(
+            "GW-17",
+            "Flooding at Weymouth",
+            "Flooding causing delays at Weymouth.",
+            &["GW"],
+            &["WEY"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["gwr-bristol-suburban".to_string(), "swr-south-west-main".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "gwr-bristol-suburban".to_string(),
+                "swr-south-west-main".to_string()
+            ])
+        );
         for m in &matches {
             assert_eq!(
                 m.scope,
@@ -3943,7 +4940,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tfw-heart-of-wales".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-heart-of-wales".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -3999,10 +4999,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["tfw-north-wales-coast".to_string(), "wcml-north-wales".to_string()])
+            HashSet::from([
+                "tfw-north-wales-coast".to_string(),
+                "wcml-north-wales".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4041,7 +5049,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4099,7 +5112,12 @@ mod tests {
             HashSet::from(["tfw-marches".to_string(), "tfw-heart-of-wales".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4137,7 +5155,12 @@ mod tests {
             HashSet::from(["tfw-marches".to_string(), "tfw-heart-of-wales".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4182,7 +5205,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4209,11 +5237,17 @@ mod tests {
             &["SHR"],
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
-        let scopes: HashMap<String, MatchScope> =
-            matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+        let scopes: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
         assert_eq!(
             scopes.keys().cloned().collect::<HashSet<String>>(),
-            HashSet::from(["tfw-cambrian".to_string(), "tfw-marches".to_string(), "tfw-heart-of-wales".to_string()])
+            HashSet::from([
+                "tfw-cambrian".to_string(),
+                "tfw-marches".to_string(),
+                "tfw-heart-of-wales".to_string()
+            ])
         );
         assert_eq!(scopes["tfw-cambrian"], MatchScope::ExclusiveSegment);
         assert_eq!(scopes["tfw-marches"], MatchScope::SharedSegment);
@@ -4238,7 +5272,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tfw-valley-lines-north".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-valley-lines-north".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4275,10 +5312,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["tfw-valley-lines-north".to_string(), "tfw-valley-lines-south".to_string()])
+            HashSet::from([
+                "tfw-valley-lines-north".to_string(),
+                "tfw-valley-lines-south".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4300,7 +5345,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tfw-valley-lines-south".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-valley-lines-south".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4331,10 +5379,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["tfw-valley-lines-north".to_string(), "tfw-valley-lines-south".to_string()])
+            HashSet::from([
+                "tfw-valley-lines-north".to_string(),
+                "tfw-valley-lines-south".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -4365,7 +5421,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tfw-valley-lines-north".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-valley-lines-north".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4391,7 +5450,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-main-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4420,7 +5482,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-chatham".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-chatham".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4443,7 +5508,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-chatham".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-chatham".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4466,7 +5534,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-highspeed".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-highspeed".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4493,10 +5564,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southeastern-main-line".to_string(), "southeastern-highspeed".to_string()])
+            HashSet::from([
+                "southeastern-main-line".to_string(),
+                "southeastern-highspeed".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4527,10 +5606,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southeastern-main-line".to_string(), "southeastern-highspeed".to_string()])
+            HashSet::from([
+                "southeastern-main-line".to_string(),
+                "southeastern-highspeed".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4542,7 +5629,8 @@ mod tests {
     // not a shared trunk - both lines match a Ramsgate incident
     // independently, each ExclusiveSegment.
     #[test]
-    fn hs1_northkent_station_overlap_matches_both_chatham_and_hs1_as_independent_exclusive_segments() {
+    fn hs1_northkent_station_overlap_matches_both_chatham_and_hs1_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -4556,10 +5644,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southeastern-chatham".to_string(), "southeastern-highspeed".to_string()])
+            HashSet::from([
+                "southeastern-chatham".to_string(),
+                "southeastern-highspeed".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4587,7 +5683,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-metro-north-kent".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-metro-north-kent".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4611,7 +5710,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-metro-north-kent".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-metro-north-kent".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4670,7 +5772,8 @@ mod tests {
     // independent ExclusiveSegment station-overlap match, same treatment as
     // every other line in this set.
     #[test]
-    fn lbg_station_overlap_matches_senk_thameslink_core_seml_and_hayes_as_independent_exclusive_segments() {
+    fn lbg_station_overlap_matches_senk_thameslink_core_seml_and_hayes_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -4695,7 +5798,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4717,7 +5825,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-hayes-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-hayes-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4760,7 +5871,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4816,7 +5932,12 @@ mod tests {
             "both named lines list LEW and must both match; before the fix each vetoed the other and this was empty"
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4857,10 +5978,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southern-brighton-main-line".to_string(), "thameslink-southern".to_string()])
+            HashSet::from([
+                "southern-brighton-main-line".to_string(),
+                "thameslink-southern".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4906,10 +6035,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southern-brighton-main-line".to_string(), "thameslink-southern".to_string()])
+            HashSet::from([
+                "southern-brighton-main-line".to_string(),
+                "thameslink-southern".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -4936,7 +6073,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southern-coastway-east".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southern-coastway-east".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -4961,7 +6101,8 @@ mod tests {
     // documented but not acted on), so this remains a fourth independent
     // ExclusiveSegment station-overlap match, not a SharedSegment one.
     #[test]
-    fn btn_station_overlap_matches_coastway_east_and_brighton_main_line_as_independent_exclusive_segments() {
+    fn btn_station_overlap_matches_coastway_east_and_brighton_main_line_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -4983,7 +6124,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5013,7 +6159,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southern-coastway-west".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southern-coastway-west".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5031,7 +6180,8 @@ mod tests {
     // Confirms an incident at Havant matches both lines independently,
     // each still scoped ExclusiveSegment, never SharedSegment.
     #[test]
-    fn hav_station_overlap_matches_coastway_west_and_swr_portsmouth_direct_as_independent_exclusive_segments() {
+    fn hav_station_overlap_matches_coastway_west_and_swr_portsmouth_direct_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5045,10 +6195,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southern-coastway-west".to_string(), "swr-portsmouth-direct".to_string()])
+            HashSet::from([
+                "southern-coastway-west".to_string(),
+                "swr-portsmouth-direct".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5076,7 +6234,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southern-oxted-uckfield".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southern-oxted-uckfield".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5102,7 +6263,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southern-oxted-uckfield".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southern-oxted-uckfield".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5118,7 +6282,8 @@ mod tests {
     // matches all three lines independently, each still scoped
     // ExclusiveSegment, never SharedSegment.
     #[test]
-    fn vic_station_overlap_matches_brighton_main_line_chatham_and_oxted_uckfield_as_independent_exclusive_segments() {
+    fn vic_station_overlap_matches_brighton_main_line_chatham_and_oxted_uckfield_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5139,7 +6304,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5181,7 +6351,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["great-northern-kings-lynn".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["great-northern-kings-lynn".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5200,7 +6373,8 @@ mod tests {
     // (d) header comment), so it now joins this set as a third independent
     // exclusive-segment match.
     #[test]
-    fn cbg_station_overlap_matches_great_northern_kings_lynn_and_xc_stansted_as_independent_exclusive_segments() {
+    fn cbg_station_overlap_matches_great_northern_kings_lynn_and_xc_stansted_as_independent_exclusive_segments()
+     {
         // Cambridge is also greater-anglia-west-anglia.toml's (`waml-mainline`)
         // and greater-anglia-norfolk-branches.toml's (`breckland-line`) own
         // terminus (both Batch 2) -- two more independent ExclusiveSegment
@@ -5228,7 +6402,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5263,7 +6442,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["great-northern-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["great-northern-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5287,7 +6469,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["great-northern-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["great-northern-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5309,7 +6494,8 @@ mod tests {
     // OVERLAP (a) header comment), so it now joins this set as a third
     // independent exclusive-segment match.
     #[test]
-    fn fpk_station_overlap_matches_great_northern_suburban_and_kings_lynn_as_independent_exclusive_segments() {
+    fn fpk_station_overlap_matches_great_northern_suburban_and_kings_lynn_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5330,7 +6516,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5360,7 +6551,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["thameslink-bedford".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["thameslink-bedford".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5389,7 +6583,8 @@ mod tests {
     // comment), so it now joins this set as a fourth independent
     // exclusive-segment match.
     #[test]
-    fn stp_station_overlap_matches_thameslink_core_bedford_and_highspeed_as_independent_exclusive_segments() {
+    fn stp_station_overlap_matches_thameslink_core_bedford_and_highspeed_as_independent_exclusive_segments()
+     {
         // St Pancras is also emr-connect.toml's and emr-midland-main-line.toml's
         // own terminus (both Batch 7, merged separately), which genuinely
         // share track London-Bedford-ward and correspondingly share the
@@ -5442,7 +6637,8 @@ mod tests {
     // `stp_station_overlap_matches_thameslink_core_bedford_and_highspeed_as_independent_exclusive_segments`
     // above; this test covers the three remaining overlap stations.
     #[test]
-    fn ltn_lut_bdm_station_overlap_between_emr_and_thameslink_bedford_stays_exclusive_for_thameslink() {
+    fn ltn_lut_bdm_station_overlap_between_emr_and_thameslink_bedford_stays_exclusive_for_thameslink()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         for (crs, station_name) in [
@@ -5458,7 +6654,10 @@ mod tests {
                 &[crs],
             );
             let matches = lines_affected_by(&inc, &lines, &registry);
-            let by_id: HashMap<String, MatchScope> = matches.iter().map(|m| (m.line.id.clone(), m.scope)).collect();
+            let by_id: HashMap<String, MatchScope> = matches
+                .iter()
+                .map(|m| (m.line.id.clone(), m.scope))
+                .collect();
             assert_eq!(
                 by_id.keys().cloned().collect::<HashSet<_>>(),
                 HashSet::from([
@@ -5468,9 +6667,21 @@ mod tests {
                 ]),
                 "unexpected match set for {crs}"
             );
-            assert_eq!(by_id.get("emr-midland-main-line"), Some(&MatchScope::SharedSegment), "{crs}");
-            assert_eq!(by_id.get("emr-connect"), Some(&MatchScope::SharedSegment), "{crs}");
-            assert_eq!(by_id.get("thameslink-bedford"), Some(&MatchScope::ExclusiveSegment), "{crs}");
+            assert_eq!(
+                by_id.get("emr-midland-main-line"),
+                Some(&MatchScope::SharedSegment),
+                "{crs}"
+            );
+            assert_eq!(
+                by_id.get("emr-connect"),
+                Some(&MatchScope::SharedSegment),
+                "{crs}"
+            );
+            assert_eq!(
+                by_id.get("thameslink-bedford"),
+                Some(&MatchScope::ExclusiveSegment),
+                "{crs}"
+            );
         }
     }
 
@@ -5502,10 +6713,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["great-northern-kings-lynn".to_string(), "thameslink-cambridge".to_string()])
+            HashSet::from([
+                "great-northern-kings-lynn".to_string(),
+                "thameslink-cambridge".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -5523,7 +6742,8 @@ mod tests {
     // cbg_station_overlap_matches_great_northern_kings_lynn_and_xc_stansted_as_independent_exclusive_segments
     // above.
     #[test]
-    fn bdk_station_overlap_matches_great_northern_kings_lynn_and_thameslink_cambridge_as_independent_exclusive_segments() {
+    fn bdk_station_overlap_matches_great_northern_kings_lynn_and_thameslink_cambridge_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5537,10 +6757,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["great-northern-kings-lynn".to_string(), "thameslink-cambridge".to_string()])
+            HashSet::from([
+                "great-northern-kings-lynn".to_string(),
+                "thameslink-cambridge".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5563,7 +6791,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["thameslink-southern".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["thameslink-southern".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5585,7 +6816,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["thameslink-southern".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["thameslink-southern".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5605,7 +6839,8 @@ mod tests {
     // bfr_station_overlap_matches_thameslink_core_and_thameslink_southern_
     // as_independent_exclusive_segments above.
     #[test]
-    fn say_station_overlap_matches_chatham_and_thameslink_southern_as_independent_exclusive_segments() {
+    fn say_station_overlap_matches_chatham_and_thameslink_southern_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5619,10 +6854,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southeastern-chatham".to_string(), "thameslink-southern".to_string()])
+            HashSet::from([
+                "southeastern-chatham".to_string(),
+                "thameslink-southern".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5642,7 +6885,8 @@ mod tests {
     // bfr_station_overlap_matches_thameslink_core_and_thameslink_southern_
     // as_independent_exclusive_segments above.
     #[test]
-    fn ecr_station_overlap_matches_brighton_main_line_and_oxted_uckfield_as_independent_exclusive_segments() {
+    fn ecr_station_overlap_matches_brighton_main_line_and_oxted_uckfield_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5663,7 +6907,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5676,7 +6925,8 @@ mod tests {
     // stp_station_overlap_matches_thameslink_core_bedford_and_highspeed_as_independent_exclusive_segments
     // above.
     #[test]
-    fn bfr_station_overlap_matches_thameslink_core_and_thameslink_southern_as_independent_exclusive_segments() {
+    fn bfr_station_overlap_matches_thameslink_core_and_thameslink_southern_as_independent_exclusive_segments()
+     {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5688,9 +6938,20 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["thameslink-core".to_string(), "thameslink-southern".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from([
+                "thameslink-core".to_string(),
+                "thameslink-southern".to_string()
+            ])
+        );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5727,9 +6988,18 @@ mod tests {
         );
         for m in &matches {
             if m.line.id == "thameslink-southern" {
-                assert_eq!(m.scope, MatchScope::ExclusiveSegment, "thameslink-southern should be ExclusiveSegment (different segment name)");
+                assert_eq!(
+                    m.scope,
+                    MatchScope::ExclusiveSegment,
+                    "thameslink-southern should be ExclusiveSegment (different segment name)"
+                );
             } else {
-                assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+                assert_eq!(
+                    m.scope,
+                    MatchScope::SharedSegment,
+                    "{} should be SharedSegment",
+                    m.line.id
+                );
             }
         }
     }
@@ -5741,7 +7011,8 @@ mod tests {
     // station's own Wikipedia article (see thameslink-southern.toml's own
     // SEV comment), so station overlap only, not a shared segment.
     #[test]
-    fn sev_station_overlap_matches_seml_and_thameslink_southern_as_independent_exclusive_segments() {
+    fn sev_station_overlap_matches_seml_and_thameslink_southern_as_independent_exclusive_segments()
+    {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         let inc = incident(
@@ -5755,10 +7026,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southeastern-main-line".to_string(), "thameslink-southern".to_string()])
+            HashSet::from([
+                "southeastern-main-line".to_string(),
+                "thameslink-southern".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -5791,7 +7070,12 @@ mod tests {
             HashSet::from(["scotrail-central-belt".to_string(), "lumo".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -5816,7 +7100,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-glasgow-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-glasgow-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5839,7 +7126,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-ayrshire".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-ayrshire".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5856,7 +7146,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-ayrshire".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-ayrshire".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5891,7 +7184,12 @@ mod tests {
             HashSet::from(["scotrail-fife-borders".to_string(), "lner-ecml".to_string()])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 
@@ -5908,7 +7206,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-fife-borders".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-fife-borders".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5935,7 +7236,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-highland-main-line".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-highland-main-line".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5971,7 +7275,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-far-north".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-far-north".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -5988,7 +7295,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-far-north".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-far-north".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6044,10 +7354,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["scotrail-far-north".to_string(), "scotrail-kyle".to_string()])
+            HashSet::from([
+                "scotrail-far-north".to_string(),
+                "scotrail-kyle".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6088,7 +7406,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6110,7 +7433,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-west-highland-fort-william".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-west-highland-fort-william".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6132,7 +7458,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-west-highland-fort-william".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-west-highland-fort-william".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6173,7 +7502,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6203,7 +7537,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-glasgow-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-glasgow-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6231,8 +7568,13 @@ mod tests {
     #[test]
     fn scotrail_glasgow_suburban_new_kilpatrick_station_on_shared_west_trunk_segment() {
         let lines = load_line("scotrail-glasgow-suburban");
-        let suburban = lines.get("scotrail-glasgow-suburban").expect("scotrail-glasgow-suburban line should exist");
-        assert!(suburban.has_station("KPT"), "Kilpatrick (KPT) should now be a station on scotrail-glasgow-suburban");
+        let suburban = lines
+            .get("scotrail-glasgow-suburban")
+            .expect("scotrail-glasgow-suburban line should exist");
+        assert!(
+            suburban.has_station("KPT"),
+            "Kilpatrick (KPT) should now be a station on scotrail-glasgow-suburban"
+        );
 
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
@@ -6245,7 +7587,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-glasgow-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-glasgow-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::SharedSegment);
     }
 
@@ -6263,8 +7608,13 @@ mod tests {
     #[test]
     fn scotrail_glasgow_suburban_new_whifflet_branch_incident_does_not_propagate() {
         let lines = load_line("scotrail-glasgow-suburban");
-        let suburban = lines.get("scotrail-glasgow-suburban").expect("scotrail-glasgow-suburban line should exist");
-        assert!(suburban.has_station("WFF"), "Whifflet (WFF) should now be a station on scotrail-glasgow-suburban");
+        let suburban = lines
+            .get("scotrail-glasgow-suburban")
+            .expect("scotrail-glasgow-suburban line should exist");
+        assert!(
+            suburban.has_station("WFF"),
+            "Whifflet (WFF) should now be a station on scotrail-glasgow-suburban"
+        );
 
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
@@ -6277,7 +7627,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-glasgow-suburban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-glasgow-suburban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6300,7 +7653,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-west-highland-oban".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-west-highland-oban".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6387,7 +7743,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-aberdeen-inverness".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-aberdeen-inverness".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6438,7 +7797,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6500,10 +7864,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["scotrail-shotts".to_string(), "scotrail-glasgow-suburban".to_string()])
+            HashSet::from([
+                "scotrail-shotts".to_string(),
+                "scotrail-glasgow-suburban".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6526,7 +7898,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["scotrail-bathgate".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["scotrail-bathgate".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6580,7 +7955,9 @@ mod tests {
         );
         for m in &matches {
             let expected = match m.line.id.as_str() {
-                "scotrail-central-belt" | "scotrail-shotts" | "scotrail-bathgate" => MatchScope::SharedSegment,
+                "scotrail-central-belt" | "scotrail-shotts" | "scotrail-bathgate" => {
+                    MatchScope::SharedSegment
+                }
                 _ => MatchScope::ExclusiveSegment,
             };
             assert_eq!(m.scope, expected, "{} scope mismatch", m.line.id);
@@ -6615,10 +7992,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["scotrail-glasgow-suburban".to_string(), "scotrail-bathgate".to_string()])
+            HashSet::from([
+                "scotrail-glasgow-suburban".to_string(),
+                "scotrail-bathgate".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6648,10 +8033,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["scotrail-glasgow-suburban".to_string(), "scotrail-bathgate".to_string()])
+            HashSet::from([
+                "scotrail-glasgow-suburban".to_string(),
+                "scotrail-bathgate".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::SharedSegment, "{} should be SharedSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::SharedSegment,
+                "{} should be SharedSegment",
+                m.line.id
+            );
         }
     }
 
@@ -6666,9 +8059,17 @@ mod tests {
     #[test]
     fn chiltern_main_line_has_previously_omitted_marylebone_approach_stations() {
         let lines = load_line("chiltern-main-line");
-        let line = lines.get("chiltern-main-line").expect("chiltern-main-line should exist");
-        assert!(line.has_station("SUD"), "chiltern-main-line should now include Sudbury & Harrow Road (SUD)");
-        assert!(line.has_station("PRR"), "chiltern-main-line should now include Princes Risborough (PRR)");
+        let line = lines
+            .get("chiltern-main-line")
+            .expect("chiltern-main-line should exist");
+        assert!(
+            line.has_station("SUD"),
+            "chiltern-main-line should now include Sudbury & Harrow Road (SUD)"
+        );
+        assert!(
+            line.has_station("PRR"),
+            "chiltern-main-line should now include Princes Risborough (PRR)"
+        );
     }
 
     // Task 10.2, continued: Lapworth, Widney Manor, Olton, Acocks Green,
@@ -6688,9 +8089,14 @@ mod tests {
     #[test]
     fn chiltern_main_line_has_previously_omitted_birmingham_approach_stations() {
         let lines = load_line("chiltern-main-line");
-        let line = lines.get("chiltern-main-line").expect("chiltern-main-line should exist");
+        let line = lines
+            .get("chiltern-main-line")
+            .expect("chiltern-main-line should exist");
         for crs in ["LPW", "WMR", "OLT", "ACG", "TYS", "SMA", "BBS"] {
-            assert!(line.has_station(crs), "chiltern-main-line should now include {crs}");
+            assert!(
+                line.has_station(crs),
+                "chiltern-main-line should now include {crs}"
+            );
         }
     }
 
@@ -6706,10 +8112,19 @@ mod tests {
     #[test]
     fn chatham_fillin_suburban_stations_are_now_modelled() {
         let lines = load_line("southeastern-chatham");
-        let chatham = lines.get("southeastern-chatham").expect("southeastern-chatham line should exist");
+        let chatham = lines
+            .get("southeastern-chatham")
+            .expect("southeastern-chatham line should exist");
         for crs in ["WDU", "SYH", "PNE", "KTH"] {
-            assert!(chatham.has_station(crs), "southeastern-chatham should now have station {crs}");
-            assert_eq!(chatham.segment_for(crs), Some("chatham-london"), "{crs} should be on chatham-london");
+            assert!(
+                chatham.has_station(crs),
+                "southeastern-chatham should now have station {crs}"
+            );
+            assert_eq!(
+                chatham.segment_for(crs),
+                Some("chatham-london"),
+                "{crs} should be on chatham-london"
+            );
         }
     }
 
@@ -6729,10 +8144,19 @@ mod tests {
     #[test]
     fn chatham_deal_branch_stations_are_now_modelled_and_stay_exclusive() {
         let lines = load_all_lines();
-        let chatham = lines.get("southeastern-chatham").expect("southeastern-chatham line should exist");
+        let chatham = lines
+            .get("southeastern-chatham")
+            .expect("southeastern-chatham line should exist");
         for crs in ["MSR", "SDW", "DEA", "WAM", "MTM"] {
-            assert!(chatham.has_station(crs), "southeastern-chatham should now have station {crs}");
-            assert_eq!(chatham.segment_for(crs), Some("chatham-deal"), "{crs} should be on chatham-deal");
+            assert!(
+                chatham.has_station(crs),
+                "southeastern-chatham should now have station {crs}"
+            );
+            assert_eq!(
+                chatham.segment_for(crs),
+                Some("chatham-deal"),
+                "{crs} should be on chatham-deal"
+            );
         }
 
         let registry = SegmentRegistry::new(&lines);
@@ -6745,7 +8169,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["southeastern-chatham".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["southeastern-chatham".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -6761,10 +8188,19 @@ mod tests {
     #[test]
     fn seml_fillin_suburban_stations_are_now_modelled() {
         let lines = load_line("southeastern-main-line");
-        let seml = lines.get("southeastern-main-line").expect("southeastern-main-line should exist");
+        let seml = lines
+            .get("southeastern-main-line")
+            .expect("southeastern-main-line should exist");
         for crs in ["NWX", "SAJ", "LEW", "HGR", "GRP", "CIT", "PET"] {
-            assert!(seml.has_station(crs), "southeastern-main-line should now have station {crs}");
-            assert_eq!(seml.segment_for(crs), Some("seml-london"), "{crs} should be on seml-london");
+            assert!(
+                seml.has_station(crs),
+                "southeastern-main-line should now have station {crs}"
+            );
+            assert_eq!(
+                seml.segment_for(crs),
+                Some("seml-london"),
+                "{crs} should be on seml-london"
+            );
         }
     }
 
@@ -6800,7 +8236,12 @@ mod tests {
             ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -6826,10 +8267,18 @@ mod tests {
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["southeastern-main-line".to_string(), "southeastern-metro-north-kent".to_string()])
+            HashSet::from([
+                "southeastern-main-line".to_string(),
+                "southeastern-metro-north-kent".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment, not shared", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment, not shared",
+                m.line.id
+            );
         }
     }
 
@@ -6871,11 +8320,27 @@ mod tests {
     #[test]
     fn southern_brighton_main_line_fillin_stations_are_now_modelled() {
         let lines = load_line("southern-brighton-main-line");
-        let bml = lines.get("southern-brighton-main-line").expect("southern-brighton-main-line should exist");
-        assert!(bml.has_station("CLJ"), "southern-brighton-main-line should now have station CLJ");
-        assert_eq!(bml.segment_for("CLJ"), Some("southern-bml-victoria"), "CLJ should be on southern-bml-victoria");
-        assert!(bml.has_station("WVF"), "southern-brighton-main-line should now have station WVF");
-        assert_eq!(bml.segment_for("WVF"), Some("southern-bml-south"), "WVF should be on southern-bml-south");
+        let bml = lines
+            .get("southern-brighton-main-line")
+            .expect("southern-brighton-main-line should exist");
+        assert!(
+            bml.has_station("CLJ"),
+            "southern-brighton-main-line should now have station CLJ"
+        );
+        assert_eq!(
+            bml.segment_for("CLJ"),
+            Some("southern-bml-victoria"),
+            "CLJ should be on southern-bml-victoria"
+        );
+        assert!(
+            bml.has_station("WVF"),
+            "southern-brighton-main-line should now have station WVF"
+        );
+        assert_eq!(
+            bml.segment_for("WVF"),
+            Some("southern-bml-south"),
+            "WVF should be on southern-bml-south"
+        );
     }
 
     // Clapham Junction (CLJ) turns out to be a six-way station overlap once
@@ -6917,7 +8382,8 @@ mod tests {
             ])
         );
         for m in &matches {
-            let expected = if ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"].contains(&m.line.id.as_str())
+            let expected = if ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"]
+                .contains(&m.line.id.as_str())
             {
                 MatchScope::SharedSegment
             } else {
@@ -6941,11 +8407,17 @@ mod tests {
     #[test]
     fn tfw_cambrian_has_station_includes_newly_added_coast_request_stops() {
         let lines = load_line("tfw-cambrian");
-        let cambrian = lines.get("tfw-cambrian").expect("tfw-cambrian line should exist");
+        let cambrian = lines
+            .get("tfw-cambrian")
+            .expect("tfw-cambrian line should exist");
         for crs in [
-            "PHG", "TNF", "LLW", "LLA", "TLB", "DYF", "LBR", "PES", "LDN", "TYG", "TAL", "LLC", "PNC",
+            "PHG", "TNF", "LLW", "LLA", "TLB", "DYF", "LBR", "PES", "LDN", "TYG", "TAL", "LLC",
+            "PNC",
         ] {
-            assert!(cambrian.has_station(crs), "tfw-cambrian should now list {crs}");
+            assert!(
+                cambrian.has_station(crs),
+                "tfw-cambrian should now list {crs}"
+            );
         }
         assert!(
             !cambrian.has_station("LGY"),
@@ -6997,8 +8469,13 @@ mod tests {
         let nwc = lines
             .get("tfw-north-wales-coast")
             .expect("tfw-north-wales-coast line should exist");
-        for crs in ["SHT", "CNW", "PMW", "LLF", "LPG", "BOR", "TYC", "RHO", "VAL"] {
-            assert!(nwc.has_station(crs), "tfw-north-wales-coast should now list {crs}");
+        for crs in [
+            "SHT", "CNW", "PMW", "LLF", "LPG", "BOR", "TYC", "RHO", "VAL",
+        ] {
+            assert!(
+                nwc.has_station(crs),
+                "tfw-north-wales-coast should now list {crs}"
+            );
         }
         assert!(
             !nwc.has_station("LLD"),
@@ -7028,7 +8505,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["tfw-north-wales-coast".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["tfw-north-wales-coast".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -7043,9 +8523,17 @@ mod tests {
     #[test]
     fn calder_valley_mytholmroyd_has_station_and_stays_exclusive() {
         let lines = load_line("northern-calder-valley");
-        let calder_valley = lines.get("northern-calder-valley").expect("northern-calder-valley should load");
-        assert!(calder_valley.has_station("MYT"), "northern-calder-valley should now list Mytholmroyd (MYT)");
-        assert_eq!(calder_valley.segment_for("MYT"), Some("northern-calder-valley"));
+        let calder_valley = lines
+            .get("northern-calder-valley")
+            .expect("northern-calder-valley should load");
+        assert!(
+            calder_valley.has_station("MYT"),
+            "northern-calder-valley should now list Mytholmroyd (MYT)"
+        );
+        assert_eq!(
+            calder_valley.segment_for("MYT"),
+            Some("northern-calder-valley")
+        );
 
         let all_lines = load_all_lines();
         let registry = SegmentRegistry::new(&all_lines);
@@ -7058,7 +8546,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-calder-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-calder-valley".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -7073,9 +8564,17 @@ mod tests {
     #[test]
     fn cumbrian_coast_sellafield_has_station_and_stays_exclusive() {
         let lines = load_line("northern-cumbrian-coast");
-        let cumbrian_coast = lines.get("northern-cumbrian-coast").expect("northern-cumbrian-coast should load");
-        assert!(cumbrian_coast.has_station("SEL"), "northern-cumbrian-coast should now list Sellafield (SEL)");
-        assert_eq!(cumbrian_coast.segment_for("SEL"), Some("northern-cumbrian-coast"));
+        let cumbrian_coast = lines
+            .get("northern-cumbrian-coast")
+            .expect("northern-cumbrian-coast should load");
+        assert!(
+            cumbrian_coast.has_station("SEL"),
+            "northern-cumbrian-coast should now list Sellafield (SEL)"
+        );
+        assert_eq!(
+            cumbrian_coast.segment_for("SEL"),
+            Some("northern-cumbrian-coast")
+        );
 
         let all_lines = load_all_lines();
         let registry = SegmentRegistry::new(&all_lines);
@@ -7088,7 +8587,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-cumbrian-coast".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-cumbrian-coast".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -7102,8 +8604,13 @@ mod tests {
     #[test]
     fn furness_grange_over_sands_has_station_and_stays_exclusive() {
         let lines = load_line("northern-furness");
-        let furness = lines.get("northern-furness").expect("northern-furness should load");
-        assert!(furness.has_station("GOS"), "northern-furness should now list Grange-over-Sands (GOS)");
+        let furness = lines
+            .get("northern-furness")
+            .expect("northern-furness should load");
+        assert!(
+            furness.has_station("GOS"),
+            "northern-furness should now list Grange-over-Sands (GOS)"
+        );
         assert_eq!(furness.segment_for("GOS"), Some("northern-furness-branch"));
 
         let all_lines = load_all_lines();
@@ -7134,8 +8641,13 @@ mod tests {
     #[test]
     fn hope_valley_bamford_has_station_and_stays_exclusive() {
         let lines = load_line("northern-hope-valley");
-        let hope_valley = lines.get("northern-hope-valley").expect("northern-hope-valley should load");
-        assert!(hope_valley.has_station("BAM"), "northern-hope-valley should now list Bamford (BAM)");
+        let hope_valley = lines
+            .get("northern-hope-valley")
+            .expect("northern-hope-valley should load");
+        assert!(
+            hope_valley.has_station("BAM"),
+            "northern-hope-valley should now list Bamford (BAM)"
+        );
         assert_eq!(hope_valley.segment_for("BAM"), Some("northern-hope-valley"));
 
         let all_lines = load_all_lines();
@@ -7149,7 +8661,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-hope-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-hope-valley".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -7162,8 +8677,13 @@ mod tests {
     #[test]
     fn lakes_burneside_has_station_and_stays_exclusive() {
         let lines = load_line("northern-lakes");
-        let lakes = lines.get("northern-lakes").expect("northern-lakes should load");
-        assert!(lakes.has_station("BUD"), "northern-lakes should now list Burneside (BUD)");
+        let lakes = lines
+            .get("northern-lakes")
+            .expect("northern-lakes should load");
+        assert!(
+            lakes.has_station("BUD"),
+            "northern-lakes should now list Burneside (BUD)"
+        );
         assert_eq!(lakes.segment_for("BUD"), Some("northern-lakes"));
 
         let all_lines = load_all_lines();
@@ -7191,8 +8711,13 @@ mod tests {
     #[test]
     fn tyne_valley_prudhoe_has_station_and_stays_exclusive() {
         let lines = load_line("northern-tyne-valley");
-        let tyne_valley = lines.get("northern-tyne-valley").expect("northern-tyne-valley should load");
-        assert!(tyne_valley.has_station("PRU"), "northern-tyne-valley should now list Prudhoe (PRU)");
+        let tyne_valley = lines
+            .get("northern-tyne-valley")
+            .expect("northern-tyne-valley should load");
+        assert!(
+            tyne_valley.has_station("PRU"),
+            "northern-tyne-valley should now list Prudhoe (PRU)"
+        );
         assert_eq!(tyne_valley.segment_for("PRU"), Some("northern-tyne-valley"));
 
         let all_lines = load_all_lines();
@@ -7206,7 +8731,10 @@ mod tests {
         );
         let matches = lines_affected_by(&inc, &all_lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
-        assert_eq!(matched_ids, HashSet::from(["northern-tyne-valley".to_string()]));
+        assert_eq!(
+            matched_ids,
+            HashSet::from(["northern-tyne-valley".to_string()])
+        );
         assert_eq!(matches[0].scope, MatchScope::ExclusiveSegment);
     }
 
@@ -7219,14 +8747,25 @@ mod tests {
     #[test]
     fn wmr_snow_hill_recognises_newly_added_stations() {
         let lines = load_line("wmr-snow-hill");
-        let line = lines.get("wmr-snow-hill").expect("wmr-snow-hill should load");
-        for crs in ["BBS", "SMA", "ACG", "OLT", "WMR", "SRI", "HLG", "YRD", "WYT", "EWD", "WDE", "DZY", "WWW", "WMC", "STY", "BKD", "HAG", "LYE", "CRA", "OHL", "ROW", "LGG", "THW", "JEQ"] {
-            assert!(line.has_station(crs), "{crs} should now be recognised on wmr-snow-hill");
+        let line = lines
+            .get("wmr-snow-hill")
+            .expect("wmr-snow-hill should load");
+        for crs in [
+            "BBS", "SMA", "ACG", "OLT", "WMR", "SRI", "HLG", "YRD", "WYT", "EWD", "WDE", "DZY",
+            "WWW", "WMC", "STY", "BKD", "HAG", "LYE", "CRA", "OHL", "ROW", "LGG", "THW", "JEQ",
+        ] {
+            assert!(
+                line.has_station(crs),
+                "{crs} should now be recognised on wmr-snow-hill"
+            );
         }
         // Fernhill Heath was named in this task's brief but confirmed closed
         // since 1965 (never reopened) against two independent sources, so it
         // deliberately stays out.
-        assert!(!line.has_station("FNH"), "Fernhill Heath is closed and must not be added");
+        assert!(
+            !line.has_station("FNH"),
+            "Fernhill Heath is closed and must not be added"
+        );
     }
 
     // None of wmr-snow-hill.toml's three segments (`wmr-snow-hill-trunk`,
@@ -7244,15 +8783,29 @@ mod tests {
     fn wmr_snow_hill_bordesley_exclusive_segment_incident_does_not_propagate() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        let inc = incident("WMR-1", "Signal failure at Bordesley", "Signal failure causing delays to West Midlands Railway services.", &["LM"], &["BBS"]);
+        let inc = incident(
+            "WMR-1",
+            "Signal failure at Bordesley",
+            "Signal failure causing delays to West Midlands Railway services.",
+            &["LM"],
+            &["BBS"],
+        );
         let matches = lines_affected_by(&inc, &lines, &registry);
         let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
         assert_eq!(
             matched_ids,
-            HashSet::from(["wmr-snow-hill".to_string(), "chiltern-main-line".to_string()])
+            HashSet::from([
+                "wmr-snow-hill".to_string(),
+                "chiltern-main-line".to_string()
+            ])
         );
         for m in &matches {
-            assert_eq!(m.scope, MatchScope::ExclusiveSegment, "{} should be ExclusiveSegment", m.line.id);
+            assert_eq!(
+                m.scope,
+                MatchScope::ExclusiveSegment,
+                "{} should be ExclusiveSegment",
+                m.line.id
+            );
         }
     }
 }

@@ -26,12 +26,16 @@ impl SegmentRegistry {
                     if !entry.contains(&line.id) {
                         entry.push(line.id.clone());
                     }
-                    station_segments.insert((line.id.clone(), station.crs.clone()), segment.clone());
+                    station_segments
+                        .insert((line.id.clone(), station.crs.clone()), segment.clone());
                 }
             }
         }
 
-        Self { segment_lines, station_segments }
+        Self {
+            segment_lines,
+            station_segments,
+        }
     }
 
     /// Every line ID that includes this segment, in load order.
@@ -46,7 +50,10 @@ impl SegmentRegistry {
 
     /// A segment is shared if more than one line uses it.
     pub fn is_shared(&self, segment: &str) -> bool {
-        self.segment_lines.get(segment).map(|v| v.len() > 1).unwrap_or(false)
+        self.segment_lines
+            .get(segment)
+            .map(|v| v.len() > 1)
+            .unwrap_or(false)
     }
 
     /// True if `line_id` is the only line using this segment.
@@ -65,10 +72,18 @@ impl SegmentRegistry {
     }
 
     /// Which of this line's segments are touched by these stations.
-    pub fn segments_touched_by(&self, line: &LineDefinition, affected_stations: &[String]) -> HashSet<String> {
+    pub fn segments_touched_by(
+        &self,
+        line: &LineDefinition,
+        affected_stations: &[String],
+    ) -> HashSet<String> {
         affected_stations
             .iter()
-            .filter_map(|crs| self.station_segments.get(&(line.id.clone(), crs.clone())).cloned())
+            .filter_map(|crs| {
+                self.station_segments
+                    .get(&(line.id.clone(), crs.clone()))
+                    .cloned()
+            })
             .collect()
     }
 }
@@ -113,8 +128,14 @@ mod tests {
     fn segment_at_returns_the_right_segment_for_a_station() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
-        assert_eq!(registry.segment_at("swr-alton", "WOK"), Some("swr-trunk-waterloo"));
-        assert_eq!(registry.segment_at("swr-alton", "AON"), Some("swr-alton-branch"));
+        assert_eq!(
+            registry.segment_at("swr-alton", "WOK"),
+            Some("swr-trunk-waterloo")
+        );
+        assert_eq!(
+            registry.segment_at("swr-alton", "AON"),
+            Some("swr-alton-branch")
+        );
         assert_eq!(registry.segment_at("swr-alton", "NOTASTATION"), None);
     }
 
@@ -168,14 +189,16 @@ mod tests {
         let far_north = &lines["scotrail-far-north"];
 
         // Alness (trunk) + Wick (exclusive Wick branch).
-        let touched_wick = registry.segments_touched_by(far_north, &["ASS".to_string(), "WCK".to_string()]);
+        let touched_wick =
+            registry.segments_touched_by(far_north, &["ASS".to_string(), "WCK".to_string()]);
         assert_eq!(touched_wick.len(), 2);
         assert!(touched_wick.contains("scotrail-far-north-trunk"));
         assert!(touched_wick.contains("scotrail-far-north-wick"));
 
         // Alness (trunk) + Thurso (exclusive Thurso branch) -- the same
         // trunk segment, proving both branches share it.
-        let touched_thurso = registry.segments_touched_by(far_north, &["ASS".to_string(), "THS".to_string()]);
+        let touched_thurso =
+            registry.segments_touched_by(far_north, &["ASS".to_string(), "THS".to_string()]);
         assert_eq!(touched_thurso.len(), 2);
         assert!(touched_thurso.contains("scotrail-far-north-trunk"));
         assert!(touched_thurso.contains("scotrail-far-north-thurso"));

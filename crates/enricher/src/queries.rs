@@ -26,9 +26,18 @@ pub struct IncidentState {
 /// LLM entirely when nothing has changed since. Returns `Ok(None)` if the
 /// incident no longer exists (e.g. it was cleared/purged between the
 /// stream event or sweep row being read and processing running).
-type IncidentStateRow = (String, String, Option<String>, Option<String>, DateTime<Utc>);
+type IncidentStateRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    DateTime<Utc>,
+);
 
-pub async fn fetch_incident_state(pool: &PgPool, incident_id: &str) -> anyhow::Result<Option<IncidentState>> {
+pub async fn fetch_incident_state(
+    pool: &PgPool,
+    incident_id: &str,
+) -> anyhow::Result<Option<IncidentState>> {
     let row: Option<IncidentStateRow> = sqlx::query_as(
         "SELECT summary, description, source_text_hash, extraction_model_version, first_seen_at \
          FROM incidents WHERE incident_id = $1",
@@ -36,13 +45,17 @@ pub async fn fetch_incident_state(pool: &PgPool, incident_id: &str) -> anyhow::R
     .bind(incident_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(summary, description, source_text_hash, extraction_model_version, first_seen_at)| IncidentState {
-        summary,
-        description,
-        source_text_hash,
-        extraction_model_version,
-        first_seen_at,
-    }))
+    Ok(row.map(
+        |(summary, description, source_text_hash, extraction_model_version, first_seen_at)| {
+            IncidentState {
+                summary,
+                description,
+                source_text_hash,
+                extraction_model_version,
+                first_seen_at,
+            }
+        },
+    ))
 }
 
 /// Persists a completed extraction. `category`/`periods` are the fields

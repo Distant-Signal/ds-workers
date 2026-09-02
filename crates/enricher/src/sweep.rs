@@ -82,7 +82,10 @@ mod tests {
     #[test]
     fn never_extracted_incident_needs_extraction() {
         let rows = vec![row("A", "text", None, None)];
-        assert_eq!(incidents_needing_extraction(&rows, "gpt-oss-20b"), vec!["A"]);
+        assert_eq!(
+            incidents_needing_extraction(&rows, "gpt-oss-20b"),
+            vec!["A"]
+        );
     }
 
     #[test]
@@ -96,13 +99,19 @@ mod tests {
     fn changed_text_needs_re_extraction_even_with_matching_model() {
         let stale_hash = text_hash("old text", "desc");
         let rows = vec![row("A", "new text", Some(&stale_hash), Some("gpt-oss-20b"))];
-        assert_eq!(incidents_needing_extraction(&rows, "gpt-oss-20b"), vec!["A"]);
+        assert_eq!(
+            incidents_needing_extraction(&rows, "gpt-oss-20b"),
+            vec!["A"]
+        );
     }
 
     #[test]
     fn model_version_bump_forces_re_extraction_even_with_matching_hash() {
         let hash = text_hash("text", "desc");
         let rows = vec![row("A", "text", Some(&hash), Some("gpt-oss-20b@prompt-v1"))];
-        assert_eq!(incidents_needing_extraction(&rows, "gpt-oss-20b@prompt-v2"), vec!["A"]);
+        assert_eq!(
+            incidents_needing_extraction(&rows, "gpt-oss-20b@prompt-v2"),
+            vec!["A"]
+        );
     }
 }

@@ -98,12 +98,18 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match stream::read_one(&mut redis).await {
             Ok(Some((entry_id, incident_id))) => {
-                if process_incident(&pool, &llm, &model_version, &incident_id, &mismatch_tracker).await {
+                if process_incident(&pool, &llm, &model_version, &incident_id, &mismatch_tracker)
+                    .await
+                {
                     if let Err(err) = stream::ack(&mut redis, &entry_id).await {
                         tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
                     }
                 } else {
-                    tracing::warn!(entry_id, incident_id, "extraction did not complete; leaving entry pending for reclaim");
+                    tracing::warn!(
+                        entry_id,
+                        incident_id,
+                        "extraction did not complete; leaving entry pending for reclaim"
+                    );
                 }
             }
             Ok(None) => {}
@@ -175,7 +181,10 @@ impl MismatchTracker {
     /// combine-mismatch failure -- exposed as
     /// `distant_signal_enricher_mismatch_incidents` (Task 9).
     fn len(&self) -> usize {
-        self.counts.lock().expect("mismatch tracker mutex poisoned").len()
+        self.counts
+            .lock()
+            .expect("mismatch tracker mutex poisoned")
+            .len()
     }
 }
 
@@ -185,14 +194,23 @@ impl MismatchTracker {
 /// consumer downtime, etc). Runs independently of that loop, processing
 /// each incident it finds through the same `process_incident` the stream
 /// loop uses.
-async fn sweep_loop(pool: PgPool, llm: Arc<LlmClient>, model_version: String, mismatch_tracker: Arc<MismatchTracker>, interval_secs: u64) {
+async fn sweep_loop(
+    pool: PgPool,
+    llm: Arc<LlmClient>,
+    model_version: String,
+    mismatch_tracker: Arc<MismatchTracker>,
+    interval_secs: u64,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     loop {
         interval.tick().await;
         match sweep::fetch_sweep_rows(&pool).await {
             Ok(rows) => {
                 let ids = sweep::incidents_needing_extraction(&rows, &model_version);
-                tracing::info!(count = ids.len(), "sweep found incidents needing extraction");
+                tracing::info!(
+                    count = ids.len(),
+                    "sweep found incidents needing extraction"
+                );
                 for id in ids {
                     process_incident(&pool, &llm, &model_version, &id, &mismatch_tracker).await;
                 }
@@ -249,7 +267,13 @@ fn record_llm_call_metrics(call: &'static str, elapsed: std::time::Duration, suc
 /// enough, rather than relying on the hourly sweep alone for a failure mode
 /// the sweep wasn't designed to catch quickly (it only re-triggers on a
 /// text or model-version change, not a bare processing failure).
-async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, incident_id: &str, mismatch_tracker: &MismatchTracker) -> bool {
+async fn process_incident(
+    pool: &PgPool,
+    llm: &LlmClient,
+    model_version: &str,
+    incident_id: &str,
+    mismatch_tracker: &MismatchTracker,
+) -> bool {
     let state = match queries::fetch_incident_state(pool, incident_id).await {
         Ok(Some(state)) => state,
         Ok(None) => {
@@ -261,7 +285,8 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
             return false;
         }
     };
-    let (summary, description, first_seen_at) = (state.summary, state.description, state.first_seen_at);
+    let (summary, description, first_seen_at) =
+        (state.summary, state.description, state.first_seen_at);
     let text_hash = hash::text_hash(&summary, &description);
 
     // Guards every caller (stream loop, sweep, reclaim) against running the
@@ -275,12 +300,17 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
     if state.source_text_hash.as_deref() == Some(text_hash.as_str())
         && state.extraction_model_version.as_deref() == Some(model_version)
     {
-        tracing::info!(incident_id, "text unchanged since last successful extraction; skipping");
+        tracing::info!(
+            incident_id,
+            "text unchanged since last successful extraction; skipping"
+        );
         return true;
     }
 
     let primary_start = std::time::Instant::now();
-    let primary_result = llm.extract_primary(&summary, &description, first_seen_at).await;
+    let primary_result = llm
+        .extract_primary(&summary, &description, first_seen_at)
+        .await;
     record_llm_call_metrics("primary", primary_start.elapsed(), primary_result.is_ok());
     let primary = match primary_result {
         Ok(p) => p,
@@ -310,12 +340,21 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
             kept_count = primary.periods.len(),
             "primary extraction exceeded the period cap; truncated to the N most severe/soonest periods"
         );
-        metrics::counter!(common::metrics::metric_name("enricher_period_truncations_total")).increment(1);
+        metrics::counter!(common::metrics::metric_name(
+            "enricher_period_truncations_total"
+        ))
+        .increment(1);
     }
 
     let resolution_adversarial_start = std::time::Instant::now();
-    let resolution_adversarial_result = llm.extract_adversarial(&summary, &description, &primary.periods).await;
-    record_llm_call_metrics("resolution_adversarial", resolution_adversarial_start.elapsed(), resolution_adversarial_result.is_ok());
+    let resolution_adversarial_result = llm
+        .extract_adversarial(&summary, &description, &primary.periods)
+        .await;
+    record_llm_call_metrics(
+        "resolution_adversarial",
+        resolution_adversarial_start.elapsed(),
+        resolution_adversarial_result.is_ok(),
+    );
     let resolution_adversarial = match resolution_adversarial_result {
         Ok(v) => v,
         Err(err) => {
@@ -325,8 +364,14 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
     };
 
     let severity_adversarial_start = std::time::Instant::now();
-    let severity_adversarial_result = llm.extract_severity_adversarial(&summary, &description, &primary.periods).await;
-    record_llm_call_metrics("severity_adversarial", severity_adversarial_start.elapsed(), severity_adversarial_result.is_ok());
+    let severity_adversarial_result = llm
+        .extract_severity_adversarial(&summary, &description, &primary.periods)
+        .await;
+    record_llm_call_metrics(
+        "severity_adversarial",
+        severity_adversarial_start.elapsed(),
+        severity_adversarial_result.is_ok(),
+    );
     let severity_adversarial = match severity_adversarial_result {
         Ok(v) => v,
         Err(err) => {
@@ -335,7 +380,11 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         }
     };
 
-    let periods = match combine::combine_periods(&primary.periods, &resolution_adversarial, &severity_adversarial) {
+    let periods = match combine::combine_periods(
+        &primary.periods,
+        &resolution_adversarial,
+        &severity_adversarial,
+    ) {
         Ok(periods) => {
             mismatch_tracker.record_success(incident_id);
             periods
@@ -360,12 +409,25 @@ async fn process_incident(pool: &PgPool, llm: &LlmClient, model_version: &str, i
         }
     };
 
-    if let Err(err) = queries::write_extraction(pool, incident_id, &primary.category, &periods, model_version, &text_hash).await {
+    if let Err(err) = queries::write_extraction(
+        pool,
+        incident_id,
+        &primary.category,
+        &periods,
+        model_version,
+        &text_hash,
+    )
+    .await
+    {
         tracing::error!(error = ?err, incident_id, "failed to write extraction result");
         return false;
     }
 
-    tracing::info!(incident_id, period_count = periods.len(), "extraction written");
+    tracing::info!(
+        incident_id,
+        period_count = periods.len(),
+        "extraction written"
+    );
     true
 }
 
@@ -391,20 +453,33 @@ async fn reclaim_loop(
 
         match stream::group_lag(&mut redis).await {
             Ok(Some(lag)) => {
-                metrics::gauge!(common::metrics::metric_name("enricher_stream_lag")).set(lag as f64);
+                metrics::gauge!(common::metrics::metric_name("enricher_stream_lag"))
+                    .set(lag as f64);
             }
             Ok(None) => {}
             Err(err) => tracing::warn!(error = ?err, "failed to sample stream consumer-group lag"),
         }
-        metrics::gauge!(common::metrics::metric_name("enricher_mismatch_incidents")).set(mismatch_tracker.len() as f64);
+        metrics::gauge!(common::metrics::metric_name("enricher_mismatch_incidents"))
+            .set(mismatch_tracker.len() as f64);
 
         match stream::claim_stale(&mut redis, min_idle).await {
             Ok(entries) => {
                 if !entries.is_empty() {
-                    tracing::info!(count = entries.len(), "reclaimed stale pending entries for retry");
+                    tracing::info!(
+                        count = entries.len(),
+                        "reclaimed stale pending entries for retry"
+                    );
                 }
                 for (entry_id, incident_id) in entries {
-                    if process_incident(&pool, &llm, &model_version, &incident_id, &mismatch_tracker).await {
+                    if process_incident(
+                        &pool,
+                        &llm,
+                        &model_version,
+                        &incident_id,
+                        &mismatch_tracker,
+                    )
+                    .await
+                    {
                         if let Err(err) = stream::ack(&mut redis, &entry_id).await {
                             tracing::error!(error = ?err, entry_id, "failed to ack reclaimed stream entry");
                         }
@@ -431,8 +506,12 @@ mod tests {
     use super::*;
 
     async fn test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres")
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres")
     }
 
     /// The full crux of this plan: a primary extraction that exceeds
@@ -454,7 +533,8 @@ mod tests {
     /// process_incident will actually send them.
     #[tokio::test]
     #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored`"]
-    async fn process_incident_writes_successfully_and_advances_hash_and_version_when_primary_extraction_is_truncated() {
+    async fn process_incident_writes_successfully_and_advances_hash_and_version_when_primary_extraction_is_truncated()
+     {
         let pool = test_pool().await;
         let incident_id = "TEST-ENRICHER-TRUNCATION-1";
         let summary = "Test incident exceeding the period cap";
@@ -517,12 +597,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        let llm = LlmClient::new(server.uri(), None, "test-model".to_string(), Duration::from_secs(30));
+        let llm = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            Duration::from_secs(30),
+        );
         let model_version = "test-model@periods-v1";
         let mismatch_tracker = MismatchTracker::default();
 
         let ok = process_incident(&pool, &llm, model_version, incident_id, &mismatch_tracker).await;
-        assert!(ok, "a truncated-but-successful extraction must return true (ack the entry), not false");
+        assert!(
+            ok,
+            "a truncated-but-successful extraction must return true (ack the entry), not false"
+        );
 
         let row: (Option<String>, Option<String>, Option<serde_json::Value>) = sqlx::query_as(
             "SELECT source_text_hash, extraction_model_version, extracted_periods FROM incidents WHERE incident_id = $1",
@@ -532,21 +620,38 @@ mod tests {
         .await
         .expect("fetch written row");
         let expected_hash = hash::text_hash(summary, description);
-        assert_eq!(row.0.as_deref(), Some(expected_hash.as_str()), "source_text_hash must advance even though the extraction was truncated");
-        assert_eq!(row.1.as_deref(), Some(model_version), "extraction_model_version must advance even though the extraction was truncated");
+        assert_eq!(
+            row.0.as_deref(),
+            Some(expected_hash.as_str()),
+            "source_text_hash must advance even though the extraction was truncated"
+        );
+        assert_eq!(
+            row.1.as_deref(),
+            Some(model_version),
+            "extraction_model_version must advance even though the extraction was truncated"
+        );
         let periods = row.2.expect("extracted_periods must be written");
-        assert_eq!(periods.as_array().expect("periods is an array").len(), MAX_PERIODS_FOR_TEST, "the written periods must be the truncated (in-cap) set, not the original over-cap one");
+        assert_eq!(
+            periods.as_array().expect("periods is an array").len(),
+            MAX_PERIODS_FOR_TEST,
+            "the written periods must be the truncated (in-cap) set, not the original over-cap one"
+        );
 
         // The actual retry-forever-loop-is-closed assertion: re-running
         // sweep::incidents_needing_extraction's own comparison against
         // what was just written must NOT re-select this incident.
         let current_hash = hash::text_hash(summary, description);
         assert!(
-            row.0.as_deref() == Some(current_hash.as_str()) && row.1.as_deref() == Some(model_version),
+            row.0.as_deref() == Some(current_hash.as_str())
+                && row.1.as_deref() == Some(model_version),
             "this incident must no longer match sweep::incidents_needing_extraction's re-select condition (sweep.rs:27-35)"
         );
 
-        sqlx::query("DELETE FROM incidents WHERE incident_id = $1").bind(incident_id).execute(&pool).await.expect("cleanup");
+        sqlx::query("DELETE FROM incidents WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
     }
 
     // `MAX_PERIODS` itself is private to `llm.rs`; this local alias avoids

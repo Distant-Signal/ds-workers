@@ -444,31 +444,60 @@ struct SeverityAdversarialExtraction {
 // `main.rs`'s reclaim loop retries it once it's been idle long enough.
 
 impl LlmClient {
-    pub fn new(base_url: String, api_key: Option<String>, model: String, request_timeout: std::time::Duration) -> Self {
+    pub fn new(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        request_timeout: std::time::Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
             .build()
             // Only fails if the TLS backend can't initialize, which would
             // break every request anyway -- there is no useful degraded mode.
             .expect("reqwest client with a timeout must build");
-        Self { base_url, api_key, model, http }
+        Self {
+            base_url,
+            api_key,
+            model,
+            http,
+        }
     }
 
-    async fn chat_completion(&self, system_prompt: &str, user_content: String, schema_name: &'static str, schema: serde_json::Value) -> anyhow::Result<String> {
+    async fn chat_completion(
+        &self,
+        system_prompt: &str,
+        user_content: String,
+        schema_name: &'static str,
+        schema: serde_json::Value,
+    ) -> anyhow::Result<String> {
         let request = ChatCompletionRequest {
             model: &self.model,
             messages: vec![
-                ChatMessage { role: "system", content: system_prompt.to_string() },
-                ChatMessage { role: "user", content: user_content },
+                ChatMessage {
+                    role: "system",
+                    content: system_prompt.to_string(),
+                },
+                ChatMessage {
+                    role: "user",
+                    content: user_content,
+                },
             ],
             response_format: ResponseFormat {
                 kind: "json_schema",
-                json_schema: JsonSchemaSpec { name: schema_name, strict: true, schema },
+                json_schema: JsonSchemaSpec {
+                    name: schema_name,
+                    strict: true,
+                    schema,
+                },
             },
             temperature: 0.0,
         };
 
-        let mut req = self.http.post(format!("{}/chat/completions", self.base_url)).json(&request);
+        let mut req = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .json(&request);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
@@ -489,14 +518,24 @@ impl LlmClient {
     /// caller has nothing better, the current time) -- threaded into the
     /// user content so the model can resolve year-less dates in the text
     /// against a concrete anchor (design §1's "year inference" convention).
-    pub async fn extract_primary(&self, summary: &str, description: &str, reference_date: DateTime<Utc>) -> anyhow::Result<PrimaryExtraction> {
+    pub async fn extract_primary(
+        &self,
+        summary: &str,
+        description: &str,
+        reference_date: DateTime<Utc>,
+    ) -> anyhow::Result<PrimaryExtraction> {
         let user_content = format!(
             "This incident was first reported around {}. Resolve any year-less date in the text below \
              relative to that reference date.\nSummary: {summary}\nDescription: {description}",
             reference_date.to_rfc3339()
         );
         let content = self
-            .chat_completion(PRIMARY_PROMPT, user_content, PRIMARY_SCHEMA_NAME, primary_schema())
+            .chat_completion(
+                PRIMARY_PROMPT,
+                user_content,
+                PRIMARY_SCHEMA_NAME,
+                primary_schema(),
+            )
             .await?;
         let mut extraction: PrimaryExtraction = serde_json::from_str(&content)
             .map_err(|err| anyhow::anyhow!("primary extraction returned malformed JSON: {err}"))?;
@@ -531,23 +570,46 @@ impl LlmClient {
     /// (design §2) -- the adversarial pass does not re-derive periods, it
     /// only returns a per-period resolution-status verdict, index-aligned
     /// and echoing back each period's `period_index`/`scope_description`.
-    pub async fn extract_adversarial(&self, summary: &str, description: &str, periods: &[ExtractionPeriod]) -> anyhow::Result<Vec<AdversarialPeriodVerdict>> {
+    pub async fn extract_adversarial(
+        &self,
+        summary: &str,
+        description: &str,
+        periods: &[ExtractionPeriod],
+    ) -> anyhow::Result<Vec<AdversarialPeriodVerdict>> {
         let user_content = build_period_user_content(summary, description, periods)?;
         let content = self
-            .chat_completion(ADVERSARIAL_PROMPT, user_content, ADVERSARIAL_SCHEMA_NAME, adversarial_schema())
+            .chat_completion(
+                ADVERSARIAL_PROMPT,
+                user_content,
+                ADVERSARIAL_SCHEMA_NAME,
+                adversarial_schema(),
+            )
             .await?;
-        let extraction: AdversarialExtraction = serde_json::from_str(&content)
-            .map_err(|err| anyhow::anyhow!("adversarial extraction returned malformed JSON: {err}"))?;
+        let extraction: AdversarialExtraction = serde_json::from_str(&content).map_err(|err| {
+            anyhow::anyhow!("adversarial extraction returned malformed JSON: {err}")
+        })?;
         Ok(extraction.periods)
     }
 
-    pub async fn extract_severity_adversarial(&self, summary: &str, description: &str, periods: &[ExtractionPeriod]) -> anyhow::Result<Vec<SeverityAdversarialPeriodVerdict>> {
+    pub async fn extract_severity_adversarial(
+        &self,
+        summary: &str,
+        description: &str,
+        periods: &[ExtractionPeriod],
+    ) -> anyhow::Result<Vec<SeverityAdversarialPeriodVerdict>> {
         let user_content = build_period_user_content(summary, description, periods)?;
         let content = self
-            .chat_completion(SEVERITY_ADVERSARIAL_PROMPT, user_content, SEVERITY_ADVERSARIAL_SCHEMA_NAME, severity_adversarial_schema())
+            .chat_completion(
+                SEVERITY_ADVERSARIAL_PROMPT,
+                user_content,
+                SEVERITY_ADVERSARIAL_SCHEMA_NAME,
+                severity_adversarial_schema(),
+            )
             .await?;
-        let extraction: SeverityAdversarialExtraction = serde_json::from_str(&content)
-            .map_err(|err| anyhow::anyhow!("severity adversarial extraction returned malformed JSON: {err}"))?;
+        let extraction: SeverityAdversarialExtraction =
+            serde_json::from_str(&content).map_err(|err| {
+                anyhow::anyhow!("severity adversarial extraction returned malformed JSON: {err}")
+            })?;
         Ok(extraction.periods)
     }
 }
@@ -573,7 +635,14 @@ fn effective_from_date(period: &ExtractionPeriod) -> Option<DateTime<Utc>> {
 /// (cheap for at most a handful of periods, and keeping the function
 /// total rather than adding an unused early-return branch is simpler).
 fn select_periods_within_cap(mut periods: Vec<ExtractionPeriod>) -> Vec<ExtractionPeriod> {
-    periods.sort_by_key(|period| (std::cmp::Reverse(crate::combine::severity_hint_rank(&period.apparent_severity)), effective_from_date(period)));
+    periods.sort_by_key(|period| {
+        (
+            std::cmp::Reverse(crate::combine::severity_hint_rank(
+                &period.apparent_severity,
+            )),
+            effective_from_date(period),
+        )
+    });
     periods.truncate(MAX_PERIODS);
     periods
 }
@@ -585,7 +654,11 @@ fn select_periods_within_cap(mut periods: Vec<ExtractionPeriod>) -> Vec<Extracti
 /// since re-showing the primary pass's own verdict back to the adversarial
 /// pass would bias it toward agreeing rather than independently arguing the
 /// opposite case (design §2).
-fn build_period_user_content(summary: &str, description: &str, periods: &[ExtractionPeriod]) -> anyhow::Result<String> {
+fn build_period_user_content(
+    summary: &str,
+    description: &str,
+    periods: &[ExtractionPeriod],
+) -> anyhow::Result<String> {
     let skeleton: Vec<serde_json::Value> = periods
         .iter()
         .enumerate()
@@ -643,9 +716,18 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let result = client
-            .extract_primary("Signal failure at Reading", "Now resolved", reference_date())
+            .extract_primary(
+                "Signal failure at Reading",
+                "Now resolved",
+                reference_date(),
+            )
             .await
             .unwrap();
 
@@ -686,13 +768,25 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let result = client
-            .extract_primary("Buses replace trains", "Engineering works", reference_date())
+            .extract_primary(
+                "Buses replace trains",
+                "Engineering works",
+                reference_date(),
+            )
             .await
             .unwrap();
 
-        assert_eq!(result.periods[0].impact_type.as_deref(), Some("rail_replacement_bus"));
+        assert_eq!(
+            result.periods[0].impact_type.as_deref(),
+            Some("rail_replacement_bus")
+        );
     }
 
     #[tokio::test]
@@ -720,8 +814,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
-        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await.unwrap();
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let result = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await
+            .unwrap();
 
         assert_eq!(result.periods[0].impact_type, None);
     }
@@ -778,15 +880,30 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let result = client
-            .extract_primary("Wandsworth Town platform closures", "Two sequential phases", reference_date())
+            .extract_primary(
+                "Wandsworth Town platform closures",
+                "Two sequential phases",
+                reference_date(),
+            )
             .await
             .unwrap();
 
         assert_eq!(result.periods.len(), 2);
-        assert_eq!(result.periods[0].scope_description.as_deref(), Some("platform 2 closed, calls at platform 1"));
-        assert_eq!(result.periods[1].scope_description.as_deref(), Some("platform 3 closed, calls at platform 4"));
+        assert_eq!(
+            result.periods[0].scope_description.as_deref(),
+            Some("platform 2 closed, calls at platform 1")
+        );
+        assert_eq!(
+            result.periods[1].scope_description.as_deref(),
+            Some("platform 3 closed, calls at platform 4")
+        );
         assert!(result.periods[0].schedule_window.is_some());
         assert!(result.periods[1].schedule_window.is_some());
     }
@@ -806,10 +923,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
-        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let result = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await;
 
-        assert!(result.is_err(), "an empty periods array must be a hard failure, not a zero-period success");
+        assert!(
+            result.is_err(),
+            "an empty periods array must be a hard failure, not a zero-period success"
+        );
     }
 
     #[tokio::test]
@@ -824,9 +951,19 @@ mod tests {
         // without also exercising the date tiebreak (that's the dedicated
         // test below).
         let severities = [
-            "blocked_or_suspended", "severe_disruption", "blocked_or_suspended", "severe_disruption",
-            "blocked_or_suspended", "severe_disruption", "blocked_or_suspended", "severe_disruption",
-            "normal", "normal", "normal", "normal", "normal",
+            "blocked_or_suspended",
+            "severe_disruption",
+            "blocked_or_suspended",
+            "severe_disruption",
+            "blocked_or_suspended",
+            "severe_disruption",
+            "blocked_or_suspended",
+            "severe_disruption",
+            "normal",
+            "normal",
+            "normal",
+            "normal",
+            "normal",
         ];
         let periods: Vec<serde_json::Value> = severities
             .iter()
@@ -854,13 +991,25 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
-        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let result = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await;
 
-        let extraction = result.expect("exceeding the soft cap must now truncate and succeed, not fail");
+        let extraction =
+            result.expect("exceeding the soft cap must now truncate and succeed, not fail");
         assert_eq!(extraction.periods.len(), 8);
         assert_eq!(extraction.dropped_period_count, 5);
-        let kept: Vec<&str> = extraction.periods.iter().map(|p| p.scope_description.as_deref().unwrap()).collect();
+        let kept: Vec<&str> = extraction
+            .periods
+            .iter()
+            .map(|p| p.scope_description.as_deref().unwrap())
+            .collect();
         assert_eq!(
             kept,
             vec!["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"],
@@ -919,7 +1068,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let extraction = client
             .extract_primary("Signal failure", "Delays", reference_date())
             .await
@@ -927,9 +1081,19 @@ mod tests {
 
         assert_eq!(extraction.periods.len(), 8);
         assert_eq!(extraction.dropped_period_count, 1);
-        let kept: Vec<&str> = extraction.periods.iter().map(|p| p.scope_description.as_deref().unwrap()).collect();
-        assert!(kept.contains(&"candidate_none_date"), "the null-from_date candidate must win the tiebreak: {kept:?}");
-        assert!(!kept.contains(&"candidate_some_date"), "the dated candidate must lose the tiebreak: {kept:?}");
+        let kept: Vec<&str> = extraction
+            .periods
+            .iter()
+            .map(|p| p.scope_description.as_deref().unwrap())
+            .collect();
+        assert!(
+            kept.contains(&"candidate_none_date"),
+            "the null-from_date candidate must win the tiebreak: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"candidate_some_date"),
+            "the dated candidate must lose the tiebreak: {kept:?}"
+        );
     }
 
     #[tokio::test]
@@ -958,12 +1122,23 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
-        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let result = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await;
 
-        let extraction = result.expect("exactly MAX_PERIODS should still be accepted, only exceeding it truncates");
+        let extraction = result
+            .expect("exactly MAX_PERIODS should still be accepted, only exceeding it truncates");
         assert_eq!(extraction.periods.len(), MAX_PERIODS);
-        assert_eq!(extraction.dropped_period_count, 0, "the boundary case must not report any truncation");
+        assert_eq!(
+            extraction.dropped_period_count, 0,
+            "the boundary case must not report any truncation"
+        );
     }
 
     #[tokio::test]
@@ -992,13 +1167,23 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         // If the reference date weren't included in the request body, the
         // mock's `body_string_contains` matcher above would not match and
         // this call would fail (no mock configured to respond).
-        let result = client.extract_primary("11 May to 26 July", "no year stated", reference_date()).await;
+        let result = client
+            .extract_primary("11 May to 26 July", "no year stated", reference_date())
+            .await;
 
-        assert!(result.is_ok(), "reference date must be present in the request sent to the LLM: {result:?}");
+        assert!(
+            result.is_ok(),
+            "reference date must be present in the request sent to the LLM: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1021,7 +1206,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let periods = vec![
             ExtractionPeriod {
                 scope_description: None,
@@ -1045,7 +1235,10 @@ mod tests {
             },
         ];
 
-        let result = client.extract_adversarial("summary", "description", &periods).await.unwrap();
+        let result = client
+            .extract_adversarial("summary", "description", &periods)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].period_index, 0);
@@ -1074,7 +1267,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let periods = vec![ExtractionPeriod {
             scope_description: None,
             date_range: None,
@@ -1086,7 +1284,10 @@ mod tests {
             severity_confidence: String::new(),
         }];
 
-        let result = client.extract_severity_adversarial("Delays", "Minor knock-on delays", &periods).await.unwrap();
+        let result = client
+            .extract_severity_adversarial("Delays", "Minor knock-on delays", &periods)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].period_index, 0);
@@ -1104,10 +1305,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = LlmClient::new(server.uri(), None, "test-model".to_string(), DEFAULT_REQUEST_TIMEOUT);
-        let result = client.extract_primary("Signal failure", "Delays", reference_date()).await;
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let result = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await;
 
-        assert!(result.is_err(), "malformed content must be rejected, not silently stored");
+        assert!(
+            result.is_err(),
+            "malformed content must be rejected, not silently stored"
+        );
     }
 
     // -- `DateRange` wire-convention fixtures (design §1's testing-plan
@@ -1129,7 +1340,10 @@ mod tests {
         // closest occurrence is later the same year.
         let json = serde_json::json!({ "from_date": "2026-05-11T00:00:00Z", "to_date": "2026-07-27T00:00:00Z" });
         let range: DateRange = serde_json::from_value(json).unwrap();
-        assert_eq!(range.from_date, Some("2026-05-11T00:00:00Z".parse().unwrap()));
+        assert_eq!(
+            range.from_date,
+            Some("2026-05-11T00:00:00Z".parse().unwrap())
+        );
         assert_eq!(range.to_date, Some("2026-07-27T00:00:00Z".parse().unwrap()));
     }
 
@@ -1140,7 +1354,10 @@ mod tests {
         // resolved wire value reflects that rollover.
         let json = serde_json::json!({ "from_date": "2027-01-15T00:00:00Z", "to_date": null });
         let range: DateRange = serde_json::from_value(json).unwrap();
-        assert_eq!(range.from_date, Some("2027-01-15T00:00:00Z".parse().unwrap()));
+        assert_eq!(
+            range.from_date,
+            Some("2027-01-15T00:00:00Z".parse().unwrap())
+        );
         assert_eq!(range.to_date, None);
     }
 
@@ -1161,7 +1378,13 @@ mod tests {
     fn date_range_both_sides_null_is_a_valid_open_ended_range() {
         let json = serde_json::json!({ "from_date": null, "to_date": null });
         let range: DateRange = serde_json::from_value(json).unwrap();
-        assert_eq!(range, DateRange { from_date: None, to_date: None });
+        assert_eq!(
+            range,
+            DateRange {
+                from_date: None,
+                to_date: None
+            }
+        );
     }
 
     // --- Live eval against a real OpenAI-compatible endpoint ---
@@ -1178,15 +1401,24 @@ mod tests {
     // default is realistic against this specific deployment.
 
     fn live_client_from_env() -> LlmClient {
-        let base_url = std::env::var("LLM_BASE_URL").expect("LLM_BASE_URL must be set for live eval");
+        let base_url =
+            std::env::var("LLM_BASE_URL").expect("LLM_BASE_URL must be set for live eval");
         let api_key = std::env::var("LLM_API_KEY").ok();
         let model = std::env::var("LLM_MODEL").expect("LLM_MODEL must be set for live eval");
         // Overridable per-run via LIVE_EVAL_TIMEOUT_SECS -- useful for giving a
         // model extra room on a cold start (first request after this server
         // swaps a different model into memory) without changing every other
         // candidate's ceiling.
-        let timeout_secs: u64 = std::env::var("LIVE_EVAL_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(180);
-        LlmClient::new(base_url, api_key, model, std::time::Duration::from_secs(timeout_secs))
+        let timeout_secs: u64 = std::env::var("LIVE_EVAL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180);
+        LlmClient::new(
+            base_url,
+            api_key,
+            model,
+            std::time::Duration::from_secs(timeout_secs),
+        )
     }
 
     const WANDSWORTH_TOWN_SUMMARY: &str = "Platform alterations at Wandsworth Town";
@@ -1256,7 +1488,8 @@ mod tests {
     // diversion clause with no date/scope boundary of its own -- the
     // segmentation ambiguity design doc's Open questions/risks item 1
     // (and the research doc's Open question 1) name as unresolved.
-    const IMPACT_DIVERSION_SUMMARY: &str = "Rail replacement buses and diversions between London Bridge and Croydon";
+    const IMPACT_DIVERSION_SUMMARY: &str =
+        "Rail replacement buses and diversions between London Bridge and Croydon";
     const IMPACT_DIVERSION_DESCRIPTION: &str = "Monday to Thursday nights, buses will replace trains between \
         London Bridge and East / West Croydon while overnight engineering work takes place. Some trains will \
         be diverted via an alternative route.";
@@ -1270,9 +1503,18 @@ mod tests {
     /// each period's key fields) rather than the full pretty-printed debug
     /// dump the earlier one-shot tests use -- built for scanning many runs
     /// across many models at once.
-    async fn run_battery_attempt(client: &LlmClient, label: &str, attempt: u32, summary: &str, description: &str) {
+    async fn run_battery_attempt(
+        client: &LlmClient,
+        label: &str,
+        attempt: u32,
+        summary: &str,
+        description: &str,
+    ) {
         let start = std::time::Instant::now();
-        match client.extract_primary(summary, description, eval_reference_date()).await {
+        match client
+            .extract_primary(summary, description, eval_reference_date())
+            .await
+        {
             Ok(primary) => {
                 let elapsed = start.elapsed();
                 eprintln!(
@@ -1284,7 +1526,12 @@ mod tests {
                     eprintln!(
                         "  BATTERY fixture={label} attempt={attempt} period[{i}] scope={:?} date_range={:?} \
                          schedule_window={:?} resolution_status={:?} apparent_severity={:?} impact_type={:?}",
-                        p.scope_description, p.date_range, p.schedule_window, p.resolution_status, p.apparent_severity, p.impact_type
+                        p.scope_description,
+                        p.date_range,
+                        p.schedule_window,
+                        p.resolution_status,
+                        p.apparent_severity,
+                        p.impact_type
                     );
                 }
             }
@@ -1301,28 +1548,73 @@ mod tests {
     #[ignore = "requires network access to a real LLM_BASE_URL; run explicitly, see comment above"]
     async fn live_eval_battery() {
         let client = live_client_from_env();
-        let repeats: u32 = std::env::var("LIVE_EVAL_REPEATS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let repeats: u32 = std::env::var("LIVE_EVAL_REPEATS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
 
         for attempt in 1..=repeats {
-            run_battery_attempt(&client, "multi", attempt, WANDSWORTH_TOWN_SUMMARY, WANDSWORTH_TOWN_DESCRIPTION).await;
+            run_battery_attempt(
+                &client,
+                "multi",
+                attempt,
+                WANDSWORTH_TOWN_SUMMARY,
+                WANDSWORTH_TOWN_DESCRIPTION,
+            )
+            .await;
         }
         for attempt in 1..=repeats.min(2) {
-            run_battery_attempt(&client, "flat", attempt, FLAT_ETA_SUMMARY, FLAT_ETA_DESCRIPTION).await;
+            run_battery_attempt(
+                &client,
+                "flat",
+                attempt,
+                FLAT_ETA_SUMMARY,
+                FLAT_ETA_DESCRIPTION,
+            )
+            .await;
         }
         for attempt in 1..=repeats.min(2) {
             run_battery_attempt(&client, "trap", attempt, TRAP_SUMMARY, TRAP_DESCRIPTION).await;
         }
         for attempt in 1..=repeats {
-            run_battery_attempt(&client, "dow_legs", attempt, BARRHEAD_DUMFRIES_SUMMARY, BARRHEAD_DUMFRIES_DESCRIPTION).await;
+            run_battery_attempt(
+                &client,
+                "dow_legs",
+                attempt,
+                BARRHEAD_DUMFRIES_SUMMARY,
+                BARRHEAD_DUMFRIES_DESCRIPTION,
+            )
+            .await;
         }
         for attempt in 1..=repeats.min(2) {
-            run_battery_attempt(&client, "undated_aside", attempt, NORWOOD_JUNCTION_SUMMARY, NORWOOD_JUNCTION_DESCRIPTION).await;
+            run_battery_attempt(
+                &client,
+                "undated_aside",
+                attempt,
+                NORWOOD_JUNCTION_SUMMARY,
+                NORWOOD_JUNCTION_DESCRIPTION,
+            )
+            .await;
         }
         for attempt in 1..=repeats.min(2) {
-            run_battery_attempt(&client, "impact_bus_noservice", attempt, IMPACT_BUS_NOSERVICE_SUMMARY, IMPACT_BUS_NOSERVICE_DESCRIPTION).await;
+            run_battery_attempt(
+                &client,
+                "impact_bus_noservice",
+                attempt,
+                IMPACT_BUS_NOSERVICE_SUMMARY,
+                IMPACT_BUS_NOSERVICE_DESCRIPTION,
+            )
+            .await;
         }
         for attempt in 1..=repeats.min(2) {
-            run_battery_attempt(&client, "impact_diversion", attempt, IMPACT_DIVERSION_SUMMARY, IMPACT_DIVERSION_DESCRIPTION).await;
+            run_battery_attempt(
+                &client,
+                "impact_diversion",
+                attempt,
+                IMPACT_DIVERSION_SUMMARY,
+                IMPACT_DIVERSION_DESCRIPTION,
+            )
+            .await;
         }
     }
 
@@ -1334,33 +1626,73 @@ mod tests {
 
         let start = std::time::Instant::now();
         let primary = client
-            .extract_primary(WANDSWORTH_TOWN_SUMMARY, WANDSWORTH_TOWN_DESCRIPTION, reference_date)
+            .extract_primary(
+                WANDSWORTH_TOWN_SUMMARY,
+                WANDSWORTH_TOWN_DESCRIPTION,
+                reference_date,
+            )
             .await
             .expect("primary extraction should succeed against a real endpoint");
-        eprintln!("primary call took {:?}, category={:?}, periods={}", start.elapsed(), primary.category, primary.periods.len());
+        eprintln!(
+            "primary call took {:?}, category={:?}, periods={}",
+            start.elapsed(),
+            primary.category,
+            primary.periods.len()
+        );
         for (i, p) in primary.periods.iter().enumerate() {
             eprintln!(
                 "  period[{i}]: scope={:?} date_range={:?} schedule_window={:?} resolution_status={:?} apparent_severity={:?}",
-                p.scope_description, p.date_range, p.schedule_window, p.resolution_status, p.apparent_severity
+                p.scope_description,
+                p.date_range,
+                p.schedule_window,
+                p.resolution_status,
+                p.apparent_severity
             );
         }
-        assert!(!primary.periods.is_empty(), "periods must never be empty on a successful parse");
+        assert!(
+            !primary.periods.is_empty(),
+            "periods must never be empty on a successful parse"
+        );
 
         let start = std::time::Instant::now();
         let resolution = client
-            .extract_adversarial(WANDSWORTH_TOWN_SUMMARY, WANDSWORTH_TOWN_DESCRIPTION, &primary.periods)
+            .extract_adversarial(
+                WANDSWORTH_TOWN_SUMMARY,
+                WANDSWORTH_TOWN_DESCRIPTION,
+                &primary.periods,
+            )
             .await
             .expect("resolution-adversarial pass should succeed against a real endpoint");
-        eprintln!("resolution-adversarial call took {:?}: {:?}", start.elapsed(), resolution);
-        assert_eq!(resolution.len(), primary.periods.len(), "adversarial array must be index-aligned with primary's periods");
+        eprintln!(
+            "resolution-adversarial call took {:?}: {:?}",
+            start.elapsed(),
+            resolution
+        );
+        assert_eq!(
+            resolution.len(),
+            primary.periods.len(),
+            "adversarial array must be index-aligned with primary's periods"
+        );
 
         let start = std::time::Instant::now();
         let severity = client
-            .extract_severity_adversarial(WANDSWORTH_TOWN_SUMMARY, WANDSWORTH_TOWN_DESCRIPTION, &primary.periods)
+            .extract_severity_adversarial(
+                WANDSWORTH_TOWN_SUMMARY,
+                WANDSWORTH_TOWN_DESCRIPTION,
+                &primary.periods,
+            )
             .await
             .expect("severity-adversarial pass should succeed against a real endpoint");
-        eprintln!("severity-adversarial call took {:?}: {:?}", start.elapsed(), severity);
-        assert_eq!(severity.len(), primary.periods.len(), "adversarial array must be index-aligned with primary's periods");
+        eprintln!(
+            "severity-adversarial call took {:?}: {:?}",
+            start.elapsed(),
+            severity
+        );
+        assert_eq!(
+            severity.len(),
+            primary.periods.len(),
+            "adversarial array must be index-aligned with primary's periods"
+        );
 
         // Soft signal, not a hard assertion: this is the segmentation-reliability
         // risk the design doc flags as needing empirical checking, not something
@@ -1382,17 +1714,33 @@ mod tests {
 
         let start = std::time::Instant::now();
         let primary = client
-            .extract_primary(BARRHEAD_DUMFRIES_SUMMARY, BARRHEAD_DUMFRIES_DESCRIPTION, reference_date)
+            .extract_primary(
+                BARRHEAD_DUMFRIES_SUMMARY,
+                BARRHEAD_DUMFRIES_DESCRIPTION,
+                reference_date,
+            )
             .await
             .expect("primary extraction should succeed against a real endpoint");
-        eprintln!("primary call took {:?}, category={:?}, periods={}", start.elapsed(), primary.category, primary.periods.len());
+        eprintln!(
+            "primary call took {:?}, category={:?}, periods={}",
+            start.elapsed(),
+            primary.category,
+            primary.periods.len()
+        );
         for (i, p) in primary.periods.iter().enumerate() {
             eprintln!(
                 "  period[{i}]: scope={:?} date_range={:?} schedule_window={:?} resolution_status={:?} apparent_severity={:?}",
-                p.scope_description, p.date_range, p.schedule_window, p.resolution_status, p.apparent_severity
+                p.scope_description,
+                p.date_range,
+                p.schedule_window,
+                p.resolution_status,
+                p.apparent_severity
             );
         }
-        assert!(!primary.periods.is_empty(), "periods must never be empty on a successful parse");
+        assert!(
+            !primary.periods.is_empty(),
+            "periods must never be empty on a successful parse"
+        );
 
         // Soft signal, not a hard assertion -- exactly like
         // live_eval_wandsworth_town_segments_into_two_periods above. The
@@ -1413,12 +1761,22 @@ mod tests {
     #[ignore = "requires network access to a real LLM_BASE_URL; run explicitly, see comment above"]
     async fn live_eval_debug_raw_wandsworth_town_response() {
         let client = live_client_from_env();
-        let user_content = format!("Summary: {WANDSWORTH_TOWN_SUMMARY}\nDescription: {WANDSWORTH_TOWN_DESCRIPTION}");
+        let user_content = format!(
+            "Summary: {WANDSWORTH_TOWN_SUMMARY}\nDescription: {WANDSWORTH_TOWN_DESCRIPTION}"
+        );
         let raw = client
-            .chat_completion(PRIMARY_PROMPT, user_content, PRIMARY_SCHEMA_NAME, primary_schema())
+            .chat_completion(
+                PRIMARY_PROMPT,
+                user_content,
+                PRIMARY_SCHEMA_NAME,
+                primary_schema(),
+            )
             .await
             .expect("raw chat completion should succeed");
-        eprintln!("=== RAW CONTENT ({} bytes) ===\n{raw}\n=== END RAW CONTENT ===", raw.len());
+        eprintln!(
+            "=== RAW CONTENT ({} bytes) ===\n{raw}\n=== END RAW CONTENT ===",
+            raw.len()
+        );
     }
 
     #[tokio::test]
@@ -1437,7 +1795,11 @@ mod tests {
             )
             .await
             .expect("primary extraction should succeed against a real endpoint");
-        eprintln!("primary call took {:?}: {:?}", start.elapsed(), primary.periods);
+        eprintln!(
+            "primary call took {:?}: {:?}",
+            start.elapsed(),
+            primary.periods
+        );
 
         assert_eq!(
             primary.periods.len(),

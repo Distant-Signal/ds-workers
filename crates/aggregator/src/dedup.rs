@@ -94,7 +94,9 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
-use common::{Defaults, LineDefinition, SampleStats, StationDeparture, StationSample, thresholds_for};
+use common::{
+    Defaults, LineDefinition, SampleStats, StationDeparture, StationSample, thresholds_for,
+};
 
 use crate::aggregation::{relevant_departures, stats_from_departures};
 
@@ -118,7 +120,10 @@ impl SeenServiceLedger {
     /// `false` on every subsequent call for the same triple: a re-poll of a
     /// train still dwelling in the LDBWS window.
     fn mark_seen(&mut self, line_id: &str, period: NaiveDate, service_id: &str) -> bool {
-        self.seen.entry((line_id.to_string(), period)).or_default().insert(service_id.to_string())
+        self.seen
+            .entry((line_id.to_string(), period))
+            .or_default()
+            .insert(service_id.to_string())
     }
 
     /// Drops every tracked `(line_id, period)` entry whose `period` is
@@ -175,8 +180,10 @@ pub fn dedup_new_sample_stats(
     let thresholds = thresholds_for(defaults, &line.severity_overrides);
     let relevant = relevant_departures(line, samples);
 
-    let new_departures: Vec<&StationDeparture> =
-        relevant.into_iter().filter(|dep| ledger.mark_seen(line_id, period, &dep.service_id)).collect();
+    let new_departures: Vec<&StationDeparture> = relevant
+        .into_iter()
+        .filter(|dep| ledger.mark_seen(line_id, period, &dep.service_id))
+        .collect();
 
     if new_departures.is_empty() {
         return None;
@@ -199,8 +206,18 @@ mod tests {
             category: "test".to_string(),
             operators: vec!["SW".to_string()],
             stations: vec![
-                Station { crs: "AON".to_string(), tiploc: None, role: "terminus".to_string(), segment: None },
-                Station { crs: "WOK".to_string(), tiploc: None, role: "waypoint".to_string(), segment: None },
+                Station {
+                    crs: "AON".to_string(),
+                    tiploc: None,
+                    role: "terminus".to_string(),
+                    segment: None,
+                },
+                Station {
+                    crs: "WOK".to_string(),
+                    tiploc: None,
+                    role: "waypoint".to_string(),
+                    segment: None,
+                },
             ],
             sample_stations: sample_stations.iter().map(|s| s.to_string()).collect(),
             match_keywords: vec![],
@@ -228,9 +245,19 @@ mod tests {
         }
     }
 
-    fn samples_with(crs: &str, departures: Vec<StationDeparture>) -> HashMap<String, StationSample> {
+    fn samples_with(
+        crs: &str,
+        departures: Vec<StationDeparture>,
+    ) -> HashMap<String, StationSample> {
         let mut samples = HashMap::new();
-        samples.insert(crs.to_string(), StationSample { crs: crs.to_string(), polled_at: Utc::now(), departures });
+        samples.insert(
+            crs.to_string(),
+            StationSample {
+                crs: crs.to_string(),
+                polled_at: Utc::now(),
+                departures,
+            },
+        );
         samples
     }
 
@@ -245,8 +272,15 @@ mod tests {
         let mut ledger = SeenServiceLedger::new();
         let samples = samples_with("AHT", vec![departure("svc-1", 0, false)]);
 
-        let stats = dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 31), &l, &samples, &defaults)
-            .expect("first sighting should be new");
+        let stats = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &samples,
+            &defaults,
+        )
+        .expect("first sighting should be new");
         assert_eq!(stats.total, 1);
     }
 
@@ -267,8 +301,12 @@ mod tests {
         // these should contribute anything new.
         for _ in 0..20 {
             let cycle = samples_with("AHT", vec![departure("svc-1", 0, false)]);
-            let result = dedup_new_sample_stats(&mut ledger, "alton", period, &l, &cycle, &defaults);
-            assert!(result.is_none(), "a still-dwelling service must not be recounted");
+            let result =
+                dedup_new_sample_stats(&mut ledger, "alton", period, &l, &cycle, &defaults);
+            assert!(
+                result.is_none(),
+                "a still-dwelling service must not be recounted"
+            );
         }
     }
 
@@ -283,10 +321,16 @@ mod tests {
         dedup_new_sample_stats(&mut ledger, "alton", period, &l, &cycle1, &defaults);
 
         // svc-1 still dwelling, svc-2 newly appeared in the window.
-        let cycle2 = samples_with("AHT", vec![departure("svc-1", 5, false), departure("svc-2", 0, false)]);
+        let cycle2 = samples_with(
+            "AHT",
+            vec![departure("svc-1", 5, false), departure("svc-2", 0, false)],
+        );
         let stats = dedup_new_sample_stats(&mut ledger, "alton", period, &l, &cycle2, &defaults)
             .expect("svc-2 is genuinely new");
-        assert_eq!(stats.total, 1, "only the new service should be counted, not the still-dwelling one");
+        assert_eq!(
+            stats.total, 1,
+            "only the new service should be counted, not the still-dwelling one"
+        );
     }
 
     #[test]
@@ -302,10 +346,17 @@ mod tests {
         let period = day(2026, 8, 31);
         let samples = samples_with("WOK", vec![departure("shared-svc", 0, false)]);
 
-        let alton_stats = dedup_new_sample_stats(&mut ledger, "alton", period, &alton, &samples, &defaults);
-        let main_stats = dedup_new_sample_stats(&mut ledger, "main", period, &main, &samples, &defaults);
+        let alton_stats =
+            dedup_new_sample_stats(&mut ledger, "alton", period, &alton, &samples, &defaults);
+        let main_stats =
+            dedup_new_sample_stats(&mut ledger, "main", period, &main, &samples, &defaults);
         assert_eq!(alton_stats.expect("alton's first sighting").total, 1);
-        assert_eq!(main_stats.expect("main's first sighting, independent ledger key").total, 1);
+        assert_eq!(
+            main_stats
+                .expect("main's first sighting, independent ledger key")
+                .total,
+            1
+        );
     }
 
     #[test]
@@ -319,10 +370,28 @@ mod tests {
         let mut ledger = SeenServiceLedger::new();
         let samples = samples_with("AHT", vec![departure("svc-1", 0, false)]);
 
-        let day1 = dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 31), &l, &samples, &defaults);
-        let day2 = dedup_new_sample_stats(&mut ledger, "alton", day(2026, 9, 1), &l, &samples, &defaults);
+        let day1 = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &samples,
+            &defaults,
+        );
+        let day2 = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 9, 1),
+            &l,
+            &samples,
+            &defaults,
+        );
         assert_eq!(day1.expect("day 1 sighting").total, 1);
-        assert_eq!(day2.expect("day 2 is a fresh period, must count again").total, 1);
+        assert_eq!(
+            day2.expect("day 2 is a fresh period, must count again")
+                .total,
+            1
+        );
     }
 
     #[test]
@@ -331,7 +400,17 @@ mod tests {
         let defaults = Defaults::default();
         let mut ledger = SeenServiceLedger::new();
         let samples: HashMap<String, StationSample> = HashMap::new();
-        assert!(dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 31), &l, &samples, &defaults).is_none());
+        assert!(
+            dedup_new_sample_stats(
+                &mut ledger,
+                "alton",
+                day(2026, 8, 31),
+                &l,
+                &samples,
+                &defaults
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -341,11 +420,21 @@ mod tests {
         // still a real observation worth counting for a rollup.
         let l = line("alton", &["AHT"]);
         let defaults = Defaults::default();
-        assert!(defaults.min_sample_size > 1, "test assumes the default gate exceeds 1");
+        assert!(
+            defaults.min_sample_size > 1,
+            "test assumes the default gate exceeds 1"
+        );
         let mut ledger = SeenServiceLedger::new();
         let samples = samples_with("AHT", vec![departure("svc-1", 0, false)]);
 
-        let stats = dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 31), &l, &samples, &defaults);
+        let stats = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &samples,
+            &defaults,
+        );
         assert_eq!(stats.expect("single new train should still count").total, 1);
     }
 
@@ -354,7 +443,10 @@ mod tests {
         let l = line("alton", &["AHT"]);
         let defaults = Defaults::default();
         let mut ledger = SeenServiceLedger::new();
-        let skipping = StationDeparture { skipped_stations: vec!["WOK".to_string()], ..departure("svc-3", 0, false) };
+        let skipping = StationDeparture {
+            skipped_stations: vec!["WOK".to_string()],
+            ..departure("svc-3", 0, false)
+        };
         let samples = samples_with(
             "AHT",
             vec![
@@ -364,8 +456,15 @@ mod tests {
             ],
         );
 
-        let stats = dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 31), &l, &samples, &defaults)
-            .expect("three new services");
+        let stats = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &samples,
+            &defaults,
+        )
+        .expect("three new services");
         assert_eq!(stats.total, 3);
         assert_eq!(stats.cancelled, 1);
         assert_eq!(stats.delayed, 1);
@@ -379,12 +478,30 @@ mod tests {
         let mut ledger = SeenServiceLedger::new();
         let samples = samples_with("AHT", vec![departure("svc-1", 0, false)]);
 
-        dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 30), &l, &samples, &defaults);
-        dedup_new_sample_stats(&mut ledger, "alton", day(2026, 8, 31), &l, &samples, &defaults);
+        dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 30),
+            &l,
+            &samples,
+            &defaults,
+        );
+        dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &samples,
+            &defaults,
+        );
         assert_eq!(ledger.tracked_period_count(), 2);
 
         ledger.prune_before(day(2026, 8, 31));
-        assert_eq!(ledger.tracked_period_count(), 1, "only the stale (2026-08-30) period should be dropped");
+        assert_eq!(
+            ledger.tracked_period_count(),
+            1,
+            "only the stale (2026-08-30) period should be dropped"
+        );
 
         // Pruned period's memory is gone, so the same service_id on that
         // now-forgotten day would count as new again if it recurred -- an

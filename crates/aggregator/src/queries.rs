@@ -162,7 +162,9 @@ async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_
 /// on real changes.
 fn normalize_for_diff(statuses: &serde_json::Value) -> serde_json::Value {
     match statuses.as_array() {
-        Some(entries) => serde_json::Value::Array(entries.iter().map(normalize_entry_for_diff).collect()),
+        Some(entries) => {
+            serde_json::Value::Array(entries.iter().map(normalize_entry_for_diff).collect())
+        }
         None => statuses.clone(),
     }
 }
@@ -214,23 +216,34 @@ const LDBWS_INFERRED: &str = "ldbws-inferred";
 /// prior entry has a different `data_quality`, or the stripped content
 /// differs) is left with its fresh `Utc::now()` stamp untouched -- this is
 /// the correct behavior for those cases, not a gap in the fix.
-fn carry_forward_ldbws_from_date(existing: &serde_json::Value, fresh: &serde_json::Value) -> serde_json::Value {
+fn carry_forward_ldbws_from_date(
+    existing: &serde_json::Value,
+    fresh: &serde_json::Value,
+) -> serde_json::Value {
     let mut fresh = fresh.clone();
     let existing_entries = existing.as_array();
-    let Some(fresh_entries) = fresh.as_array_mut() else { return fresh };
+    let Some(fresh_entries) = fresh.as_array_mut() else {
+        return fresh;
+    };
 
     for (i, entry) in fresh_entries.iter_mut().enumerate() {
         if entry.get("data_quality").and_then(|v| v.as_str()) != Some(LDBWS_INFERRED) {
             continue;
         }
-        let Some(existing_entry) = existing_entries.and_then(|arr| arr.get(i)) else { continue };
+        let Some(existing_entry) = existing_entries.and_then(|arr| arr.get(i)) else {
+            continue;
+        };
         if existing_entry.get("data_quality").and_then(|v| v.as_str()) != Some(LDBWS_INFERRED) {
             continue;
         }
         if normalize_entry_for_diff(entry) != normalize_entry_for_diff(existing_entry) {
             continue;
         }
-        let Some(old_from_date) = existing_entry.get("validity").and_then(|v| v.get("from_date")).cloned() else {
+        let Some(old_from_date) = existing_entry
+            .get("validity")
+            .and_then(|v| v.get("from_date"))
+            .cloned()
+        else {
             continue;
         };
         if let Some(validity) = entry.get_mut("validity").and_then(|v| v.as_object_mut()) {
@@ -329,7 +342,9 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
 /// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md, Open
 /// question 5, for why these two conventions coexist.
 pub fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
-    instant.with_timezone(&chrono_tz::Europe::London).date_naive()
+    instant
+        .with_timezone(&chrono_tz::Europe::London)
+        .date_naive()
 }
 
 /// Upserts one line's contribution to its `(line_id, day)` daily rollup row
@@ -364,7 +379,14 @@ pub async fn record_daily_stats(
     let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
         Some(s) => {
             let running = s.total.saturating_sub(s.cancelled) as i64;
-            (s.total as i64, s.delayed as i64, s.cancelled as i64, s.skipped as i64, running, s.avg_delay_minutes * running as f64)
+            (
+                s.total as i64,
+                s.delayed as i64,
+                s.cancelled as i64,
+                s.skipped as i64,
+                running,
+                s.avg_delay_minutes * running as f64,
+            )
         }
         None => (0, 0, 0, 0, 0, 0.0),
     };
@@ -400,10 +422,11 @@ pub async fn record_daily_stats(
 /// `daily_stats_retention_days` always carries a real value (see
 /// `config.rs` and docs/superpowers/plans/2026-09-01-ldbws-data-retention.md).
 pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM line_status_daily_stats WHERE day < (CURRENT_DATE - $1::int)")
-        .bind(retention_days as i32)
-        .execute(pool)
-        .await?;
+    let result =
+        sqlx::query("DELETE FROM line_status_daily_stats WHERE day < (CURRENT_DATE - $1::int)")
+            .bind(retention_days as i32)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected())
 }
 
@@ -416,8 +439,12 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 load_incidents_excludes_cleared_rows -- --ignored` against docker compose's postgres"]
     async fn load_incidents_excludes_cleared_rows() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
 
         sqlx::query(
             "INSERT INTO incidents \
@@ -432,15 +459,24 @@ mod tests {
         .expect("seed fixture rows");
 
         let loaded = load_incidents(&pool).await.expect("load_incidents");
-        let ids: Vec<&str> = loaded.iter().map(|i| i.message.incident_id.as_str()).collect();
+        let ids: Vec<&str> = loaded
+            .iter()
+            .map(|i| i.message.incident_id.as_str())
+            .collect();
 
         sqlx::query("DELETE FROM incidents WHERE incident_id IN ('TEST-ACTIVE', 'TEST-CLEARED')")
             .execute(&pool)
             .await
             .expect("cleanup fixture rows");
 
-        assert!(ids.contains(&"TEST-ACTIVE"), "non-cleared incident should be loaded");
-        assert!(!ids.contains(&"TEST-CLEARED"), "cleared incident should be excluded");
+        assert!(
+            ids.contains(&"TEST-ACTIVE"),
+            "non-cleared incident should be loaded"
+        );
+        assert!(
+            !ids.contains(&"TEST-CLEARED"),
+            "cleared incident should be excluded"
+        );
     }
 
     #[tokio::test]
@@ -448,8 +484,12 @@ mod tests {
                 DATABASE_URL incantation, then run with `cargo test -p aggregator \
                 prune_removed_lines_leaves_other_sources_alone -- --ignored`"]
     async fn prune_removed_lines_leaves_other_sources_alone() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
 
         sqlx::query(
             "INSERT INTO line_status (line_id, name, mode_name, operators, statuses, source) \
@@ -465,21 +505,30 @@ mod tests {
         // An empty current-line set is the worst case: the aggregator has
         // nothing of its own left, so anything it does not own must still
         // survive.
-        prune_removed_lines(&pool, &[]).await.expect("prune_removed_lines");
+        prune_removed_lines(&pool, &[])
+            .await
+            .expect("prune_removed_lines");
 
-        let survivors: Vec<String> =
-            sqlx::query_scalar("SELECT line_id FROM line_status WHERE line_id IN ('TEST-AGG', 'TEST-TFL')")
-                .fetch_all(&pool)
-                .await
-                .expect("read survivors");
+        let survivors: Vec<String> = sqlx::query_scalar(
+            "SELECT line_id FROM line_status WHERE line_id IN ('TEST-AGG', 'TEST-TFL')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read survivors");
 
         sqlx::query("DELETE FROM line_status WHERE line_id IN ('TEST-AGG', 'TEST-TFL')")
             .execute(&pool)
             .await
             .expect("cleanup fixture rows");
 
-        assert!(!survivors.contains(&"TEST-AGG".to_string()), "the aggregator's own stale row should go");
-        assert!(survivors.contains(&"TEST-TFL".to_string()), "a TfL-owned row must not be collateral damage");
+        assert!(
+            !survivors.contains(&"TEST-AGG".to_string()),
+            "the aggregator's own stale row should go"
+        );
+        assert!(
+            survivors.contains(&"TEST-TFL".to_string()),
+            "a TfL-owned row must not be collateral damage"
+        );
     }
 
     #[tokio::test]
@@ -499,8 +548,12 @@ mod tests {
         use common::{Defaults, LineDefinition, StationDeparture, StationSample};
         use std::collections::HashMap;
 
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
 
         const LINE_ID: &str = "TEST-CARRY-FORWARD-LINE";
 
@@ -532,7 +585,11 @@ mod tests {
                 is_cancelled: false,
                 delay_minutes,
                 cancel_reason: None,
-                delay_reason: if delay_minutes > 0 { Some("signal failure".to_string()) } else { None },
+                delay_reason: if delay_minutes > 0 {
+                    Some("signal failure".to_string())
+                } else {
+                    None
+                },
                 headcode: None,
                 skipped_stations: vec![],
             }
@@ -575,35 +632,42 @@ mod tests {
             common::DataQuality::LdbwsInferred,
             "sanity check: this scenario should hit the LdbwsInferred path, not an incident-derived one"
         );
-        write_line_status(&pool, report1).await.expect("write_line_status cycle 1");
-
-        let stored_after_cycle_1: serde_json::Value = sqlx::query_scalar("SELECT statuses FROM line_status WHERE line_id = $1")
-            .bind(LINE_ID)
-            .fetch_one(&pool)
+        write_line_status(&pool, report1)
             .await
-            .expect("read stored statuses after cycle 1");
+            .expect("write_line_status cycle 1");
+
+        let stored_after_cycle_1: serde_json::Value =
+            sqlx::query_scalar("SELECT statuses FROM line_status WHERE line_id = $1")
+                .bind(LINE_ID)
+                .fetch_one(&pool)
+                .await
+                .expect("read stored statuses after cycle 1");
         let from_date_after_cycle_1 = stored_after_cycle_1[0]["validity"]["from_date"].clone();
 
         // Cycle 2: identical samples (a real re-poll of the same ongoing,
         // unchanged disruption), but a later, distinct Utc::now() internally.
         let reports2 = aggregate(&lines, &no_incidents, &samples, &registry, &defaults);
         let report2 = reports2.get(LINE_ID).expect("line should have a report");
-        let fresh_from_date_cycle_2 =
-            serde_json::to_value(report2.statuses[0].validity.from_date).expect("serialize fresh from_date");
-        write_line_status(&pool, report2).await.expect("write_line_status cycle 2");
-
-        let stored_after_cycle_2: serde_json::Value = sqlx::query_scalar("SELECT statuses FROM line_status WHERE line_id = $1")
-            .bind(LINE_ID)
-            .fetch_one(&pool)
+        let fresh_from_date_cycle_2 = serde_json::to_value(report2.statuses[0].validity.from_date)
+            .expect("serialize fresh from_date");
+        write_line_status(&pool, report2)
             .await
-            .expect("read stored statuses after cycle 2");
+            .expect("write_line_status cycle 2");
+
+        let stored_after_cycle_2: serde_json::Value =
+            sqlx::query_scalar("SELECT statuses FROM line_status WHERE line_id = $1")
+                .bind(LINE_ID)
+                .fetch_one(&pool)
+                .await
+                .expect("read stored statuses after cycle 2");
         let from_date_after_cycle_2 = stored_after_cycle_2[0]["validity"]["from_date"].clone();
 
-        let history_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_history WHERE line_id = $1")
-            .bind(LINE_ID)
-            .fetch_one(&pool)
-            .await
-            .expect("count history rows");
+        let history_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM line_status_history WHERE line_id = $1")
+                .bind(LINE_ID)
+                .fetch_one(&pool)
+                .await
+                .expect("count history rows");
 
         sqlx::query("DELETE FROM line_status_history WHERE line_id = $1")
             .bind(LINE_ID)
@@ -784,14 +848,21 @@ mod tests {
     #[test]
     fn strip_live_sample_annotation_only_strips_a_trailing_annotation() {
         assert_eq!(
-            strip_live_sample_annotation("Works in the area (live samples show: 5 of 9 sampled services delayed.)"),
+            strip_live_sample_annotation(
+                "Works in the area (live samples show: 5 of 9 sampled services delayed.)"
+            ),
             "Works in the area",
         );
-        assert_eq!(strip_live_sample_annotation("Works in the area"), "Works in the area");
+        assert_eq!(
+            strip_live_sample_annotation("Works in the area"),
+            "Works in the area"
+        );
         // A reason mentioning "live samples show" mid-sentence rather than as
         // the appended trailing annotation must not be touched.
         assert_eq!(
-            strip_live_sample_annotation("Works in the area (live samples show: something) more text"),
+            strip_live_sample_annotation(
+                "Works in the area (live samples show: something) more text"
+            ),
             "Works in the area (live samples show: something) more text",
         );
     }
@@ -840,8 +911,16 @@ mod tests {
 
     #[test]
     fn carry_forward_keeps_the_old_from_date_when_content_is_unchanged() {
-        let existing = ldbws_status("2026-08-30T06:00:00Z", "minor-delays", "3 of 10 sampled services delayed.");
-        let fresh = ldbws_status("2026-08-30T09:30:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let existing = ldbws_status(
+            "2026-08-30T06:00:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
+        let fresh = ldbws_status(
+            "2026-08-30T09:30:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
 
         let result = carry_forward_ldbws_from_date(&existing, &fresh);
 
@@ -853,8 +932,16 @@ mod tests {
 
     #[test]
     fn carry_forward_uses_the_fresh_stamp_when_severity_changes() {
-        let existing = ldbws_status("2026-08-30T06:00:00Z", "minor-delays", "3 of 10 sampled services delayed.");
-        let fresh = ldbws_status("2026-08-30T09:30:00Z", "severe-delays", "7 of 10 sampled services delayed.");
+        let existing = ldbws_status(
+            "2026-08-30T06:00:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
+        let fresh = ldbws_status(
+            "2026-08-30T09:30:00Z",
+            "severe-delays",
+            "7 of 10 sampled services delayed.",
+        );
 
         let result = carry_forward_ldbws_from_date(&existing, &fresh);
 
@@ -866,7 +953,11 @@ mod tests {
 
     #[test]
     fn carry_forward_uses_the_fresh_stamp_when_reason_changes() {
-        let existing = ldbws_status("2026-08-30T06:00:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let existing = ldbws_status(
+            "2026-08-30T06:00:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
         let fresh = ldbws_status(
             "2026-08-30T09:30:00Z",
             "minor-delays",
@@ -884,7 +975,11 @@ mod tests {
     #[test]
     fn carry_forward_uses_the_fresh_stamp_when_no_prior_entry_exists() {
         let existing = serde_json::json!([]);
-        let fresh = ldbws_status("2026-08-30T09:30:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let fresh = ldbws_status(
+            "2026-08-30T09:30:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
 
         let result = carry_forward_ldbws_from_date(&existing, &fresh);
 
@@ -897,7 +992,11 @@ mod tests {
     #[test]
     fn carry_forward_uses_the_fresh_stamp_when_the_prior_entry_has_a_different_data_quality() {
         let existing = knowledgebase_status("2026-08-30T06:00:00Z");
-        let fresh = ldbws_status("2026-08-30T09:30:00Z", "minor-delays", "3 of 10 sampled services delayed.");
+        let fresh = ldbws_status(
+            "2026-08-30T09:30:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
 
         let result = carry_forward_ldbws_from_date(&existing, &fresh);
 
@@ -917,7 +1016,10 @@ mod tests {
 
         let result = carry_forward_ldbws_from_date(&existing, &fresh);
 
-        assert_eq!(result, fresh, "non-ldbws-inferred entries must pass through untouched");
+        assert_eq!(
+            result, fresh,
+            "non-ldbws-inferred entries must pass through untouched"
+        );
     }
 
     #[test]
@@ -985,7 +1087,10 @@ mod tests {
         // 2026-07-15 22:59 UTC is 2026-07-15 23:59 BST (July is daylight
         // saving, UTC+1) -- still the same London calendar day.
         let instant: DateTime<Utc> = "2026-07-15T22:59:00Z".parse().unwrap();
-        assert_eq!(london_calendar_day(instant), NaiveDate::from_ymd_opt(2026, 7, 15).unwrap());
+        assert_eq!(
+            london_calendar_day(instant),
+            NaiveDate::from_ymd_opt(2026, 7, 15).unwrap()
+        );
     }
 
     #[test]
@@ -993,7 +1098,10 @@ mod tests {
         // 2026-07-15 23:00 UTC is 2026-07-16 00:00 BST -- just crossed into
         // the next London calendar day.
         let instant: DateTime<Utc> = "2026-07-15T23:00:00Z".parse().unwrap();
-        assert_eq!(london_calendar_day(instant), NaiveDate::from_ymd_opt(2026, 7, 16).unwrap());
+        assert_eq!(
+            london_calendar_day(instant),
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
+        );
     }
 
     #[test]
@@ -1002,8 +1110,14 @@ mod tests {
         // up exactly with the UTC one -- no offset to account for.
         let just_before: DateTime<Utc> = "2026-01-15T23:59:00Z".parse().unwrap();
         let just_after: DateTime<Utc> = "2026-01-16T00:00:00Z".parse().unwrap();
-        assert_eq!(london_calendar_day(just_before), NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
-        assert_eq!(london_calendar_day(just_after), NaiveDate::from_ymd_opt(2026, 1, 16).unwrap());
+        assert_eq!(
+            london_calendar_day(just_before),
+            NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()
+        );
+        assert_eq!(
+            london_calendar_day(just_after),
+            NaiveDate::from_ymd_opt(2026, 1, 16).unwrap()
+        );
     }
 
     #[test]
@@ -1017,8 +1131,14 @@ mod tests {
         // doesn't perturb the resulting date.
         let just_before: DateTime<Utc> = "2026-03-29T00:59:00Z".parse().unwrap();
         let just_after: DateTime<Utc> = "2026-03-29T01:30:00Z".parse().unwrap();
-        assert_eq!(london_calendar_day(just_before), NaiveDate::from_ymd_opt(2026, 3, 29).unwrap());
-        assert_eq!(london_calendar_day(just_after), NaiveDate::from_ymd_opt(2026, 3, 29).unwrap());
+        assert_eq!(
+            london_calendar_day(just_before),
+            NaiveDate::from_ymd_opt(2026, 3, 29).unwrap()
+        );
+        assert_eq!(
+            london_calendar_day(just_after),
+            NaiveDate::from_ymd_opt(2026, 3, 29).unwrap()
+        );
     }
 
     #[test]
@@ -1029,8 +1149,14 @@ mod tests {
         // hour.
         let just_before: DateTime<Utc> = "2026-10-25T00:30:00Z".parse().unwrap();
         let just_after: DateTime<Utc> = "2026-10-25T01:30:00Z".parse().unwrap();
-        assert_eq!(london_calendar_day(just_before), NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
-        assert_eq!(london_calendar_day(just_after), NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
+        assert_eq!(
+            london_calendar_day(just_before),
+            NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()
+        );
+        assert_eq!(
+            london_calendar_day(just_after),
+            NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()
+        );
     }
 
     // --- record_daily_stats / prune_daily_stats ---
@@ -1048,20 +1174,38 @@ mod tests {
                 record_daily_stats_accumulates_deduped_contributions_across_a_day -- --ignored` \
                 against docker compose's postgres"]
     async fn record_daily_stats_accumulates_deduped_contributions_across_a_day() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-DAILY-STATS-ACCUMULATE";
         let day = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
 
         cleanup_daily_stats(&pool, LINE_ID).await;
 
-        let cycle1 =
-            common::SampleStats { total: 4, delayed: 1, cancelled: 1, skipped: 0, avg_delay_minutes: 6.0 };
-        let cycle2 =
-            common::SampleStats { total: 2, delayed: 2, cancelled: 0, skipped: 1, avg_delay_minutes: 12.0 };
+        let cycle1 = common::SampleStats {
+            total: 4,
+            delayed: 1,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 6.0,
+        };
+        let cycle2 = common::SampleStats {
+            total: 2,
+            delayed: 2,
+            cancelled: 0,
+            skipped: 1,
+            avg_delay_minutes: 12.0,
+        };
 
-        record_daily_stats(&pool, LINE_ID, day, Some(&cycle1)).await.expect("record cycle 1");
-        record_daily_stats(&pool, LINE_ID, day, Some(&cycle2)).await.expect("record cycle 2");
+        record_daily_stats(&pool, LINE_ID, day, Some(&cycle1))
+            .await
+            .expect("record cycle 1");
+        record_daily_stats(&pool, LINE_ID, day, Some(&cycle2))
+            .await
+            .expect("record cycle 2");
 
         let row = sqlx::query(
             "SELECT sample_cycles, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
@@ -1083,7 +1227,10 @@ mod tests {
         let running_count: i64 = row.try_get("running_count").unwrap();
         let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
 
-        assert_eq!(sample_cycles, 2, "two Some(stats) calls should each count as one covered cycle");
+        assert_eq!(
+            sample_cycles, 2,
+            "two Some(stats) calls should each count as one covered cycle"
+        );
         assert_eq!(total, 6);
         assert_eq!(delayed, 3);
         assert_eq!(cancelled, 1);
@@ -1106,15 +1253,23 @@ mod tests {
                 record_daily_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored` \
                 against docker compose's postgres"]
     async fn record_daily_stats_none_still_counts_the_cycle_but_adds_nothing() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-DAILY-STATS-NONE";
         let day = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
 
         cleanup_daily_stats(&pool, LINE_ID).await;
 
-        record_daily_stats(&pool, LINE_ID, day, None).await.expect("record a None cycle");
-        record_daily_stats(&pool, LINE_ID, day, None).await.expect("record a second None cycle");
+        record_daily_stats(&pool, LINE_ID, day, None)
+            .await
+            .expect("record a None cycle");
+        record_daily_stats(&pool, LINE_ID, day, None)
+            .await
+            .expect("record a second None cycle");
 
         let row = sqlx::query(
             "SELECT sample_cycles, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
@@ -1142,17 +1297,31 @@ mod tests {
                 record_daily_stats_a_new_day_starts_a_fresh_row -- --ignored` against docker \
                 compose's postgres"]
     async fn record_daily_stats_a_new_day_starts_a_fresh_row() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-DAILY-STATS-NEW-DAY";
         let day1 = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
         let day2 = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
 
         cleanup_daily_stats(&pool, LINE_ID).await;
 
-        let stats = common::SampleStats { total: 5, delayed: 1, cancelled: 0, skipped: 0, avg_delay_minutes: 3.0 };
-        record_daily_stats(&pool, LINE_ID, day1, Some(&stats)).await.expect("record day 1");
-        record_daily_stats(&pool, LINE_ID, day2, Some(&stats)).await.expect("record day 2");
+        let stats = common::SampleStats {
+            total: 5,
+            delayed: 1,
+            cancelled: 0,
+            skipped: 0,
+            avg_delay_minutes: 3.0,
+        };
+        record_daily_stats(&pool, LINE_ID, day1, Some(&stats))
+            .await
+            .expect("record day 1");
+        record_daily_stats(&pool, LINE_ID, day2, Some(&stats))
+            .await
+            .expect("record day 2");
 
         let day2_cycles: i64 = sqlx::query_scalar(
             "SELECT sample_cycles FROM line_status_daily_stats WHERE line_id = $1 AND day = $2",
@@ -1165,7 +1334,10 @@ mod tests {
 
         cleanup_daily_stats(&pool, LINE_ID).await;
 
-        assert_eq!(day2_cycles, 1, "a new day must start its own fresh row, not accumulate into day 1's");
+        assert_eq!(
+            day2_cycles, 1,
+            "a new day must start its own fresh row, not accumulate into day 1's"
+        );
     }
 
     #[tokio::test]
@@ -1173,8 +1345,12 @@ mod tests {
                 prune_daily_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
                 against docker compose's postgres"]
     async fn prune_daily_stats_deletes_only_rows_older_than_the_retention_window() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const OLD_LINE_ID: &str = "TEST-DAILY-STATS-PRUNE-OLD";
         const RECENT_LINE_ID: &str = "TEST-DAILY-STATS-PRUNE-RECENT";
         const RETENTION_DAYS: i64 = 30;
@@ -1194,7 +1370,9 @@ mod tests {
         .await
         .expect("seed old and recent rows");
 
-        prune_daily_stats(&pool, RETENTION_DAYS).await.expect("prune_daily_stats");
+        prune_daily_stats(&pool, RETENTION_DAYS)
+            .await
+            .expect("prune_daily_stats");
 
         let old_survives: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM line_status_daily_stats WHERE line_id = $1")
@@ -1212,7 +1390,13 @@ mod tests {
         cleanup_daily_stats(&pool, OLD_LINE_ID).await;
         cleanup_daily_stats(&pool, RECENT_LINE_ID).await;
 
-        assert_eq!(old_survives, 0, "a row older than the retention window should be pruned");
-        assert_eq!(recent_survives, 1, "a row within the retention window should be kept");
+        assert_eq!(
+            old_survives, 0,
+            "a row older than the retention window should be pruned"
+        );
+        assert_eq!(
+            recent_survives, 1,
+            "a row within the retention window should be kept"
+        );
     }
 }
