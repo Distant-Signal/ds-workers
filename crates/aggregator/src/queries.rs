@@ -156,8 +156,16 @@ async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_
 ///   same live counts as `sample_stats`, just formatted into text instead
 ///   of left structured, so it churns every cycle for the same reason and
 ///   needs the same stripping.
+/// - the live counts `classify()` (aggregation.rs) bakes directly into a
+///   sample-inferred `reason`, e.g. `"5 of 9 sampled services delayed."` --
+///   these fluctuate on essentially every poll cycle just like
+///   `sample_stats` does, for the same underlying reason (they're computed
+///   from the same live departure counts), so they need the same
+///   normalization. See `normalize_sample_counts`'s own doc comment for why
+///   only the counts -- not the `"(most cited: ...)"` suffix
+///   `infer_from_samples` also appends -- are stripped here.
 ///
-/// Without stripping all three, a "change" would be seen on every single
+/// Without stripping all of these, a "change" would be seen on every single
 /// poll cycle for most lines, defeating the point of only recording history
 /// on real changes.
 fn normalize_for_diff(statuses: &serde_json::Value) -> serde_json::Value {
@@ -184,9 +192,10 @@ fn normalize_entry_for_diff(entry: &serde_json::Value) -> serde_json::Value {
         obj.remove("sample_availability");
     }
     if let Some(reason) = entry.get_mut("reason")
-        && let Some(stripped) = reason.as_str().map(strip_live_sample_annotation)
+        && let Some(text) = reason.as_str()
     {
-        *reason = serde_json::Value::String(stripped.to_string());
+        let normalized = normalize_sample_counts(strip_live_sample_annotation(text));
+        *reason = serde_json::Value::String(normalized);
     }
     entry
 }
@@ -202,9 +211,10 @@ const LDBWS_INFERRED: &str = "ldbws-inferred";
 /// the positionally-corresponding entry in `existing`, provided that entry
 /// is also `"ldbws-inferred"` and the two entries are equal once run
 /// through `normalize_entry_for_diff` (i.e. "same underlying disruption,
-/// just a fresh poll of it" -- `sample_stats` and the live-sample-count
-/// reason suffix are allowed to churn without defeating the carry-forward,
-/// since `normalize_entry_for_diff` already strips both).
+/// just a fresh poll of it" -- `sample_stats`, the live-sample-count reason
+/// suffix, and the live counts baked directly into a sample-inferred
+/// `reason` are all allowed to churn without defeating the carry-forward,
+/// since `normalize_entry_for_diff` already strips all three).
 ///
 /// Positional matching (`existing[i]` vs. `fresh[i]`) is safe today because
 /// `infer_from_samples`/`good_service()` (`aggregation.rs`) only ever
@@ -265,6 +275,78 @@ fn strip_live_sample_annotation(reason: &str) -> &str {
         Some(idx) if reason.ends_with(')') => &reason[..idx],
         _ => reason,
     }
+}
+
+/// Replaces the fluctuating live counts `classify()` (aggregation.rs) bakes
+/// directly into a sample-inferred `reason` -- e.g. `"5 of 9 sampled
+/// services delayed."` -- with a stable placeholder (`"N of M sampled
+/// services delayed."`), so two cycles' worth of pure count wobble (5-of-9
+/// vs. 7-of-14, same underlying situation) normalize to the same identity.
+/// Every `classify()` template has this exact `"<count> of <count> sampled
+/// services <cause>"` shape (`aggregation.rs`'s `cancelled`/`delayed`/
+/// `skipping a scheduled stop` clauses, singly or joined with `", "` in the
+/// delay+skip-tie case), so a marker-based scan for `" of "` immediately
+/// followed by a digit run and `" sampled services"` catches all of them
+/// without a regex dependency or a full parse -- mirrors
+/// `strip_live_sample_annotation`'s marker-based approach.
+///
+/// Deliberately does NOT touch the `" (most cited: ...)"` suffix
+/// `infer_from_samples` separately appends after `classify()` runs: unlike
+/// the raw counts, `most_common`'s pick of the most-cited free-text delay/
+/// cancel reason is real information about *why* services are disrupted,
+/// not per-cycle sampling noise. If it genuinely changes (e.g. "Signal
+/// failure" to "Engineering works"), that's a real change in the reported
+/// cause worth its own history entry -- collapsing it away would hide a
+/// real change behind this fix meant only to suppress noise. See
+/// `normalize_entry_for_diff`'s regression tests for both directions of
+/// this.
+fn normalize_sample_counts(reason: &str) -> String {
+    const OF_MARKER: &str = " of ";
+    const SERVICES_MARKER: &str = " sampled services";
+
+    let mut result = String::with_capacity(reason.len());
+    let mut copied_to = 0usize;
+    let mut search_from = 0usize;
+
+    while let Some(of_rel) = reason[search_from..].find(OF_MARKER) {
+        let of_idx = search_from + of_rel;
+
+        // Digit run immediately preceding " of ", scanning back only as far
+        // as `copied_to` (text already emitted for an earlier match).
+        let before = &reason[copied_to..of_idx];
+        let first_digits_start =
+            copied_to + before.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |p| p + 1);
+        let first_digits = &reason[first_digits_start..of_idx];
+
+        // Digit run immediately following " of ".
+        let after_of_start = of_idx + OF_MARKER.len();
+        let after_of = &reason[after_of_start..];
+        let second_digits_len = after_of
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after_of.len());
+        let second_digits_end = after_of_start + second_digits_len;
+        let second_digits = &reason[after_of_start..second_digits_end];
+        let after_digits = &reason[second_digits_end..];
+
+        if !first_digits.is_empty()
+            && !second_digits.is_empty()
+            && after_digits.starts_with(SERVICES_MARKER)
+        {
+            result.push_str(&reason[copied_to..first_digits_start]);
+            result.push('N');
+            result.push_str(OF_MARKER);
+            result.push('M');
+            copied_to = second_digits_end;
+        }
+
+        // Always advance past this " of " occurrence, matched or not, so a
+        // non-count " of " (e.g. "delayed because of engineering works")
+        // can't stall the scan.
+        search_from = of_idx + OF_MARKER.len();
+    }
+
+    result.push_str(&reason[copied_to..]);
+    result
 }
 
 /// Upserts one line's computed report into `line_status` (always), and
@@ -977,6 +1059,109 @@ mod tests {
             ),
             "Works in the area (live samples show: something) more text",
         );
+    }
+
+    // --- normalize_sample_counts ---
+    //
+    // See that function's own doc comment for the reasoning behind
+    // stripping only the counts and deliberately leaving "(most cited:
+    // ...)" text untouched.
+
+    #[test]
+    fn normalize_sample_counts_replaces_a_single_count_clause() {
+        assert_eq!(
+            normalize_sample_counts("5 of 9 sampled services delayed."),
+            "N of M sampled services delayed.",
+        );
+        assert_eq!(
+            normalize_sample_counts("12 of 340 sampled services cancelled."),
+            "N of M sampled services cancelled.",
+        );
+    }
+
+    #[test]
+    fn normalize_sample_counts_replaces_both_clauses_of_a_combined_delay_skip_reason() {
+        assert_eq!(
+            normalize_sample_counts(
+                "5 of 9 sampled services delayed, 3 of 9 sampled services skipping a scheduled stop."
+            ),
+            "N of M sampled services delayed, N of M sampled services skipping a scheduled stop.",
+        );
+    }
+
+    #[test]
+    fn normalize_sample_counts_leaves_the_most_cited_suffix_untouched() {
+        assert_eq!(
+            normalize_sample_counts("5 of 9 sampled services delayed. (most cited: Signal failure)"),
+            "N of M sampled services delayed. (most cited: Signal failure)",
+        );
+    }
+
+    #[test]
+    fn normalize_sample_counts_leaves_unrelated_text_alone() {
+        assert_eq!(
+            normalize_sample_counts("Good Service"),
+            "Good Service",
+        );
+        // "of" not attached to a "<digits> of <digits> sampled services"
+        // shape must not be touched, and must not stall the scan.
+        assert_eq!(
+            normalize_sample_counts("Delayed because of engineering works, 5 of 9 sampled services delayed."),
+            "Delayed because of engineering works, N of M sampled services delayed.",
+        );
+    }
+
+    #[test]
+    fn normalize_entry_for_diff_ignores_sample_derived_count_churn() {
+        // The write-side regression this fix exists for: two cycles of the
+        // exact same underlying situation, live counts wobbling, must
+        // normalize to the same identity so `write_line_status` does not
+        // insert a fresh `line_status_history` row for pure count noise.
+        let a = serde_json::json!([
+            {
+                "severity": "minor-delays",
+                "reason": "5 of 9 sampled services delayed. (most cited: Signal failure)",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "ldbws-inferred"
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "minor-delays",
+                "reason": "7 of 14 sampled services delayed. (most cited: Signal failure)",
+                "validity": {"from_date": "2026-07-09T10:05:00Z"},
+                "data_quality": "ldbws-inferred"
+            }
+        ]);
+
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_entry_for_diff_still_detects_a_genuine_most_cited_cause_change() {
+        // Design decision: the count fluctuating minute-to-minute is noise,
+        // but a genuine change in the most-cited reported cause (e.g.
+        // Signal failure -> Engineering works) is real information a human
+        // cares about, so it must still register as a change even though
+        // the counts themselves also happen to differ.
+        let a = serde_json::json!([
+            {
+                "severity": "minor-delays",
+                "reason": "5 of 9 sampled services delayed. (most cited: Signal failure)",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "ldbws-inferred"
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "minor-delays",
+                "reason": "7 of 14 sampled services delayed. (most cited: Engineering works)",
+                "validity": {"from_date": "2026-07-09T10:05:00Z"},
+                "data_quality": "ldbws-inferred"
+            }
+        ]);
+
+        assert_ne!(normalize_for_diff(&a), normalize_for_diff(&b));
     }
 
     // --- carry_forward_ldbws_from_date ---
