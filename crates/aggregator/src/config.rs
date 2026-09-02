@@ -68,21 +68,31 @@ pub struct Config {
     #[arg(long, env, default_value_t = 300)]
     pub daily_stats_retention_days: i64,
 
-    /// How long to keep `line_status_hourly_stats` rows before pruning
-    /// them. Deliberately NOT a reuse of `history_retention_days` (governs
-    /// a different table, `line_status_history`) or
+    /// How long to keep `line_status_half_hourly_stats` rows before
+    /// pruning them. Deliberately NOT a reuse of `history_retention_days`
+    /// (governs a different table, `line_status_history`) or
     /// `daily_stats_retention_days` (sized for a weeks/months trend use
-    /// case this hourly rolling-24h view does not have -- reusing its
-    /// default of 300 would mean accumulating ~300 days x 24 rows/line of
-    /// data only the most recent ~25 rows of which are ever read). 48
-    /// hours is a 2x safety margin over the 24-25 rows the line-info-page
-    /// embed actually needs, per
+    /// case this half-hourly rolling-24h view does not have -- reusing its
+    /// default of 300 would mean accumulating ~300 days x 48 rows/line of
+    /// data only the most recent ~49 rows of which are ever read). 48
+    /// hours is a 2x safety margin over the 48-49 rows the line-info-page
+    /// embed actually needs at 30-minute granularity, per
     /// docs/superpowers/specs/2026-09-02-trend-chart-granularity-design.md
     /// Decision 5 -- a reasoned starting default, not empirically
     /// validated against real restart/deploy timing (see that spec's Open
     /// question 2).
+    ///
+    /// This field's UNIT is deliberately unchanged from the table's
+    /// original 1-hour-bucket era: retention is measured in wall-clock
+    /// hours, not bucket count, so halving the bucket size (1h -> 30min,
+    /// alongside this field's own rename from `hourly_stats_retention_hours`)
+    /// does not change the default value either -- 48 hours of real time
+    /// is still 48 hours of real time. The only consequence is that this
+    /// same window now holds roughly twice as many rows per line (~96
+    /// instead of ~48) to cover it, which is a trivial row count for
+    /// Postgres and not something that needs its own knob.
     #[arg(long, env, default_value_t = 48)]
-    pub hourly_stats_retention_hours: i64,
+    pub half_hourly_stats_retention_hours: i64,
 
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
