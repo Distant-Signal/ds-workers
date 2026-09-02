@@ -347,6 +347,32 @@ pub fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
         .date_naive()
 }
 
+/// The plain UTC hour `instant` falls in, truncated to the top of the
+/// hour (e.g. 14:37:12Z -> 14:00:00Z). Deliberately NOT routed through
+/// `chrono_tz::Europe::London` the way `london_calendar_day` is -- Decision
+/// 4 of docs/superpowers/specs/2026-09-02-trend-chart-granularity-design.md
+/// explains why: `line_status_hourly_stats` only ever backs a rolling
+/// 24-hour window, which has no calendar-day identity worth preserving
+/// through a DST transition the way the daily table's London-local `day`
+/// does. A plain UTC truncation has no 23/25-hour-day edge case to get
+/// wrong at all. Never displayed directly to a viewer -- always rendered
+/// through `frontend/lib/dateFormat.ts`'s `formatTime` (London wall-clock)
+/// first.
+///
+/// Implemented via explicit `NaiveDate`/`Timelike` arithmetic rather than
+/// `chrono::DurationRound::duration_trunc`, since that trait's `round`
+/// Cargo feature was not confirmed enabled for this crate's `chrono`
+/// dependency -- this avoids depending on an unverified feature flag for
+/// what is otherwise a three-line truncation.
+pub fn utc_hour_start(instant: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::Timelike;
+    instant
+        .date_naive()
+        .and_hms_opt(instant.hour(), 0, 0)
+        .expect("hour() is always 0-23, so this can never fail")
+        .and_utc()
+}
+
 /// Upserts one line's contribution to its `(line_id, day)` daily rollup row
 /// for this cycle. Called from `run_cycle` (`main.rs`, a later task) AT MOST
 /// ONCE per line per cycle, gated on the line having had ANY raw sample
@@ -427,6 +453,76 @@ pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64
             .bind(retention_days as i32)
             .execute(pool)
             .await?;
+    Ok(result.rows_affected())
+}
+
+/// Hourly-granularity sibling of `record_daily_stats` -- same
+/// accumulate-upsert shape, same "fed the DEDUPED per-cycle contribution,
+/// not raw SampleStats" contract (see that function's own doc comment,
+/// which applies here unchanged), keyed on `hour_start` (a plain UTC hour
+/// boundary from `utc_hour_start`, Decision 4) instead of a London
+/// calendar `day`.
+///
+/// Called at the exact same call site as `record_daily_stats`, fed the
+/// SAME `deduped: Option<&SampleStats>` value for a given line/cycle --
+/// see `main.rs`'s `run_cycle` and
+/// docs/superpowers/specs/2026-09-02-trend-chart-granularity-design.md
+/// Decision 2. This invariant (both calls see the identical value) is
+/// what makes a day's 24 hourly rows sum back to that day's
+/// `line_status_daily_stats` row -- see this file's
+/// `hourly_and_daily_stats_reconcile_for_a_single_line_and_period` test.
+pub async fn record_hourly_stats(
+    pool: &PgPool,
+    line_id: &str,
+    hour_start: DateTime<Utc>,
+    stats: Option<&common::SampleStats>,
+) -> Result<()> {
+    let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
+        Some(s) => {
+            let running = s.total.saturating_sub(s.cancelled) as i64;
+            (s.total as i64, s.delayed as i64, s.cancelled as i64, s.skipped as i64, running, s.avg_delay_minutes * running as f64)
+        }
+        None => (0, 0, 0, 0, 0, 0.0),
+    };
+    sqlx::query(
+        "INSERT INTO line_status_hourly_stats
+            (line_id, hour_start, sample_cycles, total, delayed, cancelled, skipped,
+             running_count, delay_minutes_sum)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (line_id, hour_start) DO UPDATE SET
+            sample_cycles     = line_status_hourly_stats.sample_cycles + 1,
+            total             = line_status_hourly_stats.total + EXCLUDED.total,
+            delayed           = line_status_hourly_stats.delayed + EXCLUDED.delayed,
+            cancelled         = line_status_hourly_stats.cancelled + EXCLUDED.cancelled,
+            skipped           = line_status_hourly_stats.skipped + EXCLUDED.skipped,
+            running_count     = line_status_hourly_stats.running_count + EXCLUDED.running_count,
+            delay_minutes_sum = line_status_hourly_stats.delay_minutes_sum + EXCLUDED.delay_minutes_sum",
+    )
+    .bind(line_id)
+    .bind(hour_start)
+    .bind(total)
+    .bind(delayed)
+    .bind(cancelled)
+    .bind(skipped)
+    .bind(running)
+    .bind(delay_minutes_sum)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mirrors `prune_daily_stats`'s shape exactly, called unconditionally
+/// every cycle from `run_cycle`, keyed on the new
+/// `hourly_stats_retention_hours` config knob (default 48, Decision 5 --
+/// NOT a reuse of either `history_retention_days` or
+/// `daily_stats_retention_days`, both of which govern unrelated tables).
+pub async fn prune_hourly_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM line_status_hourly_stats WHERE hour_start < NOW() - ($1 || ' hours')::interval",
+    )
+    .bind(retention_hours.to_string())
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -1159,6 +1255,40 @@ mod tests {
         );
     }
 
+    // --- utc_hour_start ---
+    //
+    // Deliberately no DST-transition cases here, unlike london_calendar_day's
+    // suite above -- see Decision 4 / this function's own doc comment for why
+    // a plain UTC truncation has nothing DST-related to get wrong.
+
+    #[test]
+    fn utc_hour_start_truncates_to_the_top_of_the_hour() {
+        let instant: DateTime<Utc> = "2026-08-15T14:37:12Z".parse().unwrap();
+        assert_eq!(utc_hour_start(instant), "2026-08-15T14:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn utc_hour_start_on_the_exact_hour_boundary_is_a_no_op() {
+        let instant: DateTime<Utc> = "2026-08-15T14:00:00Z".parse().unwrap();
+        assert_eq!(utc_hour_start(instant), instant);
+    }
+
+    #[test]
+    fn utc_hour_start_just_before_midnight_stays_on_the_same_utc_day() {
+        let instant: DateTime<Utc> = "2026-08-15T23:59:59Z".parse().unwrap();
+        assert_eq!(utc_hour_start(instant), "2026-08-15T23:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn utc_hour_start_across_the_uk_spring_forward_transition_is_unaffected() {
+        // Unlike london_calendar_day_across_the_spring_forward_transition, this
+        // is purely a sanity check that UTC arithmetic doesn't care that the
+        // UK clock changed at all -- there is no "skipped" or "repeated" UTC
+        // hour on this date, only on the London-local wall clock.
+        let instant: DateTime<Utc> = "2026-03-29T01:30:00Z".parse().unwrap();
+        assert_eq!(utc_hour_start(instant), "2026-03-29T01:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
     // --- record_daily_stats / prune_daily_stats ---
 
     async fn cleanup_daily_stats(pool: &PgPool, line_id: &str) {
@@ -1398,5 +1528,216 @@ mod tests {
             recent_survives, 1,
             "a row within the retention window should be kept"
         );
+    }
+
+    // --- record_hourly_stats / prune_hourly_stats ---
+
+    async fn cleanup_hourly_stats(pool: &PgPool, line_id: &str) {
+        sqlx::query("DELETE FROM line_status_hourly_stats WHERE line_id = $1")
+            .bind(line_id)
+            .execute(pool)
+            .await
+            .expect("cleanup line_status_hourly_stats");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_hourly_stats_accumulates_deduped_contributions_within_an_hour -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_hourly_stats_accumulates_deduped_contributions_within_an_hour() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-HOURLY-STATS-ACCUMULATE";
+        let hour: DateTime<Utc> = "2026-08-31T14:00:00Z".parse().unwrap();
+
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        let cycle1 = common::SampleStats { total: 4, delayed: 1, cancelled: 1, skipped: 0, avg_delay_minutes: 6.0 };
+        let cycle2 = common::SampleStats { total: 2, delayed: 2, cancelled: 0, skipped: 1, avg_delay_minutes: 12.0 };
+
+        record_hourly_stats(&pool, LINE_ID, hour, Some(&cycle1)).await.expect("record cycle 1");
+        record_hourly_stats(&pool, LINE_ID, hour, Some(&cycle2)).await.expect("record cycle 2");
+
+        let row = sqlx::query(
+            "SELECT sample_cycles, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
+             FROM line_status_hourly_stats WHERE line_id = $1 AND hour_start = $2",
+        )
+        .bind(LINE_ID)
+        .bind(hour)
+        .fetch_one(&pool)
+        .await
+        .expect("read accumulated row");
+
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        let sample_cycles: i64 = row.try_get("sample_cycles").unwrap();
+        let total: i64 = row.try_get("total").unwrap();
+        let running_count: i64 = row.try_get("running_count").unwrap();
+        let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(sample_cycles, 2);
+        assert_eq!(total, 6);
+        assert_eq!(running_count, 5);
+        assert!((delay_minutes_sum - 42.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_hourly_stats_a_new_hour_starts_a_fresh_row -- --ignored` against docker \
+                compose's postgres"]
+    async fn record_hourly_stats_a_new_hour_starts_a_fresh_row() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-HOURLY-STATS-NEW-HOUR";
+        let hour1: DateTime<Utc> = "2026-08-31T14:00:00Z".parse().unwrap();
+        let hour2: DateTime<Utc> = "2026-08-31T15:00:00Z".parse().unwrap();
+
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        let stats = common::SampleStats { total: 5, delayed: 1, cancelled: 0, skipped: 0, avg_delay_minutes: 3.0 };
+        record_hourly_stats(&pool, LINE_ID, hour1, Some(&stats)).await.expect("record hour 1");
+        record_hourly_stats(&pool, LINE_ID, hour2, Some(&stats)).await.expect("record hour 2");
+
+        let hour2_cycles: i64 = sqlx::query_scalar(
+            "SELECT sample_cycles FROM line_status_hourly_stats WHERE line_id = $1 AND hour_start = $2",
+        )
+        .bind(LINE_ID)
+        .bind(hour2)
+        .fetch_one(&pool)
+        .await
+        .expect("read hour 2 row");
+
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        assert_eq!(hour2_cycles, 1, "a new hour must start its own fresh row, not accumulate into hour 1's");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_hourly_stats_an_hour_boundary_crossing_a_day_boundary_is_unaffected -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_hourly_stats_an_hour_boundary_crossing_a_day_boundary_is_unaffected() {
+        // 23:00Z and the next day's 00:00Z are adjacent hours that also cross a
+        // UTC calendar day -- confirms record_hourly_stats treats this exactly
+        // like any other hour boundary, with no special-casing or corruption.
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-HOURLY-STATS-DAY-BOUNDARY";
+        let hour1: DateTime<Utc> = "2026-08-31T23:00:00Z".parse().unwrap();
+        let hour2: DateTime<Utc> = "2026-09-01T00:00:00Z".parse().unwrap();
+
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        let stats = common::SampleStats { total: 3, delayed: 0, cancelled: 0, skipped: 0, avg_delay_minutes: 1.0 };
+        record_hourly_stats(&pool, LINE_ID, hour1, Some(&stats)).await.expect("record hour 1");
+        record_hourly_stats(&pool, LINE_ID, hour2, Some(&stats)).await.expect("record hour 2");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_hourly_stats WHERE line_id = $1")
+            .bind(LINE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows");
+
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        assert_eq!(count, 2, "two adjacent hours either side of a day boundary must stay two separate rows");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_hourly_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                against docker compose's postgres"]
+    async fn prune_hourly_stats_deletes_only_rows_older_than_the_retention_window() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const OLD_LINE_ID: &str = "TEST-HOURLY-STATS-PRUNE-OLD";
+        const RECENT_LINE_ID: &str = "TEST-HOURLY-STATS-PRUNE-RECENT";
+        const RETENTION_HOURS: i64 = 48;
+
+        cleanup_hourly_stats(&pool, OLD_LINE_ID).await;
+        cleanup_hourly_stats(&pool, RECENT_LINE_ID).await;
+
+        sqlx::query(
+            "INSERT INTO line_status_hourly_stats (line_id, hour_start, sample_cycles, total) VALUES \
+                ($1, NOW() - (($3 + 1) || ' hours')::interval, 1, 1), \
+                ($2, NOW() - (($3 - 1) || ' hours')::interval, 1, 1)",
+        )
+        .bind(OLD_LINE_ID)
+        .bind(RECENT_LINE_ID)
+        .bind(RETENTION_HOURS)
+        .execute(&pool)
+        .await
+        .expect("seed old and recent rows");
+
+        prune_hourly_stats(&pool, RETENTION_HOURS).await.expect("prune_hourly_stats");
+
+        let old_survives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_hourly_stats WHERE line_id = $1")
+            .bind(OLD_LINE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count old survivors");
+        let recent_survives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_hourly_stats WHERE line_id = $1")
+            .bind(RECENT_LINE_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count recent survivors");
+
+        cleanup_hourly_stats(&pool, OLD_LINE_ID).await;
+        cleanup_hourly_stats(&pool, RECENT_LINE_ID).await;
+
+        assert_eq!(old_survives, 0);
+        assert_eq!(recent_survives, 1);
+    }
+
+    /// The single most important new test in this plan (Decision 2's
+    /// reconciliation invariant, made concrete): feeding the SAME
+    /// `Some(&SampleStats)` value to both `record_daily_stats` and
+    /// `record_hourly_stats` -- exactly as `main.rs`'s `run_cycle` now does at
+    /// its one call site -- must produce a daily row and an hourly row whose
+    /// sums agree. This doesn't call `run_cycle` itself (that would need a
+    /// full aggregate() pipeline); it directly exercises the two write
+    /// functions with an identical input, which is the actual invariant that
+    /// matters and is what would regress if a future edit ever computed two
+    /// separate `deduped` values instead of sharing one.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                hourly_and_daily_stats_reconcile_for_a_single_line_and_period -- --ignored` \
+                against docker compose's postgres"]
+    async fn hourly_and_daily_stats_reconcile_for_a_single_line_and_period() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        const LINE_ID: &str = "TEST-RECONCILE-DAILY-HOURLY";
+        let day = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        let hour: DateTime<Utc> = "2026-08-31T14:00:00Z".parse().unwrap();
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        let stats = common::SampleStats { total: 7, delayed: 2, cancelled: 1, skipped: 0, avg_delay_minutes: 5.0 };
+
+        // Same `deduped` value, same call pattern as run_cycle's one call site.
+        record_daily_stats(&pool, LINE_ID, day, Some(&stats)).await.expect("record daily");
+        record_hourly_stats(&pool, LINE_ID, hour, Some(&stats)).await.expect("record hourly");
+
+        let daily = sqlx::query("SELECT total, delayed, cancelled, running_count, delay_minutes_sum \
+                                  FROM line_status_daily_stats WHERE line_id = $1 AND day = $2")
+            .bind(LINE_ID).bind(day).fetch_one(&pool).await.expect("read daily row");
+        let hourly = sqlx::query("SELECT total, delayed, cancelled, running_count, delay_minutes_sum \
+                                   FROM line_status_hourly_stats WHERE line_id = $1 AND hour_start = $2")
+            .bind(LINE_ID).bind(hour).fetch_one(&pool).await.expect("read hourly row");
+
+        cleanup_daily_stats(&pool, LINE_ID).await;
+        cleanup_hourly_stats(&pool, LINE_ID).await;
+
+        let total_d: i64 = daily.try_get("total").unwrap();
+        let total_h: i64 = hourly.try_get("total").unwrap();
+        let delayed_d: i64 = daily.try_get("delayed").unwrap();
+        let delayed_h: i64 = hourly.try_get("delayed").unwrap();
+        let dms_d: f64 = daily.try_get("delay_minutes_sum").unwrap();
+        let dms_h: f64 = hourly.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(total_d, total_h, "a single hour's stats must reconcile with that hour's own contribution to the day");
+        assert_eq!(delayed_d, delayed_h);
+        assert!((dms_d - dms_h).abs() < 1e-9);
     }
 }

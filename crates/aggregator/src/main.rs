@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             &defaults,
             config.history_retention_days,
             config.daily_stats_retention_days,
+            config.hourly_stats_retention_hours,
             &mut dedup_ledger,
         )
         .await;
@@ -89,6 +90,7 @@ async fn run_cycle(
     defaults: &Defaults,
     retention_days: i64,
     daily_stats_retention_days: i64,
+    hourly_stats_retention_hours: i64,
     dedup_ledger: &mut SeenServiceLedger,
 ) -> anyhow::Result<()> {
     let custom_lines = queries::load_custom_lines(pool).await?;
@@ -119,21 +121,34 @@ async fn run_cycle(
     // per line via `lines_with_sample_coverage`, not once per status --
     // see that function's doc for why iterating `report.statuses` would
     // double-count.
-    let today = queries::london_calendar_day(chrono::Utc::now());
+    let cycle_now = chrono::Utc::now();
+    let today = queries::london_calendar_day(cycle_now);
+    let hour_start = queries::utc_hour_start(cycle_now);
     let mut new_services_this_cycle: u64 = 0;
     let mut daily_stats_recorded = 0u64;
+    let mut hourly_stats_recorded = 0u64;
     for (line_id, line) in lines_with_sample_coverage(&reports, &lines) {
         let deduped =
             dedup::dedup_new_sample_stats(dedup_ledger, line_id, today, line, &samples, defaults);
         if let Some(ref stats) = deduped {
             new_services_this_cycle += stats.total as u64;
         }
+        // Both calls below are fed the SAME `deduped` value -- this is
+        // Decision 2's whole point (see that function's own doc comment
+        // and the hourly_and_daily_stats_reconcile_for_a_single_line_and_period
+        // test in queries.rs): a day's 24 hourly rows must sum back to
+        // that day's daily row, which only holds if both writes see an
+        // identical per-cycle contribution, not two independently
+        // computed ones.
         queries::record_daily_stats(pool, line_id, today, deduped.as_ref()).await?;
+        queries::record_hourly_stats(pool, line_id, hour_start, deduped.as_ref()).await?;
         daily_stats_recorded += 1;
+        hourly_stats_recorded += 1;
     }
     dedup_ledger.prune_before(today);
 
     let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
+    let hourly_stats_pruned = queries::prune_hourly_stats(pool, hourly_stats_retention_hours).await?;
 
     metrics::gauge!(common::metrics::metric_name("aggregator_lines_total"))
         .set(reports.len() as f64);
@@ -155,6 +170,14 @@ async fn run_cycle(
         "aggregator_daily_stats_pruned_total"
     ))
     .increment(daily_stats_pruned);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_hourly_stats_recorded_total"
+    ))
+    .increment(hourly_stats_recorded);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_hourly_stats_pruned_total"
+    ))
+    .increment(hourly_stats_pruned);
 
     tracing::info!(
         lines = reports.len(),
@@ -164,6 +187,8 @@ async fn run_cycle(
         deduped_new_services = new_services_this_cycle,
         daily_stats_recorded = daily_stats_recorded,
         daily_stats_pruned = daily_stats_pruned,
+        hourly_stats_recorded = hourly_stats_recorded,
+        hourly_stats_pruned = hourly_stats_pruned,
         "aggregation cycle complete"
     );
 

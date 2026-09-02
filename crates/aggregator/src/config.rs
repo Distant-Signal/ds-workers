@@ -68,6 +68,22 @@ pub struct Config {
     #[arg(long, env, default_value_t = 300)]
     pub daily_stats_retention_days: i64,
 
+    /// How long to keep `line_status_hourly_stats` rows before pruning
+    /// them. Deliberately NOT a reuse of `history_retention_days` (governs
+    /// a different table, `line_status_history`) or
+    /// `daily_stats_retention_days` (sized for a weeks/months trend use
+    /// case this hourly rolling-24h view does not have -- reusing its
+    /// default of 300 would mean accumulating ~300 days x 24 rows/line of
+    /// data only the most recent ~25 rows of which are ever read). 48
+    /// hours is a 2x safety margin over the 24-25 rows the line-info-page
+    /// embed actually needs, per
+    /// docs/superpowers/specs/2026-09-02-trend-chart-granularity-design.md
+    /// Decision 5 -- a reasoned starting default, not empirically
+    /// validated against real restart/deploy timing (see that spec's Open
+    /// question 2).
+    #[arg(long, env, default_value_t = 48)]
+    pub hourly_stats_retention_hours: i64,
+
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
     /// for why this differs from api.service.port -- api reuses its
