@@ -102,8 +102,16 @@ mod tests {
             .collect()
     }
 
+    // Was `..._across_three_swr_lines` until `lines/swr-kingston-loop.toml`
+    // and `lines/swr-chessington.toml` were added. Those two model SWR's
+    // suburban SLOW-line corridor out of Waterloo and reuse
+    // `swr-trunk-waterloo` verbatim for the Waterloo-Raynes Park stretch
+    // they genuinely share with the three fast-line files, so the trunk now
+    // has five users. Both new files' own headers work through why reusing
+    // the name is correct here (and why it is not the situation
+    // `great-northern-suburban.toml` warns about).
     #[test]
-    fn shared_trunk_segment_is_shared_across_three_swr_lines() {
+    fn shared_trunk_segment_is_shared_across_every_swr_line() {
         let lines = load_all_lines();
         let registry = SegmentRegistry::new(&lines);
         assert!(registry.is_shared("swr-trunk-waterloo"));
@@ -111,8 +119,89 @@ mod tests {
         users.sort();
         assert_eq!(
             users,
-            vec!["swr-alton", "swr-portsmouth-direct", "swr-south-west-main"]
+            vec![
+                "swr-alton",
+                "swr-chessington",
+                "swr-kingston-loop",
+                "swr-portsmouth-direct",
+                "swr-south-west-main",
+            ]
         );
+    }
+
+    // The Kingston Loop and the Chessington branch leave the South West
+    // Main Line at *different* junctions -- Chessington at Raynes Park, the
+    // loop one station further on at New Malden -- and share no track
+    // beyond the trunk. This asserts the whole junction structure the two
+    // files were written to model:
+    //   * both carry RAY on the shared trunk (the README's "junction
+    //     stations belong to the shared trunk" rule),
+    //   * NEM is on the trunk for the loop and absent from Chessington
+    //     entirely (Chessington services never pass through New Malden),
+    //   * each line's own post-junction segments are exclusive to it.
+    #[test]
+    fn swr_suburban_lines_split_at_their_own_junctions_off_the_shared_trunk() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let loop_line = &lines["swr-kingston-loop"];
+        let chessington = &lines["swr-chessington"];
+
+        // Raynes Park: the shared junction, on the trunk for both.
+        assert_eq!(
+            registry.segment_at("swr-kingston-loop", "RAY"),
+            Some("swr-trunk-waterloo")
+        );
+        assert_eq!(
+            registry.segment_at("swr-chessington", "RAY"),
+            Some("swr-trunk-waterloo")
+        );
+
+        // New Malden: the Kingston Loop's own junction off the SWML, also
+        // on the trunk -- and not a Chessington station at all.
+        assert_eq!(
+            registry.segment_at("swr-kingston-loop", "NEM"),
+            Some("swr-trunk-waterloo")
+        );
+        assert_eq!(registry.segment_at("swr-chessington", "NEM"), None);
+        assert!(!chessington.has_station("NEM"));
+
+        // Motspur Park is Chessington's own junction, on the reusable
+        // Epsom-line segment -- and not a Kingston Loop station.
+        assert_eq!(
+            registry.segment_at("swr-chessington", "MOT"),
+            Some("swr-epsom-line")
+        );
+        assert!(!loop_line.has_station("MOT"));
+
+        // Surbiton and Berrylands belong to neither: SUR stays exclusively
+        // with the three fast-line files, BRS is uncovered by any file.
+        assert!(!loop_line.has_station("SUR"));
+        assert!(!chessington.has_station("SUR"));
+        assert!(!loop_line.has_station("BRS"));
+        assert!(!chessington.has_station("BRS"));
+
+        // Each line's post-junction segments are exclusive to it.
+        assert!(registry.is_exclusive_to("swr-kingston-loop", "swr-kingston-loop"));
+        assert!(registry.is_exclusive_to("swr-windsor-lines", "swr-kingston-loop"));
+        assert!(registry.is_exclusive_to("swr-chessington-branch", "swr-chessington"));
+        assert!(registry.is_exclusive_to("swr-epsom-line", "swr-chessington"));
+        assert!(!registry.is_shared("swr-kingston-loop"));
+        assert!(!registry.is_shared("swr-chessington-branch"));
+
+        // And the trunk is touched together with each line's own exclusive
+        // segment -- same shape as `segments_touched_by_finds_shared_and_
+        // exclusive_together` asserts for the Alton branch.
+        let touched_loop =
+            registry.segments_touched_by(loop_line, &["RAY".to_string(), "KNG".to_string()]);
+        assert_eq!(touched_loop.len(), 2);
+        assert!(touched_loop.contains("swr-trunk-waterloo"));
+        assert!(touched_loop.contains("swr-kingston-loop"));
+
+        let touched_chess =
+            registry.segments_touched_by(chessington, &["RAY".to_string(), "CSS".to_string()]);
+        assert_eq!(touched_chess.len(), 2);
+        assert!(touched_chess.contains("swr-trunk-waterloo"));
+        assert!(touched_chess.contains("swr-chessington-branch"));
     }
 
     #[test]
