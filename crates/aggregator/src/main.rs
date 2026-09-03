@@ -84,6 +84,85 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Cap on how many lines' writes share a single `sqlx::Transaction` in
+/// `run_cycle`, below. Mirrors `crates/api/src/data/queries.rs`'s
+/// `UPSERT_CHUNK_SIZE` (50) -- same rationale, same codebase precedent
+/// (`upsert_incidents`'s doc comment there spells out the tradeoff in
+/// detail): batch enough per transaction to collapse most of the
+/// per-statement WAL-fsync cost this mitigation targets, but cap it so a
+/// mid-batch failure only rolls back one chunk's worth of otherwise-good
+/// writes, not the whole cycle, and so no single transaction holds row
+/// locks across an unbounded number of lines for an unbounded time.
+///
+/// # Why chunked transactions, not one whole-cycle transaction
+///
+/// See docs/superpowers/specs/2026-09-02-slow-query-warnings-research.md,
+/// Recommendation #3. Before this change, `run_cycle` issued one
+/// autocommitted statement per line per write (~2-3 for
+/// `write_line_status`, 2 more for the daily/half-hourly stats pair) --
+/// up to ~300-400 independent WAL-fsync-gated commits per 60s cycle
+/// across up to ~110 lines, which the research doc ranks as the most
+/// likely driver of production `sqlx::query: slow statement` warnings
+/// (many backends committing into the same WAL at once, not a per-query
+/// inefficiency).
+///
+/// A single transaction wrapping the *entire* cycle was considered and
+/// rejected: `run_cycle`'s caller (`main`, above) already treats any `Err`
+/// from a cycle as "log it, retry the whole computation next interval"
+/// (60s later) -- there is no partial-credit handling today, so the
+/// *existing* per-statement-commit code already tolerates "a failure
+/// partway through drops the rest of this cycle's writes" as its error
+/// model. But collapsing all ~110 lines' worth of `write_line_status` (and
+/// separately, all lines' worth of daily/half-hourly stats) into ONE
+/// transaction each would mean a single bad statement -- realistically a
+/// transient error on one specific line, not the common case -- rolls back
+/// every other, unrelated line's already-computed, already-queued write
+/// too, discarding good work for lines that had nothing wrong with them.
+/// That is a real regression versus today's "each line's write succeeds or
+/// fails independently" behavior, not just a hypothetical concern, since a
+/// connection-level failure (which would already lose everything in
+/// flight regardless of batching) is far from the only way a single
+/// statement can fail.
+///
+/// Chunking splits the difference precisely: within a chunk, an early
+/// line's failure does roll back that chunk's other lines (an accepted,
+/// bounded regression -- at most `WRITE_CHUNK_SIZE` lines' worth, and the
+/// whole cycle retries in 60s anyway, mirroring `upsert_incidents`'s own
+/// "the poller resends the full state every round" reasoning), while
+/// still collapsing WAL-fsync count from one-per-statement down to
+/// roughly `lines / WRITE_CHUNK_SIZE` transactions for each pass. At the
+/// pasted log's own `lines=110`, that's 3 transactions instead of up to
+/// ~330 individual commits for the `write_line_status` pass alone.
+///
+/// The daily/half-hourly stats pass (below) is chunked separately from the
+/// `write_line_status` pass, in its own set of transactions -- the two
+/// passes touch different tables for a different purpose and have no
+/// atomicity requirement *between* them (a line's status can legitimately
+/// update in one cycle while its stats contribution lands, or doesn't, in
+/// another -- they were never coupled even before this change, since they
+/// were always separate autocommitted statements). This also matches the
+/// research doc's own suggestion of "a separate one for the daily/
+/// half-hourly stats pass."
+///
+/// One caveat worth recording rather than hiding: `dedup::SeenServiceLedger`
+/// (see `dedup.rs`) is mutated in-memory, synchronously, *before* the
+/// corresponding `record_daily_stats`/`record_half_hourly_stats` calls in
+/// the loop below run. If a chunk's transaction later fails and rolls
+/// back, every line already processed earlier in that same chunk has its
+/// dedup "seen" marks stay consumed in memory even though their DB writes
+/// for this cycle just got undone -- a pre-existing risk (it already
+/// existed per-line, pre-batching, whenever a single write_line_status/
+/// record_*_stats call failed) that chunking widens from "1 line" to "up
+/// to WRITE_CHUNK_SIZE lines" in the rare case a chunk transaction has to
+/// roll back. `record_daily_stats`/`record_half_hourly_stats` do simple
+/// parameterized `INSERT ... ON CONFLICT` against tables with real PKs on
+/// entirely local, already-valid data, so this is expected to be
+/// vanishingly rare in practice (the realistic failure mode is a
+/// connection-level error, which loses in-flight work regardless of
+/// batching); a smaller `WRITE_CHUNK_SIZE` trades this exposure directly
+/// against transaction count/WAL-fsync savings if it ever needs revisiting.
+const WRITE_CHUNK_SIZE: usize = 50;
+
 async fn run_cycle(
     pool: &sqlx::PgPool,
     static_lines: &HashMap<String, LineDefinition>,
@@ -102,8 +181,16 @@ async fn run_cycle(
 
     let reports = aggregation::aggregate(&lines, &incidents, &samples, &registry, defaults);
 
-    for report in reports.values() {
-        queries::write_line_status(pool, report).await?;
+    // Batched into `WRITE_CHUNK_SIZE`-sized transactions rather than one
+    // autocommitted statement per line -- see `WRITE_CHUNK_SIZE`'s doc
+    // comment for the full reasoning.
+    let report_list: Vec<&LineStatusReport> = reports.values().collect();
+    for chunk in report_list.chunks(WRITE_CHUNK_SIZE) {
+        let mut tx = pool.begin().await?;
+        for report in chunk.iter().copied() {
+            queries::write_line_status(&mut tx, report).await?;
+        }
+        tx.commit().await?;
     }
 
     let current_line_ids: Vec<String> = lines.keys().cloned().collect();
@@ -127,23 +214,42 @@ async fn run_cycle(
     let mut new_services_this_cycle: u64 = 0;
     let mut daily_stats_recorded = 0u64;
     let mut half_hourly_stats_recorded = 0u64;
-    for (line_id, line) in lines_with_sample_coverage(&reports, &lines) {
-        let deduped =
-            dedup::dedup_new_sample_stats(dedup_ledger, line_id, today, line, &samples, defaults);
-        if let Some(ref stats) = deduped {
-            new_services_this_cycle += stats.total as u64;
+    // Batched into WRITE_CHUNK_SIZE-sized transactions, same rationale (and
+    // caveat re: dedup_ledger mutation ordering) as the write_line_status
+    // pass above -- see `WRITE_CHUNK_SIZE`'s doc comment. A separate set of
+    // transactions from that pass, not a shared one: different tables,
+    // different purpose, no atomicity requirement between the two passes.
+    let coverage = lines_with_sample_coverage(&reports, &lines);
+    for chunk in coverage.chunks(WRITE_CHUNK_SIZE) {
+        let mut tx = pool.begin().await?;
+        for &(line_id, line) in chunk {
+            let deduped = dedup::dedup_new_sample_stats(
+                dedup_ledger,
+                line_id,
+                today,
+                line,
+                &samples,
+                defaults,
+            );
+            if let Some(ref stats) = deduped {
+                new_services_this_cycle += stats.total as u64;
+            }
+            // Both calls below are fed the SAME `deduped` value -- this is
+            // Decision 2's whole point (see that function's own doc comment
+            // and the half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period
+            // test in queries.rs): a day's 48 half-hourly rows must sum back to
+            // that day's daily row, which only holds if both writes see an
+            // identical per-cycle contribution, not two independently
+            // computed ones. Sharing the same chunk transaction doesn't
+            // change this invariant -- it held (and was verified by that
+            // test) back when both calls were separately autocommitted too.
+            queries::record_daily_stats(&mut *tx, line_id, today, deduped.as_ref()).await?;
+            queries::record_half_hourly_stats(&mut *tx, line_id, half_hour_start, deduped.as_ref())
+                .await?;
+            daily_stats_recorded += 1;
+            half_hourly_stats_recorded += 1;
         }
-        // Both calls below are fed the SAME `deduped` value -- this is
-        // Decision 2's whole point (see that function's own doc comment
-        // and the half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period
-        // test in queries.rs): a day's 48 half-hourly rows must sum back to
-        // that day's daily row, which only holds if both writes see an
-        // identical per-cycle contribution, not two independently
-        // computed ones.
-        queries::record_daily_stats(pool, line_id, today, deduped.as_ref()).await?;
-        queries::record_half_hourly_stats(pool, line_id, half_hour_start, deduped.as_ref()).await?;
-        daily_stats_recorded += 1;
-        half_hourly_stats_recorded += 1;
+        tx.commit().await?;
     }
     dedup_ledger.prune_before(today);
 

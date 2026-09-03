@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use common::{IncidentMessage, LineStatusReport, StationSample};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgExecutor, PgPool, Row};
 
 /// One incident loaded from the `incidents` table for this aggregation
 /// cycle, paired with our own `first_seen_at` clock. Deliberately not part
@@ -127,10 +127,13 @@ pub async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> 
 
 /// Fetches the currently-stored `statuses` JSON for one line, if any row
 /// exists yet.
-async fn existing_statuses(pool: &PgPool, line_id: &str) -> Result<Option<serde_json::Value>> {
+async fn existing_statuses(
+    conn: &mut PgConnection,
+    line_id: &str,
+) -> Result<Option<serde_json::Value>> {
     let row = sqlx::query("SELECT statuses FROM line_status WHERE line_id = $1")
         .bind(line_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
     Ok(row.map(|r| r.try_get("statuses")).transpose()?)
 }
@@ -352,9 +355,22 @@ fn normalize_sample_counts(reason: &str) -> String {
 /// Upserts one line's computed report into `line_status` (always), and
 /// inserts a `line_status_history` snapshot only if the statuses actually
 /// changed since the last cycle.
-pub async fn write_line_status(pool: &PgPool, report: &LineStatusReport) -> Result<()> {
+///
+/// Takes a `&mut PgConnection` rather than `&PgPool` (as it did before this
+/// doc comment was added) so `run_cycle` (main.rs) can batch many lines'
+/// worth of these writes into a handful of `sqlx::Transaction`s per cycle
+/// instead of every call being its own autocommitted, independently
+/// WAL-fsync-ing statement -- see
+/// docs/superpowers/specs/2026-09-02-slow-query-warnings-research.md,
+/// Recommendation #3, and the design decision recorded on
+/// `crate::main::WRITE_CHUNK_SIZE`. Both `sqlx::Transaction<'_, Postgres>`
+/// and a pool-acquired `PoolConnection<Postgres>` deref to `PgConnection`,
+/// so this function still works standalone for callers/tests that don't
+/// need batching -- just `pool.acquire().await?` first and pass
+/// `&mut *conn`.
+pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusReport) -> Result<()> {
     let fresh_statuses_json = serde_json::to_value(&report.statuses)?;
-    let existing = existing_statuses(pool, &report.id).await?;
+    let existing = existing_statuses(&mut *conn, &report.id).await?;
 
     // Carry forward `from_date` for any `ldbws-inferred` entry whose content
     // is unchanged from last cycle, before comparing/persisting -- see
@@ -389,7 +405,7 @@ pub async fn write_line_status(pool: &PgPool, report: &LineStatusReport) -> Resu
     .bind(&report.mode_name)
     .bind(&report.operators)
     .bind(&statuses_json)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     if changed {
@@ -398,7 +414,7 @@ pub async fn write_line_status(pool: &PgPool, report: &LineStatusReport) -> Resu
         )
         .bind(&report.id)
         .bind(&statuses_json)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
 
@@ -483,12 +499,22 @@ pub fn utc_half_hour_start(instant: DateTime<Utc>) -> DateTime<Utc> {
 /// trains once a line's currently-dwelling services have already been
 /// counted this period) -- it still counts as a covered cycle
 /// (`sample_cycles += 1`) but contributes zero to every other sum.
-pub async fn record_daily_stats(
-    pool: &PgPool,
+///
+/// Generic over `E: PgExecutor` (rather than `&PgPool`) so `run_cycle`
+/// (main.rs) can call this with `&mut *tx` from inside a batched
+/// `sqlx::Transaction` -- see `write_line_status`'s doc comment for the
+/// full rationale. A single query, so (unlike `write_line_status`) no
+/// `&mut PgConnection` is needed here: any executor works, including a
+/// bare `&PgPool` for standalone callers/tests.
+pub async fn record_daily_stats<'c, E>(
+    executor: E,
     line_id: &str,
     day: NaiveDate,
     stats: Option<&common::SampleStats>,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: PgExecutor<'c>,
+{
     let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
         Some(s) => {
             let running = s.total.saturating_sub(s.cancelled) as i64;
@@ -525,7 +551,7 @@ pub async fn record_daily_stats(
     .bind(skipped)
     .bind(running)
     .bind(delay_minutes_sum)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -562,12 +588,18 @@ pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64
 /// `line_status_daily_stats` row -- see this file's
 /// `half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period`
 /// test.
-pub async fn record_half_hourly_stats(
-    pool: &PgPool,
+///
+/// Generic over `E: PgExecutor` for the same reason as `record_daily_stats`
+/// -- see that function's doc comment.
+pub async fn record_half_hourly_stats<'c, E>(
+    executor: E,
     line_id: &str,
     half_hour_start: DateTime<Utc>,
     stats: Option<&common::SampleStats>,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: PgExecutor<'c>,
+{
     let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
         Some(s) => {
             let running = s.total.saturating_sub(s.cancelled) as i64;
@@ -597,7 +629,7 @@ pub async fn record_half_hourly_stats(
     .bind(skipped)
     .bind(running)
     .bind(delay_minutes_sum)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -826,7 +858,11 @@ mod tests {
             common::DataQuality::LdbwsInferred,
             "sanity check: this scenario should hit the LdbwsInferred path, not an incident-derived one"
         );
-        write_line_status(&pool, report1)
+        // write_line_status now takes a `&mut PgConnection` (see its doc
+        // comment) rather than `&PgPool`, so a standalone caller acquires
+        // one explicitly rather than passing the pool directly.
+        let mut conn = pool.acquire().await.expect("acquire connection");
+        write_line_status(&mut conn, report1)
             .await
             .expect("write_line_status cycle 1");
 
@@ -844,7 +880,7 @@ mod tests {
         let report2 = reports2.get(LINE_ID).expect("line should have a report");
         let fresh_from_date_cycle_2 = serde_json::to_value(report2.statuses[0].validity.from_date)
             .expect("serialize fresh from_date");
-        write_line_status(&pool, report2)
+        write_line_status(&mut conn, report2)
             .await
             .expect("write_line_status cycle 2");
 
@@ -886,6 +922,252 @@ mod tests {
             fresh_from_date_cycle_2, from_date_after_cycle_2,
             "sanity check: cycle 2's own freshly-computed from_date must differ from what actually got \
              stored, proving the carry-forward -- not coincidence -- is what kept the stored value stable"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                a_mid_chunk_failure_rolls_back_every_write_in_that_chunk_but_not_earlier_committed_chunks \
+                -- --ignored` against docker compose's postgres"]
+    async fn a_mid_chunk_failure_rolls_back_every_write_in_that_chunk_but_not_earlier_committed_chunks()
+     {
+        // Pins down the exact batching semantics `run_cycle`'s
+        // `WRITE_CHUNK_SIZE` chunking relies on (see main.rs's doc comment
+        // on that constant, "Why chunked transactions, not one
+        // whole-cycle transaction"): within ONE chunk's transaction, an
+        // earlier line's already-queued write is rolled back if a LATER
+        // line's write in the SAME chunk fails -- but a chunk that already
+        // committed before the failing one is left untouched. This is
+        // deliberately neither "one giant whole-cycle transaction" (an
+        // earlier chunk's good writes would never be exposed to a later
+        // chunk's failure in the real code either way, since each chunk is
+        // its own transaction) nor "every write is its own autocommit"
+        // (the pre-mitigation behavior this change replaces, where even a
+        // single already-succeeded write earlier in the SAME loop
+        // iteration group would have survived a later one's failure) --
+        // it's the chosen middle ground, checked here against a real
+        // Postgres rather than only asserted in prose.
+        use common::{DataQuality, LineStatus, SampleAvailability, Severity, ValidityPeriod};
+
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        const COMMITTED_CHUNK_LINE: &str = "TEST-TX-COMMITTED-CHUNK";
+        const ROLLED_BACK_LINE: &str = "TEST-TX-ROLLED-BACK";
+
+        fn report(id: &str) -> LineStatusReport {
+            LineStatusReport {
+                id: id.to_string(),
+                name: "Test Line".to_string(),
+                mode_name: "national-rail".to_string(),
+                operators: vec![],
+                statuses: vec![LineStatus {
+                    severity: Severity::GoodService,
+                    reason: "Good Service".to_string(),
+                    validity: ValidityPeriod {
+                        from_date: Utc::now(),
+                        to_date: None,
+                        is_now: true,
+                    },
+                    disruption: None,
+                    data_quality: DataQuality::default(),
+                    sample_stats: None,
+                    sample_availability: SampleAvailability::NoCoverage,
+                }],
+            }
+        }
+
+        // Cleanup any leftovers from a prior failed run before starting.
+        sqlx::query("DELETE FROM line_status WHERE line_id IN ($1, $2)")
+            .bind(COMMITTED_CHUNK_LINE)
+            .bind(ROLLED_BACK_LINE)
+            .execute(&pool)
+            .await
+            .expect("pre-test cleanup");
+
+        // Chunk 1: stands in for an earlier chunk in the same cycle that
+        // already committed -- must survive a LATER chunk's failure
+        // untouched.
+        let mut tx1 = pool.begin().await.expect("begin chunk 1");
+        write_line_status(&mut tx1, &report(COMMITTED_CHUNK_LINE))
+            .await
+            .expect("write committed-chunk line");
+        tx1.commit().await.expect("commit chunk 1");
+
+        // Chunk 2: one line's write succeeds first (queued, not yet
+        // committed), then a second statement in the SAME transaction
+        // deliberately violates line_status's PRIMARY KEY by re-inserting
+        // that same line_id without ON CONFLICT handling -- a stand-in for
+        // "some later write in this chunk fails" that doesn't require
+        // hacking write_line_status itself to fail on demand.
+        let mut tx2 = pool.begin().await.expect("begin chunk 2");
+        write_line_status(&mut tx2, &report(ROLLED_BACK_LINE))
+            .await
+            .expect("write rolled-back line (should succeed within the still-open transaction)");
+        let conflict_result = sqlx::query(
+            "INSERT INTO line_status (line_id, name, mode_name, operators, statuses) \
+             VALUES ($1, 'x', 'x', '{}', '[]')",
+        )
+        .bind(ROLLED_BACK_LINE)
+        .execute(&mut *tx2)
+        .await;
+        assert!(
+            conflict_result.is_err(),
+            "sanity check: the forced PRIMARY KEY conflict must actually fail, or this test isn't \
+             exercising the failure path it claims to"
+        );
+        // `run_cycle` never calls `.rollback()` explicitly -- a failing
+        // write's `?` returns early out of the chunk loop, dropping the
+        // transaction un-committed, and sqlx rolls back on drop. Rolling
+        // back explicitly here is equivalent in effect but deterministic
+        // to await in a test (no reliance on drop-time async cleanup
+        // racing the assertions below).
+        tx2.rollback().await.expect("rollback chunk 2");
+
+        let committed_survives: Option<String> =
+            sqlx::query_scalar("SELECT line_id FROM line_status WHERE line_id = $1")
+                .bind(COMMITTED_CHUNK_LINE)
+                .fetch_optional(&pool)
+                .await
+                .expect("check committed-chunk line");
+        let rolled_back_gone: Option<String> =
+            sqlx::query_scalar("SELECT line_id FROM line_status WHERE line_id = $1")
+                .bind(ROLLED_BACK_LINE)
+                .fetch_optional(&pool)
+                .await
+                .expect("check rolled-back line");
+
+        sqlx::query("DELETE FROM line_status WHERE line_id IN ($1, $2)")
+            .bind(COMMITTED_CHUNK_LINE)
+            .bind(ROLLED_BACK_LINE)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+
+        assert_eq!(
+            committed_survives.as_deref(),
+            Some(COMMITTED_CHUNK_LINE),
+            "an earlier chunk that already committed must survive a later chunk's failure"
+        );
+        assert!(
+            rolled_back_gone.is_none(),
+            "the failing chunk's earlier-in-that-chunk write must be rolled back too, not left as a \
+             partial commit"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                writing_more_lines_than_one_chunk_holds_writes_every_line_exactly_once_with_none_lost_or_duplicated \
+                -- --ignored` against docker compose's postgres"]
+    async fn writing_more_lines_than_one_chunk_holds_writes_every_line_exactly_once_with_none_lost_or_duplicated()
+     {
+        // Complements `a_mid_chunk_failure_rolls_back_every_write_in_that_chunk_but_not_earlier_committed_chunks`,
+        // above: that test pins the FAILURE-path semantics (a later chunk's
+        // rollback must not touch an earlier, already-committed chunk).
+        // This one pins the HAPPY-path semantics of the exact same
+        // `report_list.chunks(WRITE_CHUNK_SIZE)` pattern `run_cycle` (main.rs)
+        // actually uses: writing strictly more lines than fit in a single
+        // chunk must produce exactly one `line_status` row per line -- no
+        // line dropped at the chunk boundary (e.g. an off-by-one in a future
+        // edit to the chunking/loop logic silently skipping the first or
+        // last line of a chunk), and no line double-written (e.g. an
+        // accidental re-iteration of an already-committed chunk). Chosen
+        // count is `WRITE_CHUNK_SIZE + 5`, guaranteeing at least one full
+        // chunk plus a short final partial chunk, so both the
+        // full-chunk-to-full-chunk boundary and the last-partial-chunk case
+        // are covered by the one test.
+        use common::{DataQuality, LineStatus, SampleAvailability, Severity, ValidityPeriod};
+
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        const LINE_COUNT: usize = crate::WRITE_CHUNK_SIZE + 5;
+        const PREFIX: &str = "TEST-TX-BOUNDARY-";
+
+        fn line_id(i: usize) -> String {
+            format!("{PREFIX}{i:03}")
+        }
+
+        fn report(id: &str) -> LineStatusReport {
+            LineStatusReport {
+                id: id.to_string(),
+                name: "Test Line".to_string(),
+                mode_name: "national-rail".to_string(),
+                operators: vec![],
+                statuses: vec![LineStatus {
+                    severity: Severity::GoodService,
+                    reason: "Good Service".to_string(),
+                    validity: ValidityPeriod {
+                        from_date: Utc::now(),
+                        to_date: None,
+                        is_now: true,
+                    },
+                    disruption: None,
+                    data_quality: DataQuality::default(),
+                    sample_stats: None,
+                    sample_availability: SampleAvailability::NoCoverage,
+                }],
+            }
+        }
+
+        // Cleanup any leftovers from a prior failed run before starting.
+        sqlx::query("DELETE FROM line_status WHERE line_id LIKE $1")
+            .bind(format!("{PREFIX}%"))
+            .execute(&pool)
+            .await
+            .expect("pre-test cleanup");
+
+        let ids: Vec<String> = (0..LINE_COUNT).map(line_id).collect();
+        let reports: Vec<LineStatusReport> = ids.iter().map(|id| report(id)).collect();
+
+        // Exactly mirrors run_cycle's own loop shape (main.rs): chunk, begin
+        // a transaction per chunk, write every report in the chunk, commit.
+        for chunk in reports.chunks(crate::WRITE_CHUNK_SIZE) {
+            let mut tx = pool.begin().await.expect("begin chunk");
+            for report in chunk {
+                write_line_status(&mut tx, report)
+                    .await
+                    .expect("write line in chunk");
+            }
+            tx.commit().await.expect("commit chunk");
+        }
+
+        let written: Vec<String> =
+            sqlx::query_scalar("SELECT line_id FROM line_status WHERE line_id LIKE $1")
+                .bind(format!("{PREFIX}%"))
+                .fetch_all(&pool)
+                .await
+                .expect("read back written lines");
+
+        sqlx::query("DELETE FROM line_status WHERE line_id LIKE $1")
+            .bind(format!("{PREFIX}%"))
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+
+        assert_eq!(
+            written.len(),
+            LINE_COUNT,
+            "every line across both a full chunk and the trailing partial chunk must be written \
+             exactly once -- a mismatch here would mean a line was dropped or duplicated at the \
+             chunk boundary"
+        );
+        let mut written_sorted = written.clone();
+        written_sorted.sort();
+        let mut expected_sorted = ids.clone();
+        expected_sorted.sort();
+        assert_eq!(
+            written_sorted, expected_sorted,
+            "the exact set of written line_ids must match what was submitted -- not just the count"
         );
     }
 
