@@ -934,13 +934,26 @@ fn infer_from_samples(
         reason.push_str(&format!(" (most cited: {most_common})"));
     }
 
-    // `samples` is a fresh `HashMap` every poll cycle with a randomized
+    // `samples` is the single global map covering every station sampled
+    // across the whole line catalogue (`main.rs`'s `load_station_samples`),
+    // not just this line's own stations -- so, like `has_any_row` and
+    // `relevant_departures` above, this must filter down to
+    // `line.sample_stations` rather than taking `samples.keys()` wholesale,
+    // or every other line's sample stations leak into this line's
+    // `affected_stops`.
+    //
+    // `samples` is also a fresh `HashMap` every poll cycle with a randomized
     // per-process hash seed, so its iteration order is not stable across
     // cycles even for identical input. Sorting here makes the serialized
     // `affected_stops` array deterministic, which `normalize_for_diff`
     // (queries.rs) relies on to avoid writing spurious `line_status_history`
     // rows when nothing has actually changed.
-    let mut affected_stops: Vec<String> = samples.keys().cloned().collect();
+    let mut affected_stops: Vec<String> = line
+        .sample_stations
+        .iter()
+        .filter(|crs| samples.contains_key(*crs))
+        .cloned()
+        .collect();
     affected_stops.sort();
 
     LineStatus {
@@ -1803,12 +1816,27 @@ mod tests {
 
     #[test]
     fn infer_from_samples_affected_stops_are_sorted_and_deterministic() {
-        // swr-alton.toml: sample_stations = ["AHT", "FRM", "AON"]. Insert
+        // swr-alton.toml: sample_stations = ["AHT", "FNH", "AON"]. Insert
         // samples in an order that would NOT be alphabetical if it leaked
         // through raw HashMap iteration, to prove the output is sorted
         // rather than incidentally ordered.
+        //
+        // Also insert a station that is NOT one of Alton's own
+        // `sample_stations` -- "PAD" (Paddington), a genuine sample station
+        // for an unrelated line (elizabeth-line.toml) -- into the SAME
+        // global `samples` map `infer_from_samples` receives, exactly as
+        // `main.rs`/`aggregate()` pass one shared, catalogue-wide map to
+        // every line's inference call. If `affected_stops` is ever built
+        // from `samples.keys()` wholesale instead of being scoped to
+        // `line.sample_stations` (the regression this test guards against),
+        // "PAD" would leak into Alton's `affected_stops` even though it has
+        // nothing to do with the Alton line.
         let lines = load_all_lines();
         let alton = &lines["swr-alton"];
+        assert!(
+            !alton.sample_stations.contains(&"PAD".to_string()),
+            "PDN must not be one of Alton's own sample stations for this test to be meaningful"
+        );
         let defaults = Defaults::default();
         let severe = vec![
             departure("AON", 10, false),
@@ -1818,9 +1846,9 @@ mod tests {
         ];
         let mut samples = HashMap::new();
         samples.insert(
-            "FRM".to_string(),
+            "FNH".to_string(),
             StationSample {
-                crs: "FRM".to_string(),
+                crs: "FNH".to_string(),
                 polled_at: Utc::now(),
                 departures: severe.clone(),
             },
@@ -1833,6 +1861,15 @@ mod tests {
                 departures: severe,
             },
         );
+        // Another line's sample station, present in the same global map.
+        samples.insert(
+            "PAD".to_string(),
+            StationSample {
+                crs: "PAD".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![departure("RDG", 20, false)],
+            },
+        );
 
         let status = infer_from_samples(alton, &samples, &defaults);
         let stops = status
@@ -1841,8 +1878,10 @@ mod tests {
             .affected_stops;
         assert_eq!(
             stops,
-            vec!["AHT".to_string(), "FRM".to_string()],
-            "affected_stops must be sorted alphabetically"
+            vec!["AHT".to_string(), "FNH".to_string()],
+            "affected_stops must be sorted alphabetically and scoped to this \
+             line's own sample stations, not leak other lines' stations \
+             (e.g. \"PDN\") from the shared global samples map"
         );
     }
 
