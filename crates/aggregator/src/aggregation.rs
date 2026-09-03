@@ -818,36 +818,12 @@ pub(crate) fn stats_from_departures(
     line: &LineDefinition,
     thresholds: &Defaults,
 ) -> SampleStats {
-    let total = departures.len();
-    let cancelled = departures.iter().filter(|d| d.is_cancelled).count();
-    let delayed = departures
-        .iter()
-        .filter(|d| !d.is_cancelled && d.delay_minutes as i64 >= thresholds.delay_threshold_minutes)
-        .count();
     let line_stations: HashSet<&str> = line.stations.iter().map(|s| s.crs.as_str()).collect();
-    let skipped = departures
-        .iter()
-        .filter(|d| {
-            !d.is_cancelled
-                && d.skipped_stations
-                    .iter()
-                    .any(|crs| line_stations.contains(crs.as_str()))
-        })
-        .count();
-    let running: Vec<&&StationDeparture> = departures.iter().filter(|d| !d.is_cancelled).collect();
-    let avg_delay_minutes = if running.is_empty() {
-        0.0
-    } else {
-        running.iter().map(|d| d.delay_minutes as f64).sum::<f64>() / running.len() as f64
-    };
-
-    SampleStats {
-        total,
-        delayed,
-        cancelled,
-        skipped,
-        avg_delay_minutes,
-    }
+    common::compute_sample_stats(departures, thresholds.delay_threshold_minutes, |d| {
+        d.skipped_stations
+            .iter()
+            .any(|crs| line_stations.contains(crs.as_str()))
+    })
 }
 
 /// `has_any_row` is deliberately not folded into `relevant_departures`
