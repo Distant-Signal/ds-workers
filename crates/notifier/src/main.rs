@@ -210,6 +210,8 @@ mod db_tests {
             data_quality: common::DataQuality::default(),
             sample_stats: None,
             sample_availability: common::SampleAvailability::NoCoverage,
+            full_coverage_stats: None,
+            full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
         };
         serde_json::to_value(vec![status]).expect("serialize fixture LineStatus")
     }

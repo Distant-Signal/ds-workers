@@ -17,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Utc};
 use common::{
-    AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, IncidentMessage, LineDefinition,
-    LineStatus, LineStatusReport, SampleAvailability, SampleStats, Severity, StationDeparture,
-    StationSample, ValidityPeriod, severity_rank, thresholds_for,
+    AffectedRoute, CustomLine, DataQuality, Defaults, Disruption, FullCoverageAvailability,
+    IncidentMessage, LineDefinition, LineStatus, LineStatusReport, SampleAvailability, SampleStats,
+    Severity, StationDeparture, StationSample, ValidityPeriod, severity_rank, thresholds_for,
 };
 use serde::Deserialize;
 
@@ -169,6 +169,11 @@ fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) 
         },
         sample_stats: None,
         sample_availability: SampleAvailability::NoCoverage, // always overwritten by aggregate()'s Layer 2, immediately after construction
+        full_coverage_stats: None,
+        // Overwritten by merge_full_coverage's post-aggregate() pass when
+        // this line's LineDefinition.full_coverage_enabled is set;
+        // NotEnabled is the correct value for every other line.
+        full_coverage_availability: FullCoverageAvailability::NotEnabled,
     }
 }
 
@@ -951,6 +956,8 @@ fn infer_from_samples(
         data_quality: DataQuality::LdbwsInferred,
         sample_stats: Some(stats),
         sample_availability: availability,
+        full_coverage_stats: None,
+        full_coverage_availability: FullCoverageAvailability::NotEnabled,
     }
 }
 
@@ -1079,10 +1086,29 @@ fn escalate_from_sample_stats(
     if stats.total == 0 {
         return (severity, None);
     }
+    let (sample_severity, reason) = classify_stats(stats, thresholds);
+
+    if severity_rank(sample_severity) <= severity_rank(severity) {
+        return (severity, None);
+    }
+    (
+        sample_severity,
+        Some(format!("live samples show: {reason}")),
+    )
+}
+
+/// Rate/severity classification of a raw `SampleStats` -- the shared
+/// arithmetic factored out of `escalate_from_sample_stats` so its
+/// full-coverage sibling below (`escalate_from_coverage_stats`, and
+/// `merge_full_coverage_stats`'s own "no incident present" branch) can
+/// reuse the identical rate computation and `classify()` call regardless
+/// of which producer's `SampleStats` is being judged. Pure refactor --
+/// `escalate_from_sample_stats`'s own behavior is unchanged by this split.
+fn classify_stats(stats: &SampleStats, thresholds: &Defaults) -> (Severity, String) {
     let cancel_rate = stats.cancelled as f64 / stats.total as f64;
     let delay_rate = stats.delayed as f64 / stats.total as f64;
     let skip_rate = stats.skipped as f64 / stats.total as f64;
-    let (sample_severity, reason) = classify(
+    classify(
         ClassifyCounts {
             cancel_rate,
             delay_rate,
@@ -1093,15 +1119,126 @@ fn escalate_from_sample_stats(
             skipped: stats.skipped,
         },
         thresholds,
-    );
+    )
+}
 
-    if severity_rank(sample_severity) <= severity_rank(severity) {
+/// Full-coverage analog of `escalate_from_sample_stats` -- identical
+/// escalate-only shape and tie-break rule (strictly higher `severity_rank`
+/// only), reusing `classify_stats`'s shared rate arithmetic/thresholds.
+/// Differs only in the reason-annotation prefix, so a reader can tell
+/// which producer supplied the escalating number. See
+/// docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md
+/// Decision 3's "escalate_from_coverage_stats... never demoting below
+/// whatever Knowledgebase/Planned already established -- identical
+/// escalate-only posture to today's rule, one level stronger."
+fn escalate_from_coverage_stats(
+    severity: Severity,
+    stats: &SampleStats,
+    thresholds: &Defaults,
+) -> (Severity, Option<String>) {
+    if stats.total == 0 {
+        return (severity, None);
+    }
+    let (coverage_severity, reason) = classify_stats(stats, thresholds);
+
+    if severity_rank(coverage_severity) <= severity_rank(severity) {
         return (severity, None);
     }
     (
-        sample_severity,
-        Some(format!("live samples show: {reason}")),
+        coverage_severity,
+        Some(format!("full-coverage data shows: {reason}")),
     )
+}
+
+/// Layer 3 merge: attaches an already-resolved per-line full-coverage
+/// signal onto every status of an already-built `LineStatusReport`.
+/// Mirrors `poller-tfl::merge_dlr_sample_stats`'s shape (an
+/// already-resolved per-line signal merged directly on, no per-station
+/// threshold/filter logic here since the producer already did that work),
+/// deliberately NOT `compute_sample_availability`'s per-station raw-data
+/// shape -- see
+/// docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md
+/// Decision 1's "sibling type, not reuse" reasoning.
+///
+/// **Judgment call**, since the design doc's sketches don't resolve this:
+/// "no active incident present" -- the condition that gates setting
+/// `DataQuality::TrustInferred` outright, rather than merely escalating
+/// severity -- is approximated as "this status's current `data_quality`
+/// is already `LdbwsInferred`", i.e. Layer 1 found no incident for this
+/// line this cycle, so Layer 2's `infer_from_samples`/`good_service`
+/// literal is what produced this status. This mirrors the exact precedent
+/// `escalate_from_sample_stats` already established for the identical
+/// question at Layer 2 (see the design doc's "Current relevant state"
+/// section, and `escalate_from_sample_stats`'s own doc comment above).
+/// An incident-derived status (`Knowledgebase`/`Planned`/`Tfl`) always
+/// takes the escalate-only branch instead, preserving its original
+/// provenance -- identical posture to `escalate_from_sample_stats`'s
+/// existing behavior for LDBWS.
+fn merge_full_coverage_stats(
+    report: &mut LineStatusReport,
+    stats: &SampleStats,
+    thresholds: &Defaults,
+) {
+    let (coverage_severity, coverage_reason) = classify_stats(stats, thresholds);
+    for status in &mut report.statuses {
+        status.full_coverage_stats = Some(stats.clone());
+        status.full_coverage_availability = FullCoverageAvailability::Available(stats.clone());
+
+        let no_incident_present = status.data_quality == DataQuality::LdbwsInferred;
+        if no_incident_present && coverage_severity != Severity::GoodService {
+            status.severity = coverage_severity;
+            status.reason = coverage_reason.clone();
+            status.data_quality = DataQuality::TrustInferred;
+        } else {
+            let (escalated, annotation) =
+                escalate_from_coverage_stats(status.severity, stats, thresholds);
+            status.severity = escalated;
+            if let Some(annotation) = annotation {
+                status.reason.push_str(&format!(" ({annotation})"));
+            }
+        }
+    }
+}
+
+/// Post-`aggregate()` pass merging a per-line materialized full-coverage
+/// signal onto already-built reports -- see `merge_full_coverage_stats`'s
+/// doc comment for the merge rule itself. `full_coverage` is the
+/// per-line signal a dedicated TRUST-vs-schedule consumer ("Option B")
+/// would provide -- always empty in production today, since that
+/// consumer does not exist yet (building it is explicitly out of scope
+/// for this scaffolding; see
+/// docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md's
+/// own "Explicitly out of scope"). This function and its call site in
+/// `main.rs::run_cycle` are the integration point a future consumer
+/// would use -- kept as a SEPARATE pass called after `aggregate()`, not a
+/// new parameter on `aggregate()` itself, specifically so this addition
+/// doesn't touch `aggregate()`'s existing signature or its many existing
+/// call sites/tests.
+///
+/// Only touches lines with `LineDefinition.full_coverage_enabled` set
+/// (Decision 3's per-line TOML rollout gate) -- every other line's
+/// `full_coverage_availability` stays at its `NotEnabled` construction
+/// default, untouched.
+pub(crate) fn merge_full_coverage(
+    reports: &mut HashMap<String, LineStatusReport>,
+    lines: &HashMap<String, LineDefinition>,
+    full_coverage: &HashMap<String, SampleStats>,
+    defaults: &Defaults,
+) {
+    for line in lines.values().filter(|l| l.full_coverage_enabled) {
+        let Some(report) = reports.get_mut(&line.id) else {
+            continue;
+        };
+        let thresholds = thresholds_for(defaults, &line.severity_overrides);
+        match full_coverage.get(&line.id) {
+            Some(stats) => merge_full_coverage_stats(report, stats, &thresholds),
+            None => {
+                for status in &mut report.statuses {
+                    status.full_coverage_availability = FullCoverageAvailability::Pending;
+                }
+            }
+        }
+    }
 }
 
 fn good_service() -> LineStatus {
@@ -1117,6 +1254,8 @@ fn good_service() -> LineStatus {
         data_quality: DataQuality::LdbwsInferred,
         sample_stats: None,
         sample_availability: SampleAvailability::NoCoverage, // placeholder; always overwritten by every caller
+        full_coverage_stats: None,
+        full_coverage_availability: FullCoverageAvailability::NotEnabled, // placeholder; overwritten by merge_full_coverage for an enabled line
     }
 }
 
@@ -3303,5 +3442,261 @@ mod tests {
             status.disruption.unwrap().impact_type.as_deref(),
             Some("rail_replacement_bus")
         );
+    }
+
+    // --- Decision 3 scaffolding: escalate_from_coverage_stats, merge_full_coverage_stats, merge_full_coverage ---
+
+    fn test_line(id: &str, full_coverage_enabled: bool) -> LineDefinition {
+        LineDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            mode: "national-rail".to_string(),
+            category: "test".to_string(),
+            operators: vec!["SW".to_string()],
+            stations: vec![],
+            sample_stations: vec![],
+            match_keywords: vec![],
+            excluded_keywords: vec![],
+            severity_overrides: HashMap::new(),
+            exclusive_segments: vec![],
+            destination_crs_filter: vec![],
+            headcode_prefixes: vec![],
+            full_coverage_enabled,
+        }
+    }
+
+    fn coverage_stats(total: usize, delayed: usize, cancelled: usize) -> SampleStats {
+        SampleStats {
+            total,
+            delayed,
+            cancelled,
+            skipped: 0,
+            avg_delay_minutes: 4.0,
+        }
+    }
+
+    #[test]
+    fn escalate_from_coverage_stats_escalates_on_strictly_higher_rank() {
+        let defaults = Defaults::default();
+        // 60% cancelled clears part_suspended_pct (0.60 default) -> PartSuspended,
+        // strictly worse than the incoming GoodService.
+        let stats = coverage_stats(10, 0, 6);
+        let (severity, annotation) =
+            escalate_from_coverage_stats(Severity::GoodService, &stats, &defaults);
+        assert_eq!(severity, Severity::PartSuspended);
+        assert!(
+            annotation
+                .unwrap()
+                .starts_with("full-coverage data shows: ")
+        );
+    }
+
+    #[test]
+    fn escalate_from_coverage_stats_is_a_no_op_at_equal_or_lower_rank() {
+        let defaults = Defaults::default();
+        // Quiet coverage data (no delays/cancellations) must never demote an
+        // already-severe incident-derived status.
+        let stats = coverage_stats(10, 0, 0);
+        let (severity, annotation) =
+            escalate_from_coverage_stats(Severity::Suspended, &stats, &defaults);
+        assert_eq!(severity, Severity::Suspended);
+        assert!(annotation.is_none());
+    }
+
+    #[test]
+    fn escalate_from_coverage_stats_is_a_no_op_on_an_empty_population() {
+        let defaults = Defaults::default();
+        let stats = coverage_stats(0, 0, 0);
+        let (severity, annotation) =
+            escalate_from_coverage_stats(Severity::MinorDelays, &stats, &defaults);
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.is_none());
+    }
+
+    fn ldbws_status(severity: Severity) -> LineStatus {
+        let mut status = good_service();
+        status.severity = severity;
+        status.data_quality = DataQuality::LdbwsInferred;
+        status
+    }
+
+    fn incident_status(severity: Severity, data_quality: DataQuality) -> LineStatus {
+        let mut status = good_service();
+        status.severity = severity;
+        status.data_quality = data_quality;
+        status.reason = "Signal failure".to_string();
+        status
+    }
+
+    #[test]
+    fn merge_full_coverage_stats_sets_stats_and_availability_on_every_status() {
+        let defaults = Defaults::default();
+        let thresholds = thresholds_for(&defaults, &HashMap::new());
+        let mut report = LineStatusReport {
+            id: "swr-alton".to_string(),
+            name: "Alton".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec![],
+            statuses: vec![
+                ldbws_status(Severity::GoodService),
+                ldbws_status(Severity::GoodService),
+            ],
+        };
+        let stats = coverage_stats(10, 0, 0);
+
+        merge_full_coverage_stats(&mut report, &stats, &thresholds);
+
+        for status in &report.statuses {
+            assert_eq!(status.full_coverage_stats, Some(stats.clone()));
+            assert_eq!(
+                status.full_coverage_availability,
+                FullCoverageAvailability::Available(stats.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn merge_full_coverage_stats_sets_trust_inferred_when_no_incident_and_coverage_implies_disruption()
+     {
+        let defaults = Defaults::default();
+        let thresholds = thresholds_for(&defaults, &HashMap::new());
+        let mut report = LineStatusReport {
+            id: "swr-alton".to_string(),
+            name: "Alton".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec![],
+            statuses: vec![ldbws_status(Severity::GoodService)],
+        };
+        // 60% cancelled -> PartSuspended, no incident present.
+        let stats = coverage_stats(10, 0, 6);
+
+        merge_full_coverage_stats(&mut report, &stats, &thresholds);
+
+        let status = &report.statuses[0];
+        assert_eq!(status.severity, Severity::PartSuspended);
+        assert_eq!(status.data_quality, DataQuality::TrustInferred);
+    }
+
+    #[test]
+    fn merge_full_coverage_stats_escalates_without_changing_data_quality_when_an_incident_is_present()
+     {
+        let defaults = Defaults::default();
+        let thresholds = thresholds_for(&defaults, &HashMap::new());
+        let mut report = LineStatusReport {
+            id: "swr-alton".to_string(),
+            name: "Alton".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec![],
+            statuses: vec![incident_status(
+                Severity::MinorDelays,
+                DataQuality::Knowledgebase,
+            )],
+        };
+        // 60% cancelled -> PartSuspended, strictly worse than MinorDelays.
+        let stats = coverage_stats(10, 0, 6);
+
+        merge_full_coverage_stats(&mut report, &stats, &thresholds);
+
+        let status = &report.statuses[0];
+        assert_eq!(status.severity, Severity::PartSuspended);
+        // Provenance preserved -- mirrors escalate_from_sample_stats's
+        // existing behavior for an incident-derived status.
+        assert_eq!(status.data_quality, DataQuality::Knowledgebase);
+        assert!(status.reason.contains("full-coverage data shows: "));
+    }
+
+    #[test]
+    fn merge_full_coverage_stats_never_demotes_an_incident_when_coverage_reads_quiet() {
+        let defaults = Defaults::default();
+        let thresholds = thresholds_for(&defaults, &HashMap::new());
+        let mut report = LineStatusReport {
+            id: "swr-alton".to_string(),
+            name: "Alton".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec![],
+            statuses: vec![incident_status(Severity::Suspended, DataQuality::Planned)],
+        };
+        let stats = coverage_stats(10, 0, 0); // genuinely quiet
+
+        merge_full_coverage_stats(&mut report, &stats, &thresholds);
+
+        let status = &report.statuses[0];
+        assert_eq!(status.severity, Severity::Suspended);
+        assert_eq!(status.data_quality, DataQuality::Planned);
+        assert_eq!(status.reason, "Signal failure");
+    }
+
+    #[test]
+    fn merge_full_coverage_only_touches_full_coverage_enabled_lines() {
+        let defaults = Defaults::default();
+        let lines: HashMap<String, LineDefinition> = [
+            ("enabled".to_string(), test_line("enabled", true)),
+            ("disabled".to_string(), test_line("disabled", false)),
+        ]
+        .into();
+        let mut reports: HashMap<String, LineStatusReport> = [
+            (
+                "enabled".to_string(),
+                LineStatusReport {
+                    id: "enabled".to_string(),
+                    name: "Enabled".to_string(),
+                    mode_name: "national-rail".to_string(),
+                    operators: vec![],
+                    statuses: vec![ldbws_status(Severity::GoodService)],
+                },
+            ),
+            (
+                "disabled".to_string(),
+                LineStatusReport {
+                    id: "disabled".to_string(),
+                    name: "Disabled".to_string(),
+                    mode_name: "national-rail".to_string(),
+                    operators: vec![],
+                    statuses: vec![ldbws_status(Severity::GoodService)],
+                },
+            ),
+        ]
+        .into();
+        let mut full_coverage = HashMap::new();
+        full_coverage.insert("enabled".to_string(), coverage_stats(10, 0, 0));
+        full_coverage.insert("disabled".to_string(), coverage_stats(10, 0, 0));
+
+        merge_full_coverage(&mut reports, &lines, &full_coverage, &defaults);
+
+        assert_eq!(
+            reports["enabled"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::Available(coverage_stats(10, 0, 0))
+        );
+        assert_eq!(
+            reports["disabled"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::NotEnabled,
+            "a line without full_coverage_enabled must be left untouched even if a signal exists for it"
+        );
+    }
+
+    #[test]
+    fn merge_full_coverage_marks_pending_when_enabled_but_no_signal_present_this_cycle() {
+        let defaults = Defaults::default();
+        let lines: HashMap<String, LineDefinition> =
+            [("enabled".to_string(), test_line("enabled", true))].into();
+        let mut reports: HashMap<String, LineStatusReport> = [(
+            "enabled".to_string(),
+            LineStatusReport {
+                id: "enabled".to_string(),
+                name: "Enabled".to_string(),
+                mode_name: "national-rail".to_string(),
+                operators: vec![],
+                statuses: vec![ldbws_status(Severity::GoodService)],
+            },
+        )]
+        .into();
+
+        merge_full_coverage(&mut reports, &lines, &HashMap::new(), &defaults);
+
+        assert_eq!(
+            reports["enabled"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::Pending
+        );
+        assert_eq!(reports["enabled"].statuses[0].full_coverage_stats, None);
     }
 }

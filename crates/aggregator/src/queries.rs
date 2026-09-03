@@ -193,6 +193,15 @@ fn normalize_entry_for_diff(entry: &serde_json::Value) -> serde_json::Value {
     if let Some(obj) = entry.as_object_mut() {
         obj.remove("sample_stats");
         obj.remove("sample_availability");
+        // Same reasoning as the pair above, extended to the Decision-1
+        // full-coverage fields: nothing produces these yet, but once
+        // something does they will fluctuate every cycle independent of
+        // real disruption state, exactly like sample_stats/sample_availability
+        // already do -- see
+        // docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md
+        // Decision 1.
+        obj.remove("full_coverage_stats");
+        obj.remove("full_coverage_availability");
     }
     if let Some(reason) = entry.get_mut("reason")
         && let Some(text) = reason.as_str()
@@ -656,6 +665,168 @@ pub async fn prune_half_hourly_stats(pool: &PgPool, retention_hours: i64) -> Res
     Ok(result.rows_affected())
 }
 
+// --- Decision 4 scaffolding: line_status_{daily,half_hourly}_coverage_stats ---
+//
+// Sibling pair of record_daily_stats/record_half_hourly_stats above, same
+// accumulate-upsert shape, `resolved_windows` in place of `sample_cycles`.
+// See crates/api/migrations/20260903200000_line_status_daily_coverage_stats.sql's
+// own doc comment for why this is a wholly separate table rather than a
+// `source` column on the existing one.
+//
+// **Judgment call**, since neither the design doc's sketch nor any
+// existing code defines this: these functions are fed directly from
+// whatever `LineStatus.full_coverage_stats` a line's Layer-3 merge
+// produced THIS CYCLE -- NOT a deduped "new distinct trains this cycle"
+// value the way `record_daily_stats`/`record_half_hourly_stats` are fed
+// `dedup::dedup_new_sample_stats`'s output. `dedup`'s per-service ledger is
+// specifically keyed on Darwin `service_id`, an LDBWS-schema concept with
+// no defined analog for a full-coverage producer's own materialized
+// signal -- whether/how such a producer should express "this cycle's NEW
+// contribution" (rather than, say, a running total-so-far for the day) is
+// Option B's own future design question, not resolved here. Accumulating
+// whatever raw value is passed each cycle is the same posture this
+// scaffolding takes everywhere else: correct today (nothing is ever
+// passed, since full_coverage_stats stays `None`), and a real design
+// decision a future consumer's own integration work will need to make
+// explicit.
+
+/// Full-coverage sibling of `record_daily_stats` -- identical
+/// accumulate-upsert shape, `resolved_windows` incrementing by 1 every
+/// call exactly like `sample_cycles` does. See this section's own module
+/// doc comment for the "what counts as a cycle's contribution" judgment
+/// call.
+pub async fn record_daily_coverage_stats<'c, E>(
+    executor: E,
+    line_id: &str,
+    day: NaiveDate,
+    stats: Option<&common::SampleStats>,
+) -> Result<()>
+where
+    E: PgExecutor<'c>,
+{
+    let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
+        Some(s) => {
+            let running = s.total.saturating_sub(s.cancelled) as i64;
+            (
+                s.total as i64,
+                s.delayed as i64,
+                s.cancelled as i64,
+                s.skipped as i64,
+                running,
+                s.avg_delay_minutes * running as f64,
+            )
+        }
+        None => (0, 0, 0, 0, 0, 0.0),
+    };
+    sqlx::query(
+        "INSERT INTO line_status_daily_coverage_stats
+            (line_id, day, resolved_windows, total, delayed, cancelled, skipped,
+             running_count, delay_minutes_sum)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (line_id, day) DO UPDATE SET
+            resolved_windows  = line_status_daily_coverage_stats.resolved_windows + 1,
+            total             = line_status_daily_coverage_stats.total + EXCLUDED.total,
+            delayed           = line_status_daily_coverage_stats.delayed + EXCLUDED.delayed,
+            cancelled         = line_status_daily_coverage_stats.cancelled + EXCLUDED.cancelled,
+            skipped           = line_status_daily_coverage_stats.skipped + EXCLUDED.skipped,
+            running_count     = line_status_daily_coverage_stats.running_count + EXCLUDED.running_count,
+            delay_minutes_sum = line_status_daily_coverage_stats.delay_minutes_sum + EXCLUDED.delay_minutes_sum",
+    )
+    .bind(line_id)
+    .bind(day)
+    .bind(total)
+    .bind(delayed)
+    .bind(cancelled)
+    .bind(skipped)
+    .bind(running)
+    .bind(delay_minutes_sum)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Mirrors `prune_daily_stats`'s shape exactly. **Judgment call**: reuses
+/// the same `daily_stats_retention_days` config knob rather than adding a
+/// new one -- a reasonable default for a sibling table with the same shape
+/// and no real data yet to suggest it needs a different window; revisit
+/// once a real producer exists.
+pub async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM line_status_daily_coverage_stats WHERE day < (CURRENT_DATE - $1::int)",
+    )
+    .bind(retention_days as i32)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Half-hourly-granularity sibling of `record_daily_coverage_stats` --
+/// same relationship `record_half_hourly_stats` already has to
+/// `record_daily_stats`. See this section's own module doc comment for
+/// the "what counts as a cycle's contribution" judgment call.
+pub async fn record_half_hourly_coverage_stats<'c, E>(
+    executor: E,
+    line_id: &str,
+    half_hour_start: DateTime<Utc>,
+    stats: Option<&common::SampleStats>,
+) -> Result<()>
+where
+    E: PgExecutor<'c>,
+{
+    let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
+        Some(s) => {
+            let running = s.total.saturating_sub(s.cancelled) as i64;
+            (
+                s.total as i64,
+                s.delayed as i64,
+                s.cancelled as i64,
+                s.skipped as i64,
+                running,
+                s.avg_delay_minutes * running as f64,
+            )
+        }
+        None => (0, 0, 0, 0, 0, 0.0),
+    };
+    sqlx::query(
+        "INSERT INTO line_status_half_hourly_coverage_stats
+            (line_id, half_hour_start, resolved_windows, total, delayed, cancelled, skipped,
+             running_count, delay_minutes_sum)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (line_id, half_hour_start) DO UPDATE SET
+            resolved_windows  = line_status_half_hourly_coverage_stats.resolved_windows + 1,
+            total             = line_status_half_hourly_coverage_stats.total + EXCLUDED.total,
+            delayed           = line_status_half_hourly_coverage_stats.delayed + EXCLUDED.delayed,
+            cancelled         = line_status_half_hourly_coverage_stats.cancelled + EXCLUDED.cancelled,
+            skipped           = line_status_half_hourly_coverage_stats.skipped + EXCLUDED.skipped,
+            running_count     = line_status_half_hourly_coverage_stats.running_count + EXCLUDED.running_count,
+            delay_minutes_sum = line_status_half_hourly_coverage_stats.delay_minutes_sum + EXCLUDED.delay_minutes_sum",
+    )
+    .bind(line_id)
+    .bind(half_hour_start)
+    .bind(total)
+    .bind(delayed)
+    .bind(cancelled)
+    .bind(skipped)
+    .bind(running)
+    .bind(delay_minutes_sum)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Mirrors `prune_half_hourly_stats`'s shape exactly. **Judgment call**:
+/// reuses the same `half_hourly_stats_retention_hours` config knob -- same
+/// reasoning as `prune_daily_coverage_stats`'s own note.
+pub async fn prune_half_hourly_coverage_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM line_status_half_hourly_coverage_stats WHERE half_hour_start < NOW() - ($1 || ' hours')::interval",
+    )
+    .bind(retention_hours.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +968,7 @@ mod tests {
             exclusive_segments: vec![],
             destination_crs_filter: vec!["AON".to_string()],
             headcode_prefixes: vec![],
+            full_coverage_enabled: false,
         };
         let mut lines = HashMap::new();
         lines.insert(LINE_ID.to_string(), line);
@@ -977,6 +1149,8 @@ mod tests {
                     data_quality: DataQuality::default(),
                     sample_stats: None,
                     sample_availability: SampleAvailability::NoCoverage,
+                    full_coverage_stats: None,
+                    full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
                 }],
             }
         }
@@ -1115,6 +1289,8 @@ mod tests {
                     data_quality: DataQuality::default(),
                     sample_stats: None,
                     sample_availability: SampleAvailability::NoCoverage,
+                    full_coverage_stats: None,
+                    full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
                 }],
             }
         }
@@ -1199,6 +1375,47 @@ mod tests {
                     "cancelled": 1,
                     "avg_delay_minutes": 4.2
                 }
+            }
+        ]);
+
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_for_diff_ignores_full_coverage_field_changes() {
+        // Decision 1's two new fields must be stripped the same way
+        // sample_stats/sample_availability already are -- see
+        // normalize_entry_for_diff's own doc comment for why.
+        let a = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:00:00Z"},
+                "data_quality": "live",
+                "full_coverage_stats": {
+                    "total": 10,
+                    "delayed": 2,
+                    "cancelled": 0,
+                    "skipped": 0,
+                    "avg_delay_minutes": 1.5
+                },
+                "full_coverage_availability": {"state": "available"}
+            }
+        ]);
+        let b = serde_json::json!([
+            {
+                "severity": "good-service",
+                "reason": "Good service",
+                "validity": {"from_date": "2026-07-09T10:01:00Z"},
+                "data_quality": "live",
+                "full_coverage_stats": {
+                    "total": 12,
+                    "delayed": 3,
+                    "cancelled": 1,
+                    "skipped": 0,
+                    "avg_delay_minutes": 2.1
+                },
+                "full_coverage_availability": {"state": "pending"}
             }
         ]);
 
@@ -2230,5 +2447,356 @@ mod tests {
         assert_eq!(total_d, total_h, "a single half-hour's stats must reconcile with that bucket's own contribution to the day");
         assert_eq!(delayed_d, delayed_h);
         assert!((dms_d - dms_h).abs() < 1e-9);
+    }
+
+    // --- record_daily_coverage_stats / record_half_hourly_coverage_stats /
+    // prune_{daily,half_hourly}_coverage_stats (Decision 4 scaffolding) ---
+    //
+    // Mirrors the sample-stats test set above one-for-one, against the new
+    // sibling tables. No real writer ever calls these functions in
+    // production today (see queries.rs's own module doc comment on this
+    // section) -- these tests exist so the write/prune SQL itself is
+    // proven correct in advance of a real producer existing.
+
+    async fn cleanup_daily_coverage_stats(pool: &PgPool, line_id: &str) {
+        sqlx::query("DELETE FROM line_status_daily_coverage_stats WHERE line_id = $1")
+            .bind(line_id)
+            .execute(pool)
+            .await
+            .expect("cleanup line_status_daily_coverage_stats");
+    }
+
+    async fn cleanup_half_hourly_coverage_stats(pool: &PgPool, line_id: &str) {
+        sqlx::query("DELETE FROM line_status_half_hourly_coverage_stats WHERE line_id = $1")
+            .bind(line_id)
+            .execute(pool)
+            .await
+            .expect("cleanup line_status_half_hourly_coverage_stats");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_daily_coverage_stats_accumulates_across_a_day -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_daily_coverage_stats_accumulates_across_a_day() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const LINE_ID: &str = "TEST-DAILY-COVERAGE-STATS-ACCUMULATE";
+        let day = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+
+        cleanup_daily_coverage_stats(&pool, LINE_ID).await;
+
+        let cycle1 = common::SampleStats {
+            total: 4,
+            delayed: 1,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 6.0,
+        };
+        let cycle2 = common::SampleStats {
+            total: 2,
+            delayed: 2,
+            cancelled: 0,
+            skipped: 1,
+            avg_delay_minutes: 12.0,
+        };
+
+        record_daily_coverage_stats(&pool, LINE_ID, day, Some(&cycle1))
+            .await
+            .expect("record cycle 1");
+        record_daily_coverage_stats(&pool, LINE_ID, day, Some(&cycle2))
+            .await
+            .expect("record cycle 2");
+
+        let row = sqlx::query(
+            "SELECT resolved_windows, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
+             FROM line_status_daily_coverage_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("read accumulated row");
+
+        cleanup_daily_coverage_stats(&pool, LINE_ID).await;
+
+        let resolved_windows: i64 = row.try_get("resolved_windows").unwrap();
+        let total: i64 = row.try_get("total").unwrap();
+        let running_count: i64 = row.try_get("running_count").unwrap();
+        let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(resolved_windows, 2);
+        assert_eq!(total, 6);
+        assert_eq!(running_count, 5);
+        assert!((delay_minutes_sum - 42.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const LINE_ID: &str = "TEST-DAILY-COVERAGE-STATS-NONE";
+        let day = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+
+        cleanup_daily_coverage_stats(&pool, LINE_ID).await;
+
+        record_daily_coverage_stats(&pool, LINE_ID, day, None)
+            .await
+            .expect("record a None cycle");
+        record_daily_coverage_stats(&pool, LINE_ID, day, None)
+            .await
+            .expect("record a second None cycle");
+
+        let row = sqlx::query(
+            "SELECT resolved_windows, total, delay_minutes_sum \
+             FROM line_status_daily_coverage_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("read row");
+
+        cleanup_daily_coverage_stats(&pool, LINE_ID).await;
+
+        let resolved_windows: i64 = row.try_get("resolved_windows").unwrap();
+        let total: i64 = row.try_get("total").unwrap();
+        let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(resolved_windows, 2, "None still counts as a covered cycle");
+        assert_eq!(total, 0, "None must contribute zero to every sum column");
+        assert_eq!(delay_minutes_sum, 0.0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_daily_coverage_stats_a_new_day_starts_a_fresh_row -- --ignored` against \
+                docker compose's postgres"]
+    async fn record_daily_coverage_stats_a_new_day_starts_a_fresh_row() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const LINE_ID: &str = "TEST-DAILY-COVERAGE-STATS-NEW-DAY";
+        let day1 = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+
+        cleanup_daily_coverage_stats(&pool, LINE_ID).await;
+
+        let stats = common::SampleStats {
+            total: 5,
+            delayed: 1,
+            cancelled: 0,
+            skipped: 0,
+            avg_delay_minutes: 3.0,
+        };
+        record_daily_coverage_stats(&pool, LINE_ID, day1, Some(&stats))
+            .await
+            .expect("record day 1");
+        record_daily_coverage_stats(&pool, LINE_ID, day2, Some(&stats))
+            .await
+            .expect("record day 2");
+
+        let day2_windows: i64 = sqlx::query_scalar(
+            "SELECT resolved_windows FROM line_status_daily_coverage_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day2)
+        .fetch_one(&pool)
+        .await
+        .expect("read day 2 row");
+
+        cleanup_daily_coverage_stats(&pool, LINE_ID).await;
+
+        assert_eq!(
+            day2_windows, 1,
+            "a new day must start its own fresh row, not accumulate into day 1's"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_daily_coverage_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                against docker compose's postgres"]
+    async fn prune_daily_coverage_stats_deletes_only_rows_older_than_the_retention_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const OLD_LINE_ID: &str = "TEST-DAILY-COVERAGE-STATS-PRUNE-OLD";
+        const RECENT_LINE_ID: &str = "TEST-DAILY-COVERAGE-STATS-PRUNE-RECENT";
+        const RETENTION_DAYS: i64 = 30;
+
+        cleanup_daily_coverage_stats(&pool, OLD_LINE_ID).await;
+        cleanup_daily_coverage_stats(&pool, RECENT_LINE_ID).await;
+
+        sqlx::query(
+            "INSERT INTO line_status_daily_coverage_stats (line_id, day, resolved_windows, total) VALUES \
+                ($1, CURRENT_DATE - ($3::int + 1), 1, 1), \
+                ($2, CURRENT_DATE - ($3::int - 1), 1, 1)",
+        )
+        .bind(OLD_LINE_ID)
+        .bind(RECENT_LINE_ID)
+        .bind(RETENTION_DAYS as i32)
+        .execute(&pool)
+        .await
+        .expect("seed old and recent rows");
+
+        prune_daily_coverage_stats(&pool, RETENTION_DAYS)
+            .await
+            .expect("prune_daily_coverage_stats");
+
+        let old_survives: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_daily_coverage_stats WHERE line_id = $1",
+        )
+        .bind(OLD_LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count old survivors");
+        let recent_survives: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_daily_coverage_stats WHERE line_id = $1",
+        )
+        .bind(RECENT_LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count recent survivors");
+
+        cleanup_daily_coverage_stats(&pool, OLD_LINE_ID).await;
+        cleanup_daily_coverage_stats(&pool, RECENT_LINE_ID).await;
+
+        assert_eq!(old_survives, 0);
+        assert_eq!(recent_survives, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                record_half_hourly_coverage_stats_accumulates_within_a_bucket -- --ignored` \
+                against docker compose's postgres"]
+    async fn record_half_hourly_coverage_stats_accumulates_within_a_bucket() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const LINE_ID: &str = "TEST-HALF-HOURLY-COVERAGE-STATS-ACCUMULATE";
+        let bucket: DateTime<Utc> = "2026-09-03T14:00:00Z".parse().unwrap();
+
+        cleanup_half_hourly_coverage_stats(&pool, LINE_ID).await;
+
+        let cycle1 = common::SampleStats {
+            total: 4,
+            delayed: 1,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 6.0,
+        };
+        let cycle2 = common::SampleStats {
+            total: 2,
+            delayed: 2,
+            cancelled: 0,
+            skipped: 1,
+            avg_delay_minutes: 12.0,
+        };
+
+        record_half_hourly_coverage_stats(&pool, LINE_ID, bucket, Some(&cycle1))
+            .await
+            .expect("record cycle 1");
+        record_half_hourly_coverage_stats(&pool, LINE_ID, bucket, Some(&cycle2))
+            .await
+            .expect("record cycle 2");
+
+        let row = sqlx::query(
+            "SELECT resolved_windows, total, running_count, delay_minutes_sum \
+             FROM line_status_half_hourly_coverage_stats WHERE line_id = $1 AND half_hour_start = $2",
+        )
+        .bind(LINE_ID)
+        .bind(bucket)
+        .fetch_one(&pool)
+        .await
+        .expect("read accumulated row");
+
+        cleanup_half_hourly_coverage_stats(&pool, LINE_ID).await;
+
+        let resolved_windows: i64 = row.try_get("resolved_windows").unwrap();
+        let total: i64 = row.try_get("total").unwrap();
+        let running_count: i64 = row.try_get("running_count").unwrap();
+        let delay_minutes_sum: f64 = row.try_get("delay_minutes_sum").unwrap();
+
+        assert_eq!(resolved_windows, 2);
+        assert_eq!(total, 6);
+        assert_eq!(running_count, 5);
+        assert!((delay_minutes_sum - 42.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_half_hourly_coverage_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                against docker compose's postgres"]
+    async fn prune_half_hourly_coverage_stats_deletes_only_rows_older_than_the_retention_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const OLD_LINE_ID: &str = "TEST-HALF-HOURLY-COVERAGE-STATS-PRUNE-OLD";
+        const RECENT_LINE_ID: &str = "TEST-HALF-HOURLY-COVERAGE-STATS-PRUNE-RECENT";
+        const RETENTION_HOURS: i64 = 48;
+
+        cleanup_half_hourly_coverage_stats(&pool, OLD_LINE_ID).await;
+        cleanup_half_hourly_coverage_stats(&pool, RECENT_LINE_ID).await;
+
+        sqlx::query(
+            "INSERT INTO line_status_half_hourly_coverage_stats (line_id, half_hour_start, resolved_windows, total) VALUES \
+                ($1, NOW() - (($3 + 1) || ' hours')::interval, 1, 1), \
+                ($2, NOW() - (($3 - 1) || ' hours')::interval, 1, 1)",
+        )
+        .bind(OLD_LINE_ID)
+        .bind(RECENT_LINE_ID)
+        .bind(RETENTION_HOURS)
+        .execute(&pool)
+        .await
+        .expect("seed old and recent rows");
+
+        prune_half_hourly_coverage_stats(&pool, RETENTION_HOURS)
+            .await
+            .expect("prune_half_hourly_coverage_stats");
+
+        let old_survives: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_half_hourly_coverage_stats WHERE line_id = $1",
+        )
+        .bind(OLD_LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count old survivors");
+        let recent_survives: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_half_hourly_coverage_stats WHERE line_id = $1",
+        )
+        .bind(RECENT_LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count recent survivors");
+
+        cleanup_half_hourly_coverage_stats(&pool, OLD_LINE_ID).await;
+        cleanup_half_hourly_coverage_stats(&pool, RECENT_LINE_ID).await;
+
+        assert_eq!(old_survives, 0);
+        assert_eq!(recent_survives, 1);
     }
 }
