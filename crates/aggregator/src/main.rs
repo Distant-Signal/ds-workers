@@ -180,16 +180,29 @@ async fn run_cycle(
     let samples = queries::load_station_samples(pool).await?;
 
     let mut reports = aggregation::aggregate(&lines, &incidents, &samples, &registry, defaults);
-    // Layer 3 (Decision 3 scaffolding): merges a per-line materialized
-    // full-coverage signal onto the reports Layer 1/2 already built. The
-    // `&HashMap::new()` below is a placeholder -- no dedicated
-    // TRUST-vs-schedule consumer ("Option B") exists yet to populate it;
-    // building one is a separate, later, not-yet-planned task. This call
-    // site is where that future consumer's own per-line materialized rows
-    // would be handed in once it exists. See
+    // Layer 3 (Decision 3): merges a per-line materialized full-coverage
+    // signal onto the reports Layer 1/2 already built. `full-coverage-consumer`
+    // (docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md,
+    // Task 14) is that dedicated TRUST-vs-schedule consumer -- this reads
+    // its output directly via SQL (this crate's own `PgPool`, not HTTP;
+    // see that plan's Correction 1). Fails open to an empty map on a
+    // query error, matching this crate's other reload passes' fail-open
+    // posture (e.g. `stanox_crs`) -- every real line then reads as
+    // Pending for this cycle rather than aborting the whole run. See
     // docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md
     // Decision 3 and `aggregation::merge_full_coverage`'s own doc comment.
-    aggregation::merge_full_coverage(&mut reports, &lines, &HashMap::new(), defaults);
+    // Plain UTC date, deliberately NOT `queries::london_calendar_day` --
+    // see `load_full_coverage_line_stats`'s own doc comment for why this
+    // read must match its writers' (schedule-reference, full-coverage-consumer)
+    // plain-UTC `service_date` key convention.
+    let full_coverage_today = chrono::Utc::now().date_naive();
+    let full_coverage = queries::load_full_coverage_line_stats(pool, full_coverage_today)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = ?err, "failed to load full_coverage_line_stats; treating every enabled line as Pending this cycle");
+            HashMap::new()
+        });
+    aggregation::merge_full_coverage(&mut reports, &lines, &full_coverage, defaults);
 
     // Batched into `WRITE_CHUNK_SIZE`-sized transactions rather than one
     // autocommitted statement per line -- see `WRITE_CHUNK_SIZE`'s doc
@@ -264,7 +277,8 @@ async fn run_cycle(
     dedup_ledger.prune_before(today);
 
     let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
-    let half_hourly_stats_pruned = queries::prune_half_hourly_stats(pool, half_hourly_stats_retention_hours).await?;
+    let half_hourly_stats_pruned =
+        queries::prune_half_hourly_stats(pool, half_hourly_stats_retention_hours).await?;
 
     // Decision 4 scaffolding: the full-coverage sibling of the dedup/
     // daily-stats pass above. Unlike that pass, this one is fed each

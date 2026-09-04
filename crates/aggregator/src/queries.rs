@@ -103,6 +103,58 @@ pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>>
         .collect()
 }
 
+/// Every `full_coverage_line_stats` row with `availability = 'available'`
+/// AND `service_date = today`. A stale (yesterday's) or still-`pending`
+/// row is simply absent from the returned map --
+/// `aggregation::merge_full_coverage` already treats a missing key
+/// identically to "no signal yet" (Pending), so no new branch is needed
+/// in `aggregation.rs` for this. See
+/// docs/superpowers/specs/2026-09-04-option-b-live-consumer-design.md
+/// Decision 3 and
+/// docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md's
+/// Correction 1 (a direct SQL query, not the design doc's own HTTP
+/// sketch, since this crate already holds its own `PgPool`).
+///
+/// `today` here is deliberately the plain UTC calendar date
+/// (`chrono::Utc::now().date_naive()`), NOT this file's own
+/// `london_calendar_day` -- a real, considered choice, not an oversight
+/// of that existing convention: `full_coverage_line_stats.service_date`
+/// is written by `full-coverage-consumer` (Task 13) and
+/// `schedule-reference` (Task 7) against plain UTC dates (neither has a
+/// rail-day or Europe/London-calendar-day concept of its own), so this
+/// read must match that same key convention or it would silently miss
+/// every row during the roughly one BST hour a day (23:00-23:59 UTC, when
+/// London's calendar day has already rolled over but UTC's hasn't) where
+/// the two conventions disagree. `london_calendar_day` stays the right
+/// choice for this file's OTHER queries (daily-stats bucketing, an
+/// aggregator-internal concern with no cross-service writer to match).
+pub async fn load_full_coverage_line_stats(
+    pool: &PgPool,
+    today: NaiveDate,
+) -> Result<HashMap<String, common::SampleStats>> {
+    let rows = sqlx::query(
+        "SELECT line_id, total, delayed, cancelled, skipped, avg_delay_minutes \
+         FROM full_coverage_line_stats WHERE availability = 'available' AND service_date = $1",
+    )
+    .bind(today)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let line_id: String = row.try_get("line_id")?;
+            let stats = common::SampleStats {
+                total: row.try_get::<i32, _>("total")? as usize,
+                delayed: row.try_get::<i32, _>("delayed")? as usize,
+                cancelled: row.try_get::<i32, _>("cancelled")? as usize,
+                skipped: row.try_get::<i32, _>("skipped")? as usize,
+                avg_delay_minutes: row.try_get("avg_delay_minutes")?,
+            };
+            Ok((line_id, stats))
+        })
+        .collect()
+}
+
 /// Deletes `line_status` rows for any `line_id` not in `current_line_ids`.
 /// Called every cycle with the freshly-merged static+custom line set, so a
 /// deleted custom line's last-known status is removed on the next cycle
@@ -326,8 +378,10 @@ fn normalize_sample_counts(reason: &str) -> String {
         // Digit run immediately preceding " of ", scanning back only as far
         // as `copied_to` (text already emitted for an earlier match).
         let before = &reason[copied_to..of_idx];
-        let first_digits_start =
-            copied_to + before.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |p| p + 1);
+        let first_digits_start = copied_to
+            + before
+                .rfind(|c: char| !c.is_ascii_digit())
+                .map_or(0, |p| p + 1);
         let first_digits = &reason[first_digits_start..of_idx];
 
         // Digit run immediately following " of ".
@@ -612,7 +666,14 @@ where
     let (total, delayed, cancelled, skipped, running, delay_minutes_sum) = match stats {
         Some(s) => {
             let running = s.total.saturating_sub(s.cancelled) as i64;
-            (s.total as i64, s.delayed as i64, s.cancelled as i64, s.skipped as i64, running, s.avg_delay_minutes * running as f64)
+            (
+                s.total as i64,
+                s.delayed as i64,
+                s.cancelled as i64,
+                s.skipped as i64,
+                running,
+                s.avg_delay_minutes * running as f64,
+            )
         }
         None => (0, 0, 0, 0, 0, 0.0),
     };
@@ -1591,21 +1652,22 @@ mod tests {
     #[test]
     fn normalize_sample_counts_leaves_the_most_cited_suffix_untouched() {
         assert_eq!(
-            normalize_sample_counts("5 of 9 sampled services delayed. (most cited: Signal failure)"),
+            normalize_sample_counts(
+                "5 of 9 sampled services delayed. (most cited: Signal failure)"
+            ),
             "N of M sampled services delayed. (most cited: Signal failure)",
         );
     }
 
     #[test]
     fn normalize_sample_counts_leaves_unrelated_text_alone() {
-        assert_eq!(
-            normalize_sample_counts("Good Service"),
-            "Good Service",
-        );
+        assert_eq!(normalize_sample_counts("Good Service"), "Good Service",);
         // "of" not attached to a "<digits> of <digits> sampled services"
         // shape must not be touched, and must not stall the scan.
         assert_eq!(
-            normalize_sample_counts("Delayed because of engineering works, 5 of 9 sampled services delayed."),
+            normalize_sample_counts(
+                "Delayed because of engineering works, 5 of 9 sampled services delayed."
+            ),
             "Delayed because of engineering works, N of M sampled services delayed.",
         );
     }
@@ -1965,10 +2027,16 @@ mod tests {
     fn utc_half_hour_start_truncates_down_to_the_bucket_start() {
         // First half of the hour truncates to :00...
         let instant: DateTime<Utc> = "2026-08-15T14:07:12Z".parse().unwrap();
-        assert_eq!(utc_half_hour_start(instant), "2026-08-15T14:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            utc_half_hour_start(instant),
+            "2026-08-15T14:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         // ...second half truncates to :30.
         let instant: DateTime<Utc> = "2026-08-15T14:37:12Z".parse().unwrap();
-        assert_eq!(utc_half_hour_start(instant), "2026-08-15T14:30:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            utc_half_hour_start(instant),
+            "2026-08-15T14:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1982,7 +2050,10 @@ mod tests {
     #[test]
     fn utc_half_hour_start_just_before_midnight_stays_on_the_same_utc_day() {
         let instant: DateTime<Utc> = "2026-08-15T23:59:59Z".parse().unwrap();
-        assert_eq!(utc_half_hour_start(instant), "2026-08-15T23:30:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            utc_half_hour_start(instant),
+            "2026-08-15T23:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
@@ -1992,7 +2063,10 @@ mod tests {
         // UK clock changed at all -- there is no "skipped" or "repeated" UTC
         // half-hour on this date, only on the London-local wall clock.
         let instant: DateTime<Utc> = "2026-03-29T01:45:00Z".parse().unwrap();
-        assert_eq!(utc_half_hour_start(instant), "2026-03-29T01:30:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(
+            utc_half_hour_start(instant),
+            "2026-03-29T01:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     // --- record_daily_stats / prune_daily_stats ---
@@ -2251,18 +2325,38 @@ mod tests {
                 record_half_hourly_stats_accumulates_deduped_contributions_within_a_bucket -- --ignored` \
                 against docker compose's postgres"]
     async fn record_half_hourly_stats_accumulates_deduped_contributions_within_a_bucket() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-HALF-HOURLY-STATS-ACCUMULATE";
         let bucket: DateTime<Utc> = "2026-08-31T14:00:00Z".parse().unwrap();
 
         cleanup_half_hourly_stats(&pool, LINE_ID).await;
 
-        let cycle1 = common::SampleStats { total: 4, delayed: 1, cancelled: 1, skipped: 0, avg_delay_minutes: 6.0 };
-        let cycle2 = common::SampleStats { total: 2, delayed: 2, cancelled: 0, skipped: 1, avg_delay_minutes: 12.0 };
+        let cycle1 = common::SampleStats {
+            total: 4,
+            delayed: 1,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 6.0,
+        };
+        let cycle2 = common::SampleStats {
+            total: 2,
+            delayed: 2,
+            cancelled: 0,
+            skipped: 1,
+            avg_delay_minutes: 12.0,
+        };
 
-        record_half_hourly_stats(&pool, LINE_ID, bucket, Some(&cycle1)).await.expect("record cycle 1");
-        record_half_hourly_stats(&pool, LINE_ID, bucket, Some(&cycle2)).await.expect("record cycle 2");
+        record_half_hourly_stats(&pool, LINE_ID, bucket, Some(&cycle1))
+            .await
+            .expect("record cycle 1");
+        record_half_hourly_stats(&pool, LINE_ID, bucket, Some(&cycle2))
+            .await
+            .expect("record cycle 2");
 
         let row = sqlx::query(
             "SELECT sample_cycles, total, delayed, cancelled, skipped, running_count, delay_minutes_sum \
@@ -2292,17 +2386,31 @@ mod tests {
                 record_half_hourly_stats_a_new_bucket_starts_a_fresh_row -- --ignored` against docker \
                 compose's postgres"]
     async fn record_half_hourly_stats_a_new_bucket_starts_a_fresh_row() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-HALF-HOURLY-STATS-NEW-BUCKET";
         let bucket1: DateTime<Utc> = "2026-08-31T14:00:00Z".parse().unwrap();
         let bucket2: DateTime<Utc> = "2026-08-31T14:30:00Z".parse().unwrap();
 
         cleanup_half_hourly_stats(&pool, LINE_ID).await;
 
-        let stats = common::SampleStats { total: 5, delayed: 1, cancelled: 0, skipped: 0, avg_delay_minutes: 3.0 };
-        record_half_hourly_stats(&pool, LINE_ID, bucket1, Some(&stats)).await.expect("record bucket 1");
-        record_half_hourly_stats(&pool, LINE_ID, bucket2, Some(&stats)).await.expect("record bucket 2");
+        let stats = common::SampleStats {
+            total: 5,
+            delayed: 1,
+            cancelled: 0,
+            skipped: 0,
+            avg_delay_minutes: 3.0,
+        };
+        record_half_hourly_stats(&pool, LINE_ID, bucket1, Some(&stats))
+            .await
+            .expect("record bucket 1");
+        record_half_hourly_stats(&pool, LINE_ID, bucket2, Some(&stats))
+            .await
+            .expect("record bucket 2");
 
         let bucket2_cycles: i64 = sqlx::query_scalar(
             "SELECT sample_cycles FROM line_status_half_hourly_stats WHERE line_id = $1 AND half_hour_start = $2",
@@ -2315,7 +2423,10 @@ mod tests {
 
         cleanup_half_hourly_stats(&pool, LINE_ID).await;
 
-        assert_eq!(bucket2_cycles, 1, "a new bucket must start its own fresh row, not accumulate into bucket 1's");
+        assert_eq!(
+            bucket2_cycles, 1,
+            "a new bucket must start its own fresh row, not accumulate into bucket 1's"
+        );
     }
 
     #[tokio::test]
@@ -2327,27 +2438,46 @@ mod tests {
         // a UTC calendar day -- confirms record_half_hourly_stats treats this
         // exactly like any other bucket boundary, with no special-casing or
         // corruption.
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-HALF-HOURLY-STATS-DAY-BOUNDARY";
         let bucket1: DateTime<Utc> = "2026-08-31T23:30:00Z".parse().unwrap();
         let bucket2: DateTime<Utc> = "2026-09-01T00:00:00Z".parse().unwrap();
 
         cleanup_half_hourly_stats(&pool, LINE_ID).await;
 
-        let stats = common::SampleStats { total: 3, delayed: 0, cancelled: 0, skipped: 0, avg_delay_minutes: 1.0 };
-        record_half_hourly_stats(&pool, LINE_ID, bucket1, Some(&stats)).await.expect("record bucket 1");
-        record_half_hourly_stats(&pool, LINE_ID, bucket2, Some(&stats)).await.expect("record bucket 2");
-
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_half_hourly_stats WHERE line_id = $1")
-            .bind(LINE_ID)
-            .fetch_one(&pool)
+        let stats = common::SampleStats {
+            total: 3,
+            delayed: 0,
+            cancelled: 0,
+            skipped: 0,
+            avg_delay_minutes: 1.0,
+        };
+        record_half_hourly_stats(&pool, LINE_ID, bucket1, Some(&stats))
             .await
-            .expect("count rows");
+            .expect("record bucket 1");
+        record_half_hourly_stats(&pool, LINE_ID, bucket2, Some(&stats))
+            .await
+            .expect("record bucket 2");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_half_hourly_stats WHERE line_id = $1",
+        )
+        .bind(LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
 
         cleanup_half_hourly_stats(&pool, LINE_ID).await;
 
-        assert_eq!(count, 2, "two adjacent buckets either side of a day boundary must stay two separate rows");
+        assert_eq!(
+            count, 2,
+            "two adjacent buckets either side of a day boundary must stay two separate rows"
+        );
     }
 
     #[tokio::test]
@@ -2355,8 +2485,12 @@ mod tests {
                 prune_half_hourly_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
                 against docker compose's postgres"]
     async fn prune_half_hourly_stats_deletes_only_rows_older_than_the_retention_window() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const OLD_LINE_ID: &str = "TEST-HALF-HOURLY-STATS-PRUNE-OLD";
         const RECENT_LINE_ID: &str = "TEST-HALF-HOURLY-STATS-PRUNE-RECENT";
         const RETENTION_HOURS: i64 = 48;
@@ -2376,18 +2510,24 @@ mod tests {
         .await
         .expect("seed old and recent rows");
 
-        prune_half_hourly_stats(&pool, RETENTION_HOURS).await.expect("prune_half_hourly_stats");
+        prune_half_hourly_stats(&pool, RETENTION_HOURS)
+            .await
+            .expect("prune_half_hourly_stats");
 
-        let old_survives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_half_hourly_stats WHERE line_id = $1")
-            .bind(OLD_LINE_ID)
-            .fetch_one(&pool)
-            .await
-            .expect("count old survivors");
-        let recent_survives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM line_status_half_hourly_stats WHERE line_id = $1")
-            .bind(RECENT_LINE_ID)
-            .fetch_one(&pool)
-            .await
-            .expect("count recent survivors");
+        let old_survives: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_half_hourly_stats WHERE line_id = $1",
+        )
+        .bind(OLD_LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count old survivors");
+        let recent_survives: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM line_status_half_hourly_stats WHERE line_id = $1",
+        )
+        .bind(RECENT_LINE_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count recent survivors");
 
         cleanup_half_hourly_stats(&pool, OLD_LINE_ID).await;
         cleanup_half_hourly_stats(&pool, RECENT_LINE_ID).await;
@@ -2412,8 +2552,12 @@ mod tests {
                 half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period -- --ignored` \
                 against docker compose's postgres"]
     async fn half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
         const LINE_ID: &str = "TEST-RECONCILE-DAILY-HALF-HOURLY";
         let day = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
         let bucket: DateTime<Utc> = "2026-08-31T14:00:00Z".parse().unwrap();
@@ -2421,15 +2565,31 @@ mod tests {
         cleanup_daily_stats(&pool, LINE_ID).await;
         cleanup_half_hourly_stats(&pool, LINE_ID).await;
 
-        let stats = common::SampleStats { total: 7, delayed: 2, cancelled: 1, skipped: 0, avg_delay_minutes: 5.0 };
+        let stats = common::SampleStats {
+            total: 7,
+            delayed: 2,
+            cancelled: 1,
+            skipped: 0,
+            avg_delay_minutes: 5.0,
+        };
 
         // Same `deduped` value, same call pattern as run_cycle's one call site.
-        record_daily_stats(&pool, LINE_ID, day, Some(&stats)).await.expect("record daily");
-        record_half_hourly_stats(&pool, LINE_ID, bucket, Some(&stats)).await.expect("record half-hourly");
+        record_daily_stats(&pool, LINE_ID, day, Some(&stats))
+            .await
+            .expect("record daily");
+        record_half_hourly_stats(&pool, LINE_ID, bucket, Some(&stats))
+            .await
+            .expect("record half-hourly");
 
-        let daily = sqlx::query("SELECT total, delayed, cancelled, running_count, delay_minutes_sum \
-                                  FROM line_status_daily_stats WHERE line_id = $1 AND day = $2")
-            .bind(LINE_ID).bind(day).fetch_one(&pool).await.expect("read daily row");
+        let daily = sqlx::query(
+            "SELECT total, delayed, cancelled, running_count, delay_minutes_sum \
+                                  FROM line_status_daily_stats WHERE line_id = $1 AND day = $2",
+        )
+        .bind(LINE_ID)
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("read daily row");
         let half_hourly = sqlx::query("SELECT total, delayed, cancelled, running_count, delay_minutes_sum \
                                    FROM line_status_half_hourly_stats WHERE line_id = $1 AND half_hour_start = $2")
             .bind(LINE_ID).bind(bucket).fetch_one(&pool).await.expect("read half-hourly row");
@@ -2444,7 +2604,10 @@ mod tests {
         let dms_d: f64 = daily.try_get("delay_minutes_sum").unwrap();
         let dms_h: f64 = half_hourly.try_get("delay_minutes_sum").unwrap();
 
-        assert_eq!(total_d, total_h, "a single half-hour's stats must reconcile with that bucket's own contribution to the day");
+        assert_eq!(
+            total_d, total_h,
+            "a single half-hour's stats must reconcile with that bucket's own contribution to the day"
+        );
         assert_eq!(delayed_d, delayed_h);
         assert!((dms_d - dms_h).abs() < 1e-9);
     }
@@ -2798,5 +2961,82 @@ mod tests {
 
         assert_eq!(old_survives, 0);
         assert_eq!(recent_survives, 1);
+    }
+
+    /// Task 14 of docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md
+    /// -- proves `load_full_coverage_line_stats`'s staleness/availability
+    /// filtering end to end against a real Postgres. Mirrors this file's
+    /// own `load_incidents_excludes_cleared_rows`'s seed/assert/delete
+    /// shape (a real, same-crate precedent for this class of test -- the
+    /// plan's own note that `station_stats.rs::db_tests` was "the only
+    /// real precedent in this repo" for this was itself checked here and
+    /// found not to hold; this crate already had several).
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                full_coverage -- --ignored --test-threads=1` against docker compose's postgres"]
+    async fn load_full_coverage_line_stats_filters_by_availability_and_service_date() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        const AVAILABLE_TODAY: &str = "TEST-FC-AVAILABLE-TODAY";
+        const PENDING_TODAY: &str = "TEST-FC-PENDING-TODAY";
+        const AVAILABLE_YESTERDAY: &str = "TEST-FC-AVAILABLE-YESTERDAY";
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+
+        for id in [AVAILABLE_TODAY, PENDING_TODAY, AVAILABLE_YESTERDAY] {
+            sqlx::query("DELETE FROM full_coverage_line_stats WHERE line_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("cleanup any leftover fixture row");
+        }
+
+        sqlx::query(
+            "INSERT INTO full_coverage_line_stats \
+                (line_id, service_date, availability, total, delayed, cancelled, skipped, avg_delay_minutes) \
+             VALUES \
+                ($1, $4, 'available', 10, 2, 1, 0, 3.5), \
+                ($2, $4, 'pending', 10, 2, 1, 0, 3.5), \
+                ($3, $5, 'available', 10, 2, 1, 0, 3.5)",
+        )
+        .bind(AVAILABLE_TODAY)
+        .bind(PENDING_TODAY)
+        .bind(AVAILABLE_YESTERDAY)
+        .bind(today)
+        .bind(yesterday)
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        let loaded = load_full_coverage_line_stats(&pool, today)
+            .await
+            .expect("load_full_coverage_line_stats");
+
+        for id in [AVAILABLE_TODAY, PENDING_TODAY, AVAILABLE_YESTERDAY] {
+            sqlx::query("DELETE FROM full_coverage_line_stats WHERE line_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("cleanup fixture rows");
+        }
+
+        assert!(
+            loaded.contains_key(AVAILABLE_TODAY),
+            "an available, current-day row must come back"
+        );
+        assert!(
+            !loaded.contains_key(PENDING_TODAY),
+            "a pending row must be excluded, even for today"
+        );
+        assert!(
+            !loaded.contains_key(AVAILABLE_YESTERDAY),
+            "a stale (yesterday's) row must be excluded, even if available -- the staleness guard"
+        );
+        assert_eq!(loaded[AVAILABLE_TODAY].total, 10);
     }
 }
