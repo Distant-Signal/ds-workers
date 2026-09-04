@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
             config.daily_stats_retention_days,
             config.half_hourly_stats_retention_hours,
             &mut dedup_ledger,
+            config.full_coverage_enabled_default,
         )
         .await;
         metrics::histogram!(common::metrics::metric_name(
@@ -163,6 +164,14 @@ async fn main() -> anyhow::Result<()> {
 /// against transaction count/WAL-fsync savings if it ever needs revisiting.
 const WRITE_CHUNK_SIZE: usize = 50;
 
+// This crate's own single-call-site orchestration function, threading every
+// per-cycle config knob straight through -- same posture as
+// `full-coverage-consumer/src/main.rs` and `schedule-ingest/src/main.rs`'s
+// own `#[allow(clippy::too_many_arguments)]` on their analogous top-level
+// loop functions, rather than `aggregation::ClassifyCounts`'s bundling
+// pattern (which exists for a function with real internal reuse/tests
+// exercising the fields independently -- not the case here).
+#[allow(clippy::too_many_arguments)]
 async fn run_cycle(
     pool: &sqlx::PgPool,
     static_lines: &HashMap<String, LineDefinition>,
@@ -171,6 +180,7 @@ async fn run_cycle(
     daily_stats_retention_days: i64,
     half_hourly_stats_retention_hours: i64,
     dedup_ledger: &mut SeenServiceLedger,
+    full_coverage_enabled_default: bool,
 ) -> anyhow::Result<()> {
     let custom_lines = queries::load_custom_lines(pool).await?;
     let lines = aggregation::merge_custom_lines(static_lines, custom_lines);
@@ -202,7 +212,13 @@ async fn run_cycle(
             tracing::error!(error = ?err, "failed to load full_coverage_line_stats; treating every enabled line as Pending this cycle");
             HashMap::new()
         });
-    aggregation::merge_full_coverage(&mut reports, &lines, &full_coverage, defaults);
+    aggregation::merge_full_coverage(
+        &mut reports,
+        &lines,
+        &full_coverage,
+        defaults,
+        full_coverage_enabled_default,
+    );
 
     // Batched into `WRITE_CHUNK_SIZE`-sized transactions rather than one
     // autocommitted statement per line -- see `WRITE_CHUNK_SIZE`'s doc

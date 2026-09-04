@@ -1183,16 +1183,25 @@ fn merge_full_coverage_stats(
 /// call sites/tests.
 ///
 /// Only touches lines with `LineDefinition.full_coverage_enabled` set
-/// (Decision 3's per-line TOML rollout gate) -- every other line's
-/// `full_coverage_availability` stays at its `NotEnabled` construction
-/// default, untouched.
+/// (Decision 3's per-line TOML rollout gate) OR `full_coverage_enabled_default`
+/// set (the global runtime override, `Config::full_coverage_enabled_default`
+/// in `crates/aggregator/src/config.rs` -- an operator-set escape hatch
+/// that flips every line on at once without editing `lines/*.toml`) --
+/// every other line's `full_coverage_availability` stays at its
+/// `NotEnabled` construction default, untouched. `full_coverage_enabled_default`
+/// defaults to `false`, so passing it through changes nothing for a
+/// deployment that never set it.
 pub(crate) fn merge_full_coverage(
     reports: &mut HashMap<String, LineStatusReport>,
     lines: &HashMap<String, LineDefinition>,
     full_coverage: &HashMap<String, SampleStats>,
     defaults: &Defaults,
+    full_coverage_enabled_default: bool,
 ) {
-    for line in lines.values().filter(|l| l.full_coverage_enabled) {
+    for line in lines
+        .values()
+        .filter(|l| l.full_coverage_enabled || full_coverage_enabled_default)
+    {
         let Some(report) = reports.get_mut(&line.id) else {
             continue;
         };
@@ -3558,7 +3567,7 @@ mod tests {
         full_coverage.insert("enabled".to_string(), coverage_stats(10, 0, 0));
         full_coverage.insert("disabled".to_string(), coverage_stats(10, 0, 0));
 
-        merge_full_coverage(&mut reports, &lines, &full_coverage, &defaults);
+        merge_full_coverage(&mut reports, &lines, &full_coverage, &defaults, false);
 
         assert_eq!(
             reports["enabled"].statuses[0].full_coverage_availability,
@@ -3568,6 +3577,100 @@ mod tests {
             reports["disabled"].statuses[0].full_coverage_availability,
             FullCoverageAvailability::NotEnabled,
             "a line without full_coverage_enabled must be left untouched even if a signal exists for it"
+        );
+    }
+
+    /// `full_coverage_enabled_default: false` + a line's own
+    /// `full_coverage_enabled: true` must behave exactly as before this
+    /// parameter existed -- covered by the pre-existing
+    /// `merge_full_coverage_only_touches_full_coverage_enabled_lines`
+    /// test above (now passing `false` explicitly). This test instead
+    /// covers the two NEW cases the global override introduces: with the
+    /// override on, a line whose own flag is `false` now gets touched too
+    /// (the new case this task adds), and a line whose own flag is
+    /// already `true` stays touched (redundant, must not break).
+    #[test]
+    fn merge_full_coverage_enabled_default_true_enables_a_line_whose_own_flag_is_false() {
+        let defaults = Defaults::default();
+        let lines: HashMap<String, LineDefinition> = [
+            (
+                "own-flag-true".to_string(),
+                test_line("own-flag-true", true),
+            ),
+            (
+                "own-flag-false".to_string(),
+                test_line("own-flag-false", false),
+            ),
+        ]
+        .into();
+        let mut reports: HashMap<String, LineStatusReport> = [
+            (
+                "own-flag-true".to_string(),
+                LineStatusReport {
+                    id: "own-flag-true".to_string(),
+                    name: "Own Flag True".to_string(),
+                    mode_name: "national-rail".to_string(),
+                    operators: vec![],
+                    statuses: vec![ldbws_status(Severity::GoodService)],
+                },
+            ),
+            (
+                "own-flag-false".to_string(),
+                LineStatusReport {
+                    id: "own-flag-false".to_string(),
+                    name: "Own Flag False".to_string(),
+                    mode_name: "national-rail".to_string(),
+                    operators: vec![],
+                    statuses: vec![ldbws_status(Severity::GoodService)],
+                },
+            ),
+        ]
+        .into();
+        let mut full_coverage = HashMap::new();
+        full_coverage.insert("own-flag-true".to_string(), coverage_stats(10, 0, 0));
+        full_coverage.insert("own-flag-false".to_string(), coverage_stats(20, 0, 0));
+
+        merge_full_coverage(&mut reports, &lines, &full_coverage, &defaults, true);
+
+        assert_eq!(
+            reports["own-flag-true"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::Available(coverage_stats(10, 0, 0)),
+            "flag true + line's own flag true must stay enabled"
+        );
+        assert_eq!(
+            reports["own-flag-false"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::Available(coverage_stats(20, 0, 0)),
+            "flag true + line's own flag false must now be enabled (the new OR-gate case)"
+        );
+    }
+
+    /// `full_coverage_enabled_default: false` + a line's own flag `false`
+    /// must stay disabled -- today's existing shadow-mode-off behavior,
+    /// unchanged by this task.
+    #[test]
+    fn merge_full_coverage_enabled_default_false_leaves_a_disabled_line_disabled() {
+        let defaults = Defaults::default();
+        let lines: HashMap<String, LineDefinition> =
+            [("disabled".to_string(), test_line("disabled", false))].into();
+        let mut reports: HashMap<String, LineStatusReport> = [(
+            "disabled".to_string(),
+            LineStatusReport {
+                id: "disabled".to_string(),
+                name: "Disabled".to_string(),
+                mode_name: "national-rail".to_string(),
+                operators: vec![],
+                statuses: vec![ldbws_status(Severity::GoodService)],
+            },
+        )]
+        .into();
+        let mut full_coverage = HashMap::new();
+        full_coverage.insert("disabled".to_string(), coverage_stats(10, 0, 0));
+
+        merge_full_coverage(&mut reports, &lines, &full_coverage, &defaults, false);
+
+        assert_eq!(
+            reports["disabled"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::NotEnabled
         );
     }
 
@@ -3588,7 +3691,7 @@ mod tests {
         )]
         .into();
 
-        merge_full_coverage(&mut reports, &lines, &HashMap::new(), &defaults);
+        merge_full_coverage(&mut reports, &lines, &HashMap::new(), &defaults, false);
 
         assert_eq!(
             reports["enabled"].statuses[0].full_coverage_availability,

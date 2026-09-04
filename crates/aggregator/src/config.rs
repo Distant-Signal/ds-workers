@@ -113,4 +113,19 @@ pub struct Config {
     /// declarative.
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
+
+    /// Global override for `LineDefinition.full_coverage_enabled`
+    /// (Decision 3's per-line TOML rollout gate, `crates/common/src/lib.rs`).
+    /// When `true`, `aggregation::merge_full_coverage` treats EVERY
+    /// catalogued line as full-coverage-enabled, regardless of what its
+    /// own `lines/*.toml` entry sets -- a single runtime flag to flip on
+    /// full coverage everywhere at once, instead of editing 100+ TOML
+    /// files. Default `false` is deliberate: this flag must never
+    /// silently change behavior for a deployment that doesn't explicitly
+    /// set it, and `true` is never baked in here as the default (that
+    /// would require a rebuild to ever revert) -- an operator opts in via
+    /// this env var / the Helm chart's `aggregator.fullCoverageEnabledDefault`
+    /// value.
+    #[arg(long, env, default_value_t = false)]
+    pub full_coverage_enabled_default: bool,
 }
