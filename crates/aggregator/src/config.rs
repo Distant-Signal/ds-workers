@@ -69,29 +69,38 @@ pub struct Config {
     pub daily_stats_retention_days: i64,
 
     /// How long to keep `line_status_half_hourly_stats` rows before
-    /// pruning them. Deliberately NOT a reuse of `history_retention_days`
-    /// (governs a different table, `line_status_history`) or
-    /// `daily_stats_retention_days` (sized for a weeks/months trend use
-    /// case this half-hourly rolling-24h view does not have -- reusing its
-    /// default of 300 would mean accumulating ~300 days x 48 rows/line of
-    /// data only the most recent ~49 rows of which are ever read). 48
-    /// hours is a 2x safety margin over the 48-49 rows the line-info-page
-    /// embed actually needs at 30-minute granularity, per
-    /// docs/superpowers/specs/2026-09-02-trend-chart-granularity-design.md
-    /// Decision 5 -- a reasoned starting default, not empirically
-    /// validated against real restart/deploy timing (see that spec's Open
-    /// question 2).
+    /// pruning them.
     ///
-    /// This field's UNIT is deliberately unchanged from the table's
-    /// original 1-hour-bucket era: retention is measured in wall-clock
-    /// hours, not bucket count, so halving the bucket size (1h -> 30min,
-    /// alongside this field's own rename from `hourly_stats_retention_hours`)
-    /// does not change the default value either -- 48 hours of real time
-    /// is still 48 hours of real time. The only consequence is that this
-    /// same window now holds roughly twice as many rows per line (~96
-    /// instead of ~48) to cover it, which is a trivial row count for
-    /// Postgres and not something that needs its own knob.
-    #[arg(long, env, default_value_t = 48)]
+    /// Bumped from 48 hours to 840 (35 days) by
+    /// docs/superpowers/specs/2026-09-05-configurable-trend-granularity-design.md
+    /// Decision 3: this table is now also read directly (30-minute
+    /// granularity) AND grouped into 1-hour/6-hour buckets
+    /// (`crates/api/src/data/queries.rs`'s `sub_daily_stats_for_range`) by
+    /// the History page's Trends tab, over the user's actual selected
+    /// range -- up to the existing 30-day `RangePreset` ceiling, plus a
+    /// 5-day buffer. 48 hours was sized only for the line-info page's
+    /// fixed rolling-24h embed (`HalfHourlyTrendsResults`), which still
+    /// only ever requests the most recent 24 hours regardless of this
+    /// value -- this bump is purely additive for that view, unchanged
+    /// behavior.
+    ///
+    /// This table is fed the SAME LDBWS-derived `SampleStats` value as
+    /// `line_status_daily_stats` every cycle (`main.rs`'s `run_cycle`), so
+    /// the same RDM Live Departure Board licence lineage applies: the
+    /// repo owner confirmed directly that "half-hourly is still fine as
+    /// long as we aren't retaining for more than 300 days" -- the same
+    /// 300-day ceiling `daily_stats_retention_days` already uses. 840
+    /// hours (35 days) clears that with enormous margin, mirroring
+    /// `daily_stats_retention_days`'s own "real margin under a hard
+    /// compliance ceiling, not a number picked to just barely clear it"
+    /// reasoning.
+    ///
+    /// This field's UNIT is unchanged from the table's original
+    /// 1-hour-bucket era: retention is measured in wall-clock hours, not
+    /// bucket count. At 840 hours, storage is ~105 lines x 48 rows/day x
+    /// 35 days ~= 176,400 rows -- trivial for Postgres, same order of
+    /// magnitude this repo's specs have called "trivial" elsewhere.
+    #[arg(long, env, default_value_t = 840)]
     pub half_hourly_stats_retention_hours: i64,
 
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
