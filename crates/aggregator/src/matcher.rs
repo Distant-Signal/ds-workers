@@ -53,13 +53,34 @@ pub fn lines_affected_by<'a>(
         }
     }
 
-    // If any precise match exists, drop operator-only matches — they're
-    // almost certainly false positives where another line on the same
-    // operator is the actual target.
-    let has_precise = out.iter().any(|m| m.scope != MatchScope::OperatorOnly);
-    if has_precise {
-        out.retain(|m| m.scope != MatchScope::OperatorOnly);
+    // Drop an operator-only match only when another line sharing at least
+    // one of the same operator codes got a more precise match elsewhere in
+    // this incident -- they're almost certainly false positives where that
+    // other line on the same operator is the actual target. This is scoped
+    // per-operator on purpose: it must NOT strip operator-only matches for
+    // an unrelated operator just because some other operator's line got a
+    // precise (e.g. keyword) hit somewhere in the same incident text. That
+    // cross-operator interaction was the actual bug (a spurious keyword hit
+    // for one operator deleting a different operator's correct
+    // operator-only matches outright) -- do not collapse this back into a
+    // single incident-wide `has_precise` check.
+    //
+    // Operators for which some line got a more-precise-than-OperatorOnly
+    // match anywhere in this incident.
+    let mut precise_operators: HashSet<&str> = HashSet::new();
+    for m in &out {
+        if m.scope != MatchScope::OperatorOnly {
+            precise_operators.extend(m.line.operators.iter().map(String::as_str));
+        }
     }
+    out.retain(|m| {
+        m.scope != MatchScope::OperatorOnly
+            || !m
+                .line
+                .operators
+                .iter()
+                .any(|op| precise_operators.contains(op.as_str()))
+    });
 
     out
 }
@@ -124,18 +145,26 @@ fn match_one<'a>(
         });
     }
 
-    // Tier 2: keyword match.
+    // Tier 2: keyword match, unless the incident's own structured operator
+    // list positively excludes this line's operator.
     if !keyword_hits.is_empty() {
-        return Some(Match {
-            line,
-            scope: MatchScope::KeywordOnly,
-            evidence: Evidence {
-                stations: vec![],
-                segments: vec![],
-                operators: operator_overlap,
-                keywords: keyword_hits,
-            },
-        });
+        let contradicted = !incident.operators.is_empty() && operator_overlap.is_empty();
+        if !contradicted {
+            return Some(Match {
+                line,
+                scope: MatchScope::KeywordOnly,
+                evidence: Evidence {
+                    stations: vec![],
+                    segments: vec![],
+                    operators: operator_overlap,
+                    keywords: keyword_hits,
+                },
+            });
+        }
+        // else: fall through. Tier 3 also requires non-empty
+        // operator_overlap, which is false here by construction of
+        // `contradicted`, so match_one naturally returns None below --
+        // no special-cased early return needed.
     }
 
     // Tier 3: operator only.
@@ -8976,5 +9005,213 @@ mod tests {
                 m.line.id
             );
         }
+    }
+
+    // Regression coverage for incident 7F69B9D781A941AD8305FECCE3ACAA43
+    // ("Disruption between New Malden and Raynes Park"), confirmed live on
+    // 2026-09-04/05: the incident's only real `affectedOperators` entry is
+    // South Western Railway (SW), but the description's ticket-acceptance
+    // clause naming CrossCountry as an alternative route used to produce a
+    // spurious `cross-country` KeywordOnly match. That spurious match then
+    // deleted every South Western line's correct OperatorOnly match
+    // outright (the unscoped `has_precise`/`retain` bug, Decision 1) and,
+    // separately, should never have matched at all (the ungated Tier-2
+    // keyword acceptance bug, Decision 2). Both fixes are required for this
+    // test to pass: Decision 2 alone stops `cross-country` from matching;
+    // Decision 1 alone stops the SW deletion but would still leave
+    // `cross-country` matching alongside SW.
+    #[test]
+    fn real_incident_sw_disruption_not_misattributed_to_cross_country() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "7F69B9D781A941AD8305FECCE3ACAA43",
+            "Disruption between New Malden and Raynes Park",
+            "Disruption is affecting South Western Railway services between \
+             New Malden and Raynes Park due to a signalling fault. Trains \
+             may be cancelled, delayed or revised. Your ticket is also \
+             being accepted on the following alternative routes: \
+             CrossCountry services between Reading and Bournemouth.",
+            &["SW"],
+            &[],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert!(
+            !matched_ids.contains("cross-country"),
+            "spurious ticket-acceptance CrossCountry mention must not match: {matched_ids:?}"
+        );
+        for id in [
+            "swr-south-west-main",
+            "swr-kingston-loop",
+            "swr-chessington",
+            "swr-portsmouth-direct",
+            "swr-alton",
+        ] {
+            assert!(
+                matched_ids.contains(id),
+                "{id} should match (real SW attribution): {matched_ids:?}"
+            );
+        }
+        for m in &matches {
+            if m.line.id.starts_with("swr-") {
+                assert_eq!(
+                    m.scope,
+                    MatchScope::OperatorOnly,
+                    "{} should match via OperatorOnly",
+                    m.line.id
+                );
+            }
+        }
+    }
+
+    // Decision 1, generalized beyond the real incident: an incident naming
+    // two unrelated operators, where only one of them (Grand Central, GC)
+    // gets a precise (keyword) match on one of its lines. Hull Trains
+    // (HT)'s only line has no textual keyword hit at all, just the
+    // structured operator overlap, so it should still surface as
+    // OperatorOnly -- Decision 1's per-operator rescoping must not let
+    // GC's precise match strip HT's OperatorOnly match just because they
+    // co-occur in the same incident.
+    #[test]
+    fn decision1_precise_match_for_one_operator_does_not_strip_operator_only_for_another() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "D1-1",
+            "Grand Central service delayed",
+            "A Grand Central service was delayed due to a points failure \
+             near Sunderland.",
+            &["GC", "HT"],
+            &[],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let by_id: HashMap<String, MatchScope> = matches
+            .iter()
+            .map(|m| (m.line.id.clone(), m.scope))
+            .collect();
+        assert_eq!(
+            by_id.get("grand-central"),
+            Some(&MatchScope::KeywordOnly),
+            "grand-central should get the precise keyword match: {by_id:?}"
+        );
+        assert_eq!(
+            by_id.get("hull-trains"),
+            Some(&MatchScope::OperatorOnly),
+            "hull-trains's operator-only match must survive GC's unrelated \
+             precise match: {by_id:?}"
+        );
+    }
+
+    // Decision 1 must not regress the original, intended same-operator
+    // suppression: an SW incident that both tags `operators = ["SW"]`
+    // system-wide *and* names one specific SW route keyword ("Portsmouth
+    // Direct") should still treat the other SW lines' OperatorOnly matches
+    // as superseded by the named line -- this is the behavior the
+    // pre-existing comment always claimed to implement, and Decision 1
+    // must only remove the cross-operator leak, not this same-operator
+    // intent.
+    #[test]
+    fn decision1_same_operator_precise_match_still_suppresses_other_operator_only_matches() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "D1-2",
+            "Portsmouth Direct line disruption",
+            "Disruption on the Portsmouth Direct line, between Guildford \
+             and Havant, due to a signal failure.",
+            &["SW"],
+            &[],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert!(
+            matched_ids.contains("swr-portsmouth-direct"),
+            "the named line should still match: {matched_ids:?}"
+        );
+        for id in [
+            "swr-south-west-main",
+            "swr-kingston-loop",
+            "swr-chessington",
+            "swr-alton",
+        ] {
+            assert!(
+                !matched_ids.contains(id),
+                "{id}'s OperatorOnly match should still be suppressed by \
+                 swr-portsmouth-direct's precise match: {matched_ids:?}"
+            );
+        }
+    }
+
+    // Decision 2 in isolation: an SW incident with an incidental, unrelated
+    // Grand Central brand mention should not match grand-central at all --
+    // `incident.operators` positively excludes GC, so the keyword hit must
+    // be rejected outright, not merely demoted.
+    #[test]
+    fn decision2_contradicted_keyword_hit_does_not_match_at_all() {
+        let lines = load_line("grand-central");
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "D2-1",
+            "South Western Railway disruption",
+            "A South Western Railway service between London Waterloo and \
+             Southampton is disrupted due to a points failure. Elsewhere, \
+             a Grand Central service was also affected by a separate fault \
+             near Sunderland.",
+            &["SW"],
+            &[],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        let matched_ids: HashSet<String> = matches.iter().map(|m| m.line.id.clone()).collect();
+        assert!(
+            !matched_ids.contains("grand-central"),
+            "incidental Grand Central mention contradicted by \
+             incident.operators = [SW] must not match: {matched_ids:?}"
+        );
+    }
+
+    // Decision 2 must not regress a genuine brand-only incident: when
+    // `incident.operators` actually names the brand's own operator code,
+    // the keyword hit is not contradicted and should match exactly as
+    // before.
+    #[test]
+    fn decision2_genuine_brand_only_incident_still_matches() {
+        let lines = load_line("hull-trains");
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "D2-2",
+            "Hull Trains service cancelled",
+            "A Hull Trains service between London King's Cross and Hull \
+             has been cancelled due to a fault.",
+            &["HT"],
+            &[],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line.id, "hull-trains");
+        assert_eq!(matches[0].scope, MatchScope::KeywordOnly);
+    }
+
+    // Decision 2 must not regress the case cross-country.toml's own
+    // comment documents: "Cross Country Route" names real
+    // Birmingham-Bristol infrastructure, not the CrossCountry brand, and
+    // must keep matching via keyword alone when the incident's structured
+    // operators list agrees (XC).
+    #[test]
+    fn decision2_cross_country_route_infrastructure_mention_still_matches() {
+        let lines = load_line("cross-country");
+        let registry = SegmentRegistry::new(&lines);
+        let inc = incident(
+            "D2-3",
+            "Cross Country Route disruption",
+            "Disruption on the Cross Country Route between Birmingham and \
+             Bristol due to a landslip.",
+            &["XC"],
+            &[],
+        );
+        let matches = lines_affected_by(&inc, &lines, &registry);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line.id, "cross-country");
+        assert_eq!(matches[0].scope, MatchScope::KeywordOnly);
     }
 }
