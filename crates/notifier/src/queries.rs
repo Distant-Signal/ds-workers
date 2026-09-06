@@ -121,29 +121,32 @@ pub async fn poll_line_candidates(pool: &PgPool, since_id: i64) -> anyhow::Resul
 
 pub struct TrainCandidate {
     pub tracked_train_id: i64,
+    pub trains_id: i64,
     pub user_id: String,
     pub new_rank: u8,
     pub previous_rank: u8,
 }
 
-/// Per Task 3's design notes: trains have exactly one owning user per
-/// `tracked_trains` row, so there is no separate table-level-vs-per-user
-/// split here -- `train_notification_state` doubles as both. Candidates
-/// are found by touching `train_movement_events` for the watermark, but
-/// the actual current status/delay come from `train_current_state`
-/// (the only place a train's *current* derived state lives -- see this
-/// plan's Status note on journey.rs). Returns candidates plus the max
-/// event id seen (for cursor advancement even over trains this cycle
-/// found no notify-worthy transition for).
+/// Watermark now advances over `train_movement_events.trains_id` (Task 9),
+/// the shared, per-physical-train identity -- NOT `tracked_train_id`, which
+/// stops being written by new events as of Task 11. One `trains_id` can
+/// have MANY independent subscribers (`tracked_trains` rows); this fans out
+/// to every one of them, each judged by its OWN cooldown/escalation state
+/// in `train_notification_state` (still keyed by `(user_id, tracked_train_id)`
+/// -- unchanged, since that's still each user's own private escalation
+/// history for their own subscription row).
 pub async fn poll_train_candidates(
     pool: &PgPool,
     since_id: i64,
     delay_threshold_minutes: i32,
 ) -> anyhow::Result<(Vec<TrainCandidate>, i64)> {
-    let touched = sqlx::query("SELECT DISTINCT tracked_train_id FROM train_movement_events WHERE id > $1")
-        .bind(since_id)
-        .fetch_all(pool)
-        .await?;
+    let touched: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT trains_id FROM train_movement_events \
+         WHERE id > $1 AND trains_id IS NOT NULL",
+    )
+    .bind(since_id)
+    .fetch_all(pool)
+    .await?;
 
     if touched.is_empty() {
         return Ok((Vec::new(), since_id));
@@ -155,43 +158,55 @@ pub async fn poll_train_candidates(
         .await?;
 
     let mut candidates = Vec::new();
-    for row in &touched {
-        let tracked_train_id: i64 = row.try_get("tracked_train_id")?;
-
+    for trains_id in touched {
         let current = sqlx::query(
-            "SELECT t.user_id, s.status, s.delay_minutes \
-             FROM tracked_trains t JOIN train_current_state s ON s.tracked_train_id = t.id \
-             WHERE t.id = $1",
+            "SELECT status, delay_minutes FROM train_current_state WHERE trains_id = $1",
         )
-        .bind(tracked_train_id)
+        .bind(trains_id)
         .fetch_optional(pool)
         .await?;
         let Some(current) = current else { continue }; // no current-state row yet -- nothing to compare
 
-        let user_id: String = current.try_get("user_id")?;
         let status: String = current.try_get("status")?;
         let delay_minutes: Option<i32> = current.try_get("delay_minutes")?;
         let new_rank = train_severity_rank(&status, delay_minutes, delay_threshold_minutes);
 
-        let previous = sqlx::query(
-            "SELECT last_notified_status, last_notified_delay_minutes \
-             FROM train_notification_state WHERE user_id = $1 AND tracked_train_id = $2",
-        )
-        .bind(&user_id)
-        .bind(tracked_train_id)
-        .fetch_optional(pool)
-        .await?;
-        let previous_rank = match previous {
-            None => 0, // Task 3's design note: no cold-start guard for trains
-            Some(previous) => {
-                let previous_status: String = previous.try_get("last_notified_status")?;
-                let previous_delay: Option<i32> = previous.try_get("last_notified_delay_minutes")?;
-                train_severity_rank(&previous_status, previous_delay, delay_threshold_minutes)
-            }
-        };
+        let subscribers = sqlx::query("SELECT id, user_id FROM tracked_trains WHERE trains_id = $1")
+            .bind(trains_id)
+            .fetch_all(pool)
+            .await?;
+        for subscriber in subscribers {
+            let tracked_train_id: i64 = subscriber.try_get("id")?;
+            let user_id: String = subscriber.try_get("user_id")?;
 
-        if crate::decision::decide_train_notification(previous_rank, new_rank) == crate::decision::NotifyDecision::NotifyNow {
-            candidates.push(TrainCandidate { tracked_train_id, user_id, new_rank, previous_rank });
+            let previous = sqlx::query(
+                "SELECT last_notified_status, last_notified_delay_minutes \
+                 FROM train_notification_state WHERE user_id = $1 AND tracked_train_id = $2",
+            )
+            .bind(&user_id)
+            .bind(tracked_train_id)
+            .fetch_optional(pool)
+            .await?;
+            let previous_rank = match previous {
+                None => 0, // Task 3's design note: no cold-start guard for trains
+                Some(previous) => {
+                    let previous_status: String = previous.try_get("last_notified_status")?;
+                    let previous_delay: Option<i32> = previous.try_get("last_notified_delay_minutes")?;
+                    train_severity_rank(&previous_status, previous_delay, delay_threshold_minutes)
+                }
+            };
+
+            if crate::decision::decide_train_notification(previous_rank, new_rank)
+                == crate::decision::NotifyDecision::NotifyNow
+            {
+                candidates.push(TrainCandidate {
+                    tracked_train_id,
+                    trains_id,
+                    user_id,
+                    new_rank,
+                    previous_rank,
+                });
+            }
         }
     }
     Ok((candidates, max_id))
@@ -436,5 +451,79 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup fixture user");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                poll_train_candidates_fans_out_one_trains_id_to_every_subscriber \
+                -- --ignored --test-threads=1`"]
+    async fn poll_train_candidates_fans_out_one_trains_id_to_every_subscriber() {
+        let pool = connect().await;
+        let service_date: chrono::NaiveDate = "2026-09-06".parse().unwrap();
+        let trains_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-FANOUT-UID', $1) \
+             RETURNING id",
+        )
+        .bind(service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+
+        for user_id in ["TEST-FANOUT-USER-A", "TEST-FANOUT-USER-B"] {
+            sqlx::query(
+                "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(format!("{user_id}@example.com"))
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fixture user");
+            sqlx::query(
+                "INSERT INTO tracked_trains \
+                    (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
+                 VALUES ($1, $2, 'EUS', $3, $4, 'resolved')",
+            )
+            .bind(user_id)
+            .bind(service_date)
+            .bind(service_date.and_hms_opt(19, 15, 0).unwrap().and_utc())
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .expect("seed a subscription pointing at the shared train");
+        }
+
+        let (event_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO train_movement_events (trains_id, dedup_key, msg_type, raw_body) \
+             VALUES ($1, 'test-fanout-dedup', '0003', '{}'::jsonb) RETURNING id",
+        )
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a movement event for the shared train");
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status, delay_minutes) VALUES ($1, 'en_route', 20)",
+        )
+        .bind(trains_id)
+        .execute(&pool)
+        .await
+        .expect("seed current state showing a real delay");
+
+        let (candidates, max_id) = poll_train_candidates(&pool, event_id - 1, 15)
+            .await
+            .expect("poll_train_candidates");
+        assert_eq!(max_id, event_id);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "one physical train's delay must notify BOTH of its independent subscribers"
+        );
+        assert!(candidates.iter().all(|c| c.trains_id == trains_id));
+
+        sqlx::query("DELETE FROM tracked_trains WHERE trains_id = $1").bind(trains_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1").bind(trains_id).execute(&pool).await.ok();
+        for user_id in ["TEST-FANOUT-USER-A", "TEST-FANOUT-USER-B"] {
+            sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&pool).await.ok();
+        }
     }
 }

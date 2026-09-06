@@ -109,7 +109,7 @@ async fn run_cycle(
             new_rank = candidate.new_rank,
             "train notification candidate"
         );
-        let (status, delay_minutes) = current_train_state(pool, candidate.tracked_train_id).await?;
+        let (status, delay_minutes) = current_train_state(pool, candidate.trains_id).await?;
         let payload = NotificationPayload {
             title: if status == "cancelled" { "Your train was cancelled".to_string() } else { "Your train is delayed".to_string() },
             body: match delay_minutes {
@@ -129,10 +129,10 @@ async fn run_cycle(
     Ok(())
 }
 
-async fn current_train_state(pool: &PgPool, tracked_train_id: i64) -> anyhow::Result<(String, Option<i32>)> {
+async fn current_train_state(pool: &PgPool, trains_id: i64) -> anyhow::Result<(String, Option<i32>)> {
     use sqlx::Row;
-    let row = sqlx::query("SELECT status, delay_minutes FROM train_current_state WHERE tracked_train_id = $1")
-        .bind(tracked_train_id)
+    let row = sqlx::query("SELECT status, delay_minutes FROM train_current_state WHERE trains_id = $1")
+        .bind(trains_id)
         .fetch_one(pool)
         .await?;
     Ok((row.try_get("status")?, row.try_get("delay_minutes")?))
