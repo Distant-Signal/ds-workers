@@ -73,6 +73,27 @@ pub struct Config {
     #[arg(long, env, default_value_t = 840)]
     pub half_hourly_stats_retention_hours: i64,
 
+    /// How long to keep `trust_event_backlog` rows before pruning them.
+    ///
+    /// DEFAULT IS 1 DAY, DELIBERATELY. The design spec this table
+    /// implements
+    /// (docs/superpowers/specs/2026-09-05-trust-event-backlog-design.md,
+    /// Decision 5) found only a secondhand, imprecisely sourced citation
+    /// that TRUST/Train Movements retention is unrestricted by licence --
+    /// genuinely favorable evidence, but weaker than the quoted-clause
+    /// standard this repo holds itself to for LDBWS
+    /// (docs/superpowers/plans/2026-09-01-ldbws-data-retention.md). A
+    /// human must confirm TRUST's real licence terms directly with RDM
+    /// before this value is ever configured above 1 in a real production
+    /// deployment -- do not bump this default, or any Helm values.yaml
+    /// default derived from it, without that confirmation happening
+    /// first. See
+    /// docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md's
+    /// own "Scope decision: retention tier and the licensing safeguard"
+    /// section.
+    #[arg(long, env, default_value_t = 1)]
+    pub trust_event_backlog_retention_days: i64,
+
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
     /// for why this differs from api.service.port -- api reuses its

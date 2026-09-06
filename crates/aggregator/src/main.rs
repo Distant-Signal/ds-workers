@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
             config.history_retention_days,
             config.daily_stats_retention_days,
             config.half_hourly_stats_retention_hours,
+            config.trust_event_backlog_retention_days,
             &mut dedup_ledger,
             config.full_coverage_enabled_default,
         )
@@ -179,6 +180,7 @@ async fn run_cycle(
     retention_days: i64,
     daily_stats_retention_days: i64,
     half_hourly_stats_retention_hours: i64,
+    trust_event_backlog_retention_days: i64,
     dedup_ledger: &mut SeenServiceLedger,
     full_coverage_enabled_default: bool,
 ) -> anyhow::Result<()> {
@@ -236,6 +238,31 @@ async fn run_cycle(
     let removed = queries::prune_removed_lines(pool, &current_line_ids).await?;
 
     let pruned = queries::prune_history(pool, retention_days).await?;
+
+    // Loud, unmissable, per-cycle (not "first cycle only") retention
+    // safeguard for trust_event_backlog -- see
+    // Config::trust_event_backlog_retention_days's own doc comment and
+    // docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md's own
+    // "Scope decision: retention tier and the licensing safeguard"
+    // section. Checked every cycle, not gated behind a "first cycle only"
+    // flag, so it reappears in logs on every restart too, not just the
+    // very first one -- cheap, and survives log rotation.
+    if trust_event_backlog_retention_days > 1 {
+        tracing::warn!(
+            configured_days = trust_event_backlog_retention_days,
+            "trust_event_backlog retention is configured above the safe 1-day default -- \
+             a human must have already confirmed TRUST's real Train Movements licence terms \
+             directly with RDM before this value was set; see \
+             docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md's own \
+             \"Scope decision: retention tier and the licensing safeguard\" section"
+        );
+    }
+    let trust_event_backlog_pruned =
+        queries::prune_trust_event_backlog(pool, trust_event_backlog_retention_days).await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_trust_event_backlog_rows_pruned_total"
+    ))
+    .increment(trust_event_backlog_pruned);
 
     // Per-service dedup pass, folded together with the daily-stats write:
     // `dedup::dedup_new_sample_stats` is STATEFUL (it mutates `dedup_ledger`
@@ -377,6 +404,7 @@ async fn run_cycle(
         incidents = incidents.len(),
         removed_lines = removed,
         pruned_history_rows = pruned,
+        trust_event_backlog_pruned = trust_event_backlog_pruned,
         deduped_new_services = new_services_this_cycle,
         daily_stats_recorded = daily_stats_recorded,
         daily_stats_pruned = daily_stats_pruned,

@@ -495,6 +495,21 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// Prunes `trust_event_backlog` rows older than `retention_days`. See
+/// `Config::trust_event_backlog_retention_days`'s own doc comment for
+/// the licensing safeguard this default (1) exists to enforce -- this
+/// function itself has no opinion on the value passed in; it prunes
+/// whatever it's told to.
+pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM trust_event_backlog WHERE received_at < NOW() - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// The plain Europe/London CALENDAR day (midnight-to-midnight) `instant`
 /// falls on -- matching `frontend/lib/dateFormat.ts`'s `londonDayKey`, the
 /// convention the Timeline tab already groups by. Deliberately NOT
@@ -3038,5 +3053,42 @@ mod tests {
             "a stale (yesterday's) row must be excluded, even if available -- the staleness guard"
         );
         assert_eq!(loaded[AVAILABLE_TODAY].total, 10);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trust_event_backlog -- --ignored --test-threads=1`"]
+    async fn prune_trust_event_backlog_deletes_only_rows_older_than_the_retention_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO trust_event_backlog (train_id, service_date, msg_type, received_at, dedup_key) \
+             VALUES ('TEST-PRUNE-OLD', '2026-09-01', '0001', NOW() - interval '2 days', 'test-prune-old'), \
+                    ('TEST-PRUNE-NEW', '2026-09-05', '0001', NOW(), 'test-prune-new')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        let pruned = prune_trust_event_backlog(&pool, 1).await.expect("prune");
+        assert_eq!(
+            pruned, 1,
+            "only the 2-day-old row should be pruned at a 1-day retention"
+        );
+
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trust_event_backlog WHERE train_id = 'TEST-PRUNE-NEW'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining.0, 1);
+
+        sqlx::query("DELETE FROM trust_event_backlog WHERE train_id IN ('TEST-PRUNE-OLD', 'TEST-PRUNE-NEW')")
+            .execute(&pool)
+            .await
+            .ok();
     }
 }
