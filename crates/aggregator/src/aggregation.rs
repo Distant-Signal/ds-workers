@@ -271,6 +271,17 @@ fn severity_from_incident(incident: &IncidentMessage) -> Severity {
     if text.contains("lines blocked") || text.contains("all lines blocked") {
         return Severity::PartSuspended;
     }
+    // "cancel" (not just "cancelled"/"cancellation") deliberately catches
+    // every inflection -- "cancelling", "cancels", etc. -- with one
+    // substring, matching this ladder's existing style of broad,
+    // unanchored keyword matches (e.g. "diverted", "suspended"). A
+    // cancellation is a real, significant service impact, comparable to
+    // "lines blocked" -- the same tier `classify`'s sample-based path
+    // already gives a high cancellation rate (`part_suspended_pct`) -- so
+    // it is checked at this same position, before the severe-delays check.
+    if text.contains("cancel") {
+        return Severity::PartSuspended;
+    }
     if text.contains("severe delays") || text.contains("major disruption") {
         return Severity::SevereDelays;
     }
@@ -1371,6 +1382,66 @@ mod tests {
                 "{line_id} should be capped at Minor Delays"
             );
         }
+    }
+
+    #[test]
+    fn cancelled_service_maps_to_part_suspended() {
+        // "cancelled" alone (no other severity_from_incident keyword
+        // present) used to fall all the way through the keyword ladder to
+        // the MinorDelays default -- a cancellation is a real, significant
+        // service impact and should never rank as mild as vague "minor
+        // delays" chatter. PartSuspended matches the tier `classify`'s
+        // sample-based path already gives a high cancellation rate.
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-7",
+            "Service cancellation on the Alton line",
+            "This service has been cancelled due to a shortage of train crew.",
+            &["SW"],
+            &["AON"],
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        assert_eq!(
+            reports["swr-alton"].worst_severity(),
+            Severity::PartSuspended
+        );
+    }
+
+    #[test]
+    fn cancelled_text_still_resolves_severe_delays_keyword_correctly() {
+        // Regression: text that already matched an existing ladder keyword
+        // ("severe delays") must keep resolving via that ladder's ordering
+        // even once cancellation wording is also present -- the new check
+        // sits before the severe-delays check (same position as "lines
+        // blocked"), so cancellation wording wins here, exactly as "lines
+        // blocked" already wins over "severe delays" text elsewhere.
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-8",
+            "Cancellations and severe delays on the Alton line",
+            "This service has been cancelled; severe delays also expected.",
+            &["SW"],
+            &["AON"],
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        assert_eq!(
+            reports["swr-alton"].worst_severity(),
+            Severity::PartSuspended
+        );
+    }
+
+    #[test]
+    fn incident_text_without_any_keyword_falls_through_to_minor_delays() {
+        let lines = load_all_lines();
+        let inc = incident(
+            "SWR-9",
+            "Signal problem near Alton",
+            "Trains may run a few minutes late this morning.",
+            &["SW"],
+            &["AON"],
+        );
+        let reports = aggregate_with_defaults(&lines, &[inc]);
+        assert_eq!(reports["swr-alton"].worst_severity(), Severity::MinorDelays);
     }
 
     #[test]
