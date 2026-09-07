@@ -150,7 +150,7 @@ pub async fn candidates_for_trains_id(
     let delay_minutes: Option<i32> = current.try_get("delay_minutes")?;
     let new_rank = train_severity_rank(&status, delay_minutes, delay_threshold_minutes);
 
-    let subscribers = sqlx::query("SELECT id, user_id FROM tracked_trains WHERE trains_id = $1")
+    let subscribers = sqlx::query("SELECT id, user_id FROM train_subscriptions WHERE trains_id = $1")
         .bind(trains_id)
         .fetch_all(pool)
         .await?;
@@ -506,7 +506,7 @@ mod tests {
             .await
             .expect("seed fixture user");
             sqlx::query(
-                "INSERT INTO tracked_trains \
+                "INSERT INTO train_subscriptions \
                     (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
                  VALUES ($1, $2, 'EUS', $3, $4, 'resolved')",
             )
@@ -546,7 +546,7 @@ mod tests {
         );
         assert!(candidates.iter().all(|c| c.trains_id == trains_id));
 
-        sqlx::query("DELETE FROM tracked_trains WHERE trains_id = $1").bind(trains_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE trains_id = $1").bind(trains_id).execute(&pool).await.ok();
         sqlx::query("DELETE FROM trains WHERE id = $1").bind(trains_id).execute(&pool).await.ok();
         for user_id in ["TEST-FANOUT-USER-A", "TEST-FANOUT-USER-B"] {
             sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&pool).await.ok();
