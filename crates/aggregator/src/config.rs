@@ -94,6 +94,19 @@ pub struct Config {
     #[arg(long, env, default_value_t = 1)]
     pub trust_event_backlog_retention_days: i64,
 
+    /// How long to keep `trains` (and, via CASCADE,
+    /// `train_movement_events`/`train_current_state`) rows before pruning
+    /// them. Reuses the past-dates sibling design's own 30-day figure
+    /// (docs/superpowers/specs/2026-09-06-schedule-line-population-past-dates-design.md)
+    /// rather than inventing a second number for a structurally similar
+    /// concern -- see this plan's Global Constraints. Unlike
+    /// `trust_event_backlog_retention_days`'s cautious default-1-until-licence-
+    /// confirmed posture, this can default straight to 30 from day one: the
+    /// RDM licensing question that caution exists to enforce has already been
+    /// confirmed clear by the repo owner for this data.
+    #[arg(long, env, default_value_t = 30)]
+    pub trains_retention_days: i64,
+
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
     /// for why this differs from api.service.port -- api reuses its

@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
             config.daily_stats_retention_days,
             config.half_hourly_stats_retention_hours,
             config.trust_event_backlog_retention_days,
+            config.trains_retention_days,
             &mut dedup_ledger,
             config.full_coverage_enabled_default,
         )
@@ -181,6 +182,7 @@ async fn run_cycle(
     daily_stats_retention_days: i64,
     half_hourly_stats_retention_hours: i64,
     trust_event_backlog_retention_days: i64,
+    trains_retention_days: i64,
     dedup_ledger: &mut SeenServiceLedger,
     full_coverage_enabled_default: bool,
 ) -> anyhow::Result<()> {
@@ -263,6 +265,10 @@ async fn run_cycle(
         "aggregator_trust_event_backlog_rows_pruned_total"
     ))
     .increment(trust_event_backlog_pruned);
+
+    let trains_pruned = queries::prune_trains(pool, trains_retention_days).await?;
+    metrics::counter!(common::metrics::metric_name("aggregator_trains_rows_pruned_total"))
+        .increment(trains_pruned);
 
     // Per-service dedup pass, folded together with the daily-stats write:
     // `dedup::dedup_new_sample_stats` is STATEFUL (it mutates `dedup_ledger`
@@ -405,6 +411,7 @@ async fn run_cycle(
         removed_lines = removed,
         pruned_history_rows = pruned,
         trust_event_backlog_pruned = trust_event_backlog_pruned,
+        trains_pruned = trains_pruned,
         deduped_new_services = new_services_this_cycle,
         daily_stats_recorded = daily_stats_recorded,
         daily_stats_pruned = daily_stats_pruned,

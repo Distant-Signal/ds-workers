@@ -510,6 +510,23 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
     Ok(result.rows_affected())
 }
 
+/// Prunes `trains` rows older than `retention_days`, per
+/// docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §5.
+/// A single, backward-only predicate on the parent row -- `ON DELETE
+/// CASCADE` on `train_movement_events`/`train_current_state` (Task 9)
+/// does the rest inside this same statement; `tracked_trains.trains_id`'s
+/// `ON DELETE SET NULL` (Task 1) is what makes a pruned train's per-user
+/// subscription survive this delete as a no-live-data historical record.
+pub async fn prune_trains(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM trains WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// The plain Europe/London CALENDAR day (midnight-to-midnight) `instant`
 /// falls on -- matching `frontend/lib/dateFormat.ts`'s `londonDayKey`, the
 /// convention the Timeline tab already groups by. Deliberately NOT
@@ -3090,5 +3107,138 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_deletes_only_rows_older_than_the_retention_window -- --ignored --test-threads=1`"]
+    async fn prune_trains_deletes_only_rows_older_than_the_retention_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let old_date: chrono::NaiveDate = chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let recent_date: chrono::NaiveDate = chrono::Utc::now().date_naive() - chrono::Duration::days(5);
+
+        let (old_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TRAINS-OLD', $1) RETURNING id",
+        )
+        .bind(old_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed an old trains row");
+        let (recent_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TRAINS-RECENT', $1) RETURNING id",
+        )
+        .bind(recent_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a recent trains row");
+
+        let pruned = prune_trains(&pool, 30).await.expect("prune_trains");
+        assert!(pruned >= 1);
+
+        let old_still_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .expect("check old row");
+        assert!(!old_still_exists, "a 40-day-old trains row must be pruned under a 30-day retention window");
+
+        let recent_still_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+            .bind(recent_id)
+            .fetch_one(&pool)
+            .await
+            .expect("check recent row");
+        assert!(recent_still_exists, "a 5-day-old trains row must survive a 30-day retention window");
+
+        sqlx::query("DELETE FROM trains WHERE id = $1").bind(recent_id).execute(&pool).await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_cascade_delete_to_child_tables -- --ignored --test-threads=1`"]
+    async fn prune_trains_cascade_delete_to_child_tables() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let old_date: chrono::NaiveDate = chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+
+        let (old_train_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-CASCADE-DELETE-OLD', $1) RETURNING id",
+        )
+        .bind(old_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed an old trains row");
+
+        sqlx::query(
+            "INSERT INTO train_movement_events (trains_id, event_type, msg_type, dedup_key, raw_body) \
+             VALUES ($1, 'departure', '0001', 'test-cascade-' || $1, '{}'::jsonb)",
+        )
+        .bind(old_train_id)
+        .execute(&pool)
+        .await
+        .expect("insert train_movement_events row");
+
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status) \
+             VALUES ($1, 'en_route')",
+        )
+        .bind(old_train_id)
+        .execute(&pool)
+        .await
+        .expect("insert train_current_state row");
+
+        let events_before: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM train_movement_events WHERE trains_id = $1",
+        )
+        .bind(old_train_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events_before.0, 1, "should have 1 movement event before prune");
+
+        let current_state_before: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM train_current_state WHERE trains_id = $1",
+        )
+        .bind(old_train_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(current_state_before.0, 1, "should have 1 current state row before prune");
+
+        let pruned = prune_trains(&pool, 30).await.expect("prune_trains");
+        assert!(pruned >= 1, "should have pruned at least one train");
+
+        let train_still_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+            .bind(old_train_id)
+            .fetch_one(&pool)
+            .await
+            .expect("check train row");
+        assert!(!train_still_exists, "old train should be deleted");
+
+        let events_after: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM train_movement_events WHERE trains_id = $1",
+        )
+        .bind(old_train_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events_after.0, 0, "movement events should be cascade-deleted when train is pruned");
+
+        let current_state_after: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM train_current_state WHERE trains_id = $1",
+        )
+        .bind(old_train_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(current_state_after.0, 0, "current state rows should be cascade-deleted when train is pruned");
     }
 }
