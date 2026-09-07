@@ -34,18 +34,34 @@ async fn main() -> anyhow::Result<()> {
 
     let cooldown = chrono::Duration::minutes(config.cooldown_minutes);
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
+    let mut forward_interval = tokio::time::interval(Duration::from_secs(config.forward_queue_poll_interval_secs));
     loop {
-        interval.tick().await;
-        let result = run_cycle(
-            &pool,
-            cooldown,
-            config.train_delay_threshold_minutes,
-            &config.vapid_private_key,
-            &config.vapid_subject,
-        )
-        .await;
-        if let Err(err) = result {
-            tracing::error!(error = ?err, "notifier cycle failed; will retry next interval");
+        tokio::select! {
+            _ = interval.tick() => {
+                let result = run_cycle(
+                    &pool,
+                    cooldown,
+                    config.train_delay_threshold_minutes,
+                    &config.vapid_private_key,
+                    &config.vapid_subject,
+                )
+                .await;
+                if let Err(err) = result {
+                    tracing::error!(error = ?err, "notifier cycle failed; will retry next interval");
+                }
+            }
+            _ = forward_interval.tick() => {
+                let result = run_forward_queue_cycle(
+                    &pool,
+                    config.train_delay_threshold_minutes,
+                    &config.vapid_private_key,
+                    &config.vapid_subject,
+                )
+                .await;
+                if let Err(err) = result {
+                    tracing::error!(error = ?err, "notifier forward-queue cycle failed; will retry next interval");
+                }
+            }
         }
     }
 }
@@ -101,10 +117,29 @@ async fn run_cycle(
     let train_cursor_start = queries::read_cursor(pool, "train_movement_events").await?;
     let (train_candidates, train_max_id) =
         queries::poll_train_candidates(pool, train_cursor_start, train_delay_threshold_minutes).await?;
+    notify_train_candidates(pool, &train_candidates, vapid_private_key, vapid_subject, now).await?;
+    queries::advance_cursor(pool, "train_movement_events", train_max_id).await?;
 
-    for candidate in &train_candidates {
+    Ok(())
+}
+
+/// The train-notification-sending body shared by `run_cycle`'s own
+/// `train_movement_events` poll AND `run_forward_queue_cycle`'s faster
+/// `notifier_forward_queue` poll (Task 18) -- ONE decision path fed by two
+/// inputs, never a second, divergent copy of the cooldown/escalation send
+/// logic (per the design spec's own §6 non-goal on redesigning escalation
+/// logic).
+async fn notify_train_candidates(
+    pool: &PgPool,
+    candidates: &[queries::TrainCandidate],
+    vapid_private_key: &str,
+    vapid_subject: &str,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for candidate in candidates {
         tracing::info!(
             tracked_train_id = candidate.tracked_train_id,
+            trains_id = candidate.trains_id,
             previous_rank = candidate.previous_rank,
             new_rank = candidate.new_rank,
             "train notification candidate"
@@ -124,8 +159,29 @@ async fn run_cycle(
                 .await?;
         }
     }
-    queries::advance_cursor(pool, "train_movement_events", train_max_id).await?;
+    Ok(())
+}
 
+/// The forward queue's own, faster-cadence cycle (Task 17/18) -- a second
+/// INPUT into `notify_train_candidates`'s same cooldown/escalation logic,
+/// never a second decision path. Advances its own `notifier_cursor` row
+/// (name `"notifier_forward_queue"`), independent of `run_cycle`'s own
+/// `"train_movement_events"` cursor.
+async fn run_forward_queue_cycle(
+    pool: &PgPool,
+    train_delay_threshold_minutes: i32,
+    vapid_private_key: &str,
+    vapid_subject: &str,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let cursor_start = queries::read_cursor(pool, "notifier_forward_queue").await?;
+    let (touched_trains_ids, max_id) = queries::poll_forward_queue(pool, cursor_start).await?;
+    for trains_id in touched_trains_ids {
+        let candidates =
+            queries::candidates_for_trains_id(pool, trains_id, train_delay_threshold_minutes).await?;
+        notify_train_candidates(pool, &candidates, vapid_private_key, vapid_subject, now).await?;
+    }
+    queries::advance_cursor(pool, "notifier_forward_queue", max_id).await?;
     Ok(())
 }
 

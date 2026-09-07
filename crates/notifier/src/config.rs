@@ -23,6 +23,16 @@ pub struct Config {
     #[arg(long, env, default_value_t = 15)]
     pub train_delay_threshold_minutes: i32,
 
+    /// Cadence for the forwarding-queue poll (Task 17/18) -- deliberately
+    /// faster than `poll_interval_secs`, since the whole point of
+    /// trust-consumer's forwarding signal is a quicker path to a push than
+    /// waiting for train_movement_events' own slower-polled cycle. The exact
+    /// value is a judgment call, not a researched figure -- see the design
+    /// spec's own Open Question 3 on this cadence needing "concrete design
+    /// during implementation planning."
+    #[arg(long, env, default_value_t = 15)]
+    pub forward_queue_poll_interval_secs: u64,
+
     /// VAPID keys, PEM-encoded EC private key (`openssl ecparam -genkey
     /// -name prime256v1`) and the matching uncompressed public key --
     /// wired into web-push's VapidSignatureBuilder in Task 6. Fails fast
