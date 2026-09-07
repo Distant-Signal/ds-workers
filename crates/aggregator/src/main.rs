@@ -267,8 +267,10 @@ async fn run_cycle(
     .increment(trust_event_backlog_pruned);
 
     let trains_pruned = queries::prune_trains(pool, trains_retention_days).await?;
-    metrics::counter!(common::metrics::metric_name("aggregator_trains_rows_pruned_total"))
-        .increment(trains_pruned);
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_trains_rows_pruned_total"
+    ))
+    .increment(trains_pruned);
 
     // Per-service dedup pass, folded together with the daily-stats write:
     // `dedup::dedup_new_sample_stats` is STATEFUL (it mutates `dedup_ledger`

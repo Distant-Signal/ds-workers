@@ -68,7 +68,11 @@ struct LineHistoryRow {
 }
 
 fn worst_rank(statuses: &[LineStatus]) -> u8 {
-    statuses.iter().map(|s| severity_rank(s.severity)).min().unwrap_or(0)
+    statuses
+        .iter()
+        .map(|s| severity_rank(s.severity))
+        .min()
+        .unwrap_or(0)
 }
 
 /// One correlated subquery per row to find "the immediately preceding
@@ -77,7 +81,10 @@ fn worst_rank(statuses: &[LineStatus]) -> u8 {
 /// data-volume scale ("single trusted personal instance", per DESIGN.md)
 /// doesn't justify a window-function rewrite for this; revisit if line
 /// count/history volume ever grows enough to matter.
-pub async fn poll_line_candidates(pool: &PgPool, since_id: i64) -> anyhow::Result<Vec<LineCandidate>> {
+pub async fn poll_line_candidates(
+    pool: &PgPool,
+    since_id: i64,
+) -> anyhow::Result<Vec<LineCandidate>> {
     let rows = sqlx::query_as::<_, LineHistoryRow>(
         "SELECT h.id, h.line_id, h.statuses AS statuses, \
                 (SELECT h2.statuses FROM line_status_history h2 \
@@ -140,20 +147,24 @@ pub async fn candidates_for_trains_id(
     trains_id: i64,
     delay_threshold_minutes: i32,
 ) -> anyhow::Result<Vec<TrainCandidate>> {
-    let current = sqlx::query("SELECT status, delay_minutes FROM train_current_state WHERE trains_id = $1")
-        .bind(trains_id)
-        .fetch_optional(pool)
-        .await?;
-    let Some(current) = current else { return Ok(Vec::new()) }; // no current-state row yet -- nothing to compare
+    let current =
+        sqlx::query("SELECT status, delay_minutes FROM train_current_state WHERE trains_id = $1")
+            .bind(trains_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(current) = current else {
+        return Ok(Vec::new());
+    }; // no current-state row yet -- nothing to compare
 
     let status: String = current.try_get("status")?;
     let delay_minutes: Option<i32> = current.try_get("delay_minutes")?;
     let new_rank = train_severity_rank(&status, delay_minutes, delay_threshold_minutes);
 
-    let subscribers = sqlx::query("SELECT id, user_id FROM train_subscriptions WHERE trains_id = $1")
-        .bind(trains_id)
-        .fetch_all(pool)
-        .await?;
+    let subscribers =
+        sqlx::query("SELECT id, user_id FROM train_subscriptions WHERE trains_id = $1")
+            .bind(trains_id)
+            .fetch_all(pool)
+            .await?;
     let mut candidates = Vec::new();
     for subscriber in subscribers {
         let tracked_train_id: i64 = subscriber.try_get("id")?;
@@ -171,7 +182,8 @@ pub async fn candidates_for_trains_id(
             None => 0, // Task 3's design note: no cold-start guard for trains
             Some(previous) => {
                 let previous_status: String = previous.try_get("last_notified_status")?;
-                let previous_delay: Option<i32> = previous.try_get("last_notified_delay_minutes")?;
+                let previous_delay: Option<i32> =
+                    previous.try_get("last_notified_delay_minutes")?;
                 train_severity_rank(&previous_status, previous_delay, delay_threshold_minutes)
             }
         };
@@ -179,7 +191,13 @@ pub async fn candidates_for_trains_id(
         if crate::decision::decide_train_notification(previous_rank, new_rank)
             == crate::decision::NotifyDecision::NotifyNow
         {
-            candidates.push(TrainCandidate { tracked_train_id, trains_id, user_id, new_rank, previous_rank });
+            candidates.push(TrainCandidate {
+                tracked_train_id,
+                trains_id,
+                user_id,
+                new_rank,
+                previous_rank,
+            });
         }
     }
     Ok(candidates)
@@ -212,7 +230,8 @@ pub async fn poll_train_candidates(
 
     let mut candidates = Vec::new();
     for trains_id in touched {
-        candidates.extend(candidates_for_trains_id(pool, trains_id, delay_threshold_minutes).await?);
+        candidates
+            .extend(candidates_for_trains_id(pool, trains_id, delay_threshold_minutes).await?);
     }
     Ok((candidates, max_id))
 }
@@ -231,18 +250,20 @@ pub async fn poll_forward_queue(pool: &PgPool, since_id: i64) -> anyhow::Result<
     if touched.is_empty() {
         return Ok((Vec::new(), since_id));
     }
-    let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM notifier_forward_queue WHERE id > $1")
-        .bind(since_id)
-        .fetch_one(pool)
-        .await?;
+    let max_id: i64 =
+        sqlx::query_scalar("SELECT MAX(id) FROM notifier_forward_queue WHERE id > $1")
+            .bind(since_id)
+            .fetch_one(pool)
+            .await?;
     Ok((touched, max_id))
 }
 
 pub async fn pinned_users_for_line(pool: &PgPool, line_id: &str) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query_scalar::<_, String>("SELECT user_id FROM pinned_lines WHERE line_id = $1")
-        .bind(line_id)
-        .fetch_all(pool)
-        .await?;
+    let rows =
+        sqlx::query_scalar::<_, String>("SELECT user_id FROM pinned_lines WHERE line_id = $1")
+            .bind(line_id)
+            .fetch_all(pool)
+            .await?;
     Ok(rows)
 }
 
@@ -325,7 +346,10 @@ pub struct PushSubscriptionRow {
     pub auth: String,
 }
 
-pub async fn push_subscriptions_for_user(pool: &PgPool, user_id: &str) -> anyhow::Result<Vec<PushSubscriptionRow>> {
+pub async fn push_subscriptions_for_user(
+    pool: &PgPool,
+    user_id: &str,
+) -> anyhow::Result<Vec<PushSubscriptionRow>> {
     let rows = sqlx::query_as::<_, PushSubscriptionRow>(
         "SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = $1",
     )
@@ -339,7 +363,10 @@ pub async fn push_subscriptions_for_user(pool: &PgPool, user_id: &str) -> anyhow
 /// self-healing cleanup, mirroring users.rs's own "every write takes out
 /// its own trash" posture cited by the spec.
 pub async fn delete_push_subscription(pool: &PgPool, id: i64) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM push_subscriptions WHERE id = $1").bind(id).execute(pool).await?;
+    sqlx::query("DELETE FROM push_subscriptions WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -349,23 +376,36 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     async fn connect() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        PgPoolOptions::new().connect(&database_url).await.expect("connect to postgres")
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres")
     }
 
     async fn seed_user(pool: &PgPool, user_id: &str) {
-        sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING")
-            .bind(user_id)
-            .bind(format!("{user_id}@example.com"))
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("seed fixture user");
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@example.com"))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed fixture user");
     }
 
     async fn cleanup_line_history(pool: &PgPool, line_id: &str) {
-        sqlx::query("DELETE FROM line_status_history WHERE line_id = $1").bind(line_id).execute(pool).await.expect("cleanup history");
-        sqlx::query("DELETE FROM notifier_cursor WHERE name = 'line_status_history'").execute(pool).await.expect("cleanup cursor");
+        sqlx::query("DELETE FROM line_status_history WHERE line_id = $1")
+            .bind(line_id)
+            .execute(pool)
+            .await
+            .expect("cleanup history");
+        sqlx::query("DELETE FROM notifier_cursor WHERE name = 'line_status_history'")
+            .execute(pool)
+            .await
+            .expect("cleanup cursor");
     }
 
     /// Real `common::LineStatus` values, serialized the same way
@@ -378,7 +418,11 @@ mod tests {
         let status = common::LineStatus {
             severity,
             reason: String::new(),
-            validity: common::ValidityPeriod { from_date: chrono::Utc::now(), to_date: None, is_now: true },
+            validity: common::ValidityPeriod {
+                from_date: chrono::Utc::now(),
+                to_date: None,
+                is_now: true,
+            },
             disruption: None,
             data_quality: common::DataQuality::default(),
             sample_stats: None,
@@ -415,15 +459,24 @@ mod tests {
 
         let cursor_name = "line_status_history";
         let start = read_cursor(&pool, cursor_name).await.expect("read cursor");
-        let first_pass = poll_line_candidates(&pool, start).await.expect("first poll");
-        let candidate = first_pass.iter().find(|c| c.line_id == line_id).expect("the transition must be a candidate");
+        let first_pass = poll_line_candidates(&pool, start)
+            .await
+            .expect("first poll");
+        let candidate = first_pass
+            .iter()
+            .find(|c| c.line_id == line_id)
+            .expect("the transition must be a candidate");
         assert_eq!(candidate.previous_rank, 0);
         assert!(candidate.new_rank > 0);
 
         let max_id = first_pass.iter().map(|c| c.id).max().unwrap_or(start);
-        advance_cursor(&pool, cursor_name, max_id).await.expect("advance");
+        advance_cursor(&pool, cursor_name, max_id)
+            .await
+            .expect("advance");
 
-        let second_pass = poll_line_candidates(&pool, max_id).await.expect("second poll");
+        let second_pass = poll_line_candidates(&pool, max_id)
+            .await
+            .expect("second poll");
         assert!(
             second_pass.iter().all(|c| c.line_id != line_id),
             "an unchanged table must produce zero new candidates for this line on a repeat poll"
@@ -457,20 +510,28 @@ mod tests {
         .await
         .expect("seed subscription");
 
-        let subscriptions = push_subscriptions_for_user(&pool, "TEST-NOTIFIER-CLEANUP-USER").await.expect("list");
+        let subscriptions = push_subscriptions_for_user(&pool, "TEST-NOTIFIER-CLEANUP-USER")
+            .await
+            .expect("list");
         let seeded = subscriptions
             .iter()
             .find(|s| s.endpoint == "https://push.example/ep-cleanup-test")
             .expect("seeded row must be listed");
 
-        delete_push_subscription(&pool, seeded.id).await.expect("delete");
-
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_subscriptions WHERE endpoint = $1")
-            .bind("https://push.example/ep-cleanup-test")
-            .fetch_one(&pool)
+        delete_push_subscription(&pool, seeded.id)
             .await
-            .expect("count after delete");
-        assert_eq!(remaining, 0, "delete_push_subscription must actually remove the row");
+            .expect("delete");
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM push_subscriptions WHERE endpoint = $1")
+                .bind("https://push.example/ep-cleanup-test")
+                .fetch_one(&pool)
+                .await
+                .expect("count after delete");
+        assert_eq!(
+            remaining, 0,
+            "delete_push_subscription must actually remove the row"
+        );
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind("TEST-NOTIFIER-CLEANUP-USER")
@@ -546,10 +607,22 @@ mod tests {
         );
         assert!(candidates.iter().all(|c| c.trains_id == trains_id));
 
-        sqlx::query("DELETE FROM train_subscriptions WHERE trains_id = $1").bind(trains_id).execute(&pool).await.ok();
-        sqlx::query("DELETE FROM trains WHERE id = $1").bind(trains_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE trains_id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
         for user_id in ["TEST-FANOUT-USER-A", "TEST-FANOUT-USER-B"] {
-            sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&pool).await.ok();
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .ok();
         }
     }
 
@@ -587,7 +660,15 @@ mod tests {
         assert!(touched_again.is_empty());
         assert_eq!(max_id_again, max_id);
 
-        sqlx::query("DELETE FROM notifier_forward_queue WHERE id = $1").bind(queue_id).execute(&pool).await.ok();
-        sqlx::query("DELETE FROM trains WHERE id = $1").bind(trains_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM notifier_forward_queue WHERE id = $1")
+            .bind(queue_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

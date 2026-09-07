@@ -64,7 +64,11 @@ pub fn decide_user_notification(
 
 /// Maps a tracked train's derived state onto the same rank shape lines
 /// use. Cancellation always outranks any delay reading.
-pub fn train_severity_rank(status: &str, delay_minutes: Option<i32>, delay_threshold_minutes: i32) -> u8 {
+pub fn train_severity_rank(
+    status: &str,
+    delay_minutes: Option<i32>,
+    delay_threshold_minutes: i32,
+) -> u8 {
     if status == "cancelled" {
         2
     } else if delay_minutes.unwrap_or(0) >= delay_threshold_minutes {
@@ -77,7 +81,11 @@ pub fn train_severity_rank(status: &str, delay_minutes: Option<i32>, delay_thres
 /// Escalation-only (see this plan's Task 3 design notes for why trains
 /// don't get a de-escalation/cooldown branch).
 pub fn decide_train_notification(previous_rank: u8, new_rank: u8) -> NotifyDecision {
-    if new_rank > previous_rank { NotifyDecision::NotifyNow } else { NotifyDecision::Skip }
+    if new_rank > previous_rank {
+        NotifyDecision::NotifyNow
+    } else {
+        NotifyDecision::Skip
+    }
 }
 
 #[cfg(test)]
@@ -105,7 +113,8 @@ mod tests {
     fn escalation_notifies_immediately_even_during_an_active_cooldown() {
         let now = Utc::now();
         let last_notified_at = Some(now - Duration::minutes(5)); // well inside a 20-min cooldown
-        let decision = decide_user_notification(0, 4, Some(0), last_notified_at, now, Duration::minutes(20));
+        let decision =
+            decide_user_notification(0, 4, Some(0), last_notified_at, now, Duration::minutes(20));
         assert_eq!(decision, NotifyDecision::NotifyNow);
     }
 
@@ -113,7 +122,8 @@ mod tests {
     fn deescalation_is_skipped_during_an_active_cooldown() {
         let now = Utc::now();
         let last_notified_at = Some(now - Duration::minutes(5));
-        let decision = decide_user_notification(4, 0, Some(4), last_notified_at, now, Duration::minutes(20));
+        let decision =
+            decide_user_notification(4, 0, Some(4), last_notified_at, now, Duration::minutes(20));
         assert_eq!(decision, NotifyDecision::Skip);
     }
 
@@ -121,7 +131,8 @@ mod tests {
     fn deescalation_notifies_once_the_cooldown_has_elapsed() {
         let now = Utc::now();
         let last_notified_at = Some(now - Duration::minutes(25));
-        let decision = decide_user_notification(4, 0, Some(4), last_notified_at, now, Duration::minutes(20));
+        let decision =
+            decide_user_notification(4, 0, Some(4), last_notified_at, now, Duration::minutes(20));
         assert_eq!(decision, NotifyDecision::NotifyNow);
     }
 
@@ -137,14 +148,24 @@ mod tests {
         let now = Utc::now();
         // last_notified_rank already equals new_rank -- e.g. two
         // consecutive equal transitions, or a watermark replay.
-        let decision = decide_user_notification(0, 4, Some(4), Some(now - Duration::hours(1)), now, Duration::minutes(20));
+        let decision = decide_user_notification(
+            0,
+            4,
+            Some(4),
+            Some(now - Duration::hours(1)),
+            now,
+            Duration::minutes(20),
+        );
         assert_eq!(decision, NotifyDecision::Skip);
     }
 
     #[test]
     fn train_cancelled_outranks_any_delay() {
         assert_eq!(train_severity_rank("cancelled", Some(2), 15), 2);
-        assert!(train_severity_rank("cancelled", None, 15) > train_severity_rank("en_route", Some(999), 15));
+        assert!(
+            train_severity_rank("cancelled", None, 15)
+                > train_severity_rank("en_route", Some(999), 15)
+        );
     }
 
     #[test]

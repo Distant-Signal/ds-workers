@@ -18,7 +18,9 @@
 //!      bytes and a cloned signature on each attempt instead.
 
 use serde::Serialize;
-use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder};
+use web_push::{
+    ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder,
+};
 
 use crate::queries::PushSubscriptionRow;
 
@@ -49,16 +51,20 @@ pub async fn send_to_subscription(
     subscription: &PushSubscriptionRow,
     payload: &NotificationPayload,
 ) -> SendOutcome {
-    let subscription_info =
-        SubscriptionInfo::new(subscription.endpoint.clone(), subscription.p256dh.clone(), subscription.auth.clone());
+    let subscription_info = SubscriptionInfo::new(
+        subscription.endpoint.clone(),
+        subscription.p256dh.clone(),
+        subscription.auth.clone(),
+    );
 
-    let mut signature_builder = match VapidSignatureBuilder::from_pem(vapid_private_key.as_bytes(), &subscription_info) {
-        Ok(builder) => builder,
-        Err(err) => {
-            tracing::error!(error = ?err, "invalid VAPID private key"); // startup-time fail-fast (Task 6) should prevent this in practice
-            return SendOutcome::TransientFailure;
-        }
-    };
+    let mut signature_builder =
+        match VapidSignatureBuilder::from_pem(vapid_private_key.as_bytes(), &subscription_info) {
+            Ok(builder) => builder,
+            Err(err) => {
+                tracing::error!(error = ?err, "invalid VAPID private key"); // startup-time fail-fast (Task 6) should prevent this in practice
+                return SendOutcome::TransientFailure;
+            }
+        };
     signature_builder.add_claim("sub", vapid_subject);
     let signature = match signature_builder.build() {
         Ok(sig) => sig,
@@ -100,7 +106,8 @@ pub async fn send_to_subscription(
 
         match client.send(message).await {
             Ok(_) => return SendOutcome::Sent,
-            Err(web_push::WebPushError::EndpointNotValid(_)) | Err(web_push::WebPushError::EndpointNotFound(_)) => {
+            Err(web_push::WebPushError::EndpointNotValid(_))
+            | Err(web_push::WebPushError::EndpointNotFound(_)) => {
                 return SendOutcome::Expired;
             }
             Err(err) => {
