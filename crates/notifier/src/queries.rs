@@ -206,27 +206,46 @@ pub async fn candidates_for_trains_id(
 /// Watermark now advances over `train_movement_events.trains_id` (Task 9),
 /// the shared, per-physical-train identity -- NOT `tracked_train_id`, which
 /// stops being written by new events as of Task 11.
+///
+/// Since `trust-backlog-consumer` started writing `train_movement_events`
+/// for every train touched NATIONALLY (not just tracked ones), a plain
+/// `SELECT DISTINCT trains_id ... WHERE id > $1` here would return every
+/// train touched since the watermark -- almost all with zero subscribers,
+/// each then costing >= 2 more sequential round trips in
+/// `candidates_for_trains_id` for nothing. The `JOIN` below pushes the
+/// "does this train have a subscriber at all" filter into this one query,
+/// so a trains_id with zero rows in `train_subscriptions` never reaches
+/// `candidates_for_trains_id` in the first place -- a pure query-efficiency
+/// change, the per-subscriber cooldown/escalation join in
+/// `candidates_for_trains_id` below is untouched.
 pub async fn poll_train_candidates(
     pool: &PgPool,
     since_id: i64,
     delay_threshold_minutes: i32,
 ) -> anyhow::Result<(Vec<TrainCandidate>, i64)> {
+    // The watermark must advance past EVERY event since $1 (subscribed or
+    // not), or unsubscribed-train events would be re-scanned by the
+    // `touched` query below forever -- so this is deliberately computed
+    // over the whole table, NOT joined/filtered by subscriber the way
+    // `touched` is. `None` (no rows at all past $1) means don't move the
+    // cursor.
+    let max_id: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(id) FROM train_movement_events WHERE id > $1")
+            .bind(since_id)
+            .fetch_one(pool)
+            .await?;
+    let Some(max_id) = max_id else {
+        return Ok((Vec::new(), since_id));
+    };
+
     let touched: Vec<i64> = sqlx::query_scalar(
-        "SELECT DISTINCT trains_id FROM train_movement_events \
-         WHERE id > $1 AND trains_id IS NOT NULL",
+        "SELECT DISTINCT tme.trains_id FROM train_movement_events tme \
+         JOIN train_subscriptions ts ON ts.trains_id = tme.trains_id \
+         WHERE tme.id > $1 AND tme.trains_id IS NOT NULL",
     )
     .bind(since_id)
     .fetch_all(pool)
     .await?;
-
-    if touched.is_empty() {
-        return Ok((Vec::new(), since_id));
-    }
-
-    let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM train_movement_events WHERE id > $1")
-        .bind(since_id)
-        .fetch_one(pool)
-        .await?;
 
     let mut candidates = Vec::new();
     for trains_id in touched {
@@ -667,6 +686,189 @@ mod tests {
             .ok();
         sqlx::query("DELETE FROM trains WHERE id = $1")
             .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// A `tracing_subscriber::Layer` counting `sqlx`'s own per-query
+    /// tracing events (target `"sqlx::query"`, emitted once per executed
+    /// statement -- see `sqlx-core`'s `logger.rs`). Used below to prove
+    /// `poll_train_candidates` never does a per-train existence check for
+    /// trains with zero subscribers -- a plain "are the right candidates
+    /// returned" assertion can't distinguish a join-filtered single query
+    /// from N wasted round trips that all correctly return nothing.
+    struct SqlxQueryCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for SqlxQueryCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "sqlx::query" {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                poll_train_candidates_never_queries_trains_without_subscribers \
+                -- --ignored --test-threads=1`"]
+    async fn poll_train_candidates_never_queries_trains_without_subscribers() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let pool = connect().await;
+        let service_date: chrono::NaiveDate = "2026-09-06".parse().unwrap();
+        const UNSUBSCRIBED_COUNT: i64 = 20;
+
+        // Defensive: clear any leftovers from a previously-aborted run.
+        sqlx::query("DELETE FROM train_movement_events WHERE dedup_key LIKE 'test-nosub-%'")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query(
+            "DELETE FROM trains WHERE train_uid LIKE 'TEST-NOSUB-%' OR train_uid = 'TEST-NOSUB-SUBSCRIBED-UID'",
+        )
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM users WHERE id = 'TEST-NOSUB-SUBSCRIBER'")
+            .execute(&pool)
+            .await
+            .ok();
+
+        // One train WITH a subscriber -- must still produce a candidate.
+        let subscribed_trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-NOSUB-SUBSCRIBED-UID', $1) \
+             RETURNING id",
+        )
+        .bind(service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed subscribed train");
+
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind("TEST-NOSUB-SUBSCRIBER")
+        .bind("test-nosub-subscriber@example.com")
+        .bind("TEST-NOSUB-SUBSCRIBER")
+        .execute(&pool)
+        .await
+        .expect("seed fixture user");
+
+        sqlx::query(
+            "INSERT INTO train_subscriptions \
+                (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
+             VALUES ($1, $2, 'EUS', $3, $4, 'resolved')",
+        )
+        .bind("TEST-NOSUB-SUBSCRIBER")
+        .bind(service_date)
+        .bind(service_date.and_hms_opt(19, 15, 0).unwrap().and_utc())
+        .bind(subscribed_trains_id)
+        .execute(&pool)
+        .await
+        .expect("seed a subscription for the subscribed train");
+
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status, delay_minutes) VALUES ($1, 'en_route', 20)",
+        )
+        .bind(subscribed_trains_id)
+        .execute(&pool)
+        .await
+        .expect("seed current state showing a real delay");
+
+        let (subscribed_event_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO train_movement_events (trains_id, dedup_key, msg_type, raw_body) \
+             VALUES ($1, 'test-nosub-subscribed', '0003', '{}'::jsonb) RETURNING id",
+        )
+        .bind(subscribed_trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a movement event for the subscribed train");
+
+        // Twenty trains with movement events but ZERO subscribers -- these
+        // must never be looked up individually.
+        let mut unsubscribed_trains_ids = Vec::new();
+        for i in 0..UNSUBSCRIBED_COUNT {
+            let trains_id: i64 = sqlx::query_scalar(
+                "INSERT INTO trains (train_uid, service_date) VALUES ($1, $2) RETURNING id",
+            )
+            .bind(format!("TEST-NOSUB-UID-{i}"))
+            .bind(service_date)
+            .fetch_one(&pool)
+            .await
+            .expect("seed an unsubscribed train");
+            unsubscribed_trains_ids.push(trains_id);
+
+            sqlx::query(
+                "INSERT INTO train_movement_events (trains_id, dedup_key, msg_type, raw_body) \
+                 VALUES ($1, $2, '0003', '{}'::jsonb)",
+            )
+            .bind(trains_id)
+            .bind(format!("test-nosub-{i}"))
+            .execute(&pool)
+            .await
+            .expect("seed a movement event for an unsubscribed train");
+        }
+
+        let since_id = subscribed_event_id - 1;
+
+        let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(SqlxQueryCounter(query_count.clone()));
+        let guard = tracing::subscriber::set_default(subscriber);
+        let (candidates, max_id) = poll_train_candidates(&pool, since_id, 15)
+            .await
+            .expect("poll_train_candidates");
+        drop(guard);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "only the trains_id with a real subscriber must produce a candidate"
+        );
+        assert_eq!(candidates[0].trains_id, subscribed_trains_id);
+        assert!(max_id > since_id);
+
+        let observed = query_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed < 10,
+            "poll_train_candidates must not do a per-train round trip for each of the {} \
+             unsubscribed trains -- observed {observed} sqlx queries for one subscribed train \
+             plus {} unsubscribed ones",
+            UNSUBSCRIBED_COUNT,
+            UNSUBSCRIBED_COUNT
+        );
+
+        sqlx::query("DELETE FROM train_movement_events WHERE dedup_key LIKE 'test-nosub-%'")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE trains_id = $1")
+            .bind(subscribed_trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_current_state WHERE trains_id = $1")
+            .bind(subscribed_trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(subscribed_trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        for trains_id in unsubscribed_trains_ids {
+            sqlx::query("DELETE FROM trains WHERE id = $1")
+                .bind(trains_id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM users WHERE id = 'TEST-NOSUB-SUBSCRIBER'")
             .execute(&pool)
             .await
             .ok();

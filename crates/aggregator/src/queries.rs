@@ -510,21 +510,49 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
     Ok(result.rows_affected())
 }
 
+/// Batch size for `prune_trains`'s delete loop -- mirrors
+/// `crates/api/src/data/legacy_backfill.rs`'s own `BATCH` precedent for
+/// bounding one statement's row count, just sized for a DELETE instead of
+/// that module's SELECT-then-UPDATE passes.
+const PRUNE_TRAINS_BATCH: i64 = 1000;
+
 /// Prunes `trains` rows older than `retention_days`, per
 /// docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §5.
-/// A single, backward-only predicate on the parent row -- `ON DELETE
-/// CASCADE` on `train_movement_events`/`train_current_state` (Task 9)
-/// does the rest inside this same statement; `tracked_trains.trains_id`'s
-/// `ON DELETE SET NULL` (Task 1) is what makes a pruned train's per-user
-/// subscription survive this delete as a no-live-data historical record.
+/// A backward-only predicate on the parent row -- `ON DELETE CASCADE` on
+/// `train_movement_events`/`train_current_state` (Task 9) does the rest
+/// inside each batch's statement; `tracked_trains.trains_id`'s `ON DELETE
+/// SET NULL` (Task 1) is what makes a pruned train's per-user subscription
+/// survive this delete as a no-live-data historical record.
+///
+/// Deletes in bounded batches (`PRUNE_TRAINS_BATCH` rows per statement,
+/// looped until a batch deletes zero rows) rather than one unbounded
+/// `DELETE`, so a national-scale, 30-day-retention prune never holds one
+/// long lock / one large WAL burst across potentially millions of rows --
+/// see this fix's own review note. Each batch is still its own standalone
+/// statement/transaction (same as the loop this mirrors in
+/// `legacy_backfill.rs`), so a crash mid-prune loses at most one batch's
+/// worth of progress, never the whole run.
 pub async fn prune_trains(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM trains WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
-    )
-    .bind(retention_days.to_string())
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    let mut pruned = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM trains WHERE id IN ( \
+                SELECT id FROM trains \
+                WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
+                LIMIT $2 \
+             )",
+        )
+        .bind(retention_days.to_string())
+        .bind(PRUNE_TRAINS_BATCH)
+        .execute(pool)
+        .await?;
+        let rows_affected = result.rows_affected();
+        pruned += rows_affected;
+        if rows_affected == 0 {
+            break;
+        }
+    }
+    Ok(pruned)
 }
 
 /// The plain Europe/London CALENDAR day (midnight-to-midnight) `instant`
@@ -3257,6 +3285,132 @@ mod tests {
         assert_eq!(
             current_state_after.0, 0,
             "current state rows should be cascade-deleted when train is pruned"
+        );
+    }
+
+    /// A `tracing_subscriber::Layer` counting `sqlx`'s own per-query
+    /// tracing events (target `"sqlx::query"`, emitted once per executed
+    /// statement -- see `sqlx-core`'s `logger.rs`). Used below to prove
+    /// `prune_trains` actually issues MULTIPLE DELETE round trips for a
+    /// row count exceeding one batch, rather than the one unbounded
+    /// statement it used to be -- a plain "did every row get deleted"
+    /// assertion can't distinguish the two, since an unbounded DELETE
+    /// deletes everything in a single statement too.
+    struct SqlxQueryCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for SqlxQueryCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "sqlx::query" {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_deletes_all_rows_across_multiple_batches -- --ignored --test-threads=1`"]
+    async fn prune_trains_deletes_all_rows_across_multiple_batches() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let old_date: chrono::NaiveDate =
+            chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        const SEEDED_ROWS: i64 = 1500; // > the batch size any sane batched impl would use
+
+        sqlx::query("DELETE FROM trains WHERE train_uid LIKE 'TEST-PRUNE-BATCH-%'")
+            .execute(&pool)
+            .await
+            .ok(); // defensive: clear any leftovers from a previously-aborted run
+
+        let seeded_ids: Vec<i64> = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) \
+             SELECT 'TEST-PRUNE-BATCH-' || gs, $1 FROM generate_series(1, $2) AS gs \
+             RETURNING id",
+        )
+        .bind(old_date)
+        .bind(SEEDED_ROWS)
+        .fetch_all(&pool)
+        .await
+        .expect("bulk-seed trains rows older than the retention window");
+        assert_eq!(seeded_ids.len() as i64, SEEDED_ROWS);
+
+        // A couple of children on rows scattered across the batch boundary,
+        // to confirm cascade delete still works when the parent is removed
+        // by a LATER batch iteration, not just the first.
+        for &trains_id in &[
+            seeded_ids[0],
+            seeded_ids[seeded_ids.len() / 2],
+            *seeded_ids.last().unwrap(),
+        ] {
+            sqlx::query(
+                "INSERT INTO train_movement_events (trains_id, event_type, msg_type, dedup_key, raw_body) \
+                 VALUES ($1, 'departure', '0001', 'test-prune-batch-' || $1, '{}'::jsonb)",
+            )
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .expect("seed a movement event on a batch row");
+            sqlx::query(
+                "INSERT INTO train_current_state (trains_id, status) VALUES ($1, 'en_route')",
+            )
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .expect("seed a current-state row on a batch row");
+        }
+
+        let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(SqlxQueryCounter(query_count.clone()));
+        let guard = tracing::subscriber::set_default(subscriber);
+        let pruned = prune_trains(&pool, 30).await.expect("prune_trains");
+        drop(guard);
+
+        assert!(
+            pruned >= SEEDED_ROWS as u64,
+            "must delete every seeded row despite batching, got {pruned}"
+        );
+        assert!(
+            query_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "1500 rows must not fit in a single DELETE round trip once batched -- \
+             only {} query event(s) were observed, meaning this is still one unbounded statement",
+            query_count.load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trains WHERE train_uid LIKE 'TEST-PRUNE-BATCH-%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining batch rows");
+        assert_eq!(remaining, 0, "every batch-seeded row must be gone");
+
+        let remaining_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM train_movement_events WHERE dedup_key LIKE 'test-prune-batch-%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining movement events");
+        assert_eq!(
+            remaining_events, 0,
+            "cascade delete must still remove child movement events across batches"
+        );
+
+        let remaining_state: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM train_current_state WHERE trains_id = ANY($1)",
+        )
+        .bind(&seeded_ids)
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining current-state rows");
+        assert_eq!(
+            remaining_state, 0,
+            "cascade delete must still remove child current-state rows across batches"
         );
     }
 }
