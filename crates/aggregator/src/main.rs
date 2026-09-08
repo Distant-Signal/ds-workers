@@ -72,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
             config.half_hourly_stats_retention_hours,
             config.trust_event_backlog_retention_days,
             config.trains_retention_days,
+            config.untracked_trains_retention_days,
+            config.schedule_destination_departures_retention_days,
             &mut dedup_ledger,
             config.full_coverage_enabled_default,
         )
@@ -183,6 +185,8 @@ async fn run_cycle(
     half_hourly_stats_retention_hours: i64,
     trust_event_backlog_retention_days: i64,
     trains_retention_days: i64,
+    untracked_trains_retention_days: i64,
+    schedule_destination_departures_retention_days: i64,
     dedup_ledger: &mut SeenServiceLedger,
     full_coverage_enabled_default: bool,
 ) -> anyhow::Result<()> {
@@ -266,11 +270,34 @@ async fn run_cycle(
     ))
     .increment(trust_event_backlog_pruned);
 
-    let trains_pruned = queries::prune_trains(pool, trains_retention_days).await?;
+    // Two-tier retention: a train with at least one train_subscriptions
+    // row keeps trains_retention_days (30 by default), an untracked train
+    // (no subscription at all) is pruned on the shorter
+    // untracked_trains_retention_days (14 by default) instead -- see
+    // Config::untracked_trains_retention_days's own doc comment and
+    // queries::prune_trains's doc comment for the two-tier query
+    // structure.
+    let trains_pruned =
+        queries::prune_trains(pool, trains_retention_days, untracked_trains_retention_days).await?;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_trains_rows_pruned_total"
     ))
     .increment(trains_pruned);
+
+    // The CIF-derived destination-search table -- the one published product
+    // in this repo that genuinely accrues (~377,000 rows per service date,
+    // one row per departure) rather than wholesale-replacing a bounded key
+    // space. See queries::prune_schedule_destination_departures' own doc
+    // comment.
+    let schedule_destination_departures_pruned = queries::prune_schedule_destination_departures(
+        pool,
+        schedule_destination_departures_retention_days,
+    )
+    .await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_destination_departures_rows_pruned_total"
+    ))
+    .increment(schedule_destination_departures_pruned);
 
     // Per-service dedup pass, folded together with the daily-stats write:
     // `dedup::dedup_new_sample_stats` is STATEFUL (it mutates `dedup_ledger`

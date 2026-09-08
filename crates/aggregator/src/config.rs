@@ -107,6 +107,49 @@ pub struct Config {
     #[arg(long, env, default_value_t = 30)]
     pub trains_retention_days: i64,
 
+    /// How long to keep `schedule_destination_departures` rows before
+    /// pruning them, in whole service dates.
+    ///
+    /// **2, not 1**, and the difference matters. 1 would match
+    /// `trust_event_backlog_retention_days` above, but that default exists
+    /// to enforce an RDM licensing safeguard for TRUST Train Movements
+    /// data -- a constraint that does not apply to CIF SCHEDULE timetable
+    /// data at all. Copying the number would copy a restriction that isn't
+    /// real here while giving up the margin that is: `service_date` is a
+    /// RAIL day, which crosses midnight, and a CIF delivery can land late,
+    /// so a 1-day window can delete the only published day shortly before
+    /// its replacement arrives. 2 covers both edges.
+    ///
+    /// Nothing reads a past service date -- every read computes `today`
+    /// server-side -- so this window protects the producer's edges, not a
+    /// consumer, and there is no reason to raise it further. At ~377,000
+    /// rows per day, 2 days is ~750,000 rows and ~80-120MB with the index.
+    ///
+    /// Unlike `trust_event_backlog_retention_days` there is deliberately NO
+    /// warning emitted when this is configured higher: nothing legal is at
+    /// stake, only disk.
+    #[arg(long, env, default_value_t = 2)]
+    pub schedule_destination_departures_retention_days: i64,
+
+    /// How long to keep a `trains` row (and its cascaded
+    /// `train_movement_events`/`train_current_state` rows) when NO
+    /// `train_subscriptions` row references it (`trains_id`) -- i.e.
+    /// nobody ever pinned this journey. `trains_retention_days` above
+    /// still governs a train with at least one subscription: a real user
+    /// tracked that journey, and their history for it should not
+    /// disappear sooner just because this shorter tier shipped. This
+    /// field only shortens the window for the orphan case -- rows this
+    /// service itself resolved from the schedule/TRUST feeds but that no
+    /// one is actually watching, which make up the bulk of `trains` at
+    /// national scale and have no per-user value once stale. 14 (2
+    /// weeks) is comfortably under the existing 30-day
+    /// `trains_retention_days` default, and reuses the same already-
+    /// confirmed-clear RDM licensing posture that default's own doc
+    /// comment cites -- this is a narrower cut of the same data, not a
+    /// new licensing question.
+    #[arg(long, env, default_value_t = 14)]
+    pub untracked_trains_retention_days: i64,
+
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
     /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
     /// for why this differs from api.service.port -- api reuses its

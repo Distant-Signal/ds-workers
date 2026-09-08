@@ -510,35 +510,121 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
     Ok(result.rows_affected())
 }
 
+/// Prunes `schedule_destination_departures` rows for service dates older
+/// than `retention_days`.
+///
+/// **This table is the one CIF-derived published product that genuinely
+/// needs pruning**, unlike its sibling `schedule_network_departures`, which
+/// has no pruning job anywhere in this repo. The sibling's wholesale
+/// replace is scoped per `(crs, service_date)` over ~2,500 CRS codes, so
+/// its steady-state size is trivial. This one holds ONE ROW PER
+/// DEPARTURE -- roughly 377,000 rows per service date -- and its wholesale
+/// replace is scoped to a single day, so without this job every day the
+/// service has ever seen accumulates forever.
+///
+/// Nothing reads a past service date: every read of this table computes
+/// `today` server-side, so the window exists to protect the PRODUCER's
+/// edges, not a consumer -- see `Config::schedule_destination_departures_retention_days`
+/// for why the default is 2 rather than 1.
+///
+/// Modelled on `prune_history` and `prune_trust_event_backlog` directly
+/// above, with the one difference that this table's age column is a `DATE`
+/// (`service_date`, a rail day) rather than a `TIMESTAMPTZ`, so the
+/// comparison is against `CURRENT_DATE`. The comparison is strictly `<`,
+/// never `<=`: today's rows must survive any retention value, including 0.
+///
+/// A single unbatched `DELETE`, unlike `prune_trains` a little further down
+/// -- which loops in `PRUNE_TRAINS_BATCH`-sized chunks. That is the right
+/// call here and worth stating: this deletes at most one service date's
+/// worth of rows per run once the window is steady, it runs against a table
+/// nothing reads for past dates, and the aggregator's cycle is a forgiving
+/// place to spend the time. If lock duration or WAL volume ever does bite,
+/// `service_date` partitioning with a partition swap is the standard
+/// mitigation -- reach for that rather than for a batching loop.
+pub async fn prune_schedule_destination_departures(
+    pool: &PgPool,
+    retention_days: i64,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM schedule_destination_departures \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Batch size for `prune_trains`'s delete loop -- mirrors
 /// `crates/api/src/data/legacy_backfill.rs`'s own `BATCH` precedent for
 /// bounding one statement's row count, just sized for a DELETE instead of
 /// that module's SELECT-then-UPDATE passes.
 const PRUNE_TRAINS_BATCH: i64 = 1000;
 
-/// Prunes `trains` rows older than `retention_days`, per
-/// docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §5.
-/// A backward-only predicate on the parent row -- `ON DELETE CASCADE` on
+/// Prunes `trains` rows on two retention tiers, per
+/// docs/superpowers/specs/2026-09-06-shared-train-identity-design.md §5
+/// and the later untracked-trains-retention follow-up: a train with at
+/// least one `train_subscriptions` row referencing it (`trains_id`) is
+/// kept for `retention_days` (a real user tracked that journey); a train
+/// with NO such row -- nobody is following it -- is kept for the shorter
+/// `untracked_retention_days` instead. A backward-only predicate on the
+/// parent row in both cases -- `ON DELETE CASCADE` on
 /// `train_movement_events`/`train_current_state` (Task 9) does the rest
-/// inside each batch's statement; `tracked_trains.trains_id`'s `ON DELETE
-/// SET NULL` (Task 1) is what makes a pruned train's per-user subscription
-/// survive this delete as a no-live-data historical record.
+/// inside each batch's statement; `train_subscriptions.trains_id`'s `ON
+/// DELETE SET NULL` (Task 1) is what makes a pruned train's per-user
+/// subscription survive this delete as a no-live-data historical record,
+/// identically under either tier.
 ///
-/// Deletes in bounded batches (`PRUNE_TRAINS_BATCH` rows per statement,
-/// looped until a batch deletes zero rows) rather than one unbounded
-/// `DELETE`, so a national-scale, 30-day-retention prune never holds one
+/// Two separate batched loops run in sequence rather than one combined
+/// query: the first only ever touches rows with no `train_subscriptions`
+/// row (`NOT EXISTS`), the second only ever touches rows with at least
+/// one (`EXISTS`), so neither loop can delete a row the other tier owns
+/// regardless of which runs first or how the two retention windows
+/// compare. Both loops delete in bounded batches (`PRUNE_TRAINS_BATCH`
+/// rows per statement, looped until a batch deletes zero rows) rather
+/// than one unbounded `DELETE`, so a national-scale prune never holds one
 /// long lock / one large WAL burst across potentially millions of rows --
 /// see this fix's own review note. Each batch is still its own standalone
 /// statement/transaction (same as the loop this mirrors in
 /// `legacy_backfill.rs`), so a crash mid-prune loses at most one batch's
 /// worth of progress, never the whole run.
-pub async fn prune_trains(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub async fn prune_trains(
+    pool: &PgPool,
+    retention_days: i64,
+    untracked_retention_days: i64,
+) -> Result<u64> {
     let mut pruned = 0u64;
     loop {
         let result = sqlx::query(
             "DELETE FROM trains WHERE id IN ( \
                 SELECT id FROM trains \
                 WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM train_subscriptions \
+                      WHERE train_subscriptions.trains_id = trains.id \
+                  ) \
+                LIMIT $2 \
+             )",
+        )
+        .bind(untracked_retention_days.to_string())
+        .bind(PRUNE_TRAINS_BATCH)
+        .execute(pool)
+        .await?;
+        let rows_affected = result.rows_affected();
+        pruned += rows_affected;
+        if rows_affected == 0 {
+            break;
+        }
+    }
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM trains WHERE id IN ( \
+                SELECT id FROM trains \
+                WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
+                  AND EXISTS ( \
+                      SELECT 1 FROM train_subscriptions \
+                      WHERE train_subscriptions.trains_id = trains.id \
+                  ) \
                 LIMIT $2 \
              )",
         )
@@ -3139,6 +3225,114 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_schedule_destination_departures -- --ignored --test-threads=1`"]
+    async fn prune_schedule_destination_departures_deletes_only_rows_older_than_the_retention_window()
+    {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        // Relative to CURRENT_DATE, not hardcoded: the predicate is
+        // `service_date < CURRENT_DATE - $1`, so a fixed date would flip
+        // this test's meaning as the calendar moved.
+        let today = chrono::Utc::now().date_naive();
+        let stale = today - chrono::Duration::days(5);
+        let fresh = today - chrono::Duration::days(1);
+
+        for (service_date, train_uid) in [(stale, "TEST-PRUNE-OLD"), (fresh, "TEST-PRUNE-NEW")] {
+            sqlx::query(
+                "INSERT INTO schedule_destination_departures \
+                    (service_date, destination_crs, scheduled, train_uid, origin_crs) \
+                 VALUES ($1, 'ZRB', '08:00:00', $2, 'EUS')",
+            )
+            .bind(service_date)
+            .bind(train_uid)
+            .execute(&pool)
+            .await
+            .expect("seed fixture rows");
+        }
+
+        let pruned = prune_schedule_destination_departures(&pool, 2)
+            .await
+            .expect("prune");
+        assert_eq!(
+            pruned, 1,
+            "only the 5-day-old row should be pruned at a 2-day retention"
+        );
+
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM schedule_destination_departures \
+             WHERE train_uid = 'TEST-PRUNE-NEW'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.0, 1,
+            "yesterday's rows are inside a 2-day window and must survive"
+        );
+
+        sqlx::query(
+            "DELETE FROM schedule_destination_departures \
+             WHERE train_uid IN ('TEST-PRUNE-OLD', 'TEST-PRUNE-NEW')",
+        )
+        .execute(&pool)
+        .await
+        .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_schedule_destination_departures -- --ignored --test-threads=1`"]
+    async fn prune_schedule_destination_departures_never_deletes_todays_rows() {
+        // The discriminating case, and the one that would actually hurt: a
+        // retention window is only ever allowed to reach into the PAST.
+        // Deleting today's rows would blank the live search between one CIF
+        // delivery and the next, which no retention value should ever be
+        // able to do.
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, train_uid, origin_crs) \
+             VALUES ($1, 'ZRB', '08:00:00', 'TEST-PRUNE-TODAY', 'EUS')",
+        )
+        .bind(today)
+        .execute(&pool)
+        .await
+        .expect("seed today's fixture row");
+
+        // Even at the most aggressive value this config field allows.
+        prune_schedule_destination_departures(&pool, 0)
+            .await
+            .expect("prune");
+
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM schedule_destination_departures \
+             WHERE train_uid = 'TEST-PRUNE-TODAY'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.0, 1,
+            "today's rows must survive any retention value -- the predicate is strictly \
+             `service_date < CURRENT_DATE - $1`, never `<=`"
+        );
+
+        sqlx::query(
+            "DELETE FROM schedule_destination_departures WHERE train_uid = 'TEST-PRUNE-TODAY'",
+        )
+        .execute(&pool)
+        .await
+        .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 prune_trains_deletes_only_rows_older_than_the_retention_window -- --ignored --test-threads=1`"]
     async fn prune_trains_deletes_only_rows_older_than_the_retention_window() {
         let database_url =
@@ -3164,7 +3358,7 @@ mod tests {
         .await
         .expect("seed a recent trains row");
 
-        let pruned = prune_trains(&pool, 30).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 30).await.expect("prune_trains");
         assert!(pruned >= 1);
 
         let old_still_exists: bool =
@@ -3254,7 +3448,7 @@ mod tests {
             "should have 1 current state row before prune"
         );
 
-        let pruned = prune_trains(&pool, 30).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 30).await.expect("prune_trains");
         assert!(pruned >= 1, "should have pruned at least one train");
 
         let train_still_exists: bool =
@@ -3368,7 +3562,7 @@ mod tests {
         let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subscriber = tracing_subscriber::registry().with(SqlxQueryCounter(query_count.clone()));
         let guard = tracing::subscriber::set_default(subscriber);
-        let pruned = prune_trains(&pool, 30).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 30).await.expect("prune_trains");
         drop(guard);
 
         assert!(
@@ -3412,5 +3606,210 @@ mod tests {
             remaining_state, 0,
             "cascade delete must still remove child current-state rows across batches"
         );
+    }
+
+    /// The new two-tier behavior's headline case: an UNTRACKED train (no
+    /// `train_subscriptions` row references it) older than the 14-day
+    /// untracked tier but younger than the 30-day tracked tier IS pruned.
+    /// Under the old single-tier logic (`retention_days` alone, always
+    /// 30) this row would have survived -- proving this test actually
+    /// exercises the new shorter window, not just a renamed old one.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_prunes_an_untracked_train_past_only_the_untracked_window \
+                -- --ignored --test-threads=1`"]
+    async fn prune_trains_prunes_an_untracked_train_past_only_the_untracked_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        // 20 days: older than the 14-day untracked tier, younger than the
+        // 30-day tracked tier.
+        let mid_date: chrono::NaiveDate =
+            chrono::Utc::now().date_naive() - chrono::Duration::days(20);
+
+        let (untracked_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TIER-UNTRACKED', $1) \
+             RETURNING id",
+        )
+        .bind(mid_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed an untracked trains row");
+
+        let pruned = prune_trains(&pool, 30, 14).await.expect("prune_trains");
+        assert!(pruned >= 1);
+
+        let still_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+                .bind(untracked_id)
+                .fetch_one(&pool)
+                .await
+                .expect("check untracked row");
+        assert!(
+            !still_exists,
+            "a 20-day-old UNTRACKED trains row must be pruned under a 14-day untracked \
+             retention window, even though it's within the 30-day tracked window"
+        );
+    }
+
+    /// The tiering's protective case: a TRACKED train (has a
+    /// `train_subscriptions` row pointing at it) older than the 14-day
+    /// untracked tier but younger than the 30-day tracked tier is NOT
+    /// pruned. This is the test that would fail if `prune_trains` were
+    /// implemented as a naive single blanket 14-day cutover instead of
+    /// true two-tier logic -- it proves a real user's tracked journey
+    /// survives on the longer, existing `trains_retention_days` window.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_keeps_a_tracked_train_past_the_untracked_window \
+                -- --ignored --test-threads=1`"]
+    async fn prune_trains_keeps_a_tracked_train_past_the_untracked_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        // 20 days: older than the 14-day untracked tier, younger than the
+        // 30-day tracked tier.
+        let mid_date: chrono::NaiveDate =
+            chrono::Utc::now().date_naive() - chrono::Duration::days(20);
+        let user_id = "TEST-PRUNE-TIER-TRACKED-USER";
+
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind("prune-tier-tracked@example.com")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed fixture user");
+
+        let (tracked_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TIER-TRACKED', $1) \
+             RETURNING id",
+        )
+        .bind(mid_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a trains row");
+
+        sqlx::query(
+            "INSERT INTO train_subscriptions \
+                 (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure) \
+             VALUES ($1, $2, $3, 'EUS', NOW())",
+        )
+        .bind(user_id)
+        .bind(tracked_id)
+        .bind(mid_date)
+        .execute(&pool)
+        .await
+        .expect("seed a subscription referencing the trains row");
+
+        prune_trains(&pool, 30, 14).await.expect("prune_trains");
+
+        let still_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+                .bind(tracked_id)
+                .fetch_one(&pool)
+                .await
+                .expect("check tracked row");
+        assert!(
+            still_exists,
+            "a 20-day-old TRACKED trains row must survive the 14-day untracked window -- \
+             it has a train_subscriptions row, so trains_retention_days (30) applies instead"
+        );
+
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(tracked_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// The existing tier's survival case: a TRACKED train older than the
+    /// 30-day tracked tier IS still pruned -- proves `trains_retention_days`'s
+    /// existing behavior for subscribed trains is unchanged by adding the
+    /// new untracked tier alongside it.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_still_prunes_a_tracked_train_past_the_tracked_window \
+                -- --ignored --test-threads=1`"]
+    async fn prune_trains_still_prunes_a_tracked_train_past_the_tracked_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let old_date: chrono::NaiveDate =
+            chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let user_id = "TEST-PRUNE-TIER-TRACKED-OLD-USER";
+
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind("prune-tier-tracked-old@example.com")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed fixture user");
+
+        let (tracked_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TIER-TRACKED-OLD', $1) \
+             RETURNING id",
+        )
+        .bind(old_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a trains row");
+
+        sqlx::query(
+            "INSERT INTO train_subscriptions \
+                 (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure) \
+             VALUES ($1, $2, $3, 'EUS', NOW())",
+        )
+        .bind(user_id)
+        .bind(tracked_id)
+        .bind(old_date)
+        .execute(&pool)
+        .await
+        .expect("seed a subscription referencing the trains row");
+
+        let pruned = prune_trains(&pool, 30, 14).await.expect("prune_trains");
+        assert!(pruned >= 1);
+
+        let still_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+                .bind(tracked_id)
+                .fetch_one(&pool)
+                .await
+                .expect("check tracked row");
+        assert!(
+            !still_exists,
+            "a 40-day-old TRACKED trains row must still be pruned under the existing \
+             30-day trains_retention_days window"
+        );
+
+        // The train row (and its cascade-deleted children, if any) are
+        // already gone; the subscription row itself survives with
+        // trains_id set NULL (ON DELETE SET NULL) rather than being
+        // deleted, so only the fixture user needs explicit cleanup here.
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }
