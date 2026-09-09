@@ -110,25 +110,38 @@ pub struct Config {
     /// How long to keep `schedule_destination_departures` rows before
     /// pruning them, in whole service dates.
     ///
-    /// **2, not 1**, and the difference matters. 1 would match
+    /// **8, not 1**, and the difference matters. 1 would match
     /// `trust_event_backlog_retention_days` above, but that default exists
     /// to enforce an RDM licensing safeguard for TRUST Train Movements
     /// data -- a constraint that does not apply to CIF SCHEDULE timetable
     /// data at all. Copying the number would copy a restriction that isn't
     /// real here while giving up the margin that is: `service_date` is a
     /// RAIL day, which crosses midnight, and a CIF delivery can land late,
-    /// so a 1-day window can delete the only published day shortly before
-    /// its replacement arrives. 2 covers both edges.
+    /// so a too-tight window can delete a still-searchable day shortly
+    /// before its replacement arrives.
     ///
-    /// Nothing reads a past service date -- every read computes `today`
-    /// server-side -- so this window protects the producer's edges, not a
-    /// consumer, and there is no reason to raise it further. At ~377,000
-    /// rows per day, 2 days is ~750,000 rows and ~80-120MB with the index.
+    /// `GET /public/trains/search` can now search up to 7 days INTO THE
+    /// PAST (`crates/api/src/routes/trains.rs::SEARCH_WINDOW_BACKWARD_DAYS`)
+    /// -- unlike the "nothing reads a past service date" reasoning this
+    /// default used to be justified by, this window now has a real reader.
+    /// 8, not 7: one extra day of safety margin beyond the search window,
+    /// the same reasoning this field's default has always used (previously
+    /// "2 rather than 1" for the identical reason), so a boundary date
+    /// can't flake into a 404 if `aggregator`'s prune cycle runs against
+    /// that date moments before a request for it lands. See
+    /// docs/superpowers/specs/2026-09-09-trains-search-multi-day-design.md
+    /// §1.2/§3.
+    ///
+    /// At ~377,000 rows per day, 8 days is ~3,016,000 rows and roughly
+    /// 600MB with the index (§1.3 of the design doc above; that section's
+    /// own ~675MB figure is the 9-day TOTAL resident size once today's own
+    /// unretained row is counted alongside this 8-day backward window, not
+    /// a second estimate of this field's own retained span).
     ///
     /// Unlike `trust_event_backlog_retention_days` there is deliberately NO
     /// warning emitted when this is configured higher: nothing legal is at
     /// stake, only disk.
-    #[arg(long, env, default_value_t = 2)]
+    #[arg(long, env, default_value_t = 8)]
     pub schedule_destination_departures_retention_days: i64,
 
     /// How long to keep a `trains` row (and its cascaded

@@ -522,10 +522,12 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
 /// replace is scoped to a single day, so without this job every day the
 /// service has ever seen accumulates forever.
 ///
-/// Nothing reads a past service date: every read of this table computes
-/// `today` server-side, so the window exists to protect the PRODUCER's
-/// edges, not a consumer -- see `Config::schedule_destination_departures_retention_days`
-/// for why the default is 2 rather than 1.
+/// `GET /public/trains/search` now reads past service dates too (up to 7
+/// days back, `crates/api/src/routes/trains.rs::SEARCH_WINDOW_BACKWARD_DAYS`)
+/// -- this window used to exist only to protect the PRODUCER's edges, and
+/// now also has to keep a real consumer's supported range intact. See
+/// `Config::schedule_destination_departures_retention_days` for why the
+/// default is 8, one day more than that 7-day window strictly needs.
 ///
 /// Modelled on `prune_history` and `prune_trust_event_backlog` directly
 /// above, with the one difference that this table's age column is a `DATE`
