@@ -9,18 +9,16 @@
 mod aggregation;
 mod config;
 mod dedup;
-mod matcher;
 mod queries;
-mod segments;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use clap::Parser;
+use common::segments::SegmentRegistry;
 use common::{Defaults, LineDefinition, LineStatus, LineStatusReport};
 use config::Config;
 use dedup::SeenServiceLedger;
-use segments::SegmentRegistry;
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]

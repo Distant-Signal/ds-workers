@@ -1150,7 +1150,7 @@ mod tests {
         // cycle's stored row (the new behavior this design fixes).
         use crate::aggregation::aggregate;
         use crate::queries::LoadedIncident;
-        use crate::segments::SegmentRegistry;
+        use common::segments::SegmentRegistry;
         use common::{Defaults, LineDefinition, StationDeparture, StationSample};
         use std::collections::HashMap;
 

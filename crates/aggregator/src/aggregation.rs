@@ -23,9 +23,10 @@ use common::{
 };
 use serde::Deserialize;
 
-use crate::matcher::{Match, MatchScope, lines_affected_by};
+use common::matcher::{Match, MatchScope, lines_affected_by};
+use common::segments::SegmentRegistry;
+
 use crate::queries::LoadedIncident;
-use crate::segments::SegmentRegistry;
 
 /// Merges DB-stored custom lines into the static catalogue, converting
 /// each into a `LineDefinition` (see `common::CustomLine`'s `From` impl) so
@@ -3402,10 +3403,10 @@ mod tests {
             first_seen_at: Utc::now(),
             extracted_periods: Some(periods),
         };
-        let m = crate::matcher::Match {
+        let m = common::matcher::Match {
             line: alton,
             scope: MatchScope::ExclusiveSegment,
-            evidence: crate::matcher::Evidence {
+            evidence: common::matcher::Evidence {
                 stations: vec!["AHT".to_string()],
                 segments: vec![],
                 operators: vec![],
