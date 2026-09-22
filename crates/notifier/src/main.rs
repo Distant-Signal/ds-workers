@@ -7,6 +7,7 @@ mod config;
 mod decision;
 mod queries;
 mod send;
+mod skip_check;
 
 use std::time::Duration;
 
@@ -50,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
     let mut forward_interval =
         tokio::time::interval(Duration::from_secs(config.forward_queue_poll_interval_secs));
+    let mut skip_check_interval =
+        tokio::time::interval(Duration::from_secs(config.skip_check_poll_interval_secs));
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -75,6 +78,17 @@ async fn main() -> anyhow::Result<()> {
                 .await;
                 if let Err(err) = result {
                     tracing::error!(error = ?err, "notifier forward-queue cycle failed; will retry next interval");
+                }
+            }
+            _ = skip_check_interval.tick() => {
+                let result = run_skip_check_cycle(
+                    &pool,
+                    &config.vapid_private_key,
+                    &config.vapid_subject,
+                )
+                .await;
+                if let Err(err) = result {
+                    tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
                 }
             }
         }
@@ -182,21 +196,14 @@ async fn notify_train_candidates(
             "train notification candidate"
         );
         let (status, delay_minutes) = current_train_state(pool, candidate.trains_id).await?;
-        let payload = NotificationPayload {
-            title: if status == "cancelled" {
-                "Your train was cancelled".to_string()
-            } else {
-                "Your train is delayed".to_string()
-            },
-            body: match delay_minutes {
-                Some(minutes) if status != "cancelled" => {
-                    format!("Now running about {minutes} minutes late.")
-                }
-                _ => "Check the latest status.".to_string(),
-            },
-            url: format!("/track/{}", candidate.tracked_train_id),
-            tag: format!("train-{}", candidate.tracked_train_id),
-        };
+        let journey_context =
+            queries::journey_leg_for_train_subscription(pool, candidate.tracked_train_id).await?;
+        let payload = build_train_notification_payload(
+            candidate.tracked_train_id,
+            &status,
+            delay_minutes,
+            journey_context.as_ref(),
+        );
         if send_to_all_subscriptions(
             pool,
             &candidate.user_id,
@@ -220,6 +227,72 @@ async fn notify_train_candidates(
     Ok(())
 }
 
+/// Builds the delay/cancellation `NotificationPayload` -- journey/leg-aware
+/// when `journey_context` names a genuine multi-leg journey (`total_legs >
+/// 1`), otherwise byte-for-byte today's plain copy (Judgment Call 5). CRS
+/// codes, not resolved station names, in the multi-leg body (Judgment
+/// Call 6). Extracted out of `notify_train_candidates` as its own pure
+/// function so this copy-building logic (the ONLY thing §5.1 changes,
+/// design spec's own framing) is independently testable without a database.
+fn build_train_notification_payload(
+    tracked_train_id: i64,
+    status: &str,
+    delay_minutes: Option<i32>,
+    journey_context: Option<&queries::JourneyLegContext>,
+) -> NotificationPayload {
+    let is_cancelled = status == "cancelled";
+
+    let multi_leg = journey_context.filter(|ctx| ctx.total_legs > 1);
+    let Some(ctx) = multi_leg else {
+        // Fallback: no journey_legs row, or a trivial one-leg journey --
+        // today's exact copy/URL, unchanged.
+        return NotificationPayload {
+            title: if is_cancelled {
+                "Your train was cancelled".to_string()
+            } else {
+                "Your train is delayed".to_string()
+            },
+            body: match delay_minutes {
+                Some(minutes) if !is_cancelled => format!("Now running about {minutes} minutes late."),
+                _ => "Check the latest status.".to_string(),
+            },
+            url: format!("/track/{tracked_train_id}"),
+            tag: format!("train-{tracked_train_id}"),
+        };
+    };
+
+    let journey_label = match &ctx.journey_name {
+        Some(name) => format!("'{name}'"),
+        None => "your journey".to_string(),
+    };
+    let route = match (&ctx.origin_crs, &ctx.destination_crs) {
+        (Some(origin), Some(destination)) => Some(format!("{origin} to {destination}")),
+        _ => None,
+    };
+
+    let title = if is_cancelled {
+        format!("Leg {} of {journey_label} was cancelled", ctx.leg_order)
+    } else {
+        format!("Leg {} of {journey_label} is delayed", ctx.leg_order)
+    };
+    let body = match (is_cancelled, delay_minutes, &route) {
+        (true, _, Some(route)) => format!("The {route} service was cancelled."),
+        (true, _, None) => "This service was cancelled.".to_string(),
+        (false, Some(minutes), Some(route)) => {
+            format!("{route}, now running about {minutes} minutes late.")
+        }
+        (false, Some(minutes), None) => format!("Now running about {minutes} minutes late."),
+        (false, None, _) => "Check the latest status.".to_string(),
+    };
+
+    NotificationPayload {
+        title,
+        body,
+        url: format!("/journeys/{}", ctx.journey_id),
+        tag: format!("train-{tracked_train_id}"), // unchanged -- still the same underlying tracked-train row
+    }
+}
+
 /// The forward queue's own, faster-cadence cycle (Task 17/18) -- a second
 /// INPUT into `notify_train_candidates`'s same cooldown/escalation logic,
 /// never a second decision path. Advances its own `notifier_cursor` row
@@ -241,6 +314,66 @@ async fn run_forward_queue_cycle(
         notify_train_candidates(pool, &candidates, vapid_private_key, vapid_subject, now).await?;
     }
     queries::advance_cursor(pool, "notifier_forward_queue", max_id).await?;
+    Ok(())
+}
+
+/// The station-skip check's own cycle (Task 9, §5.2) -- a full poll of
+/// today's committed journey legs every `skip_check_poll_interval_secs`,
+/// not cursor/watermark-based (see `config.rs`'s own doc comment on why).
+/// Each leg is judged independently against its own
+/// `journey_leg_notification_state` row -- `decide_skip_notification`'s
+/// escalation-only shape, same discipline as every other notification path
+/// in this crate: state is written only after a successful send.
+async fn run_skip_check_cycle(
+    pool: &PgPool,
+    vapid_private_key: &str,
+    vapid_subject: &str,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let today = now.date_naive();
+    let legs = queries::list_committed_legs_for_today(pool, today).await?;
+
+    for leg in &legs {
+        let is_skipped = skip_check::leg_is_skipped(pool, leg).await?;
+        let was_skipped = queries::skip_notification_state(pool, &leg.user_id, leg.journey_leg_id)
+            .await?
+            .unwrap_or(false);
+
+        // Mirrors notify_train_candidates's own tracing::info! on its
+        // candidates -- also the only production (non-test) read of
+        // CommittedLeg::trains_id, which leg_is_skipped itself never needs
+        // (it matches purely by CRS code, not by the shared physical-train
+        // id), so this line is what keeps that field genuinely wired up
+        // rather than dead outside of queries.rs's own tests.
+        tracing::debug!(
+            journey_leg_id = leg.journey_leg_id,
+            trains_id = leg.trains_id,
+            is_skipped,
+            was_skipped,
+            "skip-check leg evaluated"
+        );
+
+        if decision::decide_skip_notification(was_skipped, is_skipped) != decision::NotifyDecision::NotifyNow
+        {
+            continue;
+        }
+
+        let payload = NotificationPayload {
+            title: "A stop on your journey is being skipped".to_string(),
+            body: format!(
+                "Your service between {} and {} is no longer calling at one of those stops today.",
+                leg.origin_crs, leg.destination_crs
+            ),
+            url: format!("/journeys/{}", leg.journey_id),
+            tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
+        };
+
+        if send_to_all_subscriptions(pool, &leg.user_id, &payload, vapid_private_key, vapid_subject).await? {
+            queries::upsert_skip_notification_state(pool, &leg.user_id, leg.journey_leg_id, true, now)
+                .await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -289,6 +422,73 @@ async fn send_to_all_subscriptions(
         }
     }
     Ok(any_ok)
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    fn ctx(total_legs: i64, journey_name: Option<&str>) -> queries::JourneyLegContext {
+        queries::JourneyLegContext {
+            journey_id: 42,
+            journey_name: journey_name.map(str::to_string),
+            leg_order: 2,
+            total_legs,
+            origin_crs: Some("WAV".to_string()),
+            destination_crs: Some("KGX".to_string()),
+        }
+    }
+
+    #[test]
+    fn no_journey_context_falls_back_to_todays_exact_copy() {
+        let payload = build_train_notification_payload(7, "en_route", Some(18), None);
+        assert_eq!(payload.title, "Your train is delayed");
+        assert_eq!(payload.body, "Now running about 18 minutes late.");
+        assert_eq!(payload.url, "/track/7");
+        assert_eq!(payload.tag, "train-7");
+    }
+
+    #[test]
+    fn a_one_leg_journey_also_falls_back_to_todays_exact_copy() {
+        let context = ctx(1, Some("Weekend in Edinburgh"));
+        let payload = build_train_notification_payload(7, "cancelled", None, Some(&context));
+        assert_eq!(payload.title, "Your train was cancelled");
+        assert_eq!(payload.url, "/track/7");
+    }
+
+    #[test]
+    fn a_multi_leg_journey_names_the_leg_and_journey() {
+        let context = ctx(3, Some("Weekend in Edinburgh"));
+        let payload = build_train_notification_payload(7, "en_route", Some(18), Some(&context));
+        assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' is delayed");
+        assert_eq!(payload.body, "WAV to KGX, now running about 18 minutes late.");
+        assert_eq!(payload.url, "/journeys/42");
+        assert_eq!(payload.tag, "train-7");
+    }
+
+    #[test]
+    fn an_unnamed_multi_leg_journey_falls_back_to_a_generic_journey_label() {
+        let context = ctx(2, None);
+        let payload = build_train_notification_payload(7, "en_route", Some(5), Some(&context));
+        assert_eq!(payload.title, "Leg 2 of your journey is delayed");
+    }
+
+    #[test]
+    fn a_multi_leg_cancellation_names_the_route_when_known() {
+        let context = ctx(2, Some("Weekend in Edinburgh"));
+        let payload = build_train_notification_payload(7, "cancelled", None, Some(&context));
+        assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' was cancelled");
+        assert_eq!(payload.body, "The WAV to KGX service was cancelled.");
+    }
+
+    #[test]
+    fn a_multi_leg_journey_with_no_leg_origin_destination_omits_the_route() {
+        let mut context = ctx(2, Some("Weekend in Edinburgh"));
+        context.origin_crs = None;
+        context.destination_crs = None;
+        let payload = build_train_notification_payload(7, "en_route", Some(5), Some(&context));
+        assert_eq!(payload.body, "Now running about 5 minutes late.");
+    }
 }
 
 #[cfg(test)]

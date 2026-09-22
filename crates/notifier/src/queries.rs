@@ -358,6 +358,55 @@ pub async fn upsert_train_notification_state(
 }
 
 #[derive(Debug, sqlx::FromRow)]
+pub struct JourneyLegContext {
+    pub journey_id: i64,
+    pub journey_name: Option<String>,
+    pub leg_order: i32,
+    pub total_legs: i64,
+    pub origin_crs: Option<String>,
+    pub destination_crs: Option<String>,
+}
+
+/// Finds the journey/leg context for a `train_subscriptions.id`, if one
+/// exists -- absent for every legacy tracked train until Phase 1's own
+/// migration wraps it in a one-row journey (§7.1 of the design spec), and
+/// for any train tracked outside the journeys flow, if that path stays
+/// open at all. `notify_train_candidates` falls back to today's exact
+/// copy/URL when this returns `None`, OR when it returns `Some` with
+/// `total_legs == 1` (Judgment Call 5 -- a one-leg journey's notification
+/// copy is indistinguishable in value from today's plain tracked-train
+/// copy, so this plan doesn't change it).
+///
+/// `ORDER BY jl.id LIMIT 1`: a known, accepted edge case -- if the SAME
+/// physical train (`trains_id`) is tracked via two different legs (legal:
+/// `create_subscription_for_train` is idempotent by `(user_id, trains_id)`,
+/// so a second leg pointing at the same trains_id reuses the same
+/// `train_subscriptions` row -- design spec §0.1), this query returns only
+/// the first-created leg's context, so the payload describes only one of
+/// the two legs even though both legs' owners (if different users) are
+/// notified via the existing per-trains_id fan-out. Rare, and no worse
+/// than the ambiguity already inherent in "one physical train, several
+/// subscribers" today.
+pub async fn journey_leg_for_train_subscription(
+    pool: &PgPool,
+    tracked_train_id: i64,
+) -> anyhow::Result<Option<JourneyLegContext>> {
+    let row = sqlx::query_as::<_, JourneyLegContext>(
+        "SELECT j.id AS journey_id, j.custom_name AS journey_name, jl.leg_order, \
+                (SELECT COUNT(*) FROM journey_legs jl2 WHERE jl2.journey_id = jl.journey_id) AS total_legs, \
+                jl.origin_crs, jl.destination_crs \
+         FROM journey_legs jl \
+         JOIN journeys j ON j.id = jl.journey_id \
+         WHERE jl.train_subscription_id = $1 \
+         ORDER BY jl.id LIMIT 1",
+    )
+    .bind(tracked_train_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+#[derive(Debug, sqlx::FromRow)]
 pub struct PushSubscriptionRow {
     pub id: i64,
     pub endpoint: String,
@@ -386,6 +435,133 @@ pub async fn delete_push_subscription(pool: &PgPool, id: i64) -> anyhow::Result<
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// This crate's own copy of `crates/api/src/data/queries.rs`'s
+/// `latest_station_sample` -- necessarily duplicated, not imported, since
+/// `crates/notifier` does not (and per this plan's Global Constraints,
+/// must not) depend on `crates/api`. Same table (`station_samples`,
+/// wholesale-replaced per poll, one row per station, no history), same
+/// "None means no sample for this CRS yet" contract.
+pub async fn station_sample_for_crs(
+    pool: &PgPool,
+    crs: &str,
+) -> anyhow::Result<Option<common::StationSample>> {
+    let row = sqlx::query("SELECT crs, polled_at, departures FROM station_samples WHERE crs = $1")
+        .bind(crs)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let departures_json: serde_json::Value = row.try_get("departures")?;
+    Ok(Some(common::StationSample {
+        crs: row.try_get("crs")?,
+        polled_at: row.try_get("polled_at")?,
+        departures: serde_json::from_value(departures_json)?,
+    }))
+}
+
+pub struct CommittedLeg {
+    pub journey_leg_id: i64,
+    pub journey_id: i64,
+    pub user_id: String,
+    pub origin_crs: String,
+    pub destination_crs: String,
+    pub trains_id: i64,
+    pub pin_destination_crs: Option<String>,
+    pub next_calling_point: Option<String>,
+    pub train_origin_crs: Option<String>,
+}
+
+/// Every leg worth station-skip-checking today: bound to a real train
+/// (`train_subscription_id IS NOT NULL`), resolved to a shared `trains`
+/// row (`ts.trains_id IS NOT NULL` -- an unresolved pin has no departure
+/// board to check against), with a known own origin/destination (§7.1's
+/// nullability correction), on `today` (Judgment Call 3 -- bounds this
+/// full poll to journeys actually happening today, since `station_samples`
+/// is a current-snapshot table with no watermark to diff against). One row
+/// per leg, already carrying everything `skip_check::leg_is_skipped`
+/// (Task 9) needs -- no further per-leg query required.
+pub async fn list_committed_legs_for_today(
+    pool: &PgPool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Vec<CommittedLeg>> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
+                jl.origin_crs, jl.destination_crs, ts.trains_id, \
+                ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
+         FROM journey_legs jl \
+         JOIN journeys j ON j.id = jl.journey_id \
+         JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+         LEFT JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
+         LEFT JOIN trains tr ON tr.id = ts.trains_id \
+         WHERE jl.train_subscription_id IS NOT NULL \
+           AND ts.trains_id IS NOT NULL \
+           AND jl.service_date = $1 \
+           AND jl.origin_crs IS NOT NULL \
+           AND jl.destination_crs IS NOT NULL",
+    )
+    .bind(today)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CommittedLeg {
+                journey_leg_id: row.try_get("journey_leg_id")?,
+                journey_id: row.try_get("journey_id")?,
+                user_id: row.try_get("user_id")?,
+                origin_crs: row.try_get("origin_crs")?,
+                destination_crs: row.try_get("destination_crs")?,
+                trains_id: row.try_get("trains_id")?,
+                pin_destination_crs: row.try_get("pin_destination_crs")?,
+                next_calling_point: row.try_get("next_calling_point")?,
+                train_origin_crs: row.try_get("train_origin_crs")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn skip_notification_state(
+    pool: &PgPool,
+    user_id: &str,
+    journey_leg_id: i64,
+) -> anyhow::Result<Option<bool>> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT last_notified_skipped FROM journey_leg_notification_state \
+         WHERE user_id = $1 AND journey_leg_id = $2",
+    )
+    .bind(user_id)
+    .bind(journey_leg_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(skipped,)| skipped))
+}
+
+pub async fn upsert_skip_notification_state(
+    pool: &PgPool,
+    user_id: &str,
+    journey_leg_id: i64,
+    skipped: bool,
+    at: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO journey_leg_notification_state \
+           (user_id, journey_leg_id, last_notified_skipped, last_notified_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (user_id, journey_leg_id) DO UPDATE SET \
+           last_notified_skipped = EXCLUDED.last_notified_skipped, \
+           last_notified_at = EXCLUDED.last_notified_at",
+    )
+    .bind(user_id)
+    .bind(journey_leg_id)
+    .bind(skipped)
+    .bind(at)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -557,6 +733,146 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup fixture user");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with Phase 1's journeys/journey_legs tables \
+                already migrated; run with `DATABASE_URL=... cargo test -p notifier \
+                list_committed_legs_for_today_finds_a_bound_leg_with_a_live_sample \
+                -- --ignored --test-threads=1`"]
+    async fn list_committed_legs_for_today_finds_a_bound_leg_with_a_live_sample() {
+        let pool = connect().await;
+        let service_date: chrono::NaiveDate = "2026-09-22".parse().unwrap();
+        seed_user(&pool, "TEST-SKIP-LEG-USER").await;
+
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date, origin_crs) \
+             VALUES ('TEST-SKIP-LEG-UID', $1, 'PAD') RETURNING id",
+        )
+        .bind(service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+
+        let tracked_train_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions \
+                (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
+             VALUES ($1, $2, 'RDG', $3, $4, 'resolved') RETURNING id",
+        )
+        .bind("TEST-SKIP-LEG-USER")
+        .bind(service_date)
+        .bind(service_date.and_hms_opt(9, 0, 0).unwrap().and_utc())
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed train_subscriptions row");
+
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind("TEST-SKIP-LEG-USER")
+        .fetch_one(&pool)
+        .await
+        .expect("seed journeys row");
+
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, $3, 'manual') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(service_date)
+        .bind(tracked_train_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_legs row");
+
+        let legs = list_committed_legs_for_today(&pool, service_date)
+            .await
+            .expect("list_committed_legs_for_today");
+        let found = legs
+            .iter()
+            .find(|leg| leg.journey_leg_id == journey_leg_id)
+            .expect("the seeded leg must be returned");
+        assert_eq!(found.origin_crs, "RDG");
+        assert_eq!(found.destination_crs, "WOK");
+        assert_eq!(found.trains_id, trains_id);
+        assert_eq!(found.train_origin_crs.as_deref(), Some("PAD"));
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1").bind(journey_leg_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1").bind(journey_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1").bind(tracked_train_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1").bind(trains_id).execute(&pool).await.ok();
+        cleanup_user_skip(&pool, "TEST-SKIP-LEG-USER").await;
+    }
+
+    async fn cleanup_user_skip(pool: &PgPool, user_id: &str) {
+        sqlx::query("DELETE FROM journey_leg_notification_state WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with Phase 1's journeys/journey_legs tables \
+                already migrated; run with `DATABASE_URL=... cargo test -p notifier \
+                skip_notification_state_round_trips -- --ignored --test-threads=1`"]
+    async fn skip_notification_state_round_trips() {
+        let pool = connect().await;
+        seed_user(&pool, "TEST-SKIP-STATE-USER").await;
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind("TEST-SKIP-STATE-USER")
+        .fetch_one(&pool)
+        .await
+        .expect("seed journeys row");
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', '2026-09-22', 'unmatched') RETURNING id",
+        )
+        .bind(journey_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_legs row");
+
+        assert_eq!(
+            skip_notification_state(&pool, "TEST-SKIP-STATE-USER", journey_leg_id)
+                .await
+                .expect("read before any write"),
+            None
+        );
+
+        let now = Utc::now();
+        upsert_skip_notification_state(&pool, "TEST-SKIP-STATE-USER", journey_leg_id, true, now)
+            .await
+            .expect("first upsert");
+        assert_eq!(
+            skip_notification_state(&pool, "TEST-SKIP-STATE-USER", journey_leg_id)
+                .await
+                .expect("read after first upsert"),
+            Some(true)
+        );
+
+        upsert_skip_notification_state(&pool, "TEST-SKIP-STATE-USER", journey_leg_id, false, now)
+            .await
+            .expect("second upsert (resolved)");
+        assert_eq!(
+            skip_notification_state(&pool, "TEST-SKIP-STATE-USER", journey_leg_id)
+                .await
+                .expect("read after second upsert"),
+            Some(false)
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1").bind(journey_leg_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1").bind(journey_id).execute(&pool).await.ok();
+        cleanup_user_skip(&pool, "TEST-SKIP-STATE-USER").await;
     }
 
     #[tokio::test]

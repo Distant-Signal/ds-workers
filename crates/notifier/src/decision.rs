@@ -88,6 +88,25 @@ pub fn decide_train_notification(previous_rank: u8, new_rank: u8) -> NotifyDecis
     }
 }
 
+/// Escalation-only, same shape as [`decide_train_notification`]: fires the
+/// instant a leg transitions from not-skipped to skipped, never on the
+/// reverse (a skip that later resolves itself does not warrant a second
+/// push -- matching every other de-escalation-is-silent decision in this
+/// module). No cold-start guard, same as [`decide_train_notification`]'s
+/// own documented posture: a leg that's ALREADY skipped the very first
+/// time this notifier ever checks it (no prior
+/// `journey_leg_notification_state` row, so `was_skipped` is `false` by
+/// convention -- see `crates/notifier/src/queries.rs`'s
+/// `skip_notification_state`) still notifies once immediately, the same
+/// way "a newly tracked already-delayed train does notify once."
+pub fn decide_skip_notification(was_skipped: bool, is_skipped: bool) -> NotifyDecision {
+    if is_skipped && !was_skipped {
+        NotifyDecision::NotifyNow
+    } else {
+        NotifyDecision::Skip
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +214,38 @@ mod tests {
         // (no prior train_notification_state row) is the correct baseline,
         // not a skip.
         assert_eq!(decide_train_notification(0, 1), NotifyDecision::NotifyNow);
+    }
+}
+
+#[cfg(test)]
+mod skip_notification_tests {
+    use super::*;
+
+    #[test]
+    fn not_skipped_to_skipped_notifies() {
+        assert_eq!(decide_skip_notification(false, true), NotifyDecision::NotifyNow);
+    }
+
+    #[test]
+    fn skipped_to_not_skipped_does_not_notify() {
+        assert_eq!(decide_skip_notification(true, false), NotifyDecision::Skip);
+    }
+
+    #[test]
+    fn staying_skipped_does_not_re_notify() {
+        assert_eq!(decide_skip_notification(true, true), NotifyDecision::Skip);
+    }
+
+    #[test]
+    fn staying_not_skipped_does_not_notify() {
+        assert_eq!(decide_skip_notification(false, false), NotifyDecision::Skip);
+    }
+
+    #[test]
+    fn a_leg_already_skipped_on_first_ever_check_notifies_once() {
+        // Status note mirroring decide_train_notification's own equivalent
+        // test: no cold-start guard -- was_skipped=false (no prior state
+        // row) is the correct baseline, not a skip.
+        assert_eq!(decide_skip_notification(false, true), NotifyDecision::NotifyNow);
     }
 }

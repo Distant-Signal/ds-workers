@@ -33,6 +33,16 @@ pub struct Config {
     #[arg(long, env, default_value_t = 15)]
     pub forward_queue_poll_interval_secs: u64,
 
+    /// Cadence for the station-skip check (Task 9, §5.2) -- an independent
+    /// full poll every interval, NOT cursor/watermark-based like the other
+    /// two cycles, because `station_samples` is a wholesale-replaced
+    /// current snapshot with no append log to diff against (see this
+    /// plan's Architecture section). A reasonable-sounding, not
+    /// load-tested figure -- same "revisit with real usage" posture this
+    /// crate's other interval constants are already flagged with.
+    #[arg(long, env, default_value_t = 90)]
+    pub skip_check_poll_interval_secs: u64,
+
     /// VAPID keys, PEM-encoded EC private key (`openssl ecparam -genkey
     /// -name prime256v1`) and the matching uncompressed public key --
     /// wired into web-push's VapidSignatureBuilder in Task 6. Fails fast
