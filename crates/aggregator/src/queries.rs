@@ -3231,7 +3231,7 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 prune_schedule_destination_departures -- --ignored --test-threads=1`"]
     async fn prune_schedule_destination_departures_deletes_only_rows_older_than_the_retention_window()
-    {
+     {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();

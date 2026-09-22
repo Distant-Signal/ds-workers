@@ -799,10 +799,26 @@ mod tests {
         assert_eq!(found.trains_id, trains_id);
         assert_eq!(found.train_origin_crs.as_deref(), Some("PAD"));
 
-        sqlx::query("DELETE FROM journey_legs WHERE id = $1").bind(journey_leg_id).execute(&pool).await.ok();
-        sqlx::query("DELETE FROM journeys WHERE id = $1").bind(journey_id).execute(&pool).await.ok();
-        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1").bind(tracked_train_id).execute(&pool).await.ok();
-        sqlx::query("DELETE FROM trains WHERE id = $1").bind(trains_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(tracked_train_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
         cleanup_user_skip(&pool, "TEST-SKIP-LEG-USER").await;
     }
 
@@ -870,8 +886,16 @@ mod tests {
             Some(false)
         );
 
-        sqlx::query("DELETE FROM journey_legs WHERE id = $1").bind(journey_leg_id).execute(&pool).await.ok();
-        sqlx::query("DELETE FROM journeys WHERE id = $1").bind(journey_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
         cleanup_user_skip(&pool, "TEST-SKIP-STATE-USER").await;
     }
 

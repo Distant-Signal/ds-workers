@@ -253,7 +253,9 @@ fn build_train_notification_payload(
                 "Your train is delayed".to_string()
             },
             body: match delay_minutes {
-                Some(minutes) if !is_cancelled => format!("Now running about {minutes} minutes late."),
+                Some(minutes) if !is_cancelled => {
+                    format!("Now running about {minutes} minutes late.")
+                }
                 _ => "Check the latest status.".to_string(),
             },
             url: format!("/track/{tracked_train_id}"),
@@ -353,7 +355,8 @@ async fn run_skip_check_cycle(
             "skip-check leg evaluated"
         );
 
-        if decision::decide_skip_notification(was_skipped, is_skipped) != decision::NotifyDecision::NotifyNow
+        if decision::decide_skip_notification(was_skipped, is_skipped)
+            != decision::NotifyDecision::NotifyNow
         {
             continue;
         }
@@ -368,9 +371,23 @@ async fn run_skip_check_cycle(
             tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
         };
 
-        if send_to_all_subscriptions(pool, &leg.user_id, &payload, vapid_private_key, vapid_subject).await? {
-            queries::upsert_skip_notification_state(pool, &leg.user_id, leg.journey_leg_id, true, now)
-                .await?;
+        if send_to_all_subscriptions(
+            pool,
+            &leg.user_id,
+            &payload,
+            vapid_private_key,
+            vapid_subject,
+        )
+        .await?
+        {
+            queries::upsert_skip_notification_state(
+                pool,
+                &leg.user_id,
+                leg.journey_leg_id,
+                true,
+                now,
+            )
+            .await?;
         }
     }
 
@@ -461,7 +478,10 @@ mod copy_tests {
         let context = ctx(3, Some("Weekend in Edinburgh"));
         let payload = build_train_notification_payload(7, "en_route", Some(18), Some(&context));
         assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' is delayed");
-        assert_eq!(payload.body, "WAV to KGX, now running about 18 minutes late.");
+        assert_eq!(
+            payload.body,
+            "WAV to KGX, now running about 18 minutes late."
+        );
         assert_eq!(payload.url, "/journeys/42");
         assert_eq!(payload.tag, "train-7");
     }
@@ -477,7 +497,10 @@ mod copy_tests {
     fn a_multi_leg_cancellation_names_the_route_when_known() {
         let context = ctx(2, Some("Weekend in Edinburgh"));
         let payload = build_train_notification_payload(7, "cancelled", None, Some(&context));
-        assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' was cancelled");
+        assert_eq!(
+            payload.title,
+            "Leg 2 of 'Weekend in Edinburgh' was cancelled"
+        );
         assert_eq!(payload.body, "The WAV to KGX service was cancelled.");
     }
 

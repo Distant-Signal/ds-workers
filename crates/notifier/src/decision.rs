@@ -223,7 +223,10 @@ mod skip_notification_tests {
 
     #[test]
     fn not_skipped_to_skipped_notifies() {
-        assert_eq!(decide_skip_notification(false, true), NotifyDecision::NotifyNow);
+        assert_eq!(
+            decide_skip_notification(false, true),
+            NotifyDecision::NotifyNow
+        );
     }
 
     #[test]
@@ -246,6 +249,9 @@ mod skip_notification_tests {
         // Status note mirroring decide_train_notification's own equivalent
         // test: no cold-start guard -- was_skipped=false (no prior state
         // row) is the correct baseline, not a skip.
-        assert_eq!(decide_skip_notification(false, true), NotifyDecision::NotifyNow);
+        assert_eq!(
+            decide_skip_notification(false, true),
+            NotifyDecision::NotifyNow
+        );
     }
 }
