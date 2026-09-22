@@ -1524,6 +1524,8 @@ mod tests {
             },
             headcode: None,
             skipped_stations: vec![],
+            platform: None,
+            planned_platform: None,
         }
     }
 

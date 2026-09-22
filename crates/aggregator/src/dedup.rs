@@ -243,6 +243,8 @@ mod tests {
             delay_reason: None,
             headcode: None,
             skipped_stations: vec![],
+            platform: None,
+            planned_platform: None,
         }
     }
 
