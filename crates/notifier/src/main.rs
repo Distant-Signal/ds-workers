@@ -11,7 +11,7 @@ mod skip_check;
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use config::Config;
 use send::{NotificationPayload, SendOutcome, send_to_subscription};
@@ -53,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::interval(Duration::from_secs(config.forward_queue_poll_interval_secs));
     let mut skip_check_interval =
         tokio::time::interval(Duration::from_secs(config.skip_check_poll_interval_secs));
+    let mut template_sweep_interval = tokio::time::interval(Duration::from_secs(
+        config.template_sweep_poll_interval_secs,
+    ));
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -89,6 +92,18 @@ async fn main() -> anyhow::Result<()> {
                 .await;
                 if let Err(err) = result {
                     tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
+                }
+            }
+            _ = template_sweep_interval.tick() => {
+                let result = run_template_sweep_cycle(
+                    &pool,
+                    config.auto_commit_lead_minutes,
+                    &config.vapid_private_key,
+                    &config.vapid_subject,
+                )
+                .await;
+                if let Err(err) = result {
+                    tracing::error!(error = ?err, "notifier template-sweep cycle failed; will retry next interval");
                 }
             }
         }
@@ -394,6 +409,149 @@ async fn run_skip_check_cycle(
     Ok(())
 }
 
+/// The recurring-journey materialization sweep's own cycle (Task 4/5,
+/// spec §3.1-3.2). "Today" is a plain Europe/London calendar date (see
+/// this plan's Architecture section for why not a rail day) -- computed
+/// once per tick and used for both stages.
+async fn run_template_sweep_cycle(
+    pool: &PgPool,
+    auto_commit_lead_minutes: i64,
+    vapid_private_key: &str,
+    vapid_subject: &str,
+) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
+
+    // --- Stage 1: mint due occurrences ---
+    for template in queries::due_templates_for(pool, today).await? {
+        match queries::materialize_due_template_occurrence(
+            pool,
+            template.id,
+            &template.user_id,
+            template.custom_name.as_deref(),
+            today,
+        )
+        .await
+        {
+            Ok(Some(journey_id)) => {
+                tracing::info!(
+                    template_id = template.id,
+                    journey_id,
+                    "materialized today's occurrence"
+                );
+            }
+            Ok(None) => {} // already materialized this cycle or a prior one today
+            Err(err) => {
+                tracing::error!(error = ?err, template_id = template.id, "failed to materialize template occurrence; will retry next cycle");
+            }
+        }
+    }
+
+    // --- Stage 2: commit-check due unmatched auto legs ---
+    for leg in queries::unmatched_auto_legs_for_commit_check(pool, today).await? {
+        let Some(earliest_bound) = leg.depart_after.or(leg.arrive_after) else {
+            continue; // guarded by the query's own WHERE, defensive only
+        };
+        let Some(earliest_bound_utc) = london_to_utc(leg.service_date.and_time(earliest_bound))
+        else {
+            continue; // nonexistent local time (spring-forward gap) -- best-effort, skip this tick
+        };
+        if !decision::is_due_for_commit_check(now, earliest_bound_utc, auto_commit_lead_minutes) {
+            continue;
+        }
+
+        let candidates = queries::schedule_candidates_for_leg(
+            pool,
+            &leg.origin_crs,
+            &leg.destination_crs,
+            leg.service_date,
+            leg.depart_after,
+            leg.depart_before,
+            leg.arrive_after,
+            leg.arrive_before,
+        )
+        .await?;
+
+        if candidates.is_empty() {
+            let already_notified =
+                queries::unmatched_notification_state(pool, &leg.user_id, leg.journey_leg_id)
+                    .await?
+                    .unwrap_or(false);
+            if decision::decide_unmatched_notification(already_notified)
+                != decision::NotifyDecision::NotifyNow
+            {
+                continue;
+            }
+            let payload = NotificationPayload {
+                title: "Your recurring journey needs attention".to_string(),
+                body: format!(
+                    "No {} to {} service was found for today within your usual window.",
+                    leg.origin_crs, leg.destination_crs
+                ),
+                url: format!("/journeys/{}", leg.journey_id),
+                tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+            };
+            if send_to_all_subscriptions(
+                pool,
+                &leg.user_id,
+                &payload,
+                vapid_private_key,
+                vapid_subject,
+            )
+            .await?
+            {
+                queries::upsert_unmatched_notification_state(
+                    pool,
+                    &leg.user_id,
+                    leg.journey_leg_id,
+                    now,
+                )
+                .await?;
+            }
+            continue;
+        }
+
+        let now_local = now.with_timezone(&chrono_tz::Europe::London).time();
+        let scheduled_times: Vec<chrono::NaiveTime> = candidates.iter().map(|(_, t)| *t).collect();
+        let Some(winner_idx) = decision::pick_nearest_to_now_candidate(&scheduled_times, now_local)
+        else {
+            continue; // unreachable given the is_empty() check above, defensive only
+        };
+        let (train_uid, _) = &candidates[winner_idx];
+
+        let trains_id = queries::find_or_create_train(pool, train_uid, leg.service_date).await?;
+        let tracking_id =
+            queries::create_subscription_for_train(pool, trains_id, &leg.user_id).await?;
+        if !queries::commit_leg_to_train(pool, leg.journey_leg_id, tracking_id).await? {
+            tracing::warn!(
+                journey_leg_id = leg.journey_leg_id,
+                "leg was committed by a concurrent tick before this one finished; skipping"
+            );
+        } else {
+            tracing::info!(
+                journey_leg_id = leg.journey_leg_id,
+                train_uid,
+                "auto-committed leg to nearest-to-now candidate"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolves a service_date + local wall-clock TIME to the UTC instant it
+/// names -- same `LocalResult` handling as
+/// `crates/api::data::eta_blend::london_to_utc` (duplicated, per this
+/// crate's crate-boundary constraint; that one is `pub(crate)` and
+/// unreachable from here anyway).
+fn london_to_utc(naive: chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
+    match chrono_tz::Europe::London.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
+        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&Utc)),
+        chrono::LocalResult::None => None,
+    }
+}
+
 async fn current_train_state(
     pool: &PgPool,
     trains_id: i64,
@@ -673,5 +831,314 @@ mod db_tests {
         );
 
         cleanup(&pool, user_id, line_id).await;
+    }
+}
+
+#[cfg(test)]
+mod sweep_cycle_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn connect() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres")
+    }
+
+    async fn seed_user(pool: &PgPool, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@example.com"))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed fixture user");
+    }
+
+    async fn cleanup_user(pool: &PgPool, user_id: &str) {
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Today's own Europe/London calendar date -- must match exactly what
+    /// `run_template_sweep_cycle` itself computes (see that function's own
+    /// doc comment), so a seeded template's `days_of_week` bit and a seeded
+    /// leg's/schedule row's `service_date` actually line up with what the
+    /// cycle looks for as "today" when these tests run for real.
+    fn today_london() -> chrono::NaiveDate {
+        Utc::now()
+            .with_timezone(&chrono_tz::Europe::London)
+            .date_naive()
+    }
+
+    /// End-to-end: seeds one `'auto'`-mode template + one template leg + a
+    /// published `schedule_destination_departures` row inside the (very
+    /// generous, so this test is not time-of-day-dependent) lead window,
+    /// runs `run_template_sweep_cycle` once, and asserts BOTH stages fired
+    /// in that same tick -- a `journeys` row was minted (stage 1) AND its
+    /// leg was auto-committed to the seeded train (stage 2). A second run
+    /// must mint no second journey and must not re-commit the leg to a
+    /// different `train_subscription_id`.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                run_template_sweep_cycle_mints_and_auto_commits_then_is_idempotent \
+                -- --ignored --test-threads=1`"]
+    async fn run_template_sweep_cycle_mints_and_auto_commits_then_is_idempotent() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-CYCLE-COMMIT-USER";
+        let train_uid = "TEST-SWEEP-CYCLE-COMMIT-UID";
+        seed_user(&pool, user_id).await;
+        let today = today_london();
+
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode, days_of_week, active) \
+             VALUES ($1, 'E2E Auto Template', 'auto', $2, TRUE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(decision::weekday_bit(today))
+        .fetch_one(&pool)
+        .await
+        .expect("seed template");
+
+        sqlx::query(
+            "INSERT INTO journey_template_legs \
+                (template_id, leg_order, origin_crs, destination_crs, depart_after) \
+             VALUES ($1, 1, 'RDG', 'WOK', '00:00:00')",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed template leg");
+
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, train_uid, origin_crs) \
+             VALUES ($1, 'WOK', '09:05:00', $2, 'RDG')",
+        )
+        .bind(today)
+        .bind(train_uid)
+        .execute(&pool)
+        .await
+        .expect("seed published schedule row");
+
+        run_template_sweep_cycle(
+            &pool,
+            1440, // generous lead window -- a seeded 00:00:00 depart_after is always "due" by the time this test runs
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("first run_template_sweep_cycle must succeed");
+
+        let journey_id: i64 =
+            sqlx::query_scalar("SELECT id FROM journeys WHERE source_template_id = $1")
+                .bind(template_id)
+                .fetch_one(&pool)
+                .await
+                .expect("a journey must have been minted for this template in the first run");
+
+        let (match_mode, train_subscription_id): (String, Option<i64>) = sqlx::query_as(
+            "SELECT match_mode, train_subscription_id FROM journey_legs WHERE journey_id = $1",
+        )
+        .bind(journey_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the minted leg must exist");
+        assert_eq!(
+            match_mode, "auto",
+            "the leg must have been auto-committed in the SAME tick as its own minting"
+        );
+        let train_subscription_id =
+            train_subscription_id.expect("a train_subscription_id must be set on auto-commit");
+
+        run_template_sweep_cycle(
+            &pool,
+            1440,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("second run_template_sweep_cycle must also succeed");
+
+        let journeys_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM journeys WHERE source_template_id = $1")
+                .bind(template_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count journeys after replay");
+        assert_eq!(
+            journeys_count, 1,
+            "a replay with the occurrence already materialized must not mint a second journey"
+        );
+
+        let (match_mode_after, train_subscription_id_after): (String, Option<i64>) =
+            sqlx::query_as(
+                "SELECT match_mode, train_subscription_id FROM journey_legs WHERE journey_id = $1",
+            )
+            .bind(journey_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the leg must still exist after replay");
+        assert_eq!(match_mode_after, "auto");
+        assert_eq!(
+            train_subscription_id_after,
+            Some(train_subscription_id),
+            "a replay of an already-committed leg must not re-commit it to a different train_subscription_id"
+        );
+
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_legs + journey_leg_notification_state
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(train_subscription_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE train_uid = $1")
+            .bind(train_uid)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid = $1")
+            .bind(train_uid)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_template_legs
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// End-to-end: seeds one `'auto'`-mode template + one template leg, and
+    /// deliberately publishes ZERO `schedule_destination_departures` rows
+    /// for that route/date. Runs `run_template_sweep_cycle` once, asserts
+    /// the "needs attention" notification's DB side effect
+    /// (`journey_leg_notification_state.last_notified_unmatched`) was
+    /// written exactly once, then runs it again and asserts
+    /// `last_notified_unmatched_at` is byte-for-byte unchanged -- the
+    /// escalation-only, no-re-fire behavior `decision::decide_unmatched_notification`
+    /// implements.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                run_template_sweep_cycle_notifies_once_on_zero_candidates_and_does_not_renotify \
+                -- --ignored --test-threads=1`"]
+    async fn run_template_sweep_cycle_notifies_once_on_zero_candidates_and_does_not_renotify() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-CYCLE-UNMATCHED-USER";
+        seed_user(&pool, user_id).await;
+        let today = today_london();
+
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode, days_of_week, active) \
+             VALUES ($1, 'E2E Unmatched Template', 'auto', $2, TRUE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(decision::weekday_bit(today))
+        .fetch_one(&pool)
+        .await
+        .expect("seed template");
+
+        sqlx::query(
+            "INSERT INTO journey_template_legs \
+                (template_id, leg_order, origin_crs, destination_crs, depart_after) \
+             VALUES ($1, 1, 'RDG', 'WOK', '00:00:00')",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed template leg");
+
+        // Deliberately zero schedule_destination_departures rows for this
+        // route/date -- this is the "genuinely nothing published" case
+        // this test exercises.
+
+        run_template_sweep_cycle(
+            &pool,
+            1440,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("first run_template_sweep_cycle must succeed");
+
+        let journey_id: i64 =
+            sqlx::query_scalar("SELECT id FROM journeys WHERE source_template_id = $1")
+                .bind(template_id)
+                .fetch_one(&pool)
+                .await
+                .expect("a journey must have been minted for this template in the first run");
+        let journey_leg_id: i64 =
+            sqlx::query_scalar("SELECT id FROM journey_legs WHERE journey_id = $1")
+                .bind(journey_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the minted leg must exist");
+
+        let (last_notified_unmatched, last_notified_unmatched_at): (
+            Option<bool>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT last_notified_unmatched, last_notified_unmatched_at \
+             FROM journey_leg_notification_state WHERE user_id = $1 AND journey_leg_id = $2",
+        )
+        .bind(user_id)
+        .bind(journey_leg_id)
+        .fetch_one(&pool)
+        .await
+        .expect("a notification_state row must exist after the first run's zero-candidate branch");
+        assert_eq!(last_notified_unmatched, Some(true));
+        let first_at = last_notified_unmatched_at.expect("last_notified_unmatched_at must be set");
+
+        run_template_sweep_cycle(
+            &pool,
+            1440,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("second run_template_sweep_cycle must also succeed");
+
+        let (_, last_notified_unmatched_at_after): (Option<bool>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT last_notified_unmatched, last_notified_unmatched_at \
+                 FROM journey_leg_notification_state WHERE user_id = $1 AND journey_leg_id = $2",
+            )
+            .bind(user_id)
+            .bind(journey_leg_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the notification_state row must still exist after replay");
+        assert_eq!(
+            last_notified_unmatched_at_after,
+            Some(first_at),
+            "a second run within the same window must not re-write last_notified_unmatched_at"
+        );
+
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_legs + journey_leg_notification_state
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_template_legs
+        cleanup_user(&pool, user_id).await;
     }
 }

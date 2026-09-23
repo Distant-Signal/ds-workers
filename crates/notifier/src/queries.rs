@@ -565,6 +565,425 @@ pub async fn upsert_skip_notification_state(
     Ok(())
 }
 
+/// One due template's `journeys`/`journey_legs` row(s), minted idempotently.
+/// Deliberately duplicates the shape of Phase B's own
+/// `crates/api/src/data/journey_templates.rs::materialize_template` --
+/// per `crates/notifier`'s hard "never depend on crates/api" constraint,
+/// this crate cannot import that function and must keep its own copy of
+/// the same INSERT shapes instead. This function's SQL has since been
+/// diffed against Phase B's real `materialize_template` (once by the
+/// controller running this branch's SDD process, again independently by
+/// the final-review reviewer): no divergence was found in the INSERT
+/// column shapes.
+///
+/// One deliberate difference IS worth stating explicitly rather than
+/// leaving implicit: the real `materialize_template` has NO idempotency
+/// guard at all -- it mints unconditionally every time it's called,
+/// because a human pressing "Run now" twice for the same date is a
+/// legitimate, supported case there. THIS function's own `WHERE NOT
+/// EXISTS` guard below is a deliberate, necessary addition on top of that
+/// shared shape -- the sweep calling this on an hourly, unattended timer
+/// needs the guard that the manual, attended "Run now" route intentionally
+/// does not have.
+///
+/// Every leg is minted `'unmatched'` regardless of the template's
+/// `default_match_mode` -- `'auto'`-vs-`'manual'` behavior is entirely this
+/// crate's stage-2 commit-check's job (see `unmatched_auto_legs_for_commit_check`
+/// below), never decided at mint time (spec §3.2's own 2026-09-22 addendum:
+/// this is the whole point of the two-stage split).
+///
+/// Idempotency: the INSERT's own `WHERE NOT EXISTS` guard, single
+/// statement, same idiom as `find_or_create_train`'s `ON CONFLICT DO UPDATE
+/// ... RETURNING` and `create_subscription_for_train`'s CTE -- safe under
+/// this crate's normal single-process sequential-tick execution; a true
+/// concurrent double-mint is the same accepted, documented residual race
+/// `create_subscription_for_train`'s own doc comment already names for this
+/// codebase ("closes the ordinary repeat case, not a true concurrent
+/// double-submit").
+///
+/// Returns `Ok(None)` if this template already has an occurrence for
+/// `today` (no-op, not an error) or if the template has zero legs (should
+/// be unreachable given Phase B's own validation, but defensively a no-op
+/// rather than a partially-minted journey).
+///
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 1) --
+/// also exercised directly by this module's own `sweep_tests`.
+pub async fn materialize_due_template_occurrence(
+    pool: &PgPool,
+    template_id: i64,
+    user_id: &str,
+    custom_name: Option<&str>,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Option<i64>> {
+    #[allow(clippy::type_complexity)]
+    let legs: Vec<(
+        i32,
+        Option<String>,
+        Option<String>,
+        Option<chrono::NaiveTime>,
+        Option<chrono::NaiveTime>,
+        Option<chrono::NaiveTime>,
+        Option<chrono::NaiveTime>,
+    )> = sqlx::query_as(
+        "SELECT leg_order, origin_crs, destination_crs, depart_after, depart_before, \
+                arrive_after, arrive_before \
+         FROM journey_template_legs WHERE template_id = $1 ORDER BY leg_order",
+    )
+    .bind(template_id)
+    .fetch_all(pool)
+    .await?;
+    if legs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut tx = pool.begin().await?;
+    let journey_id: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO journeys (user_id, custom_name, source_template_id) \
+         SELECT $1, $2, $3 \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM journeys j JOIN journey_legs jl ON jl.journey_id = j.id \
+             WHERE j.source_template_id = $3 AND jl.service_date = $4 \
+         ) \
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(custom_name)
+    .bind(template_id)
+    .bind(today)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(journey_id) = journey_id else {
+        tx.rollback().await?;
+        return Ok(None); // already materialized today -- idempotent no-op
+    };
+
+    for (
+        leg_order,
+        origin_crs,
+        destination_crs,
+        depart_after,
+        depart_before,
+        arrive_after,
+        arrive_before,
+    ) in legs
+    {
+        sqlx::query(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, \
+                 depart_after, depart_before, arrive_after, arrive_before, match_mode) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unmatched')",
+        )
+        .bind(journey_id)
+        .bind(leg_order)
+        .bind(origin_crs)
+        .bind(destination_crs)
+        .bind(today)
+        .bind(depart_after)
+        .bind(depart_before)
+        .bind(arrive_after)
+        .bind(arrive_before)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(journey_id))
+}
+
+/// Every active template due to materialize `today` -- active, today's
+/// weekday bit set, today within [starts_on, ends_on]. Does NOT itself
+/// check the idempotency guard (that's `materialize_due_template_occurrence`'s
+/// own job, per-template) -- this just narrows the sweep's per-tick
+/// candidate set. `days_of_week IS NULL` (a one-shot, non-recurring
+/// template, spec §2.2) is correctly excluded by the AND below (NULL &
+/// anything is NULL, never non-zero).
+///
+/// This struct and `due_templates_for` below are called from `main.rs`'s
+/// `run_template_sweep_cycle` (Task 5, stage 1) -- also exercised directly
+/// by this module's own `sweep_tests`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct DueTemplate {
+    pub id: i64,
+    pub user_id: String,
+    pub custom_name: Option<String>,
+}
+
+pub async fn due_templates_for(
+    pool: &PgPool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Vec<DueTemplate>> {
+    let rows = sqlx::query_as::<_, DueTemplate>(
+        "SELECT id, user_id, custom_name FROM journey_templates \
+         WHERE active \
+           AND days_of_week IS NOT NULL \
+           AND (days_of_week & (1 << (EXTRACT(ISODOW FROM $1::date)::int - 1))) != 0 \
+           AND $1::date >= COALESCE(starts_on, $1::date) \
+           AND $1::date <= COALESCE(ends_on, $1::date)",
+    )
+    .bind(today)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// A leg eligible for this cycle's commit-check -- `'unmatched'`,
+/// `service_date = today`, belonging to a journey whose source template
+/// has `default_match_mode = 'auto'` AND is still `active` -- a paused
+/// template (`active = false`) must not have its already-minted legs
+/// auto-committed just because the user paused it after today's occurrence
+/// was already stamped; see this module's own
+/// `unmatched_auto_legs_for_commit_check_excludes_paused_templates` test.
+/// Does NOT itself apply the `auto_commit_lead_minutes` lead-time gate
+/// (see `decision::is_due_for_commit_check`, applied per-row by the caller
+/// in Task 5) -- keeping that check in Rust, not SQL, keeps it
+/// unit-testable in isolation (Task 1) without a DB.
+///
+/// This struct and `unmatched_auto_legs_for_commit_check` below are called
+/// from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) -- also
+/// exercised directly by this module's own `sweep_tests`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct CommitCheckLeg {
+    pub journey_leg_id: i64,
+    pub journey_id: i64,
+    pub user_id: String,
+    pub origin_crs: String,
+    pub destination_crs: String,
+    pub service_date: chrono::NaiveDate,
+    pub depart_after: Option<chrono::NaiveTime>,
+    pub depart_before: Option<chrono::NaiveTime>,
+    pub arrive_after: Option<chrono::NaiveTime>,
+    pub arrive_before: Option<chrono::NaiveTime>,
+}
+
+pub async fn unmatched_auto_legs_for_commit_check(
+    pool: &PgPool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Vec<CommitCheckLeg>> {
+    let rows = sqlx::query_as::<_, CommitCheckLeg>(
+        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
+                jl.origin_crs, jl.destination_crs, jl.service_date, \
+                jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before \
+         FROM journey_legs jl \
+         JOIN journeys j ON j.id = jl.journey_id \
+         JOIN journey_templates jt ON jt.id = j.source_template_id \
+         WHERE jl.match_mode = 'unmatched' \
+           AND jl.service_date = $1 \
+           AND jt.default_match_mode = 'auto' \
+           AND jt.active \
+           AND jl.origin_crs IS NOT NULL \
+           AND jl.destination_crs IS NOT NULL \
+           AND (jl.depart_after IS NOT NULL OR jl.arrive_after IS NOT NULL)",
+    )
+    .bind(today)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// One `(train_uid, scheduled departure at the leg's own origin)`
+/// candidate. A deliberately slimmed sibling of
+/// `crates/api::data::queries::search_journey_leg_candidates` -- drops
+/// that function's cursor pagination and leg-destination-arrival
+/// subqueries (this stage only needs enough to pick a train, never
+/// renders a candidate to a human), keeps its WHERE-clause reachability
+/// logic (a candidate's route must actually call at `destination_crs`
+/// after `origin_crs`) and window-bound logic verbatim, duplicated per
+/// this crate's established crate-boundary constraint. `LIMIT 100` is a
+/// safety cap, not true pagination -- this crate never needs a second
+/// page.
+///
+/// `#[allow(clippy::too_many_arguments)]`: same eight-argument shape as
+/// the real `search_journey_leg_candidates` this duplicates (that
+/// function carries the same allow, plus `clippy::type_complexity` for
+/// its wider return type, which this slimmed version doesn't need).
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
+/// also exercised directly by this module's own `sweep_tests`.
+#[allow(clippy::too_many_arguments)]
+pub async fn schedule_candidates_for_leg(
+    pool: &PgPool,
+    origin_crs: &str,
+    destination_crs: &str,
+    service_date: chrono::NaiveDate,
+    depart_after: Option<chrono::NaiveTime>,
+    depart_before: Option<chrono::NaiveTime>,
+    arrive_after: Option<chrono::NaiveTime>,
+    arrive_before: Option<chrono::NaiveTime>,
+) -> anyhow::Result<Vec<(String, chrono::NaiveTime)>> {
+    let rows: Vec<(String, chrono::NaiveTime)> = sqlx::query_as(
+        "SELECT main.train_uid, main.scheduled \
+         FROM schedule_destination_departures main \
+         WHERE main.service_date = $1 \
+           AND main.origin_crs = $2 \
+           AND ($3::time IS NULL OR main.scheduled >= $3) \
+           AND ($4::time IS NULL OR main.scheduled <= $4) \
+           AND ( \
+                 main.destination_crs = $5 \
+                 OR EXISTS ( \
+                     SELECT 1 FROM schedule_destination_departures stop \
+                     WHERE stop.service_date = $1 AND stop.train_uid = main.train_uid \
+                       AND stop.origin_crs = $5 \
+                       AND (stop.day_offset, stop.scheduled) > (main.day_offset, main.scheduled) \
+                 ) \
+           ) \
+           AND ( \
+                 ($6::time IS NULL AND $7::time IS NULL) \
+                 OR ( \
+                     main.destination_crs = $5 \
+                     AND ($6::time IS NULL OR main.destination_arrival >= $6) \
+                     AND ($7::time IS NULL OR main.destination_arrival <= $7) \
+                 ) \
+                 OR EXISTS ( \
+                     SELECT 1 FROM schedule_destination_departures stop \
+                     WHERE stop.service_date = $1 AND stop.train_uid = main.train_uid \
+                       AND stop.origin_crs = $5 \
+                       AND (stop.day_offset, stop.scheduled) > (main.day_offset, main.scheduled) \
+                       AND ($6::time IS NULL OR stop.calling_point_arrival >= $6) \
+                       AND ($7::time IS NULL OR stop.calling_point_arrival <= $7) \
+                 ) \
+           ) \
+         ORDER BY main.scheduled, main.train_uid \
+         LIMIT 100",
+    )
+    .bind(service_date)
+    .bind(origin_crs)
+    .bind(depart_after)
+    .bind(depart_before)
+    .bind(destination_crs)
+    .bind(arrive_after)
+    .bind(arrive_before)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Duplicates `crates/api::data::trains::find_or_create_train` --
+/// necessarily, per this crate's crate-boundary constraint. Keep this in
+/// sync with that function's exact ON CONFLICT shape if it ever changes.
+///
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
+/// also exercised directly by this module's own `sweep_tests`.
+pub async fn find_or_create_train(
+    pool: &PgPool,
+    train_uid: &str,
+    service_date: chrono::NaiveDate,
+) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO trains (train_uid, service_date) VALUES ($1, $2) \
+         ON CONFLICT (train_uid, service_date) DO UPDATE SET train_uid = EXCLUDED.train_uid \
+         RETURNING id",
+    )
+    .bind(train_uid)
+    .bind(service_date)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Duplicates `crates/api::data::train_tracking::create_subscription_for_train`
+/// -- same CTE idempotency idiom, same accepted "ordinary repeat case
+/// only" concurrency caveat as the original's own doc comment states.
+///
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
+/// also exercised directly by this module's own `sweep_tests`.
+pub async fn create_subscription_for_train(
+    pool: &PgPool,
+    trains_id: i64,
+    user_id: &str,
+) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "WITH existing AS ( \
+             SELECT id FROM train_subscriptions \
+             WHERE user_id = $1 AND trains_id = $2 ORDER BY id LIMIT 1 \
+         ), inserted AS ( \
+             INSERT INTO train_subscriptions \
+                 (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure, pin_destination_crs) \
+             SELECT $1, tr.id, tr.service_date, tr.origin_crs, tr.scheduled_departure, tr.destination_crs \
+             FROM trains tr WHERE tr.id = $2 AND NOT EXISTS (SELECT 1 FROM existing) \
+             RETURNING id \
+         ) \
+         SELECT id FROM existing UNION ALL SELECT id FROM inserted",
+    )
+    .bind(user_id)
+    .bind(trains_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Commits a leg to a train working -- the auto-commit sibling of
+/// `crates/api::data::journeys::set_leg_train_subscription`, but sets
+/// `match_mode = 'auto'` (never `'manual'`) and is guarded by `AND
+/// match_mode = 'unmatched'` so a leg already committed by a concurrent
+/// tick (or since raced-and-lost) is a silent no-op, not a double write.
+///
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
+/// also exercised directly by this module's own `sweep_tests`.
+pub async fn commit_leg_to_train(
+    pool: &PgPool,
+    journey_leg_id: i64,
+    train_subscription_id: i64,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE journey_legs SET train_subscription_id = $1, match_mode = 'auto' \
+         WHERE id = $2 AND match_mode = 'unmatched'",
+    )
+    .bind(train_subscription_id)
+    .bind(journey_leg_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
+/// also exercised directly by this module's own `sweep_tests`.
+pub async fn unmatched_notification_state(
+    pool: &PgPool,
+    user_id: &str,
+    journey_leg_id: i64,
+) -> anyhow::Result<Option<bool>> {
+    let row: Option<(Option<bool>,)> = sqlx::query_as(
+        "SELECT last_notified_unmatched FROM journey_leg_notification_state \
+         WHERE user_id = $1 AND journey_leg_id = $2",
+    )
+    .bind(user_id)
+    .bind(journey_leg_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(v,)| v))
+}
+
+/// Only touches the two unmatched-specific columns on conflict -- never
+/// clobbers `last_notified_skipped`/`last_notified_at` if the skip-check
+/// cycle (Phase 3) already has a row here. On a genuine first INSERT for
+/// this `(user_id, journey_leg_id)`, supplies `last_notified_skipped =
+/// FALSE` -- not a placeholder but the literally correct value: a still-
+/// unmatched leg has no bound train to be "skipped" against yet.
+///
+/// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
+/// also exercised directly by this module's own `sweep_tests`.
+pub async fn upsert_unmatched_notification_state(
+    pool: &PgPool,
+    user_id: &str,
+    journey_leg_id: i64,
+    at: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO journey_leg_notification_state \
+            (user_id, journey_leg_id, last_notified_skipped, last_notified_at, \
+             last_notified_unmatched, last_notified_unmatched_at) \
+         VALUES ($1, $2, FALSE, $3, TRUE, $3) \
+         ON CONFLICT (user_id, journey_leg_id) DO UPDATE SET \
+           last_notified_unmatched = EXCLUDED.last_notified_unmatched, \
+           last_notified_unmatched_at = EXCLUDED.last_notified_unmatched_at",
+    )
+    .bind(user_id)
+    .bind(journey_leg_id)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,5 +1631,573 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+}
+
+/// The two-stage recurrence sweep's DB layer -- mint (stage 1) and
+/// commit-check (stage 2). A separate module from `mod tests` above
+/// (mirroring `decision.rs`'s own `tests`/`skip_notification_tests`/
+/// `sweep_tests` three-way split), not because these tests need different
+/// machinery, but to keep this plan's own addition reviewable as one
+/// self-contained unit.
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn connect() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres")
+    }
+
+    async fn seed_user(pool: &PgPool, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@example.com"))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed fixture user");
+    }
+
+    async fn cleanup_user(pool: &PgPool, user_id: &str) {
+        sqlx::query("DELETE FROM journey_leg_notification_state WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                materialize_due_template_occurrence_is_idempotent_on_a_second_call \
+                -- --ignored --test-threads=1`"]
+    async fn materialize_due_template_occurrence_is_idempotent_on_a_second_call() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-MINT-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name) \
+             VALUES ($1, 'Test Mint Template') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_templates row");
+
+        sqlx::query(
+            "INSERT INTO journey_template_legs \
+                (template_id, leg_order, origin_crs, destination_crs, depart_after) \
+             VALUES ($1, 1, 'RDG', 'WOK', '09:00:00')",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed journey_template_legs row");
+
+        let first = materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
+            .await
+            .expect("first materialize call");
+        let journey_id = first.expect("the first call must mint a journey");
+
+        let second = materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
+            .await
+            .expect("second materialize call");
+        assert_eq!(
+            second, None,
+            "a second call for the same template/day must be an idempotent no-op"
+        );
+
+        let journeys_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM journeys WHERE source_template_id = $1")
+                .bind(template_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count journeys");
+        assert_eq!(
+            journeys_count, 1,
+            "exactly one journeys row must exist after two calls"
+        );
+
+        let legs_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM journey_legs WHERE journey_id = $1")
+                .bind(journey_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count journey_legs");
+        assert_eq!(
+            legs_count, 1,
+            "exactly one journey_legs row must exist after two calls"
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE journey_id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_template_legs WHERE template_id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                due_templates_for_respects_days_of_week_active_and_date_range \
+                -- --ignored --test-threads=1`"]
+    async fn due_templates_for_respects_days_of_week_active_and_date_range() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-DUE-USER";
+        seed_user(&pool, user_id).await;
+
+        // 2026-09-23 is a Wednesday (weekday_bit = 4); 2026-09-21 is a
+        // Monday (weekday_bit = 1) -- same convention decision.rs's own
+        // weekday_bit tests use.
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+        let wednesday_bit: i16 = 4;
+        let monday_bit: i16 = 1;
+
+        let due_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week, active) \
+             VALUES ($1, 'Due', $2, TRUE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(wednesday_bit)
+        .fetch_one(&pool)
+        .await
+        .expect("seed due template");
+
+        let inactive_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week, active) \
+             VALUES ($1, 'Inactive', $2, FALSE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(wednesday_bit)
+        .fetch_one(&pool)
+        .await
+        .expect("seed inactive template");
+
+        let wrong_day_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week, active) \
+             VALUES ($1, 'WrongDay', $2, TRUE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(monday_bit)
+        .fetch_one(&pool)
+        .await
+        .expect("seed wrong-day template");
+
+        let ended_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week, active, ends_on) \
+             VALUES ($1, 'Ended', $2, TRUE, $3) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(wednesday_bit)
+        .bind(today.pred_opt().unwrap())
+        .fetch_one(&pool)
+        .await
+        .expect("seed ended template");
+
+        let due = due_templates_for(&pool, today)
+            .await
+            .expect("due_templates_for");
+        let due_ids: Vec<i64> = due.iter().map(|t| t.id).collect();
+
+        assert!(
+            due_ids.contains(&due_id),
+            "the active/right-weekday/in-range template must be due"
+        );
+        assert!(
+            !due_ids.contains(&inactive_id),
+            "an inactive template must not be due"
+        );
+        assert!(
+            !due_ids.contains(&wrong_day_id),
+            "a template without today's weekday bit set must not be due"
+        );
+        assert!(
+            !due_ids.contains(&ended_id),
+            "a template whose ends_on is before today must not be due"
+        );
+
+        for id in [due_id, inactive_id, wrong_day_id, ended_id] {
+            sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                unmatched_auto_legs_for_commit_check_excludes_manual_mode_templates \
+                -- --ignored --test-threads=1`"]
+    async fn unmatched_auto_legs_for_commit_check_excludes_manual_mode_templates() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-COMMIT-CHECK-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let auto_template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode) \
+             VALUES ($1, 'Auto Template', 'auto') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed auto template");
+
+        let manual_template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode) \
+             VALUES ($1, 'Manual Template', 'manual') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed manual template");
+
+        let auto_journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name, source_template_id) \
+             VALUES ($1, NULL, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(auto_template_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed auto journey");
+
+        let manual_journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name, source_template_id) \
+             VALUES ($1, NULL, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(manual_template_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed manual journey");
+
+        let auto_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, depart_after, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, '09:00:00', 'unmatched') RETURNING id",
+        )
+        .bind(auto_journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed auto leg");
+
+        let manual_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, depart_after, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, '09:00:00', 'unmatched') RETURNING id",
+        )
+        .bind(manual_journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed manual leg");
+
+        let legs = unmatched_auto_legs_for_commit_check(&pool, today)
+            .await
+            .expect("unmatched_auto_legs_for_commit_check");
+        let leg_ids: Vec<i64> = legs.iter().map(|l| l.journey_leg_id).collect();
+        assert!(
+            leg_ids.contains(&auto_leg_id),
+            "the auto-template's leg must be a commit-check candidate"
+        );
+        assert!(
+            !leg_ids.contains(&manual_leg_id),
+            "the manual-template's leg must be excluded"
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE id IN ($1, $2)")
+            .bind(auto_leg_id)
+            .bind(manual_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id IN ($1, $2)")
+            .bind(auto_journey_id)
+            .bind(manual_journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id IN ($1, $2)")
+            .bind(auto_template_id)
+            .bind(manual_template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                unmatched_auto_legs_for_commit_check_excludes_paused_templates \
+                -- --ignored --test-threads=1`"]
+    async fn unmatched_auto_legs_for_commit_check_excludes_paused_templates() {
+        // Final-review Finding 1: a paused template's ('active = false')
+        // already-minted 'unmatched' leg must NOT be a commit-check
+        // candidate -- otherwise flipping the Pause toggle after today's
+        // occurrence was already stamped is silently ignored by the sweep
+        // and the leg gets auto-committed to a real train anyway. The
+        // sibling `unmatched_auto_legs_for_commit_check_excludes_manual_mode_templates`
+        // test above already covers the `active = true` (default) case
+        // returning a row, so this test only adds the negative `active =
+        // false` case.
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-PAUSED-COMMIT-CHECK-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let paused_template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode, active) \
+             VALUES ($1, 'Paused Auto Template', 'auto', FALSE) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed paused auto template");
+
+        let paused_journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name, source_template_id) \
+             VALUES ($1, NULL, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(paused_template_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed paused journey");
+
+        let paused_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, depart_after, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, '09:00:00', 'unmatched') RETURNING id",
+        )
+        .bind(paused_journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed paused leg");
+
+        let legs = unmatched_auto_legs_for_commit_check(&pool, today)
+            .await
+            .expect("unmatched_auto_legs_for_commit_check");
+        let leg_ids: Vec<i64> = legs.iter().map(|l| l.journey_leg_id).collect();
+        assert!(
+            !leg_ids.contains(&paused_leg_id),
+            "a paused ('active = false') template's already-minted leg must be excluded \
+             from the commit-check, even though it is still 'unmatched' and under an \
+             'auto'-mode template"
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(paused_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(paused_journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(paused_template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                commit_leg_to_train_is_a_no_op_once_already_committed \
+                -- --ignored --test-threads=1`"]
+    async fn commit_leg_to_train_is_a_no_op_once_already_committed() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-COMMIT-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey");
+
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, 'unmatched') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey leg");
+
+        let sub1_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed first train_subscriptions row");
+
+        let sub2_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed second train_subscriptions row");
+
+        let first_commit = commit_leg_to_train(&pool, journey_leg_id, sub1_id)
+            .await
+            .expect("first commit");
+        assert!(first_commit, "the first commit must succeed");
+
+        let second_commit = commit_leg_to_train(&pool, journey_leg_id, sub2_id)
+            .await
+            .expect("second commit attempt");
+        assert!(
+            !second_commit,
+            "a second commit attempt on an already-committed leg must be a no-op"
+        );
+
+        let (train_subscription_id, match_mode): (Option<i64>, String) = sqlx::query_as(
+            "SELECT train_subscription_id, match_mode FROM journey_legs WHERE id = $1",
+        )
+        .bind(journey_leg_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read leg after both commit attempts");
+        assert_eq!(
+            train_subscription_id,
+            Some(sub1_id),
+            "the FIRST train_subscription_id must survive a second commit attempt"
+        );
+        assert_eq!(match_mode, "auto");
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id IN ($1, $2)")
+            .bind(sub1_id)
+            .bind(sub2_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                unmatched_notification_state_round_trips_without_clobbering_skip_state \
+                -- --ignored --test-threads=1`"]
+    async fn unmatched_notification_state_round_trips_without_clobbering_skip_state() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-UNMATCHED-STATE-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey");
+
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, 'unmatched') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey leg");
+
+        let now = Utc::now();
+        upsert_skip_notification_state(&pool, user_id, journey_leg_id, true, now)
+            .await
+            .expect("seed a skip-state row via Phase 3's existing upsert");
+
+        upsert_unmatched_notification_state(&pool, user_id, journey_leg_id, now)
+            .await
+            .expect("upsert_unmatched_notification_state");
+
+        assert_eq!(
+            skip_notification_state(&pool, user_id, journey_leg_id)
+                .await
+                .expect("read skip state after the unmatched upsert"),
+            Some(true),
+            "upsert_unmatched_notification_state must not clobber the existing skip-state row"
+        );
+        assert_eq!(
+            unmatched_notification_state(&pool, user_id, journey_leg_id)
+                .await
+                .expect("read unmatched state"),
+            Some(true)
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
     }
 }

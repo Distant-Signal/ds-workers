@@ -107,6 +107,66 @@ pub fn decide_skip_notification(was_skipped: bool, is_skipped: bool) -> NotifyDe
     }
 }
 
+/// Mon=1 (bit 0) .. Sun=64 (bit 6) -- the exact convention
+/// `journey_templates.days_of_week` uses (spec §2.2). Mirrors the SQL
+/// this plan's Task 4 writes as `1 << (EXTRACT(ISODOW FROM $1)::int - 1)`
+/// -- ISODOW is 1=Monday..7=Sunday, matching `num_days_from_monday()`'s
+/// 0=Monday..6=Sunday after the +1/-1 shift.
+#[allow(dead_code)]
+pub fn weekday_bit(date: chrono::NaiveDate) -> i16 {
+    use chrono::Datelike;
+    1i16 << date.weekday().num_days_from_monday()
+}
+
+/// True once `now` is within `lead_minutes` of `earliest_bound_utc` --
+/// the leg's own `depart_after` (or `arrive_after` if no `depart_after`
+/// was set), converted to an absolute instant. Stays true for the rest
+/// of that leg's `service_date` (Judgment Call 3 -- the caller's own
+/// `service_date = today` query scoping is what eventually stops this
+/// from being consulted forever, not this function).
+pub fn is_due_for_commit_check(
+    now: DateTime<Utc>,
+    earliest_bound_utc: DateTime<Utc>,
+    lead_minutes: i64,
+) -> bool {
+    now >= earliest_bound_utc - Duration::minutes(lead_minutes)
+}
+
+/// Picks the index of the candidate scheduled time closest to `now_local`
+/// by absolute distance -- ties broken toward the EARLIER candidate (a
+/// deterministic, arbitrary-but-documented choice; the spec does not
+/// resolve exact-tie behavior and an exact tie is vanishingly unlikely
+/// against real CIF data, which never publishes two departures at the
+/// identical minute for the same origin/destination pair in practice).
+/// `None` only for an empty slice -- callers already filter to a leg with
+/// >= 1 candidate before calling this.
+pub fn pick_nearest_to_now_candidate(
+    candidate_scheduled_times: &[chrono::NaiveTime],
+    now_local: chrono::NaiveTime,
+) -> Option<usize> {
+    candidate_scheduled_times
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, t)| {
+            let delta = t.signed_duration_since(now_local).num_seconds().abs();
+            // Tie-break: (delta, scheduled_time) ordering makes an earlier
+            // candidate win a tie, since NaiveTime: Ord.
+            (delta, **t)
+        })
+        .map(|(i, _)| i)
+}
+
+/// Fires once, the first time an `'auto'`-mode leg's commit-check finds
+/// zero candidates for today; never re-fires for the same leg (§4.2,
+/// narrowly scoped per this plan's own Judgment Call 4).
+pub fn decide_unmatched_notification(already_notified: bool) -> NotifyDecision {
+    if already_notified {
+        NotifyDecision::Skip
+    } else {
+        NotifyDecision::NotifyNow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +313,107 @@ mod skip_notification_tests {
             decide_skip_notification(false, true),
             NotifyDecision::NotifyNow
         );
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use chrono::{NaiveDate, NaiveTime, Utc};
+
+    #[test]
+    fn weekday_bit_monday_is_one() {
+        let monday = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(); // 2026-09-21 is a Monday
+        assert_eq!(weekday_bit(monday), 1);
+    }
+
+    #[test]
+    fn weekday_bit_sunday_is_sixtyfour() {
+        let sunday = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(); // 2026-09-27 is a Sunday
+        assert_eq!(weekday_bit(sunday), 64);
+    }
+
+    #[test]
+    fn weekday_bit_wednesday_is_four() {
+        let wednesday = NaiveDate::from_ymd_opt(2026, 9, 23).unwrap(); // 2026-09-23 is a Wednesday
+        assert_eq!(weekday_bit(wednesday), 4);
+    }
+
+    #[test]
+    fn is_due_for_commit_check_false_well_before_lead_window() {
+        let now = Utc::now();
+        let earliest_bound_utc = now + Duration::hours(1);
+        assert!(!is_due_for_commit_check(now, earliest_bound_utc, 15));
+    }
+
+    #[test]
+    fn is_due_for_commit_check_false_one_minute_before_lead_boundary() {
+        let now = Utc::now();
+        let earliest_bound_utc = now + Duration::minutes(16);
+        assert!(!is_due_for_commit_check(now, earliest_bound_utc, 15));
+    }
+
+    #[test]
+    fn is_due_for_commit_check_true_exactly_at_lead_boundary() {
+        let now = Utc::now();
+        let earliest_bound_utc = now + Duration::minutes(15);
+        assert!(is_due_for_commit_check(now, earliest_bound_utc, 15));
+    }
+
+    #[test]
+    fn is_due_for_commit_check_true_well_after_lead_window() {
+        let now = Utc::now();
+        let earliest_bound_utc = now - Duration::minutes(30);
+        assert!(is_due_for_commit_check(now, earliest_bound_utc, 15));
+    }
+
+    #[test]
+    fn pick_nearest_to_now_candidate_empty_slice_returns_none() {
+        let candidates: &[NaiveTime] = &[];
+        let now = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        assert_eq!(pick_nearest_to_now_candidate(candidates, now), None);
+    }
+
+    #[test]
+    fn pick_nearest_to_now_candidate_single_candidate_returns_index_zero() {
+        let candidates = [NaiveTime::from_hms_opt(10, 30, 0).unwrap()];
+        let now = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
+        assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(0));
+    }
+
+    #[test]
+    fn pick_nearest_to_now_candidate_exact_tie_break_prefers_earlier_candidate() {
+        let candidates = [
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(12, 10, 0).unwrap(),
+        ];
+        let now = NaiveTime::from_hms_opt(12, 5, 0).unwrap();
+        assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(0));
+    }
+
+    #[test]
+    fn nearest_to_now_prefers_the_least_stale_candidate_over_the_earliest_one_when_now_has_already_passed_every_candidate()
+     {
+        let candidates = [
+            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        ];
+        let now = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
+        // All candidates are in the past. The latest one (10:00) is closest to now.
+        assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(2));
+    }
+
+    #[test]
+    fn decide_unmatched_notification_false_returns_notify_now() {
+        assert_eq!(
+            decide_unmatched_notification(false),
+            NotifyDecision::NotifyNow
+        );
+    }
+
+    #[test]
+    fn decide_unmatched_notification_true_returns_skip() {
+        assert_eq!(decide_unmatched_notification(true), NotifyDecision::Skip);
     }
 }

@@ -43,6 +43,30 @@ pub struct Config {
     #[arg(long, env, default_value_t = 90)]
     pub skip_check_poll_interval_secs: u64,
 
+    /// Cadence for the recurring-journey materialization sweep (spec §3.1) --
+    /// one branch does BOTH the daily mint (stage 1) and the auto-commit
+    /// lead-time check (stage 2), per the spec's own "checked on the same
+    /// hourly cadence" wording (§3.2's 2026-09-22 addendum) -- not two
+    /// separate intervals. A reasonable-sounding, not load-tested figure,
+    /// same "revisit with real usage" posture as this crate's other interval
+    /// constants.
+    #[arg(long, env, default_value_t = 3600)]
+    pub template_sweep_poll_interval_secs: u64,
+
+    /// Spec §3.2 (2026-09-22 addendum): an `'auto'`-mode leg's commit-check
+    /// only runs once "now" is within this many minutes of the leg's earliest
+    /// window bound (`depart_after` if set, else `arrive_after`) -- NOT at
+    /// materialization time, which is what makes `'nearest_to_now'` mean
+    /// something different from `'earliest'` (see that section's own worked
+    /// reasoning for why committing immediately would make the two rules
+    /// degenerate into the same behavior). 120 (2 hours ahead of the window)
+    /// is the spec's own suggested starting default, explicitly flagged there
+    /// as "this document's own suggestion, not a second product decision" --
+    /// i64, not i32, to pair directly with `chrono::Duration::minutes` the
+    /// same way `cooldown_minutes` already does.
+    #[arg(long, env, default_value_t = 120)]
+    pub auto_commit_lead_minutes: i64,
+
     /// VAPID keys, PEM-encoded EC private key (`openssl ecparam -genkey
     /// -name prime256v1`) and the matching uncompressed public key --
     /// wired into web-push's VapidSignatureBuilder in Task 6. Fails fast
