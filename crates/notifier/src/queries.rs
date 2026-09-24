@@ -780,8 +780,20 @@ pub async fn unmatched_auto_legs_for_commit_check(
     Ok(rows)
 }
 
-/// One `(train_uid, scheduled departure at the leg's own origin)`
-/// candidate. A deliberately slimmed sibling of
+/// One `(train_uid, day_offset, scheduled departure at the leg's own
+/// origin)` candidate -- `day_offset` is `main.day_offset`, the SAME
+/// column/meaning `schedule_query::resolve`'s `assign_day_offsets` and
+/// `schedule-reference`'s `schedule_network_departures_rows` already sort
+/// by: how many calendar days past `service_date` this departure at the
+/// leg's origin really falls on (0 for an ordinary same-day departure, 1
+/// or more for a schedule whose calling points have already regressed
+/// past midnight by the time they reach this leg's origin stop). Surfaced
+/// here, rather than dropped the way this function used to, so
+/// `decision::pick_nearest_to_now_candidate` can compare candidates
+/// day-offset-aware instead of by bare clock time alone -- see that
+/// function's own doc comment for the bug this fixes.
+///
+/// A deliberately slimmed sibling of
 /// `crates/api::data::queries::search_journey_leg_candidates` -- drops
 /// that function's cursor pagination and leg-destination-arrival
 /// subqueries (this stage only needs enough to pick a train, never
@@ -808,9 +820,9 @@ pub async fn schedule_candidates_for_leg(
     depart_before: Option<chrono::NaiveTime>,
     arrive_after: Option<chrono::NaiveTime>,
     arrive_before: Option<chrono::NaiveTime>,
-) -> anyhow::Result<Vec<(String, chrono::NaiveTime)>> {
-    let rows: Vec<(String, chrono::NaiveTime)> = sqlx::query_as(
-        "SELECT main.train_uid, main.scheduled \
+) -> anyhow::Result<Vec<(String, u8, chrono::NaiveTime)>> {
+    let rows: Vec<(String, i16, chrono::NaiveTime)> = sqlx::query_as(
+        "SELECT main.train_uid, main.day_offset, main.scheduled \
          FROM schedule_destination_departures main \
          WHERE main.service_date = $1 \
            AND main.origin_crs = $2 \
@@ -841,7 +853,7 @@ pub async fn schedule_candidates_for_leg(
                        AND ($7::time IS NULL OR stop.calling_point_arrival <= $7) \
                  ) \
            ) \
-         ORDER BY main.scheduled, main.train_uid \
+         ORDER BY main.day_offset, main.scheduled, main.train_uid \
          LIMIT 100",
     )
     .bind(service_date)
@@ -853,7 +865,16 @@ pub async fn schedule_candidates_for_leg(
     .bind(arrive_before)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        // `schedule_destination_departures.day_offset` is a Postgres
+        // `SMALLINT` (`i16`); every other day_offset field in this
+        // codebase (`RawCallingPoint::day_offset`,
+        // `trip_planning::CallingPointRow::day_offset` at its own call
+        // site) is `u8` -- same `unwrap_or(0)` fallback-to-same-day
+        // conversion convention as those.
+        .map(|(uid, day_offset, scheduled)| (uid, u8::try_from(day_offset).unwrap_or(0), scheduled))
+        .collect())
 }
 
 /// Duplicates `crates/api::data::trains::find_or_create_train` --

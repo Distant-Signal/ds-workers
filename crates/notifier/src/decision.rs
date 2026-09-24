@@ -132,26 +132,52 @@ pub fn is_due_for_commit_check(
     now >= earliest_bound_utc - Duration::minutes(lead_minutes)
 }
 
-/// Picks the index of the candidate scheduled time closest to `now_local`
-/// by absolute distance -- ties broken toward the EARLIER candidate (a
-/// deterministic, arbitrary-but-documented choice; the spec does not
-/// resolve exact-tie behavior and an exact tie is vanishingly unlikely
-/// against real CIF data, which never publishes two departures at the
-/// identical minute for the same origin/destination pair in practice).
+/// Picks the index of the candidate `(day_offset, scheduled_time)` closest
+/// to `now_local` by absolute distance -- ties broken toward the EARLIER
+/// candidate (a deterministic, arbitrary-but-documented choice; the spec
+/// does not resolve exact-tie behavior and an exact tie is vanishingly
+/// unlikely against real CIF data, which never publishes two departures at
+/// the identical minute for the same origin/destination pair in practice).
 /// `None` only for an empty slice -- callers already filter to a leg with
 /// >= 1 candidate before calling this.
+///
+/// `now_local` is always implicitly `day_offset` 0 -- the caller
+/// (`main.rs`'s commit-check stage) only ever calls this for a leg whose
+/// `service_date` is today, so "now" IS today, day zero, by construction.
+/// Each candidate's own `day_offset` (`queries::schedule_candidates_for_leg`'s
+/// `main.day_offset`, the schedule's day offset for the leg's origin stop,
+/// same column/meaning `schedule_query::resolve`'s `assign_day_offsets` and
+/// `schedule-reference`'s `schedule_network_departures_rows` sort by) is
+/// folded into the distance as `day_offset * 86_400 + seconds_from_midnight`
+/// seconds past midnight on `service_date`, mirroring this codebase's own
+/// `(day_offset, time)` day-offset-aware comparison convention rather than
+/// comparing bare `NaiveTime`s. A bare-time comparison (this function's
+/// pre-fix behavior) has no notion of "day" at all: `NaiveTime`'s own `Sub`
+/// is a plain seconds-from-midnight difference with no wraparound, so a
+/// genuine overnight candidate just after midnight (`day_offset: 1`,
+/// e.g. `00:05`) reads as ALMOST A FULL DAY away from a `now_local` late in
+/// the evening (e.g. `23:58`) instead of the few minutes away it really is
+/// -- the same "post-midnight time sorts as earlier/farther than it really
+/// is" bug class already fixed for `schedule_network_departures_rows` and
+/// `schedule-query::resolve`'s terminus-TIPLOC handling.
 pub fn pick_nearest_to_now_candidate(
-    candidate_scheduled_times: &[chrono::NaiveTime],
+    candidates: &[(u8, chrono::NaiveTime)],
     now_local: chrono::NaiveTime,
 ) -> Option<usize> {
-    candidate_scheduled_times
+    use chrono::Timelike;
+
+    let now_secs = i64::from(now_local.num_seconds_from_midnight());
+    candidates
         .iter()
         .enumerate()
-        .min_by_key(|(_, t)| {
-            let delta = t.signed_duration_since(now_local).num_seconds().abs();
-            // Tie-break: (delta, scheduled_time) ordering makes an earlier
-            // candidate win a tie, since NaiveTime: Ord.
-            (delta, **t)
+        .min_by_key(|(_, (day_offset, t))| {
+            let candidate_secs =
+                i64::from(*day_offset) * 86_400 + i64::from(t.num_seconds_from_midnight());
+            let delta = (candidate_secs - now_secs).abs();
+            // Tie-break: (delta, day_offset, scheduled_time) ordering makes
+            // the chronologically earlier candidate win a tie, not just the
+            // one with the smaller bare clock time.
+            (delta, *day_offset, *t)
         })
         .map(|(i, _)| i)
 }
@@ -369,14 +395,14 @@ mod sweep_tests {
 
     #[test]
     fn pick_nearest_to_now_candidate_empty_slice_returns_none() {
-        let candidates: &[NaiveTime] = &[];
+        let candidates: &[(u8, NaiveTime)] = &[];
         let now = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
         assert_eq!(pick_nearest_to_now_candidate(candidates, now), None);
     }
 
     #[test]
     fn pick_nearest_to_now_candidate_single_candidate_returns_index_zero() {
-        let candidates = [NaiveTime::from_hms_opt(10, 30, 0).unwrap()];
+        let candidates = [(0, NaiveTime::from_hms_opt(10, 30, 0).unwrap())];
         let now = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
         assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(0));
     }
@@ -384,8 +410,8 @@ mod sweep_tests {
     #[test]
     fn pick_nearest_to_now_candidate_exact_tie_break_prefers_earlier_candidate() {
         let candidates = [
-            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
-            NaiveTime::from_hms_opt(12, 10, 0).unwrap(),
+            (0, NaiveTime::from_hms_opt(12, 0, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(12, 10, 0).unwrap()),
         ];
         let now = NaiveTime::from_hms_opt(12, 5, 0).unwrap();
         assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(0));
@@ -395,13 +421,48 @@ mod sweep_tests {
     fn nearest_to_now_prefers_the_least_stale_candidate_over_the_earliest_one_when_now_has_already_passed_every_candidate()
      {
         let candidates = [
-            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
-            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
-            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+            (0, NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(10, 0, 0).unwrap()),
         ];
         let now = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
         // All candidates are in the past. The latest one (10:00) is closest to now.
         assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(2));
+    }
+
+    #[test]
+    fn nearest_to_now_candidate_is_day_offset_aware_across_a_midnight_boundary() {
+        // Same real overnight shape as `schedule_query::resolve`'s
+        // `f49687_raw` fixture and `schedule-reference`'s
+        // `schedule_network_departures_rows_sorts_by_day_offset_before_scheduled_time`
+        // (Barking, F49687, `00:07`/day_offset 1): one candidate is a
+        // stale same-day departure from hours ago (`08:00`, day_offset 0);
+        // the other is a genuine post-midnight departure (`00:05`,
+        // day_offset 1) that, on the REAL clock, is only 7 minutes from
+        // now (`23:58`) -- `23:58` today plus 7 minutes rolls into
+        // `00:05` tomorrow.
+        //
+        // Before this fix, `pick_nearest_to_now_candidate` compared bare
+        // `NaiveTime`s with no day-offset context at all. `NaiveTime`'s own
+        // `Sub` has no wraparound (verified directly against this crate's
+        // pinned chrono: `00:05.signed_duration_since(23:58)` returns
+        // -86_260 seconds, not -420), so the day_offset-1 candidate read as
+        // ~23h51m away instead of 7 minutes away -- always losing to the
+        // stale `08:00` candidate (~16h before `23:58`, still "closer" by
+        // the buggy, day-blind math) even though `00:05` is the genuinely
+        // nearest-to-now departure.
+        let candidates = [
+            (0, NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
+            (1, NaiveTime::from_hms_opt(0, 5, 0).unwrap()),
+        ];
+        let now = NaiveTime::from_hms_opt(23, 58, 0).unwrap();
+        assert_eq!(
+            pick_nearest_to_now_candidate(&candidates, now),
+            Some(1),
+            "the day_offset-1 00:05 candidate is only 7 real minutes from 23:58 -- genuinely \
+             nearer than the day_offset-0 08:00 candidate's ~16 real hours, even though 08:00's \
+             bare clock time looks closer to 23:58 than 00:05's does"
+        );
     }
 
     #[test]

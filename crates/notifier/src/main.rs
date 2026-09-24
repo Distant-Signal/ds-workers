@@ -512,12 +512,23 @@ async fn run_template_sweep_cycle(
         }
 
         let now_local = now.with_timezone(&chrono_tz::Europe::London).time();
-        let scheduled_times: Vec<chrono::NaiveTime> = candidates.iter().map(|(_, t)| *t).collect();
-        let Some(winner_idx) = decision::pick_nearest_to_now_candidate(&scheduled_times, now_local)
+        // `(day_offset, scheduled)` per candidate, not bare `scheduled` --
+        // `now_local` is always day_offset 0 here (this leg's
+        // `service_date` is `today`, by the `unmatched_auto_legs_for_commit_check`
+        // query's own scoping), so a genuine overnight candidate whose
+        // `day_offset` regressed past midnight before reaching this leg's
+        // origin must still compare correctly against it. See
+        // `decision::pick_nearest_to_now_candidate`'s own doc comment.
+        let day_offset_times: Vec<(u8, chrono::NaiveTime)> = candidates
+            .iter()
+            .map(|(_, day_offset, t)| (*day_offset, *t))
+            .collect();
+        let Some(winner_idx) =
+            decision::pick_nearest_to_now_candidate(&day_offset_times, now_local)
         else {
             continue; // unreachable given the is_empty() check above, defensive only
         };
-        let (train_uid, _) = &candidates[winner_idx];
+        let (train_uid, _, _) = &candidates[winner_idx];
 
         let trains_id = queries::find_or_create_train(pool, train_uid, leg.service_date).await?;
         let tracking_id =
