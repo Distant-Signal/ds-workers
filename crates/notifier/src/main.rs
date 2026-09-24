@@ -449,9 +449,23 @@ async fn run_template_sweep_cycle(
 
     // --- Stage 2: commit-check due unmatched auto legs ---
     for leg in queries::unmatched_auto_legs_for_commit_check(pool, today).await? {
-        let Some(earliest_bound) = leg.depart_after.or(leg.arrive_after) else {
-            continue; // guarded by the query's own WHERE, defensive only
-        };
+        // A template leg is allowed to carry no time window at all (see
+        // `api::data::journey_templates::validate_template_leg`'s own doc
+        // comment) -- `unmatched_auto_legs_for_commit_check` no longer
+        // filters such a leg out, so `depart_after`/`arrive_after` can
+        // both genuinely be `None` here. Midnight is used as the
+        // "earliest bound" in that case rather than skipping the leg:
+        // with no lower bound at all there is no "too early" to guard
+        // against, and since this leg's own `service_date` is always
+        // `today` (the caller's own query scoping), `now` is always
+        // already on-or-after local midnight, so `is_due_for_commit_check`
+        // below is unconditionally true from the very first sweep tick of
+        // the day -- i.e. this degrades to "always due," not to a
+        // still-gated check against a fake bound.
+        let earliest_bound = leg
+            .depart_after
+            .or(leg.arrive_after)
+            .unwrap_or(chrono::NaiveTime::MIN);
         let Some(earliest_bound_utc) = london_to_utc(leg.service_date.and_time(earliest_bound))
         else {
             continue; // nonexistent local time (spring-forward gap) -- best-effort, skip this tick
@@ -1023,6 +1037,182 @@ mod sweep_cycle_tests {
             .ok();
         sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid = $1")
             .bind(train_uid)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_template_legs
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// End-to-end regression test for a template leg with NO time window
+    /// at all (`api::data::journey_templates::validate_template_leg`'s own
+    /// doc comment confirms this is a deliberately allowed state -- a
+    /// template leg is never itself "matched," so the "at least one
+    /// window bound" rule an ordinary journey leg needs doesn't apply
+    /// here). Seeds a template leg with `depart_after`/`depart_before`/
+    /// `arrive_after`/`arrive_before` all omitted (NULL), and publishes
+    /// TWO candidate departures rather than one -- both to prove
+    /// `schedule_candidates_for_leg` returns every departure for the
+    /// route/date when every bound is NULL (not zero, not the whole
+    /// network), and so `pick_nearest_to_now_candidate`'s "closest to now"
+    /// choice between the two candidates is a real assertion, not
+    /// vacuously true with a single candidate.
+    ///
+    /// Before this fix: `unmatched_auto_legs_for_commit_check`'s own WHERE
+    /// clause required `depart_after IS NOT NULL OR arrive_after IS NOT
+    /// NULL`, so this leg was never even selected for a commit-check, and
+    /// `main.rs`'s own `let Some(earliest_bound) = ... else { continue }`
+    /// independently skipped it even if it had been -- either way, this
+    /// leg would stay `'unmatched'` forever. This test fails on either the
+    /// pre-fix query or the pre-fix `main.rs` guard alone, so it is a real
+    /// regression test for both halves of that fix together.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                run_template_sweep_cycle_mints_and_auto_commits_a_leg_with_no_time_window \
+                -- --ignored --test-threads=1`"]
+    async fn run_template_sweep_cycle_mints_and_auto_commits_a_leg_with_no_time_window() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-CYCLE-OPEN-WINDOW-USER";
+        let nearer_uid = "TEST-SWEEP-CYCLE-OPEN-WINDOW-NEARER-UID";
+        let farther_uid = "TEST-SWEEP-CYCLE-OPEN-WINDOW-FARTHER-UID";
+        seed_user(&pool, user_id).await;
+        let today = today_london();
+        let now_local = Utc::now().with_timezone(&chrono_tz::Europe::London).time();
+
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode, days_of_week, active) \
+             VALUES ($1, 'E2E Open Window Auto Template', 'auto', $2, TRUE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(decision::weekday_bit(today))
+        .fetch_one(&pool)
+        .await
+        .expect("seed template");
+
+        // No depart_after/depart_before/arrive_after/arrive_before column
+        // at all in this INSERT -- every one of the four stays NULL.
+        sqlx::query(
+            "INSERT INTO journey_template_legs (template_id, leg_order, origin_crs, destination_crs) \
+             VALUES ($1, 1, 'RDG', 'WOK')",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed fully-open-window template leg");
+
+        // Two candidates: one an hour from now, one twelve hours from
+        // now -- both real, in-range departures given no window bound at
+        // all, but only the nearer one should win the auto-commit.
+        // `day_offset`-aware, same "seconds past midnight on
+        // `service_date`" arithmetic `decision::pick_nearest_to_now_candidate`
+        // itself uses -- this test must stay correct even when it happens
+        // to run within a few hours of real local midnight, where a naive
+        // `now_local + Duration::hours(12)` would wrap the clock time back
+        // toward "now" without also advancing `day_offset`, silently
+        // reintroducing the exact bug that function's own regression test
+        // (`nearest_to_now_candidate_is_day_offset_aware_across_a_midnight_boundary`)
+        // already covers for the pure-decision layer.
+        fn offset_from_now(
+            now_local: chrono::NaiveTime,
+            add_hours: i64,
+        ) -> (i16, chrono::NaiveTime) {
+            use chrono::Timelike;
+            let total_secs = i64::from(now_local.num_seconds_from_midnight()) + add_hours * 3600;
+            let day_offset =
+                i16::try_from(total_secs.div_euclid(86_400)).expect("small day offset");
+            let secs_in_day =
+                u32::try_from(total_secs.rem_euclid(86_400)).expect("secs in day fits u32");
+            let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs_in_day, 0)
+                .expect("valid wall-clock time");
+            (day_offset, time)
+        }
+        let (nearer_day_offset, nearer_time) = offset_from_now(now_local, 1);
+        let (farther_day_offset, farther_time) = offset_from_now(now_local, 12);
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, day_offset, train_uid, origin_crs) \
+             VALUES ($1, 'WOK', $2, $3, $4, 'RDG'), ($1, 'WOK', $5, $6, $7, 'RDG')",
+        )
+        .bind(today)
+        .bind(nearer_time)
+        .bind(nearer_day_offset)
+        .bind(nearer_uid)
+        .bind(farther_time)
+        .bind(farther_day_offset)
+        .bind(farther_uid)
+        .execute(&pool)
+        .await
+        .expect("seed published schedule rows");
+
+        run_template_sweep_cycle(
+            &pool,
+            120, // the spec's own suggested default -- irrelevant here since a fully-open leg is always due
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_template_sweep_cycle must succeed for a fully-open-window leg");
+
+        let journey_id: i64 =
+            sqlx::query_scalar("SELECT id FROM journeys WHERE source_template_id = $1")
+                .bind(template_id)
+                .fetch_one(&pool)
+                .await
+                .expect("a journey must have been minted for this template");
+
+        let (match_mode, train_subscription_id): (String, Option<i64>) = sqlx::query_as(
+            "SELECT match_mode, train_subscription_id FROM journey_legs WHERE journey_id = $1",
+        )
+        .bind(journey_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the minted leg must exist");
+        assert_eq!(
+            match_mode, "auto",
+            "a fully-open-window leg under an 'auto'-mode template must still get auto-committed"
+        );
+        let train_subscription_id =
+            train_subscription_id.expect("a train_subscription_id must be set on auto-commit");
+
+        let committed_train_uid: String = sqlx::query_scalar(
+            "SELECT t.train_uid FROM train_subscriptions ts \
+             JOIN trains t ON t.id = ts.trains_id \
+             WHERE ts.id = $1",
+        )
+        .bind(train_subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the committed train's own uid");
+        assert_eq!(
+            committed_train_uid, nearer_uid,
+            "with no window at all, the sweep must still pick the candidate genuinely nearest \
+             to now, not the farther one and not an arbitrary one"
+        );
+
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_legs + journey_leg_notification_state
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(train_subscription_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE train_uid IN ($1, $2)")
+            .bind(nearer_uid)
+            .bind(farther_uid)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid IN ($1, $2)")
+            .bind(nearer_uid)
+            .bind(farther_uid)
             .execute(&pool)
             .await
             .ok();

@@ -738,6 +738,22 @@ pub async fn due_templates_for(
 /// in Task 5) -- keeping that check in Rust, not SQL, keeps it
 /// unit-testable in isolation (Task 1) without a DB.
 ///
+/// Deliberately does NOT require `depart_after`/`arrive_after` to be set.
+/// A template leg is allowed to carry no time window at all (see
+/// `api::data::journey_templates::validate_template_leg`'s own doc
+/// comment: "a template leg is never itself 'matched,' so the ambiguity
+/// [requiring a window bound] exists to prevent for an ordinary journey
+/// leg doesn't apply here"), and a materialized leg copies that verbatim
+/// (`materialize_template`/`materialize_due_template_occurrence`) -- so a
+/// fully-open-window `journey_legs` row is a real, reachable state this
+/// query must not silently exclude. An earlier version of this query
+/// required `depart_after IS NOT NULL OR arrive_after IS NOT NULL`, which
+/// meant an `'auto'`-mode leg with no window at all was NEVER returned
+/// here and therefore never auto-committed by the sweep -- see this
+/// module's own `unmatched_auto_legs_for_commit_check_includes_a_fully_open_window_leg`
+/// regression test, and `main.rs`'s own commit-check loop for how the
+/// caller now treats a leg with neither bound set (midnight, not a skip).
+///
 /// This struct and `unmatched_auto_legs_for_commit_check` below are called
 /// from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) -- also
 /// exercised directly by this module's own `sweep_tests`.
@@ -771,8 +787,7 @@ pub async fn unmatched_auto_legs_for_commit_check(
            AND jt.default_match_mode = 'auto' \
            AND jt.active \
            AND jl.origin_crs IS NOT NULL \
-           AND jl.destination_crs IS NOT NULL \
-           AND (jl.depart_after IS NOT NULL OR jl.arrive_after IS NOT NULL)",
+           AND jl.destination_crs IS NOT NULL",
     )
     .bind(today)
     .fetch_all(pool)
@@ -1977,6 +1992,99 @@ mod sweep_tests {
         sqlx::query("DELETE FROM journey_templates WHERE id IN ($1, $2)")
             .bind(auto_template_id)
             .bind(manual_template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                unmatched_auto_legs_for_commit_check_includes_a_fully_open_window_leg \
+                -- --ignored --test-threads=1`"]
+    async fn unmatched_auto_legs_for_commit_check_includes_a_fully_open_window_leg() {
+        // Regression test: a template leg is allowed to carry NO time
+        // window at all -- see `api::data::journey_templates::validate_template_leg`'s
+        // own doc comment ("a template leg is never itself 'matched,' so
+        // the ambiguity [requiring a window bound] exists to prevent for
+        // an ordinary journey leg doesn't apply here"). A materialized leg
+        // copies that verbatim, so `depart_after`/`depart_before`/
+        // `arrive_after`/`arrive_before` can all genuinely be NULL on a
+        // real `journey_legs` row under an `'auto'`-mode template.
+        //
+        // This query used to additionally require
+        // `depart_after IS NOT NULL OR arrive_after IS NOT NULL`, which
+        // meant such a leg was NEVER returned here -- and therefore never
+        // auto-committed by the sweep at all, silently, forever. That
+        // requirement is gone; this test proves a fully-open-window leg is
+        // a real commit-check candidate now.
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-OPEN-WINDOW-COMMIT-CHECK-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let auto_template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode) \
+             VALUES ($1, 'Open Window Auto Template', 'auto') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed auto template");
+
+        let auto_journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name, source_template_id) \
+             VALUES ($1, NULL, $2) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(auto_template_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed auto journey");
+
+        // No depart_after/depart_before/arrive_after/arrive_before bound
+        // at all -- every one of the four stays NULL by omission.
+        let open_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, 'unmatched') RETURNING id",
+        )
+        .bind(auto_journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed fully-open-window leg");
+
+        let legs = unmatched_auto_legs_for_commit_check(&pool, today)
+            .await
+            .expect("unmatched_auto_legs_for_commit_check");
+        let leg_ids: Vec<i64> = legs.iter().map(|l| l.journey_leg_id).collect();
+        assert!(
+            leg_ids.contains(&open_leg_id),
+            "a leg with no time window at all must still be a commit-check candidate"
+        );
+        let open_leg = legs
+            .iter()
+            .find(|l| l.journey_leg_id == open_leg_id)
+            .expect("the fully-open-window leg's own row");
+        assert_eq!(open_leg.depart_after, None);
+        assert_eq!(open_leg.depart_before, None);
+        assert_eq!(open_leg.arrive_after, None);
+        assert_eq!(open_leg.arrive_before, None);
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(open_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(auto_journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(auto_template_id)
             .execute(&pool)
             .await
             .ok();
