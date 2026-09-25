@@ -1275,25 +1275,71 @@ where
 /// match_mode = 'unmatched'` so a leg already committed by a concurrent
 /// tick (or since raced-and-lost) is a silent no-op, not a double write.
 ///
-/// Generic over the executor for the same reason
-/// [`create_subscription_for_train`] is -- [`auto_commit_leg_to_train`]
-/// runs both inside ONE transaction. Still called directly (with a plain
-/// `&PgPool`) by this module's own `sweep_tests`.
-pub async fn commit_leg_to_train<'e, E>(
-    executor: E,
+/// **Defense-in-depth ownership guard.** Neither current caller can
+/// actually trigger a cross-user link: [`auto_commit_leg_to_train`] always
+/// derives `train_subscription_id` via [`create_subscription_for_train`]
+/// using the SAME `user_id` the leg's own journey belongs to, and this
+/// module's own tests only ever pass a same-user subscription. But this
+/// function has no such guarantee of its own -- it takes a bare
+/// `train_subscription_id` and writes it onto `journey_leg_id` with no
+/// check that the two share an owner at all. A future caller (a manual
+/// "commit this leg" route, say) that ever passed a `train_subscription_id`
+/// sourced from user input would silently attach one user's train tracking
+/// to another user's journey leg -- an IDOR sitting latent in a function
+/// whose name gives no hint that it skips the check. Verify the owners
+/// match before writing anything, and fail loudly (not merely a silent
+/// no-op indistinguishable from "already committed by someone else") if
+/// they don't.
+///
+/// Takes `A: Acquire` (not the single-query `E: PgExecutor` shape
+/// [`create_subscription_for_train`] uses) because the ownership check
+/// above is now a SECOND statement against the same connection, ahead of
+/// the UPDATE -- `Acquire::acquire` hands back one reusable `&mut
+/// PgConnection` for both, still composing with
+/// [`auto_commit_leg_to_train`]'s own transaction (`Acquire` is implemented
+/// for `&mut Transaction<'_, Postgres>` as well as for `&Pool<Postgres>`).
+/// Still called directly (with a plain `&PgPool`) by this module's own
+/// `sweep_tests`.
+pub async fn commit_leg_to_train<'e, A>(
+    executor: A,
     journey_leg_id: i64,
     train_subscription_id: i64,
 ) -> anyhow::Result<bool>
 where
-    E: sqlx::PgExecutor<'e>,
+    A: sqlx::Acquire<'e, Database = sqlx::Postgres>,
 {
+    let mut conn = executor.acquire().await?;
+
+    // `None` means either id doesn't exist at all -- leave that to the
+    // UPDATE below's own `WHERE` clause to no-op on, exactly as before this
+    // guard existed, rather than special-casing "not found" here too.
+    let owners: Option<(String, String)> = sqlx::query_as(
+        "SELECT j.user_id, ts.user_id \
+         FROM journey_legs jl \
+         JOIN journeys j ON j.id = jl.journey_id, \
+              train_subscriptions ts \
+         WHERE jl.id = $1 AND ts.id = $2",
+    )
+    .bind(journey_leg_id)
+    .bind(train_subscription_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some((leg_owner, subscription_owner)) = &owners {
+        anyhow::ensure!(
+            leg_owner == subscription_owner,
+            "refusing to commit journey_leg {journey_leg_id} (owned by user {leg_owner}) to \
+             train_subscription {train_subscription_id} (owned by user {subscription_owner}): \
+             owner mismatch"
+        );
+    }
+
     let result = sqlx::query(
         "UPDATE journey_legs SET train_subscription_id = $1, match_mode = 'auto' \
          WHERE id = $2 AND match_mode = 'unmatched'",
     )
     .bind(train_subscription_id)
     .bind(journey_leg_id)
-    .execute(executor)
+    .execute(&mut *conn)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -3508,6 +3554,94 @@ mod sweep_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+
+    /// Finding 4 (Low-severity, defense-in-depth): `commit_leg_to_train`
+    /// must refuse to link a `train_subscription_id` owned by a DIFFERENT
+    /// user than the journey leg's own owner, rather than silently writing
+    /// the cross-user link (the latent IDOR this guard closes -- no current
+    /// caller can trigger it, since `auto_commit_leg_to_train` always
+    /// derives the subscription id from the same `user_id` as the leg, but
+    /// nothing in `commit_leg_to_train`'s own signature enforced that).
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                commit_leg_to_train_refuses_to_link_a_subscription_owned_by_a_different_user \
+                -- --ignored --test-threads=1`"]
+    async fn commit_leg_to_train_refuses_to_link_a_subscription_owned_by_a_different_user() {
+        let pool = connect().await;
+        let leg_owner = "TEST-SWEEP-IDOR-LEG-OWNER";
+        let other_owner = "TEST-SWEEP-IDOR-OTHER-OWNER";
+        seed_user(&pool, leg_owner).await;
+        seed_user(&pool, other_owner).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind(leg_owner)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey");
+
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, 'unmatched') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey leg");
+
+        // Owned by a DIFFERENT user than the leg's own journey.
+        let other_users_subscription_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(other_owner)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("seed the other user's train_subscriptions row");
+
+        let result = commit_leg_to_train(&pool, journey_leg_id, other_users_subscription_id).await;
+        assert!(
+            result.is_err(),
+            "linking a subscription owned by a different user must return an error, not a \
+             silent no-op or a successful link"
+        );
+
+        let (train_subscription_id, match_mode): (Option<i64>, String) = sqlx::query_as(
+            "SELECT train_subscription_id, match_mode FROM journey_legs WHERE id = $1",
+        )
+        .bind(journey_leg_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read leg after the refused commit attempt");
+        assert_eq!(
+            train_subscription_id, None,
+            "the cross-user subscription must never have been written onto the leg"
+        );
+        assert_eq!(match_mode, "unmatched");
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(other_users_subscription_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, leg_owner).await;
+        cleanup_user(&pool, other_owner).await;
     }
 
     #[tokio::test]

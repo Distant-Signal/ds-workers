@@ -229,12 +229,10 @@ pub fn commit_check_window(
     }
 }
 
-/// Picks the index of the candidate `(day_offset, scheduled_time)` closest
-/// to `now_local` by absolute distance -- ties broken toward the EARLIER
-/// candidate (a deterministic, arbitrary-but-documented choice; the spec
-/// does not resolve exact-tie behavior and an exact tie is vanishingly
-/// unlikely against real CIF data, which never publishes two departures at
-/// the identical minute for the same origin/destination pair in practice).
+/// Picks the index of the candidate `(day_offset, scheduled_time)` nearest
+/// to `now_local` -- but NOT by plain symmetric absolute distance. See the
+/// "Low-severity residual" section below for the asymmetry this function
+/// applies between a candidate that hasn't departed yet and one that has.
 /// `None` only for an empty slice -- callers already filter to a leg with
 /// >= 1 candidate before calling this.
 ///
@@ -257,21 +255,47 @@ pub fn commit_check_window(
 /// -- the same "post-midnight time sorts as earlier/farther than it really
 /// is" bug class already fixed for `schedule_network_departures_rows` and
 /// `schedule-query::resolve`'s terminus-TIPLOC handling.
+///
+/// **Low-severity residual this function still has to account for.** This
+/// is the ONLY selector [`commit_check_window`]'s `EarliestKnown` case
+/// uses (a leg that names its own `depart_after`/`arrive_after`), precisely
+/// because an already-departed candidate is meant to remain a legitimate
+/// answer there -- the sweep may simply be running a little behind the
+/// window the user chose. But plain symmetric absolute-distance comparison
+/// treats "5 minutes late" and "5 minutes early" as equally good, which is
+/// wrong: a candidate that has ALREADY LEFT is a strictly worse match than
+/// one still to come, even at an identical (or smaller) numeric distance --
+/// most likely to bite after an outage or delayed sweep tick catches up
+/// against a leg affected by the (separately fixed) midnight-tick finding,
+/// where a late-running sweep's `now` can land almost exactly between a
+/// stale departed service and a genuine upcoming one. So this function
+/// first tries [`pick_next_upcoming_candidate`] (nearest candidate that has
+/// NOT yet departed) and only falls back to the nearest already-departed
+/// candidate when literally every candidate has already gone -- preserving
+/// "an already-departed candidate is still acceptable" as a last resort,
+/// never as a preference over a comparably-close upcoming one.
 pub fn pick_nearest_to_now_candidate(
     candidates: &[(u8, chrono::NaiveTime)],
     now_local: chrono::NaiveTime,
 ) -> Option<usize> {
     use chrono::Timelike;
 
+    if let Some(upcoming) = pick_next_upcoming_candidate(candidates, now_local) {
+        return Some(upcoming);
+    }
+
+    // Every candidate has already departed -- fall back to the least-stale
+    // (nearest-to-now) one, ties broken toward the EARLIER candidate (a
+    // deterministic, arbitrary-but-documented choice; an exact tie is
+    // vanishingly unlikely against real CIF data, which never publishes two
+    // departures at the identical minute for the same origin/destination
+    // pair in practice).
     let now_secs = i64::from(now_local.num_seconds_from_midnight());
     candidates
         .iter()
         .enumerate()
         .min_by_key(|(_, (day_offset, t))| {
             let delta = (candidate_secs(*day_offset, *t) - now_secs).abs();
-            // Tie-break: (delta, day_offset, scheduled_time) ordering makes
-            // the chronologically earlier candidate win a tie, not just the
-            // one with the smaller bare clock time.
             (delta, *day_offset, *t)
         })
         .map(|(i, _)| i)
@@ -550,13 +574,36 @@ mod sweep_tests {
     }
 
     #[test]
-    fn pick_nearest_to_now_candidate_exact_tie_break_prefers_earlier_candidate() {
+    fn pick_nearest_to_now_candidate_prefers_the_upcoming_candidate_on_an_exact_tie() {
+        // Finding 1 (Low-severity residual): 12:00 already departed 5
+        // minutes ago, 12:10 is 5 minutes away -- an exact tie by absolute
+        // distance. Pre-fix this picked the departed 12:00 candidate
+        // (ties broke toward the numerically/chronologically earlier one,
+        // which in a past-vs-future tie is always the departed one); a
+        // train that has already left is a strictly worse match than one
+        // still to come, so the upcoming 12:10 must win instead.
         let candidates = [
             (0, NaiveTime::from_hms_opt(12, 0, 0).unwrap()),
             (0, NaiveTime::from_hms_opt(12, 10, 0).unwrap()),
         ];
         let now = NaiveTime::from_hms_opt(12, 5, 0).unwrap();
-        assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(0));
+        assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(1));
+    }
+
+    #[test]
+    fn pick_nearest_to_now_candidate_prefers_upcoming_even_when_it_is_numerically_farther() {
+        // Finding 1's general (non-tied) shape: the departed candidate is
+        // NUMERICALLY closer to `now` (3 minutes stale) than the upcoming
+        // one is away (6 minutes out), so plain symmetric absolute-distance
+        // comparison would still pick the departed one. An already-departed
+        // train is a worse match regardless, so the upcoming candidate must
+        // win even though it is farther by the raw clock-distance metric.
+        let candidates = [
+            (0, NaiveTime::from_hms_opt(9, 57, 0).unwrap()), // departed 3 min ago
+            (0, NaiveTime::from_hms_opt(10, 6, 0).unwrap()), // 6 min from now, not yet departed
+        ];
+        let now = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+        assert_eq!(pick_nearest_to_now_candidate(&candidates, now), Some(1));
     }
 
     #[test]
@@ -692,9 +739,18 @@ mod sweep_tests {
     fn next_upcoming_candidate_never_picks_one_that_has_already_departed() {
         // The reported production shape, reduced: the sweep's first tick
         // after midnight (00:37) against an overnight 00:34 departure and the
-        // next real service at 01:05. Nearest-to-now picks the 00:34 that has
-        // ALREADY LEFT (3 minutes behind beats 28 minutes ahead); for a leg
-        // whose only stated intent is "any train," that is never right.
+        // next real service at 01:05. Pure absolute-distance nearness would
+        // pick the 00:34 that has ALREADY LEFT (3 minutes behind beats 28
+        // minutes ahead); for a leg whose only stated intent is "any train,"
+        // that is never right.
+        //
+        // Both selectors must skip it: `pick_next_upcoming_candidate` by
+        // construction (that's its whole job for an open/latest-only
+        // window), and -- since finding 1's Low-severity fix --
+        // `pick_nearest_to_now_candidate` too, for the SAME leg shape an
+        // `EarliestKnown` window would present it with (an already-departed
+        // candidate only wins there when NOTHING upcoming exists at all; see
+        // that function's own doc comment).
         let candidates = [
             (0, NaiveTime::from_hms_opt(0, 34, 0).unwrap()),
             (0, NaiveTime::from_hms_opt(1, 5, 0).unwrap()),
@@ -702,9 +758,9 @@ mod sweep_tests {
         let now = NaiveTime::from_hms_opt(0, 37, 0).unwrap();
         assert_eq!(
             pick_nearest_to_now_candidate(&candidates, now),
-            Some(0),
-            "nearest-to-now is direction-blind -- this is the behavior that bound a commuter's \
-             template to a departed overnight service"
+            Some(1),
+            "an already-departed candidate must never win over an upcoming one just because it \
+             is numerically closer to now"
         );
         assert_eq!(
             pick_next_upcoming_candidate(&candidates, now),

@@ -22,6 +22,11 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let config = Config::parse();
 
+    // Fail fast on a zero poll interval -- `tokio::time::interval` below
+    // panics outright on a zero `Duration` with no context at all; see
+    // `Config::validate`'s own doc comment.
+    config.validate()?;
+
     // Fail fast rather than silently no-op every cycle -- matches
     // crates/api/src/app.rs's existing `ensure!(!config.internal_token.is_empty(), ...)`
     // posture (see this plan's Error handling section).
@@ -91,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
             _ = skip_check_interval.tick() => {
                 let result = run_skip_check_cycle(
                     &pool,
+                    Utc::now(),
                     &config.vapid_private_key,
                     &config.vapid_subject,
                 )
@@ -385,13 +391,30 @@ async fn run_forward_queue_cycle(
 /// `journey_leg_notification_state` row -- `decide_skip_notification`'s
 /// escalation-only shape, same discipline as every other notification path
 /// in this crate: state is written only after a successful send.
+///
+/// `now` is INJECTED, not read from the clock inside here -- same
+/// convention `run_template_sweep_cycle` already establishes (see its own
+/// doc comment), needed here for the same reason: which day's committed
+/// legs this cycle checks is now a direct function of `now`'s London-local
+/// date (see below), so that has to be controllable from a test.
 async fn run_skip_check_cycle(
     pool: &PgPool,
+    now: DateTime<Utc>,
     vapid_private_key: &str,
     vapid_subject: &str,
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
-    let today = now.date_naive();
+    // London-local calendar date, NOT `now.date_naive()` (bare UTC) --
+    // `journey_legs.service_date` is always a London-local calendar date
+    // (same convention `run_template_sweep_cycle` already establishes for
+    // `today` above), so during the UTC/London date-boundary gap (BST,
+    // UTC+1: 00:00-01:00 London is still "yesterday" in UTC) a bare-UTC
+    // `today` checked the WRONG day's legs for up to an hour after London
+    // midnight -- this cycle's own 90-second-default poll would then find
+    // zero committed legs for the correct (London) day and silently skip
+    // every skip-check for that hour, exactly the same recurring
+    // UTC-vs-London-date bug class already fixed for
+    // `routes::trains`'s own `london_now` split.
+    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
     let legs = queries::list_committed_legs_for_today(pool, today).await?;
 
     for leg in &legs {
@@ -2004,5 +2027,173 @@ mod sweep_cycle_tests {
         );
 
         cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Finding 2 (Low-severity): `run_skip_check_cycle` must scope
+    /// "today's committed legs" by the London-local calendar date, not
+    /// `now.date_naive()` (bare UTC) -- the same UTC/London date-boundary
+    /// gap already fixed elsewhere in this codebase (`routes::trains`'s own
+    /// `london_now` split, and this file's own `run_template_sweep_cycle`).
+    ///
+    /// 2026-07-15 is deep in BST (UTC+1): `23:30` UTC on that date is
+    /// `00:30` London on `2026-07-16`. The committed leg's `service_date`
+    /// is `2026-07-16` (the correct LONDON day) -- pre-fix, `now.date_naive()`
+    /// would read `2026-07-15` (the UTC day) for this exact `now`, so
+    /// `list_committed_legs_for_today` would look up the wrong day and find
+    /// nothing, silently skipping every skip-check for this leg for the
+    /// whole BST gap hour.
+    ///
+    /// No `push_subscriptions` row is seeded for this user, so
+    /// `send_to_all_subscriptions` takes its own documented "zero
+    /// subscriptions still counts as handled" branch and
+    /// `journey_leg_notification_state` gets written regardless of whether
+    /// a real push was ever attempted -- letting this test observe "the leg
+    /// was found and judged skipped" without needing a live push endpoint.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                skip_check_cycle_uses_londons_calendar_date_not_bare_utc_during_the_bst_gap \
+                -- --ignored --test-threads=1`"]
+    async fn skip_check_cycle_uses_londons_calendar_date_not_bare_utc_during_the_bst_gap() {
+        let pool = connect().await;
+        let user_id = "TEST-SKIP-CYCLE-BST-USER";
+        let train_uid = "TEST-SKIP-CYCLE-BST-UID";
+        let utc_date: chrono::NaiveDate = "2026-07-15".parse().unwrap();
+        let london_service_date: chrono::NaiveDate = "2026-07-16".parse().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-15T23:30:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            now.date_naive(),
+            utc_date,
+            "sanity check: this `now` is still 2026-07-15 in bare UTC"
+        );
+        assert_eq!(
+            now.with_timezone(&chrono_tz::Europe::London).date_naive(),
+            london_service_date,
+            "sanity check: this `now` is already 2026-07-16 in Europe/London (BST, UTC+1)"
+        );
+
+        seed_user(&pool, user_id).await;
+
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date, origin_crs) \
+             VALUES ($1, $2, 'RDG') RETURNING id",
+        )
+        .bind(train_uid)
+        .bind(london_service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+
+        let train_subscription_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions \
+                (user_id, service_date, pin_origin_crs, pin_destination_crs, \
+                 pin_scheduled_departure, trains_id, resolution_status) \
+             VALUES ($1, $2, 'RDG', 'PAD', $3, $4, 'resolved') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(london_service_date)
+        .bind(london_service_date.and_hms_opt(9, 0, 0).unwrap().and_utc())
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed train_subscriptions row");
+
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journeys row");
+
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, \
+                 train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, $3, 'manual') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(london_service_date)
+        .bind(train_subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_legs row");
+
+        // A live Darwin sample at the leg's own origin (RDG), on a through
+        // service to PAD (the subscription's `pin_destination_crs`) that
+        // skips WOK -- the leg's own destination -- today. Same fixture
+        // shape as `skip_check::tests::seed_station_sample`.
+        let departures = serde_json::json!([{
+            "service_id": "test-skip-cycle-bst-service",
+            "operator": "GW",
+            "destination_crs": "PAD",
+            "scheduled": "23:45",
+            "estimated": "On time",
+            "is_cancelled": false,
+            "delay_minutes": 0,
+            "skipped_stations": ["WOK"],
+        }]);
+        sqlx::query(
+            "INSERT INTO station_samples (crs, polled_at, departures) VALUES ('RDG', NOW(), $1::jsonb) \
+             ON CONFLICT (crs) DO UPDATE SET polled_at = EXCLUDED.polled_at, departures = EXCLUDED.departures",
+        )
+        .bind(departures)
+        .execute(&pool)
+        .await
+        .expect("seed station_samples row");
+
+        run_skip_check_cycle(
+            &pool,
+            now,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_skip_check_cycle must succeed");
+
+        let last_notified_skipped: Option<bool> = sqlx::query_scalar(
+            "SELECT last_notified_skipped FROM journey_leg_notification_state \
+             WHERE user_id = $1 AND journey_leg_id = $2",
+        )
+        .bind(user_id)
+        .bind(journey_leg_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("read journey_leg_notification_state");
+        assert_eq!(
+            last_notified_skipped,
+            Some(true),
+            "the leg's service_date is 2026-07-16 (London-local, matching this now's London \
+             date) -- if the cycle scoped its lookup by bare UTC date (2026-07-15) instead, this \
+             leg would never be found and no notification_state row would exist at all"
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(train_subscription_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM station_samples WHERE crs = 'RDG'")
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
     }
 }

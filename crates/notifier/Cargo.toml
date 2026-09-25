@@ -25,3 +25,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `default = ["isahc-client"]`, so `default-features = false` is required
 # to actually drop isahc, not just add hyper-client alongside it.
 web-push = { version = "0.11", default-features = false, features = ["hyper-client"] }
+
+[dev-dependencies]
+# Same `0.2` `web-push 0.11.0` itself pins (its own `parse_response(status,
+# body)` takes this crate's `StatusCode`, not a re-export of its own) --
+# `send.rs`'s own test module drives that real function directly (rather
+# than constructing a `web_push::WebPushError` by hand, which is impossible
+# from outside that crate: its `ErrorInfo` payload type is not
+# publicly reachable) to get a genuine `WebPushError` value for each status
+# code its 410/404/401 classification cares about.
+http = "0.2"

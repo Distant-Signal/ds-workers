@@ -105,3 +105,112 @@ pub struct Config {
     #[arg(long, env, default_value = "info")]
     pub log_level: String,
 }
+
+impl Config {
+    /// Fails loudly, with a clear message naming the offending field, if
+    /// any of this crate's four `tokio::time::interval`-backed poll
+    /// cadences is configured to zero seconds.
+    ///
+    /// **The bug this closes.** `tokio::time::interval(Duration::from_secs(0))`
+    /// PANICS immediately (`Interval` requires a strictly-positive period) --
+    /// so a misconfigured `POLL_INTERVAL_SECS=0` (or any of its three
+    /// siblings) previously crashed the whole process at startup with a bare
+    /// `tokio` panic message pointing at `main.rs`'s `tokio::time::interval`
+    /// call, giving an operator no hint that the actual mistake was in their
+    /// own config. Validating each value explicitly, before any interval is
+    /// constructed, turns that into the same "refuse to start on a bad
+    /// config, with a message that says why" posture this crate's own VAPID
+    /// `ensure!`s already establish in `main`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.poll_interval_secs > 0,
+            "poll_interval_secs (--poll-interval-secs / POLL_INTERVAL_SECS) must be greater \
+             than zero"
+        );
+        anyhow::ensure!(
+            self.forward_queue_poll_interval_secs > 0,
+            "forward_queue_poll_interval_secs (--forward-queue-poll-interval-secs / \
+             FORWARD_QUEUE_POLL_INTERVAL_SECS) must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.skip_check_poll_interval_secs > 0,
+            "skip_check_poll_interval_secs (--skip-check-poll-interval-secs / \
+             SKIP_CHECK_POLL_INTERVAL_SECS) must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.template_sweep_poll_interval_secs > 0,
+            "template_sweep_poll_interval_secs (--template-sweep-poll-interval-secs / \
+             TEMPLATE_SWEEP_POLL_INTERVAL_SECS) must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config with every interval at a harmless nonzero value, so each
+    /// test below only needs to override the ONE field it's exercising.
+    fn valid_config() -> Config {
+        Config {
+            database_url: "postgres://test".to_string(),
+            poll_interval_secs: 60,
+            cooldown_minutes: 20,
+            train_delay_threshold_minutes: 15,
+            cursor_grace_seconds: 120,
+            forward_queue_poll_interval_secs: 15,
+            skip_check_poll_interval_secs: 90,
+            template_sweep_poll_interval_secs: 3600,
+            auto_commit_lead_minutes: 120,
+            vapid_private_key: "test".to_string(),
+            vapid_public_key: "test".to_string(),
+            vapid_subject: "mailto:test@example.invalid".to_string(),
+            log_level: "info".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_fully_valid_config_passes() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn a_zero_poll_interval_secs_is_rejected_with_a_clear_message() {
+        let config = Config {
+            poll_interval_secs: 0,
+            ..valid_config()
+        };
+        let err = config
+            .validate()
+            .expect_err("zero poll_interval_secs must be rejected");
+        assert!(err.to_string().contains("poll_interval_secs"));
+    }
+
+    #[test]
+    fn a_zero_forward_queue_poll_interval_secs_is_rejected() {
+        let config = Config {
+            forward_queue_poll_interval_secs: 0,
+            ..valid_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_zero_skip_check_poll_interval_secs_is_rejected() {
+        let config = Config {
+            skip_check_poll_interval_secs: 0,
+            ..valid_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_zero_template_sweep_poll_interval_secs_is_rejected() {
+        let config = Config {
+            template_sweep_poll_interval_secs: 0,
+            ..valid_config()
+        };
+        assert!(config.validate().is_err());
+    }
+}
