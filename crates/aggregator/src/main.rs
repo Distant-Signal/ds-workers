@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
             config.trains_retention_days,
             config.untracked_trains_retention_days,
             config.schedule_destination_departures_retention_days,
+            config.schedule_derived_products_retention_days,
         )
         .await
         {
@@ -431,6 +432,7 @@ async fn run_retention(
     trains_retention_days: i64,
     untracked_trains_retention_days: i64,
     schedule_destination_departures_retention_days: i64,
+    schedule_derived_products_retention_days: i64,
 ) -> anyhow::Result<()> {
     let pruned = queries::prune_history(pool, retention_days).await?;
     metrics::counter!(common::metrics::metric_name(
@@ -491,6 +493,39 @@ async fn run_retention(
         "aggregator_schedule_destination_departures_rows_pruned_total"
     ))
     .increment(schedule_destination_departures_pruned);
+
+    // The other three CIF-derived published products, which had NO pruning job
+    // anywhere in this repo until 2026-09-25. All three grow by a new
+    // `service_date` per delivery, forever -- the "bounded key space, trivial
+    // steady-state size" reasoning that justified skipping them (quoted in the
+    // comment directly above, which called its own table "the one published
+    // product in this repo that genuinely accrues") bounded the `crs`/`line_id`
+    // dimension and not the date one. See
+    // Config::schedule_derived_products_retention_days and each prune
+    // function's own doc comment.
+    let schedule_calling_points_full_pruned =
+        queries::prune_schedule_calling_points_full(pool, schedule_derived_products_retention_days)
+            .await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_calling_points_full_rows_pruned_total"
+    ))
+    .increment(schedule_calling_points_full_pruned);
+
+    let schedule_network_departures_pruned =
+        queries::prune_schedule_network_departures(pool, schedule_derived_products_retention_days)
+            .await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_network_departures_rows_pruned_total"
+    ))
+    .increment(schedule_network_departures_pruned);
+
+    let schedule_line_population_pruned =
+        queries::prune_schedule_line_population(pool, schedule_derived_products_retention_days)
+            .await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_line_population_rows_pruned_total"
+    ))
+    .increment(schedule_line_population_pruned);
 
     let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
     metrics::counter!(common::metrics::metric_name(

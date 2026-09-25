@@ -144,6 +144,49 @@ pub struct Config {
     #[arg(long, env, default_value_t = 8)]
     pub schedule_destination_departures_retention_days: i64,
 
+    /// Retention window, in days of `service_date`, for the OTHER three
+    /// CIF-derived published products: `schedule_calling_points_full`,
+    /// `schedule_network_departures` and `schedule_line_population`.
+    ///
+    /// **None of the three had a pruning job anywhere in this repo until
+    /// 2026-09-25, and all three genuinely accrue.** The reasoning that
+    /// justified leaving them alone -- "their wholesale replace is scoped per
+    /// `(crs, service_date)` / `(line_id, service_date)` over a bounded key
+    /// space, so steady-state size is trivial" -- was only ever half true: the
+    /// KEY space is bounded, but `service_date` is not one of the bounds.
+    /// `schedule-reference` publishes a new `service_date` on every delivery
+    /// (and, for `schedule_calling_points_full`, eight forward dates per
+    /// cycle), so each product grows by roughly a day's worth of rows per day,
+    /// forever. `schedule_calling_points_full` is the one that actually hurts:
+    /// it is one row per calling point of every non-cancelled schedule --
+    /// realistically 2-3x `schedule_destination_departures`' ~377,000 rows per
+    /// date, since it includes the passing points and junction TIPLOCs that
+    /// product excludes.
+    ///
+    /// 8, matching `schedule_destination_departures_retention_days` above, for
+    /// the same reason: it is one day past the 7-day window
+    /// `crates/api/src/routes/trains.rs`'s `SEARCH_WINDOW_BACKWARD_DAYS` and
+    /// `schedule-reference`'s own `TRIP_PLANNING_FORWARD_DAYS` both work in, so
+    /// a boundary date cannot flake into a 404 because a prune ran moments
+    /// before a request for it landed.
+    ///
+    /// **One known consequence, stated rather than hidden:** beyond this
+    /// window, `journey::build_journey_stops`' fallback read of
+    /// `schedule_calling_points_full` for an old TRACKED train (`trains` rows
+    /// live up to `trains_retention_days`, 30) finds nothing. That fallback is
+    /// already the second source -- `trains.calling_points`, populated by
+    /// schedule-matching, is the primary one -- and keeping ~1M rows/day for 30
+    /// days to serve it would cost several GB. If that fallback ever needs to
+    /// reach further back, raise this deliberately and budget the disk;
+    /// `service_date` partitioning with a partition swap is the right
+    /// mitigation before a longer unpartitioned window.
+    ///
+    /// Like `schedule_destination_departures_retention_days`, and unlike
+    /// `trust_event_backlog_retention_days`, nothing legal is at stake in
+    /// raising this -- only disk -- so no warning is emitted.
+    #[arg(long, env, default_value_t = 8)]
+    pub schedule_derived_products_retention_days: i64,
+
     /// How long to keep a `trains` row (and its cascaded
     /// `train_movement_events`/`train_current_state` rows) when NO
     /// `train_subscriptions` row references it (`trains_id`) -- i.e.

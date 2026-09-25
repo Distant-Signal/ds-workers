@@ -699,6 +699,77 @@ pub async fn prune_schedule_destination_departures(
     Ok(result.rows_affected())
 }
 
+/// Prunes `schedule_calling_points_full` rows for service dates older than
+/// `retention_days`.
+///
+/// **The biggest of the three products that had no pruning job at all until
+/// 2026-09-25.** One row per calling point of every non-cancelled schedule,
+/// for eight forward dates per publish cycle -- realistically 2-3x
+/// `schedule_destination_departures`' ~377,000 rows per date, because unlike
+/// that product this one keeps the passing points and junction TIPLOCs too.
+/// Its wholesale replace is scoped to one `service_date`, and
+/// `schedule-reference` publishes a new `service_date` every day, so without
+/// this job every day the service has ever seen accumulates forever.
+///
+/// Same shape as `prune_schedule_destination_departures` directly above, for
+/// the same reasons, including the strictly-`<` comparison against
+/// `CURRENT_DATE` so today's rows survive any retention value including 0.
+/// See `Config::schedule_derived_products_retention_days` for the window and
+/// for the one reader whose reach this deliberately bounds.
+pub async fn prune_schedule_calling_points_full(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM schedule_calling_points_full \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Prunes `schedule_network_departures` rows for service dates older than
+/// `retention_days`.
+///
+/// Small per day -- one JSONB row per `(crs, service_date)` over ~2,500 CRS
+/// codes, which is exactly the reasoning that was used to argue this table
+/// needed no pruning at all. That reasoning bounded the wrong dimension: the
+/// CRS key space is bounded, `service_date` is not, so this grows by ~2,500
+/// rows (each holding up to `MAX_DEPARTURES_PER_STATION` departures) per day,
+/// forever. Cheap to keep bounded, and nothing reads a `service_date` past
+/// the window (`queries::get_schedule_network_departures` is a single-date
+/// lookup for a board being rendered now).
+pub async fn prune_schedule_network_departures(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM schedule_network_departures \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Prunes `schedule_line_population` rows for service dates older than
+/// `retention_days`.
+///
+/// One JSONB row per `(line_id, service_date)` over ~109 catalogued lines --
+/// the smallest of the three, but each `population` blob holds every resolved
+/// schedule touching that line for that day, so the rows are individually
+/// large. Same unbounded-`service_date` growth as its two siblings above, and
+/// the same single-date reader
+/// (`full-coverage-consumer`'s reload via `GET /private/schedule-line-population`,
+/// which asks for one `(line_id, service_date)` it is gating right now).
+pub async fn prune_schedule_line_population(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM schedule_line_population \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Batch size for `prune_trains`'s delete loop -- mirrors
 /// `crates/api/src/data/legacy_backfill.rs`'s own `BATCH` precedent for
 /// bounding one statement's row count, just sized for a DELETE instead of
@@ -3665,6 +3736,180 @@ mod tests {
         .execute(&pool)
         .await
         .ok();
+    }
+
+    /// The three products that had NO pruning job at all until 2026-09-25 --
+    /// `schedule_calling_points_full`, `schedule_network_departures`,
+    /// `schedule_line_population`. One parameterised test per table rather than
+    /// one shared loop, so a failure names the table.
+    ///
+    /// Both properties the existing `schedule_destination_departures` tests
+    /// check are checked here for each table, because both are the ones that
+    /// would actually hurt: a stale `service_date` really is deleted (otherwise
+    /// the table grows forever, which is the bug), and today's rows survive
+    /// even at retention 0 (otherwise a prune blanks a live product between one
+    /// CIF delivery and the next).
+    ///
+    /// Dates are relative to `CURRENT_DATE`, never hardcoded -- the predicate
+    /// is `service_date < CURRENT_DATE - $1`, so a fixed date would flip these
+    /// tests' meaning as the calendar moved.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_schedule_derived -- --ignored --test-threads=1`"]
+    async fn prune_schedule_derived_calling_points_full_prunes_stale_dates_and_keeps_today() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let stale = today - chrono::Duration::days(5);
+        let fresh = today - chrono::Duration::days(1);
+
+        for (service_date, uid) in [
+            (stale, "TEST-PRUNE-CPF-OLD"),
+            (fresh, "TEST-PRUNE-CPF-NEW"),
+            (today, "TEST-PRUNE-CPF-TODAY"),
+        ] {
+            sqlx::query(
+                "INSERT INTO schedule_calling_points_full \
+                    (service_date, uid, seq, tiploc, kind, booked_departure, day_offset) \
+                 VALUES ($1, $2, 0, 'EUSTON', 'origin', '08:00:00', 0)",
+            )
+            .bind(service_date)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("seed fixture rows");
+        }
+
+        let pruned = prune_schedule_calling_points_full(&pool, 2)
+            .await
+            .expect("prune");
+        assert_eq!(
+            pruned, 1,
+            "only the 5-day-old row should be pruned at a 2-day retention"
+        );
+
+        // Even at the most aggressive value, today survives.
+        prune_schedule_calling_points_full(&pool, 0)
+            .await
+            .expect("prune at 0");
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM schedule_calling_points_full WHERE uid = 'TEST-PRUNE-CPF-TODAY'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.0, 1,
+            "today's rows must survive any retention value -- the predicate is strictly `<`"
+        );
+
+        sqlx::query("DELETE FROM schedule_calling_points_full WHERE uid LIKE 'TEST-PRUNE-CPF-%'")
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_schedule_derived -- --ignored --test-threads=1`"]
+    async fn prune_schedule_derived_network_departures_prunes_stale_dates_and_keeps_today() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let stale = today - chrono::Duration::days(5);
+        let fresh = today - chrono::Duration::days(1);
+
+        for (service_date, crs) in [(stale, "ZQ1"), (fresh, "ZQ2"), (today, "ZQ3")] {
+            sqlx::query(
+                "INSERT INTO schedule_network_departures (crs, service_date, departures) \
+                 VALUES ($1, $2, '[]'::jsonb)",
+            )
+            .bind(crs)
+            .bind(service_date)
+            .execute(&pool)
+            .await
+            .expect("seed fixture rows");
+        }
+
+        let pruned = prune_schedule_network_departures(&pool, 2)
+            .await
+            .expect("prune");
+        assert_eq!(pruned, 1);
+
+        prune_schedule_network_departures(&pool, 0)
+            .await
+            .expect("prune at 0");
+        let remaining: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schedule_network_departures WHERE crs = 'ZQ3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining.0, 1,
+            "today's rows must survive any retention value -- the predicate is strictly `<`"
+        );
+
+        sqlx::query("DELETE FROM schedule_network_departures WHERE crs IN ('ZQ1','ZQ2','ZQ3')")
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_schedule_derived -- --ignored --test-threads=1`"]
+    async fn prune_schedule_derived_line_population_prunes_stale_dates_and_keeps_today() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let stale = today - chrono::Duration::days(5);
+        let fresh = today - chrono::Duration::days(1);
+
+        for (service_date, line_id) in [
+            (stale, "test-prune-pop-old"),
+            (fresh, "test-prune-pop-new"),
+            (today, "test-prune-pop-today"),
+        ] {
+            sqlx::query(
+                "INSERT INTO schedule_line_population (line_id, service_date, population) \
+                 VALUES ($1, $2, '[]'::jsonb)",
+            )
+            .bind(line_id)
+            .bind(service_date)
+            .execute(&pool)
+            .await
+            .expect("seed fixture rows");
+        }
+
+        let pruned = prune_schedule_line_population(&pool, 2)
+            .await
+            .expect("prune");
+        assert_eq!(pruned, 1);
+
+        prune_schedule_line_population(&pool, 0)
+            .await
+            .expect("prune at 0");
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM schedule_line_population WHERE line_id = 'test-prune-pop-today'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.0, 1,
+            "today's rows must survive any retention value -- the predicate is strictly `<`"
+        );
+
+        sqlx::query("DELETE FROM schedule_line_population WHERE line_id LIKE 'test-prune-pop-%'")
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     #[tokio::test]
