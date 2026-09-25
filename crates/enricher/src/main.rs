@@ -9,6 +9,7 @@ mod config;
 mod hash;
 mod llm;
 mod queries;
+mod retry_backoff;
 mod stream;
 mod sweep;
 
@@ -19,6 +20,7 @@ use std::time::Duration;
 use clap::Parser;
 use config::Config;
 use llm::LlmClient;
+use retry_backoff::RetryBackoff;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -75,12 +77,14 @@ async fn main() -> anyhow::Result<()> {
     let model_version = format!("{}@periods-v2", config.llm_model);
 
     let mismatch_tracker = Arc::new(MismatchTracker::default());
+    let retry_backoff = Arc::new(RetryBackoff::default());
 
     tokio::spawn(sweep_loop(
         pool.clone(),
         Arc::clone(&llm),
         model_version.clone(),
         Arc::clone(&mismatch_tracker),
+        Arc::clone(&retry_backoff),
         config.sweep_interval_secs,
     ));
 
@@ -90,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&llm),
         model_version.clone(),
         Arc::clone(&mismatch_tracker),
+        Arc::clone(&retry_backoff),
         reclaim_redis,
         config.reclaim_interval_secs,
         config.reclaim_min_idle_secs,
@@ -98,8 +103,15 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match stream::read_one(&mut redis).await {
             Ok(Some((entry_id, incident_id))) => {
-                if process_incident(&pool, &llm, &model_version, &incident_id, &mismatch_tracker)
-                    .await
+                if process_incident(
+                    &pool,
+                    &llm,
+                    &model_version,
+                    &incident_id,
+                    &mismatch_tracker,
+                    &retry_backoff,
+                )
+                .await
                 {
                     if let Err(err) = stream::ack(&mut redis, &entry_id).await {
                         tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
@@ -140,6 +152,33 @@ async fn main() -> anyhow::Result<()> {
 /// couple of log lines a second rather than a pegged core. Correctness never
 /// depends on this: the hourly sweep re-finds anything the stream missed.
 const STREAM_ERROR_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Builds a `tokio::time::Interval` firing every `interval_secs`, with
+/// `MissedTickBehavior::Delay` rather than the default `Burst`. Shared by
+/// `sweep_loop` and `reclaim_loop` (both otherwise built their own inline
+/// `tokio::time::interval` with the default behavior).
+///
+/// `Burst` fires every missed tick back-to-back with zero gap once a cycle
+/// overruns its own interval (a slow LLM endpoint, a DB hiccup) -- for
+/// `sweep_loop` that means a pile of immediate back-to-back sweeps the
+/// moment things recover, each re-running `fetch_sweep_rows` and
+/// re-queuing whatever it finds; for `reclaim_loop`, a pile of immediate
+/// back-to-back `XAUTOCLAIM` scans. `Delay` instead waits a fresh
+/// `interval_secs` from whenever the overrun tick actually completes, so a
+/// slow cycle never causes a burst of immediate follow-up work. Same fix
+/// already applied to `crates/common::poller_loop` and (separately)
+/// `crates/aggregator`'s own loop -- see their doc comments for the fuller
+/// "why" this repo keeps hitting the same default-`Burst` footgun. Split
+/// into its own function (mirroring `common::poller_loop`'s own
+/// `poll_interval_with_delay_on_overrun`) so the configuration is directly
+/// assertable in a unit test, since the missed-tick BEHAVIOR itself (skipping
+/// ticks under a real overrun) isn't practically testable without a slow,
+/// timing-flaky test.
+fn ticking_interval(interval_secs: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 /// Tracks consecutive `CombineError` (length/ordinal-alignment mismatch)
 /// failures per `incident_id`, across retries from any of the three call
@@ -199,9 +238,10 @@ async fn sweep_loop(
     llm: Arc<LlmClient>,
     model_version: String,
     mismatch_tracker: Arc<MismatchTracker>,
+    retry_backoff: Arc<RetryBackoff>,
     interval_secs: u64,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut interval = ticking_interval(interval_secs);
     loop {
         interval.tick().await;
         match sweep::fetch_sweep_rows(&pool).await {
@@ -212,7 +252,15 @@ async fn sweep_loop(
                     "sweep found incidents needing extraction"
                 );
                 for id in ids {
-                    process_incident(&pool, &llm, &model_version, &id, &mismatch_tracker).await;
+                    process_incident(
+                        &pool,
+                        &llm,
+                        &model_version,
+                        &id,
+                        &mismatch_tracker,
+                        &retry_backoff,
+                    )
+                    .await;
                 }
             }
             Err(err) => tracing::error!(error = ?err, "sweep query failed"),
@@ -267,12 +315,18 @@ fn record_llm_call_metrics(call: &'static str, elapsed: std::time::Duration, suc
 /// enough, rather than relying on the hourly sweep alone for a failure mode
 /// the sweep wasn't designed to catch quickly (it only re-triggers on a
 /// text or model-version change, not a bare processing failure).
+///
+/// `retry_backoff` may also make this a no-op that immediately returns
+/// `false` -- see `retry_backoff::RetryBackoff`'s own doc for why a second
+/// consecutive failure against the same text is backed off rather than
+/// retried at full LLM cost on every call.
 async fn process_incident(
     pool: &PgPool,
     llm: &LlmClient,
     model_version: &str,
     incident_id: &str,
     mismatch_tracker: &MismatchTracker,
+    retry_backoff: &RetryBackoff,
 ) -> bool {
     let state = match queries::fetch_incident_state(pool, incident_id).await {
         Ok(Some(state)) => state,
@@ -307,6 +361,19 @@ async fn process_incident(
         return true;
     }
 
+    if retry_backoff.should_skip(incident_id, &text_hash) {
+        // This exact text already failed extraction at least once before
+        // and hasn't waited out its backoff window yet -- see
+        // `retry_backoff::RetryBackoff` for why. Skip without spending an
+        // LLM call; the entry stays unacked (`false`) so the caller's own
+        // normal retry path picks it up again once the backoff elapses.
+        tracing::info!(
+            incident_id,
+            "backing off a recently-failing extraction; skipping this attempt"
+        );
+        return false;
+    }
+
     let primary_start = std::time::Instant::now();
     let primary_result = llm
         .extract_primary(&summary, &description, first_seen_at)
@@ -316,6 +383,7 @@ async fn process_incident(
         Ok(p) => p,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "primary extraction failed");
+            retry_backoff.record_failure(incident_id, &text_hash);
             return false;
         }
     };
@@ -359,6 +427,7 @@ async fn process_incident(
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "adversarial extraction failed");
+            retry_backoff.record_failure(incident_id, &text_hash);
             return false;
         }
     };
@@ -376,6 +445,7 @@ async fn process_incident(
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "severity adversarial extraction failed");
+            retry_backoff.record_failure(incident_id, &text_hash);
             return false;
         }
     };
@@ -387,10 +457,18 @@ async fn process_incident(
     ) {
         Ok(periods) => {
             mismatch_tracker.record_success(incident_id);
+            // The extraction pipeline itself (all three LLM calls plus
+            // combination) demonstrably worked against this exact text --
+            // clear any backoff now rather than waiting for the write below
+            // to also succeed, since a subsequent write failure (DB error,
+            // or the stale-text race handled below) is not a reason to keep
+            // treating this text as one that fails extraction.
+            retry_backoff.record_success(incident_id);
             periods
         }
         Err(err) => {
             let consecutive = mismatch_tracker.record_failure(incident_id);
+            retry_backoff.record_failure(incident_id, &text_hash);
             if consecutive > 1 {
                 // Distinguishable from the generic error path below on
                 // purpose -- design §7 item 3 wants this recognizable as
@@ -467,16 +545,23 @@ async fn process_incident(
 /// reclaim pass. Runs independently of the stream consumer loop and the
 /// hourly sweep -- this is the debounced retry path for a transient
 /// per-incident failure, distinct from both.
+// Same posture as `crates/common::poller_loop::run_poll_loop`,
+// `crates/aggregator`/`crates/schedule-ingest`'s own analogous top-level
+// loop functions: every per-cycle config/dependency knob threaded straight
+// through in one call, rather than introducing a config struct for a
+// single call site.
+#[allow(clippy::too_many_arguments)]
 async fn reclaim_loop(
     pool: PgPool,
     llm: Arc<LlmClient>,
     model_version: String,
     mismatch_tracker: Arc<MismatchTracker>,
+    retry_backoff: Arc<RetryBackoff>,
     mut redis: redis::aio::ConnectionManager,
     interval_secs: u64,
     min_idle_secs: u64,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut interval = ticking_interval(interval_secs);
     let min_idle = Duration::from_secs(min_idle_secs);
     loop {
         interval.tick().await;
@@ -507,6 +592,7 @@ async fn reclaim_loop(
                         &model_version,
                         &incident_id,
                         &mismatch_tracker,
+                        &retry_backoff,
                     )
                     .await
                     {
@@ -534,6 +620,19 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    /// Finding regression: `sweep_loop`/`reclaim_loop`'s own interval must
+    /// be configured with `MissedTickBehavior::Delay`, not the
+    /// default `Burst` -- see `ticking_interval`'s own doc for why.
+    #[tokio::test]
+    async fn ticking_interval_defaults_to_delay_not_burst_on_a_missed_tick() {
+        let interval = ticking_interval(60);
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay,
+            "an overrun sweep/reclaim cycle must not burst-fire every missed tick back-to-back"
+        );
+    }
 
     async fn test_pool() -> PgPool {
         let database_url =
@@ -635,8 +734,17 @@ mod tests {
         );
         let model_version = "test-model@periods-v1";
         let mismatch_tracker = MismatchTracker::default();
+        let retry_backoff = RetryBackoff::default();
 
-        let ok = process_incident(&pool, &llm, model_version, incident_id, &mismatch_tracker).await;
+        let ok = process_incident(
+            &pool,
+            &llm,
+            model_version,
+            incident_id,
+            &mismatch_tracker,
+            &retry_backoff,
+        )
+        .await;
         assert!(
             ok,
             "a truncated-but-successful extraction must return true (ack the entry), not false"
@@ -690,4 +798,102 @@ mod tests {
     // Task 5's Axis 2 process ever changes the real constant. Update this
     // alongside `llm::MAX_PERIODS` if that ever happens.
     const MAX_PERIODS_FOR_TEST: usize = 8;
+
+    /// Finding regression: a deterministically-failing incident (here, an
+    /// endpoint that always returns malformed content for the primary
+    /// pass -- indistinguishable, from `process_incident`'s point of view,
+    /// from a model that can never parse this particular text) must stop
+    /// costing an LLM call on every single attempt. The first two attempts
+    /// against unchanged text (the original call, plus one retry) still
+    /// reach the endpoint -- `RetryBackoff` never delays the first failure,
+    /// so a genuinely transient blip keeps retrying at the caller's normal
+    /// cadence -- but the THIRD attempt, still against the same
+    /// unchanged text, must be skipped locally without another request,
+    /// proving the backoff actually suppresses the wasted call rather than
+    /// merely logging about it.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored`"]
+    async fn process_incident_backs_off_a_second_consecutive_deterministic_failure_without_another_llm_call()
+     {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-BACKOFF-1";
+        let summary = "Test incident whose extraction can never succeed";
+        let description = "Deliberately triggers a malformed primary-pass response every time.";
+
+        sqlx::query(
+            "INSERT INTO incidents (incident_id, summary, description, operators, affected_stations, priority) \
+             VALUES ($1, $2, $3, '{}', '{}', 3) \
+             ON CONFLICT (incident_id) DO UPDATE SET summary = EXCLUDED.summary, description = EXCLUDED.description, \
+                 source_text_hash = NULL, extraction_model_version = NULL, extracted_periods = NULL",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(description)
+        .execute(&pool)
+        .await
+        .expect("seed fixture incident row");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": "not valid json" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let llm = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            Duration::from_secs(30),
+        );
+        let model_version = "test-model@periods-v1";
+        let mismatch_tracker = MismatchTracker::default();
+        let retry_backoff = RetryBackoff::default();
+
+        for attempt in 1..=2 {
+            let ok = process_incident(
+                &pool,
+                &llm,
+                model_version,
+                incident_id,
+                &mismatch_tracker,
+                &retry_backoff,
+            )
+            .await;
+            assert!(!ok, "a malformed response must never be treated as success");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                attempt,
+                "attempt {attempt} against unchanged text must still reach the endpoint -- only \
+                 a SECOND consecutive failure starts backing off later attempts, not this one"
+            );
+        }
+
+        // Third attempt, same unchanged text: `RetryBackoff` must now skip
+        // it locally -- the request count must stay at 2, not become 3.
+        let ok = process_incident(
+            &pool,
+            &llm,
+            model_version,
+            incident_id,
+            &mismatch_tracker,
+            &retry_backoff,
+        )
+        .await;
+        assert!(!ok, "a backed-off attempt still has nothing to ack");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "a third attempt against the same still-failing text must be backed off locally, \
+             not spend another LLM call reproducing the identical deterministic failure"
+        );
+
+        sqlx::query("DELETE FROM incidents WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
 }

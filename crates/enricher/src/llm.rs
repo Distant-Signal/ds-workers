@@ -30,10 +30,66 @@ use serde::{Deserialize, Serialize};
 /// three conventions explicitly; this struct does no date arithmetic of its
 /// own, matching the existing `ScheduleWindow` convention of trusting the
 /// model to have already applied the stated local-time semantics.
+///
+/// Both fields use [`deserialize_lenient_date`] rather than deriving
+/// straight through to `DateTime<Utc>`'s own `Deserialize` impl. The JSON
+/// schema (`primary_schema` below) only constrains `from_date`/`to_date` to
+/// `["string", "null"]` -- it cannot require RFC-3339 shape, so a model that
+/// gets every OTHER field right can still emit an unparseable date string on
+/// one period's one field (e.g. `"May 2026"` instead of a full timestamp).
+/// Deriving straight through would fail `serde_json::from_str::<PrimaryExtraction>`
+/// as a whole on that single bad string -- discarding this incident's
+/// `category` and every other period's already-correct facts along with it.
+/// `deserialize_lenient_date` instead degrades just that one field to
+/// `None` (a real, valid state per this struct's own doc above) and logs a
+/// warning, so one malformed date poisons only itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DateRange {
+    #[serde(default, deserialize_with = "deserialize_lenient_date")]
     pub from_date: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "deserialize_lenient_date")]
     pub to_date: Option<DateTime<Utc>>,
+}
+
+/// Decodes one `DateRange` field leniently: a valid RFC-3339 string parses
+/// as today; `null` (or the key being absent entirely -- `#[serde(default)]`
+/// on the field covers that) is `None`, same as before; but a PRESENT,
+/// non-null value that ISN'T a parseable RFC-3339 timestamp -- the case
+/// that used to fail the entire surrounding `PrimaryExtraction` deserialize
+/// -- degrades to `None` with a `tracing::warn!` instead of propagating a
+/// `serde::de::Error`. See `DateRange`'s own doc comment for why graceful
+/// per-field degradation matters more here than strict validation: the
+/// alternative is silently discarding a whole incident's correctly-extracted
+/// category/resolution/severity signal over one field this schema can't
+/// constrain the shape of.
+fn deserialize_lenient_date<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match raw {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => match DateTime::parse_from_rfc3339(&s) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(err) => {
+                tracing::warn!(
+                    value = %s,
+                    error = %err,
+                    "primary extraction returned an unparseable date; treating this one field \
+                     as null rather than discarding the whole extraction"
+                );
+                None
+            }
+        },
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "primary extraction returned a non-string, non-null date value; treating this \
+                 one field as null rather than discarding the whole extraction"
+            );
+            None
+        }
+    })
 }
 
 /// Nested weekly time-of-day restriction *within* a period's `date_range`,
@@ -1385,6 +1441,114 @@ mod tests {
                 to_date: None
             }
         );
+    }
+
+    // -- Finding regression: a malformed date on ONE field must not poison
+    // the whole extraction. Before `deserialize_lenient_date`, any of the
+    // fixtures below would fail `serde_json::from_value::<DateRange>` (and,
+    // in the real pipeline, the surrounding `PrimaryExtraction` deserialize
+    // in `extract_primary`) outright -- discarding this incident's
+    // `category` and every other period's already-correct facts along with
+    // the one bad field. `deserialize_lenient_date` now degrades just that
+    // field to `None` instead.
+
+    #[test]
+    fn date_range_degrades_an_unparseable_from_date_to_null_instead_of_failing() {
+        let json =
+            serde_json::json!({ "from_date": "May 2026", "to_date": "2026-07-27T00:00:00Z" });
+        let range: DateRange =
+            serde_json::from_value(json).expect("a bad from_date must not fail the whole struct");
+        assert_eq!(
+            range.from_date, None,
+            "the unparseable value must degrade to null, not surface as a parse error"
+        );
+        assert_eq!(
+            range.to_date,
+            Some("2026-07-27T00:00:00Z".parse().unwrap()),
+            "the OTHER, well-formed field on the same object must be unaffected"
+        );
+    }
+
+    #[test]
+    fn date_range_degrades_an_unparseable_to_date_to_null_instead_of_failing() {
+        let json =
+            serde_json::json!({ "from_date": "2026-05-11T00:00:00Z", "to_date": "26th July" });
+        let range: DateRange =
+            serde_json::from_value(json).expect("a bad to_date must not fail the whole struct");
+        assert_eq!(
+            range.from_date,
+            Some("2026-05-11T00:00:00Z".parse().unwrap())
+        );
+        assert_eq!(range.to_date, None);
+    }
+
+    #[test]
+    fn date_range_degrades_a_non_string_date_value_to_null_instead_of_failing() {
+        // Not a realistic model output for this schema, but a defensive
+        // fixture: any JSON shape other than a string or null must still
+        // degrade gracefully rather than propagate a type-mismatch error.
+        let json = serde_json::json!({ "from_date": 12345, "to_date": null });
+        let range: DateRange =
+            serde_json::from_value(json).expect("a non-string date must not fail the whole struct");
+        assert_eq!(range.from_date, None);
+    }
+
+    #[tokio::test]
+    async fn extract_primary_keeps_the_rest_of_a_period_when_one_of_its_dates_is_malformed() {
+        // End-to-end version of the fixtures above: a malformed date buried
+        // inside `extract_primary`'s real response must not discard the
+        // period's `resolution_status`/`apparent_severity`/`category`, or
+        // any sibling period, along with it.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": serde_json::json!({
+                            "category": "signal_failure",
+                            "periods": [{
+                                "scope_description": null,
+                                "date_range": { "from_date": "not a date", "to_date": null },
+                                "schedule_window": null,
+                                "resolution_status": "ongoing",
+                                "apparent_severity": "severe_disruption",
+                                "impact_type": null
+                            }]
+                        }).to_string()
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "test-model".to_string(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let result = client
+            .extract_primary("Signal failure", "Delays", reference_date())
+            .await;
+
+        let extraction =
+            result.expect("a malformed date on one field must not fail the whole extraction");
+        assert_eq!(extraction.category, "signal_failure");
+        assert_eq!(extraction.periods.len(), 1);
+        assert_eq!(
+            extraction.periods[0]
+                .date_range
+                .as_ref()
+                .and_then(|r| r.from_date),
+            None,
+            "the malformed field itself degrades to null"
+        );
+        assert_eq!(
+            extraction.periods[0].resolution_status, "ongoing",
+            "every OTHER field on the same period must survive intact"
+        );
+        assert_eq!(extraction.periods[0].apparent_severity, "severe_disruption");
     }
 
     // --- Live eval against a real OpenAI-compatible endpoint ---
