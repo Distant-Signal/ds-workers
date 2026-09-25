@@ -257,19 +257,111 @@ fn has_recurring_schedule(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
     })
 }
 
+/// Negation words this ladder recognizes immediately before a keyword
+/// match. Kept short and specific to how UK/Irish rail incident-report
+/// prose actually phrases a reassurance -- "No severe delays are
+/// expected", "not suspended", "without any cancellations" -- rather than
+/// an exhaustive general-English negation list; this is not a general NLP
+/// negation detector, just enough to stop the concrete false-positive
+/// pattern this ladder is known to hit.
+const NEGATION_WORDS: [&str; 6] = ["no", "not", "without", "isn't", "aren't", "never"];
+
+/// How many words immediately before a keyword match to scan for a
+/// `NEGATION_WORDS` entry. 3 comfortably covers "without any
+/// cancellations" (two words between "without" and the keyword) without
+/// being so wide it picks up an unrelated negation from an earlier clause.
+const NEGATION_LOOKBACK_WORDS: usize = 3;
+
+/// Whether `text` contains `keyword` as a genuine, non-negated positive
+/// match -- `text.contains(keyword)`, plus a check that none of the
+/// `NEGATION_LOOKBACK_WORDS` words immediately before the match is a
+/// `NEGATION_WORDS` entry.
+///
+/// Fixes the Signal Box Audit Low finding that plain substring matching
+/// had no negation handling at all: "No severe delays are expected" used
+/// to match the substring "severe delays" and classify as `SevereDelays`
+/// -- exactly backwards, since the sentence is a reassurance that nothing
+/// is happening. A `text` can contain the same keyword more than once
+/// (one negated, one genuine); this returns `true` if ANY occurrence is a
+/// positive match, since a single real disruption mention elsewhere in
+/// the same text is still real evidence.
+///
+/// Word boundaries are approximate (`split_whitespace` plus trimming
+/// leading/trailing punctuation), not linguistically precise -- adequate
+/// for incident-report prose, which is what this ladder actually sees.
+fn matches_keyword(text: &str, keyword: &str) -> bool {
+    text.match_indices(keyword)
+        .any(|(idx, _)| !preceded_by_negation(text, idx))
+}
+
+/// Whether one of the `NEGATION_LOOKBACK_WORDS` words immediately before
+/// byte offset `match_start` in `text` is a `NEGATION_WORDS` entry.
+fn preceded_by_negation(text: &str, match_start: usize) -> bool {
+    let preceding_words: Vec<&str> = text[..match_start]
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .collect();
+    let start = preceding_words
+        .len()
+        .saturating_sub(NEGATION_LOOKBACK_WORDS);
+    preceding_words[start..]
+        .iter()
+        .any(|word| NEGATION_WORDS.contains(word))
+}
+
+/// Reassurance nouns that, immediately after a "no service" match, flip it
+/// from a genuine "trains aren't running" signal into the opposite: a
+/// standard incident-report boilerplate line saying nothing is expected to
+/// change. E.g. "No service alterations are expected" / "No service
+/// changes are planned" / "No service disruption is anticipated".
+///
+/// This is a SEPARATE check from `matches_keyword`'s general
+/// preceded-by-negation logic, because "no service" is unusual among this
+/// ladder's keywords: its own negation word ("no") is the keyword's own
+/// first token, not something separately preceding it -- there is nothing
+/// before "No" to inspect at the start of "No service alterations are
+/// expected." The disambiguating signal here is instead what FOLLOWS the
+/// match, so this checks the very next word instead.
+const NO_SERVICE_REASSURANCE_FOLLOWERS: [&str; 6] = [
+    "alteration",
+    "alterations",
+    "change",
+    "changes",
+    "disruption",
+    "disruptions",
+];
+
+/// Whether `text` contains "no service" as a genuine "trains aren't
+/// running" signal (e.g. "No service between Andover and Basingstoke due
+/// to a fault"), as opposed to the boilerplate reassurance pattern "No
+/// service alterations/changes/disruption(s) are expected/planned" that
+/// `NO_SERVICE_REASSURANCE_FOLLOWERS` catches. See that constant's doc
+/// comment for why this needs a follows-check rather than a
+/// preceded-by-negation check.
+fn matches_no_service(text: &str) -> bool {
+    text.match_indices("no service").any(|(idx, matched)| {
+        let after = &text[idx + matched.len()..];
+        let next_word = after
+            .split_whitespace()
+            .next()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()));
+        !matches!(next_word, Some(word) if NO_SERVICE_REASSURANCE_FOLLOWERS.contains(&word))
+    })
+}
+
 fn severity_from_incident(incident: &IncidentMessage) -> Severity {
     if incident.is_planned {
         return Severity::PlannedClosure;
     }
 
     let text = format!("{} {}", incident.summary, incident.description).to_lowercase();
-    if text.contains("suspended") || text.contains("no service") {
+    if matches_keyword(&text, "suspended") || matches_no_service(&text) {
         return Severity::Suspended;
     }
-    if text.contains("rail replacement") || text.contains("replacement bus") {
+    if matches_keyword(&text, "rail replacement") || matches_keyword(&text, "replacement bus") {
         return Severity::BusService;
     }
-    if text.contains("lines blocked") || text.contains("all lines blocked") {
+    if matches_keyword(&text, "lines blocked") || matches_keyword(&text, "all lines blocked") {
         return Severity::PartSuspended;
     }
     // "cancel" (not just "cancelled"/"cancellation") deliberately catches
@@ -280,13 +372,13 @@ fn severity_from_incident(incident: &IncidentMessage) -> Severity {
     // "lines blocked" -- the same tier `classify`'s sample-based path
     // already gives a high cancellation rate (`part_suspended_pct`) -- so
     // it is checked at this same position, before the severe-delays check.
-    if text.contains("cancel") {
+    if matches_keyword(&text, "cancel") {
         return Severity::PartSuspended;
     }
-    if text.contains("severe delays") || text.contains("major disruption") {
+    if matches_keyword(&text, "severe delays") || matches_keyword(&text, "major disruption") {
         return Severity::SevereDelays;
     }
-    if text.contains("diverted") {
+    if matches_keyword(&text, "diverted") {
         return Severity::Diverted;
     }
     Severity::MinorDelays
@@ -1584,6 +1676,103 @@ mod tests {
         );
         let reports = aggregate_with_defaults(&lines, &[inc]);
         assert_eq!(reports["swr-alton"].worst_severity(), Severity::MinorDelays);
+    }
+
+    #[test]
+    fn no_service_alterations_reassurance_is_not_classified_suspended() {
+        // The exact false positive from the Signal Box Audit finding: "No
+        // service alterations are expected" matches the substring "no
+        // service" and used to classify as Suspended -- the MOST severe
+        // tier -- for a sentence that is actually announcing nothing is
+        // wrong.
+        let inc = incident(
+            "SWR-10",
+            "Service update",
+            "No service alterations are expected because of this.",
+            &["SW"],
+            &["AON"],
+        );
+        assert_eq!(
+            severity_from_incident(&inc),
+            Severity::MinorDelays,
+            "a reassurance that no alterations are expected must not classify as Suspended"
+        );
+    }
+
+    #[test]
+    fn similar_no_service_reassurance_phrasings_are_not_classified_suspended() {
+        for description in [
+            "No service changes are planned for this weekend.",
+            "No service disruption is anticipated this evening.",
+            "No service alterations are currently expected.",
+        ] {
+            let inc = incident("SWR-11", "Service update", description, &["SW"], &["AON"]);
+            assert_eq!(
+                severity_from_incident(&inc),
+                Severity::MinorDelays,
+                "{description:?} must not classify as Suspended"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_no_service_text_still_classifies_as_suspended() {
+        // The negation/reassurance fix must not blunt the genuine case:
+        // "no service" announcing a real, ongoing lack of trains.
+        let inc = incident(
+            "SWR-12",
+            "Service disruption",
+            "No service between Woking and Basingstoke due to a fault.",
+            &["SW"],
+            &["WOK"],
+        );
+        assert_eq!(severity_from_incident(&inc), Severity::Suspended);
+    }
+
+    #[test]
+    fn negated_severity_keywords_do_not_match_their_tier() {
+        for description in [
+            "No severe delays are expected this morning.",
+            "The line is not suspended and services are running as normal.",
+            "No cancellations are expected today.",
+            "Without any rail replacement services required.",
+        ] {
+            let inc = incident("SWR-13", "Service update", description, &["SW"], &["AON"]);
+            assert_eq!(
+                severity_from_incident(&inc),
+                Severity::MinorDelays,
+                "{description:?} must fall through to the MinorDelays default, not match its \
+                 negated keyword's tier"
+            );
+        }
+    }
+
+    #[test]
+    fn non_negated_severe_delays_keyword_still_classifies_correctly() {
+        // Proves the negation check is scoped to an immediately preceding
+        // negation word, not so broad it swallows genuine matches: the
+        // identical keyword ("severe delays") without any negation nearby
+        // must still classify as SevereDelays.
+        let inc = incident(
+            "SWR-14",
+            "Service disruption",
+            "Severe delays are expected on all SWR services today.",
+            &["SW"],
+            &["AON"],
+        );
+        assert_eq!(severity_from_incident(&inc), Severity::SevereDelays);
+    }
+
+    #[test]
+    fn non_negated_cancel_keyword_still_classifies_correctly() {
+        let inc = incident(
+            "SWR-15",
+            "Service update",
+            "This service has been cancelled due to a shortage of train crew.",
+            &["SW"],
+            &["AON"],
+        );
+        assert_eq!(severity_from_incident(&inc), Severity::PartSuspended);
     }
 
     #[test]

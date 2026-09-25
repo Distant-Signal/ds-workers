@@ -82,6 +82,28 @@
 //!   restart-frequency problem, not a per-cycle one -- real, ongoing I/O
 //!   cost for a small edge-case improvement given the above.
 //!
+//! ## Correction: day rollover is not a restart
+//!
+//! The framing above -- "the only reset-driven overcount exposure is a
+//! rare process restart" -- was itself wrong, independent of the
+//! restart-vs-persistence tradeoff it was arguing for. `SeenServiceLedger`
+//! keys its `HashSet`s by `(line_id, period)`, and until this fix,
+//! `mark_seen` only ever consulted the bucket for the CURRENT `period`.
+//! That bucket is just as empty the first time a new calendar day's
+//! `period` value is passed in as it is after a genuine process restart --
+//! so the exact same "services still in the window get treated as new
+//! again" overcount fired at every single midnight rollover, for every
+//! line with a service dwelling at that moment, not only on the rare
+//! occasions the process actually restarts. Unlike a restart, day
+//! rollover is not rare: it is guaranteed, every day, forever, so this was
+//! a systemic daily overcount rather than an occasional one.
+//! `SeenServiceLedger::mark_seen` now also checks the immediately
+//! preceding period's bucket and treats a hit there as "already counted,"
+//! not new -- see its doc comment -- which closes this for rollover
+//! specifically while leaving the restart case exactly as analyzed above
+//! (a real process restart still clears the whole in-memory map, so that
+//! exposure remains, and remains judged acceptable for the reasons given).
+//!
 //! If this residual exposure is later judged unacceptable (e.g. once real
 //! restart frequency / traffic data is measured against a shipped rollup),
 //! `SeenServiceLedger`'s `mark_seen` could be backed by a
@@ -115,15 +137,51 @@ impl SeenServiceLedger {
     }
 
     /// Records `service_id` as seen for `line_id`/`period`. Returns `true`
-    /// the first time a given `service_id` is marked for that
-    /// `(line_id, period)` pair -- a genuinely new train this period --
-    /// `false` on every subsequent call for the same triple: a re-poll of a
-    /// train still dwelling in the LDBWS window.
+    /// the first time a given `service_id` is marked for that `line_id` --
+    /// a genuinely new train -- `false` on every subsequent call for the
+    /// same pair: a re-poll of a train still dwelling in the LDBWS window,
+    /// including one that is still dwelling after `period` has rolled over
+    /// to the next calendar day.
+    ///
+    /// ## The day-rollover double-count this guards against
+    ///
+    /// A train delayed past midnight (e.g. scheduled 23:55, still not
+    /// departed at 00:05) never leaves the LDBWS departure-board window --
+    /// it is the SAME physical service, continuously visible, across the
+    /// rollover. Before this fix, `mark_seen` looked up ONLY the current
+    /// `(line_id, period)` bucket: the very first poll after midnight
+    /// passes the new `period`, finds no bucket for it yet (an empty
+    /// `HashSet`), and inserts+returns `true` -- counting that train a
+    /// SECOND time, once for yesterday's period and again for today's,
+    /// even though nothing new actually happened. This fired on every
+    /// single day's rollover for every line with a service dwelling at
+    /// midnight, not just after a process restart -- the module's own
+    /// docs above previously (incorrectly) framed the "reset ledger"
+    /// overcount as a restart-only, rare-event exposure; rollover made it
+    /// a daily one.
+    ///
+    /// The fix: also check whether `service_id` was already recorded
+    /// under the immediately PRECEDING period (`period.pred()`) for this
+    /// `line_id`. If so, this is a continuing sighting of an
+    /// already-counted train, not a new one -- return `false` -- but still
+    /// copy it forward into the current period's bucket (so a service that
+    /// happens to dwell across TWO consecutive midnights is still
+    /// recognized as already-seen on the second rollover too, without
+    /// needing to look back more than one day at a time).
     fn mark_seen(&mut self, line_id: &str, period: NaiveDate, service_id: &str) -> bool {
-        self.seen
+        let already_counted_yesterday = period.pred_opt().is_some_and(|prev| {
+            self.seen
+                .get(&(line_id.to_string(), prev))
+                .is_some_and(|set| set.contains(service_id))
+        });
+
+        let newly_inserted_today = self
+            .seen
             .entry((line_id.to_string(), period))
             .or_default()
-            .insert(service_id.to_string())
+            .insert(service_id.to_string());
+
+        newly_inserted_today && !already_counted_yesterday
     }
 
     /// Drops every tracked `(line_id, period)` entry whose `period` is
@@ -363,10 +421,15 @@ mod tests {
 
     #[test]
     fn dedup_is_scoped_per_period_not_global() {
-        // The same service_id reappearing on a later day (a different
-        // service that happens to hash to the same Darwin ID, or -- more
-        // relevantly -- the ledger correctly starting a fresh count once
-        // `period` advances) must count again.
+        // A service_id string genuinely reappearing several days later (a
+        // different Darwin service that happens to reuse the same ID once
+        // the original has long since been pruned from the ledger, per
+        // `prune_before`'s own docs) must count again -- unlike the
+        // IMMEDIATELY adjacent-day case (see
+        // `day_rollover_does_not_double_count_a_still_dwelling_service`
+        // below), five days apart is well beyond `mark_seen`'s
+        // one-day-back rollover check, so this is unambiguously a fresh
+        // sighting, not a continuing one.
         let l = line("alton", &["AHT"]);
         let defaults = Defaults::default();
         let mut ledger = SeenServiceLedger::new();
@@ -383,16 +446,81 @@ mod tests {
         let day2 = dedup_new_sample_stats(
             &mut ledger,
             "alton",
-            day(2026, 9, 1),
+            day(2026, 9, 5),
             &l,
             &samples,
             &defaults,
         );
         assert_eq!(day1.expect("day 1 sighting").total, 1);
         assert_eq!(
-            day2.expect("day 2 is a fresh period, must count again")
-                .total,
+            day2.expect(
+                "a sighting 5 days later, well beyond the rollover check, must count again"
+            )
+            .total,
             1
+        );
+    }
+
+    #[test]
+    fn day_rollover_does_not_double_count_a_still_dwelling_service() {
+        // The Finding #1 regression: a service delayed past midnight never
+        // leaves the LDBWS window -- it is the SAME train, continuously
+        // visible, across the day boundary. Before the fix, the first
+        // poll after rollover passed a brand-new `period` value, found an
+        // empty bucket for it, and counted the still-dwelling train a
+        // SECOND time even though nothing new happened. A correct fix
+        // counts it exactly once across the whole rollover.
+        let l = line("alton", &["AHT"]);
+        let defaults = Defaults::default();
+        let mut ledger = SeenServiceLedger::new();
+        let day1 = day(2026, 8, 31);
+        let day2 = day(2026, 9, 1);
+
+        // Last poll of day 1: svc-1 is dwelling (e.g. delayed, due out at
+        // 23:55 but not yet departed) and is counted for day 1.
+        let samples = samples_with("AHT", vec![departure("svc-1", 30, false)]);
+        let first = dedup_new_sample_stats(&mut ledger, "alton", day1, &l, &samples, &defaults);
+        assert_eq!(
+            first.expect("first sighting, still within day 1").total,
+            1,
+            "the dwelling service must be counted once, on day 1"
+        );
+
+        // First poll after midnight: same service_id, same physical train,
+        // still sitting in the window -- now evaluated against day 2's
+        // period. This must NOT be treated as a new sighting.
+        let samples_after_rollover = samples_with("AHT", vec![departure("svc-1", 35, false)]);
+        let after_rollover = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day2,
+            &l,
+            &samples_after_rollover,
+            &defaults,
+        );
+        assert!(
+            after_rollover.is_none(),
+            "a train dwelling across midnight must not be double-counted at rollover"
+        );
+
+        // A GENUINELY new train appearing after rollover must still count,
+        // proving the fix doesn't just suppress day 2 entirely.
+        let samples_new_train = samples_with(
+            "AHT",
+            vec![departure("svc-1", 40, false), departure("svc-2", 0, false)],
+        );
+        let new_train = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day2,
+            &l,
+            &samples_new_train,
+            &defaults,
+        );
+        assert_eq!(
+            new_train.expect("svc-2 is genuinely new on day 2").total,
+            1,
+            "only the genuinely new train should be counted, not the carried-over one"
         );
     }
 

@@ -1,6 +1,34 @@
 use clap::Parser;
 use common::config::{LineCatalogue, parse_lines};
 
+/// Rejects a negative retention value, loudly, at startup.
+///
+/// Signal Box Audit Low finding: every `*_retention_days`/
+/// `*_retention_hours` field below feeds a `queries.rs` prune query shaped
+/// like `WHERE <col> < (CURRENT_DATE - $1::int)` or
+/// `NOW() - ($1 || ' days')::interval`. Subtracting a NEGATIVE value flips
+/// the arithmetic into ADDITION -- `CURRENT_DATE - (-7)` is 7 days in the
+/// FUTURE, so `day < CURRENT_DATE - (-7)` matches every row up to and
+/// including today, deleting current data instead of the old/stale data
+/// the cutoff is supposed to target. A negative value could only ever
+/// reach here via a typo'd or deliberately hostile `--*-retention-days`/
+/// env var -- there is no legitimate reason to configure one -- so this
+/// fails startup outright rather than silently accepting it, the same
+/// "fail loud on bad config" convention `parse_lines`/`parse_stanox_crs`
+/// already use for THEIR own value_parsers (see `common::config::parse_lines`'s
+/// doc comment).
+fn non_negative_retention(s: &str) -> anyhow::Result<i64> {
+    let value: i64 = s
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid retention value {s:?}: {e}"))?;
+    anyhow::ensure!(
+        value >= 0,
+        "retention value must not be negative, got {value} -- a negative retention window \
+         becomes a FUTURE cutoff that deletes today's data instead of old data"
+    );
+    Ok(value)
+}
+
 /// CLI/env configuration for the `aggregator` service.
 #[derive(Debug, Parser)]
 pub struct Config {
@@ -20,7 +48,7 @@ pub struct Config {
     pub poll_interval_secs: u64,
 
     /// How long to keep `line_status_history` rows before pruning them.
-    #[arg(long, env, default_value_t = 7)]
+    #[arg(long, env, default_value_t = 7, value_parser = non_negative_retention)]
     pub history_retention_days: i64,
 
     /// How long to keep `line_status_daily_stats` rows before pruning them.
@@ -35,7 +63,7 @@ pub struct Config {
     /// 365 remains a product/UX call (how far back the Trends tab should
     /// let a user scroll, docs/superpowers/specs/2026-08-31-line-history-graphics-design.md,
     /// Open question 1), this default just guarantees a ceiling exists.
-    #[arg(long, env, default_value_t = 300)]
+    #[arg(long, env, default_value_t = 300, value_parser = non_negative_retention)]
     pub daily_stats_retention_days: i64,
 
     /// How long to keep `line_status_half_hourly_stats` rows before
@@ -70,7 +98,7 @@ pub struct Config {
     /// bucket count. At 840 hours, storage is ~105 lines x 48 rows/day x
     /// 35 days ~= 176,400 rows -- trivial for Postgres, same order of
     /// magnitude this repo's specs have called "trivial" elsewhere.
-    #[arg(long, env, default_value_t = 840)]
+    #[arg(long, env, default_value_t = 840, value_parser = non_negative_retention)]
     pub half_hourly_stats_retention_hours: i64,
 
     /// How long to keep `trust_event_backlog` rows before pruning them.
@@ -91,7 +119,7 @@ pub struct Config {
     /// docs/superpowers/plans/2026-09-05-trust-event-backlog-plan.md's
     /// own "Scope decision: retention tier and the licensing safeguard"
     /// section.
-    #[arg(long, env, default_value_t = 1)]
+    #[arg(long, env, default_value_t = 1, value_parser = non_negative_retention)]
     pub trust_event_backlog_retention_days: i64,
 
     /// How long to keep `trains` (and, via CASCADE,
@@ -104,7 +132,7 @@ pub struct Config {
     /// confirmed posture, this can default straight to 30 from day one: the
     /// RDM licensing question that caution exists to enforce has already been
     /// confirmed clear by the repo owner for this data.
-    #[arg(long, env, default_value_t = 30)]
+    #[arg(long, env, default_value_t = 30, value_parser = non_negative_retention)]
     pub trains_retention_days: i64,
 
     /// How long to keep `schedule_destination_departures` rows before
@@ -141,7 +169,7 @@ pub struct Config {
     /// Unlike `trust_event_backlog_retention_days` there is deliberately NO
     /// warning emitted when this is configured higher: nothing legal is at
     /// stake, only disk.
-    #[arg(long, env, default_value_t = 8)]
+    #[arg(long, env, default_value_t = 8, value_parser = non_negative_retention)]
     pub schedule_destination_departures_retention_days: i64,
 
     /// Retention window, in days of `service_date`, for the OTHER three
@@ -184,7 +212,7 @@ pub struct Config {
     /// Like `schedule_destination_departures_retention_days`, and unlike
     /// `trust_event_backlog_retention_days`, nothing legal is at stake in
     /// raising this -- only disk -- so no warning is emitted.
-    #[arg(long, env, default_value_t = 8)]
+    #[arg(long, env, default_value_t = 8, value_parser = non_negative_retention)]
     pub schedule_derived_products_retention_days: i64,
 
     /// How long to keep a `trains` row (and its cascaded
@@ -203,7 +231,7 @@ pub struct Config {
     /// confirmed-clear RDM licensing posture that default's own doc
     /// comment cites -- this is a narrower cut of the same data, not a
     /// new licensing question.
-    #[arg(long, env, default_value_t = 14)]
+    #[arg(long, env, default_value_t = 14, value_parser = non_negative_retention)]
     pub untracked_trains_retention_days: i64,
 
     /// Port for the aggregator's Prometheus `/metrics` endpoint. See
@@ -240,4 +268,86 @@ pub struct Config {
     /// value.
     #[arg(long, env, default_value_t = false)]
     pub full_coverage_enabled_default: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines_dir() -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lines")
+            .to_str()
+            .expect("utf8 lines dir path")
+            .to_string()
+    }
+
+    fn minimal_args(extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "aggregator".to_string(),
+            "--database-url".to_string(),
+            "postgres://user:pass@localhost/db".to_string(),
+            "--lines-dir".to_string(),
+            lines_dir(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    #[test]
+    fn a_negative_retention_days_value_is_rejected_at_parse_time() {
+        // Signal Box Audit Low finding: a negative retention value becomes
+        // a FUTURE cutoff (`CURRENT_DATE - (-7)`), which would delete
+        // TODAY's data instead of old data. This must fail startup loudly,
+        // not silently parse.
+        let result = Config::try_parse_from(minimal_args(&["--history-retention-days", "-7"]));
+        assert!(
+            result.is_err(),
+            "a negative history_retention_days must be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn every_retention_field_rejects_a_negative_value() {
+        for flag in [
+            "--history-retention-days",
+            "--daily-stats-retention-days",
+            "--half-hourly-stats-retention-hours",
+            "--trust-event-backlog-retention-days",
+            "--trains-retention-days",
+            "--schedule-destination-departures-retention-days",
+            "--schedule-derived-products-retention-days",
+            "--untracked-trains-retention-days",
+        ] {
+            let result = Config::try_parse_from(minimal_args(&[flag, "-1"]));
+            assert!(
+                result.is_err(),
+                "{flag} must reject a negative value, but parsing succeeded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_negative_retention_days_value_still_parses_normally() {
+        let config = Config::try_parse_from(minimal_args(&["--history-retention-days", "0"]))
+            .expect("zero is a valid (if aggressive) retention window");
+        assert_eq!(config.history_retention_days, 0);
+    }
+
+    #[test]
+    fn default_retention_values_parse_with_no_overrides() {
+        // Regression against accidentally requiring the new value_parser
+        // args to be explicitly supplied: every default must still parse
+        // cleanly on its own.
+        let config =
+            Config::try_parse_from(minimal_args(&[])).expect("defaults alone must still parse");
+        assert_eq!(config.history_retention_days, 7);
+        assert_eq!(config.daily_stats_retention_days, 300);
+        assert_eq!(config.half_hourly_stats_retention_hours, 840);
+        assert_eq!(config.trust_event_backlog_retention_days, 1);
+        assert_eq!(config.trains_retention_days, 30);
+        assert_eq!(config.schedule_destination_departures_retention_days, 8);
+        assert_eq!(config.schedule_derived_products_retention_days, 8);
+        assert_eq!(config.untracked_trains_retention_days, 14);
+    }
 }

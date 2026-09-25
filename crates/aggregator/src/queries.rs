@@ -251,7 +251,32 @@ fn full_coverage_stats_from_row(
 /// `/private/tfl-line-status` ingest and are pruned by that endpoint
 /// against its own batch — they are invisible to this crate's line set, so
 /// an unscoped DELETE here would wipe them on the very next cycle.
+///
+/// **Guards against an EMPTY `current_line_ids`.** `NOT (line_id =
+/// ANY($1))` is true for every row when `$1` is an empty array — Postgres's
+/// `ANY` over an empty array never matches, so the `NOT` flips that to
+/// "match everything." An empty list here almost certainly means the
+/// static+custom line catalogue failed to load or came back empty (a typo'd
+/// `--lines-dir`, a custom-lines fetch that errored and was swallowed
+/// upstream, etc.) rather than "every line was deliberately removed" — the
+/// static catalogue alone is never legitimately empty in a real deployment.
+/// Without this guard, that misconfiguration would silently DELETE every
+/// aggregator-sourced `line_status` row on the very next cycle, since
+/// nothing here previously distinguished "the catalogue is genuinely down
+/// to zero lines" from "the catalogue failed to load." Rather than proceed
+/// into a delete that can wipe the whole table, this no-ops and logs a
+/// warning: the next cycle retries with (hopefully) a populated catalogue,
+/// and existing rows survive the gap either way.
 pub async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> Result<u64> {
+    if current_line_ids.is_empty() {
+        tracing::warn!(
+            "prune_removed_lines called with an empty line-id list; skipping the prune rather \
+             than deleting every aggregator-sourced line_status row (this usually means the \
+             line catalogue failed to load or came back empty)"
+        );
+        return Ok(0);
+    }
+
     let result = sqlx::query(
         "DELETE FROM line_status WHERE source = 'aggregator' AND NOT (line_id = ANY($1))",
     )
@@ -1421,10 +1446,14 @@ mod tests {
         .await
         .expect("seed fixture rows");
 
-        // An empty current-line set is the worst case: the aggregator has
-        // nothing of its own left, so anything it does not own must still
-        // survive.
-        prune_removed_lines(&pool, &[])
+        // A non-empty current-line set that no longer includes 'TEST-AGG':
+        // that row is genuinely stale and should go, while the TfL-owned
+        // row (a different `source`, never in this crate's line set at
+        // all) must survive regardless of what this list contains. Note
+        // this deliberately does NOT use an empty `current_line_ids` --
+        // see `prune_removed_lines_no_ops_on_an_empty_line_id_list` below
+        // for that guard's own regression test.
+        prune_removed_lines(&pool, &["some-other-line".to_string()])
             .await
             .expect("prune_removed_lines");
 
@@ -1447,6 +1476,56 @@ mod tests {
         assert!(
             survivors.contains(&"TEST-TFL".to_string()),
             "a TfL-owned row must not be collateral damage"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; see the plan's Global Constraints for the \
+                DATABASE_URL incantation, then run with `cargo test -p aggregator \
+                prune_removed_lines_no_ops_on_an_empty_line_id_list -- --ignored`"]
+    async fn prune_removed_lines_no_ops_on_an_empty_line_id_list() {
+        // Signal Box Audit Low finding: an EMPTY `current_line_ids` (e.g.
+        // from a misconfigured or failed-to-load line catalogue) must not
+        // wipe every aggregator-sourced `line_status` row. `NOT (line_id =
+        // ANY($1))` over an empty `$1` is true for every row, so without a
+        // guard this would delete everything the aggregator owns.
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        sqlx::query(
+            "INSERT INTO line_status (line_id, name, mode_name, operators, statuses, source) \
+             VALUES \
+                ('TEST-AGG-EMPTY', 'test aggregator line', 'national-rail', '{}', '[]', \
+                 'aggregator') \
+             ON CONFLICT (line_id) DO UPDATE SET source = EXCLUDED.source",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture row");
+
+        let removed = prune_removed_lines(&pool, &[])
+            .await
+            .expect("prune_removed_lines must no-op, not error, on an empty list");
+
+        let survivors: Vec<String> =
+            sqlx::query_scalar("SELECT line_id FROM line_status WHERE line_id = 'TEST-AGG-EMPTY'")
+                .fetch_all(&pool)
+                .await
+                .expect("read survivors");
+
+        sqlx::query("DELETE FROM line_status WHERE line_id = 'TEST-AGG-EMPTY'")
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture row");
+
+        assert_eq!(removed, 0, "an empty line-id list must delete nothing");
+        assert!(
+            survivors.contains(&"TEST-AGG-EMPTY".to_string()),
+            "an empty line-id list must not wipe existing aggregator-sourced rows"
         );
     }
 

@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     // sufficient.
     let mut dedup_ledger = SeenServiceLedger::new();
 
-    let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
+    let mut interval = cycle_interval(Duration::from_secs(config.poll_interval_secs));
 
     loop {
         interval.tick().await;
@@ -185,6 +185,35 @@ async fn main() -> anyhow::Result<()> {
 /// batching); a smaller `WRITE_CHUNK_SIZE` trades this exposure directly
 /// against transaction count/WAL-fsync savings if it ever needs revisiting.
 const WRITE_CHUNK_SIZE: usize = 50;
+
+/// Builds `main`'s own top-level cycle `tokio::time::Interval`, with
+/// `MissedTickBehavior::Delay` rather than the default `Burst`.
+///
+/// `Burst` fires every missed tick back-to-back with zero gap once a cycle
+/// overruns `poll_interval` (a slow DB write, a stuck retention pass, or a
+/// run of failing cycles that each still take real wall-clock time) --
+/// exactly when the service is already struggling, it would pile up a
+/// burst of immediate follow-up cycles against the database instead of
+/// settling back into its normal cadence. `Delay` instead waits a fresh
+/// `poll_interval` from whenever the overrun tick actually completes, so a
+/// slow or failing cycle degrades to a slower cadence, never a
+/// thundering-herd burst. Same fix, same rationale, as
+/// `common::poller_loop`'s `poll_interval_with_delay_on_overrun` (shared by
+/// every `poller-*` crate) and `enricher`'s own loop -- `aggregator`
+/// predates `common::poller_loop` and does not share its loop scaffolding
+/// (it has its own retention pass interleaved with aggregation, see
+/// `run_retention` below), so this crate needed the identical fix applied
+/// locally rather than by adopting that shared helper. Split into its own
+/// function, mirroring `poller_loop`'s, so the configuration is directly
+/// assertable in a unit test via `Interval::missed_tick_behavior()`,
+/// since the missed-tick BEHAVIOR itself (skipping ticks under a real
+/// overrun) isn't practically observable without a slow, flaky, real-time
+/// test.
+fn cycle_interval(poll_interval: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 // This crate's own single-call-site orchestration function. Every retention
 // knob it used to thread through now belongs to `run_retention` instead --
@@ -632,6 +661,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn cycle_interval_defaults_to_delay_not_burst_on_a_missed_tick() {
+        let interval = cycle_interval(Duration::from_secs(60));
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay,
+            "a slow or failing cycle must not burst-fire every missed tick back-to-back"
+        );
+    }
 
     fn line_def(id: &str) -> LineDefinition {
         LineDefinition {
