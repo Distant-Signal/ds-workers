@@ -23,6 +23,25 @@ pub struct Config {
     #[arg(long, env, default_value_t = 15)]
     pub train_delay_threshold_minutes: i32,
 
+    /// How long a watermark proposal must age before this crate promotes it
+    /// into a cursor's real `last_processed_id` -- the grace window that
+    /// stops an out-of-order COMMIT from being skipped forever. See
+    /// `queries::advance_cursor_with_grace`'s own doc comment for the
+    /// mechanic and for the residual case it deliberately accepts (a
+    /// transaction in flight for longer than this window).
+    ///
+    /// 120 seconds: comfortably longer than any write transaction the three
+    /// polled tables' own writers actually take (each is a single
+    /// INSERT/UPSERT, or a small batch of them, inside one statement or one
+    /// short transaction), while costing only "each row is examined by two
+    /// or three consecutive cycles instead of one" -- every send path these
+    /// cursors feed is already idempotent against a re-read. Same
+    /// "reasonable round number, revisit with real usage" posture as this
+    /// crate's other interval constants, not an independently measured
+    /// figure.
+    #[arg(long, env, default_value_t = 120)]
+    pub cursor_grace_seconds: i64,
+
     /// Cadence for the forwarding-queue poll (Task 17/18) -- deliberately
     /// faster than `poll_interval_secs`, since the whole point of
     /// trust-consumer's forwarding signal is a quicker path to a push than

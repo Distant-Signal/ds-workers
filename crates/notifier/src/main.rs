@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let cooldown = chrono::Duration::minutes(config.cooldown_minutes);
+    let cursor_grace = chrono::Duration::seconds(config.cursor_grace_seconds);
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
     let mut forward_interval =
         tokio::time::interval(Duration::from_secs(config.forward_queue_poll_interval_secs));
@@ -61,8 +62,10 @@ async fn main() -> anyhow::Result<()> {
             _ = interval.tick() => {
                 let result = run_cycle(
                     &pool,
+                    Utc::now(),
                     cooldown,
                     config.train_delay_threshold_minutes,
+                    cursor_grace,
                     &config.vapid_private_key,
                     &config.vapid_subject,
                 )
@@ -74,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
             _ = forward_interval.tick() => {
                 let result = run_forward_queue_cycle(
                     &pool,
+                    Utc::now(),
                     config.train_delay_threshold_minutes,
+                    cursor_grace,
                     &config.vapid_private_key,
                     &config.vapid_subject,
                 )
@@ -97,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
             _ = template_sweep_interval.tick() => {
                 let result = run_template_sweep_cycle(
                     &pool,
+                    Utc::now(),
                     config.auto_commit_lead_minutes,
                     &config.vapid_private_key,
                     &config.vapid_subject,
@@ -112,23 +118,32 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_cycle(
     pool: &PgPool,
+    now: DateTime<Utc>,
     cooldown: chrono::Duration,
     train_delay_threshold_minutes: i32,
+    cursor_grace: chrono::Duration,
     vapid_private_key: &str,
     vapid_subject: &str,
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
-
     // --- Lines (Decision 2/3/5) ---
-    let line_cursor_start = queries::read_cursor(pool, "line_status_history").await?;
-    let line_candidates = queries::poll_line_candidates(pool, line_cursor_start).await?;
-    let line_max_id = line_candidates
-        .iter()
-        .map(|c| c.id)
-        .max()
-        .unwrap_or(line_cursor_start);
+    let line_cursor = queries::read_cursor(pool, "line_status_history").await?;
+    let (line_candidates, line_observed_max_id) =
+        queries::poll_line_candidates(pool, line_cursor.last_processed_id).await?;
 
     for candidate in &line_candidates {
+        // Mirrors `notify_train_candidates`'s own per-candidate log, and is
+        // the only production read of `LineCandidate::id` now that the
+        // watermark advances over every row POLLED rather than over the
+        // candidate ids alone (see `queries::poll_line_candidates`) -- worth
+        // keeping precisely because "which history row did this push come
+        // from" is the first question asked when a notification looks wrong.
+        tracing::debug!(
+            line_status_history_id = candidate.id,
+            line_id = %candidate.line_id,
+            previous_rank = candidate.previous_rank,
+            new_rank = candidate.new_rank,
+            "line notification candidate"
+        );
         let user_ids = queries::pinned_users_for_line(pool, &candidate.line_id).await?;
         for user_id in user_ids {
             let state =
@@ -169,13 +184,24 @@ async fn run_cycle(
             }
         }
     }
-    queries::advance_cursor(pool, "line_status_history", line_max_id).await?;
+    queries::advance_cursor_with_grace(
+        pool,
+        "line_status_history",
+        &line_cursor,
+        line_observed_max_id,
+        now,
+        cursor_grace,
+    )
+    .await?;
 
     // --- Trains (Decision 4) ---
-    let train_cursor_start = queries::read_cursor(pool, "train_movement_events").await?;
-    let (train_candidates, train_max_id) =
-        queries::poll_train_candidates(pool, train_cursor_start, train_delay_threshold_minutes)
-            .await?;
+    let train_cursor = queries::read_cursor(pool, "train_movement_events").await?;
+    let (train_candidates, train_max_id) = queries::poll_train_candidates(
+        pool,
+        train_cursor.last_processed_id,
+        train_delay_threshold_minutes,
+    )
+    .await?;
     notify_train_candidates(
         pool,
         &train_candidates,
@@ -184,7 +210,15 @@ async fn run_cycle(
         now,
     )
     .await?;
-    queries::advance_cursor(pool, "train_movement_events", train_max_id).await?;
+    queries::advance_cursor_with_grace(
+        pool,
+        "train_movement_events",
+        &train_cursor,
+        train_max_id,
+        now,
+        cursor_grace,
+    )
+    .await?;
 
     Ok(())
 }
@@ -317,20 +351,30 @@ fn build_train_notification_payload(
 /// `"train_movement_events"` cursor.
 async fn run_forward_queue_cycle(
     pool: &PgPool,
+    now: DateTime<Utc>,
     train_delay_threshold_minutes: i32,
+    cursor_grace: chrono::Duration,
     vapid_private_key: &str,
     vapid_subject: &str,
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
-    let cursor_start = queries::read_cursor(pool, "notifier_forward_queue").await?;
-    let (touched_trains_ids, max_id) = queries::poll_forward_queue(pool, cursor_start).await?;
+    let cursor = queries::read_cursor(pool, "notifier_forward_queue").await?;
+    let (touched_trains_ids, max_id) =
+        queries::poll_forward_queue(pool, cursor.last_processed_id).await?;
     for trains_id in touched_trains_ids {
         let candidates =
             queries::candidates_for_trains_id(pool, trains_id, train_delay_threshold_minutes)
                 .await?;
         notify_train_candidates(pool, &candidates, vapid_private_key, vapid_subject, now).await?;
     }
-    queries::advance_cursor(pool, "notifier_forward_queue", max_id).await?;
+    queries::advance_cursor_with_grace(
+        pool,
+        "notifier_forward_queue",
+        &cursor,
+        max_id,
+        now,
+        cursor_grace,
+    )
+    .await?;
     Ok(())
 }
 
@@ -412,14 +456,23 @@ async fn run_skip_check_cycle(
 /// The recurring-journey materialization sweep's own cycle (Task 4/5,
 /// spec §3.1-3.2). "Today" is a plain Europe/London calendar date (see
 /// this plan's Architecture section for why not a rail day) -- computed
-/// once per tick and used for both stages.
+/// once per tick from `now` and used for both stages.
+///
+/// `now` is INJECTED, not read from the clock inside here -- the same
+/// convention `api::data::reconciliation::retry_schedule_enrichment_for_nr_primary_trains`
+/// and `train_tracking::validate_pin(pin, now)` already establish in this
+/// workspace. Which candidate this sweep commits a leg to is now a direct
+/// function of the time of day it runs at (see
+/// `decision::commit_check_window`), so that time of day has to be
+/// controllable from a test rather than being whatever the clock happened to
+/// read while the suite ran.
 async fn run_template_sweep_cycle(
     pool: &PgPool,
+    now: DateTime<Utc>,
     auto_commit_lead_minutes: i64,
     vapid_private_key: &str,
     vapid_subject: &str,
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
     let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
 
     // --- Stage 1: mint due occurrences ---
@@ -451,26 +504,31 @@ async fn run_template_sweep_cycle(
     for leg in queries::unmatched_auto_legs_for_commit_check(pool, today).await? {
         // A template leg is allowed to carry no time window at all (see
         // `api::data::journey_templates::validate_template_leg`'s own doc
-        // comment) -- `unmatched_auto_legs_for_commit_check` no longer
-        // filters such a leg out, so `depart_after`/`arrive_after` can
-        // both genuinely be `None` here. Midnight is used as the
-        // "earliest bound" in that case rather than skipping the leg:
-        // with no lower bound at all there is no "too early" to guard
-        // against, and since this leg's own `service_date` is always
-        // `today` (the caller's own query scoping), `now` is always
-        // already on-or-after local midnight, so `is_due_for_commit_check`
-        // below is unconditionally true from the very first sweep tick of
-        // the day -- i.e. this degrades to "always due," not to a
-        // still-gated check against a fake bound.
-        let earliest_bound = leg
-            .depart_after
-            .or(leg.arrive_after)
-            .unwrap_or(chrono::NaiveTime::MIN);
-        let Some(earliest_bound_utc) = london_to_utc(leg.service_date.and_time(earliest_bound))
-        else {
-            continue; // nonexistent local time (spring-forward gap) -- best-effort, skip this tick
+        // comment) -- `unmatched_auto_legs_for_commit_check` does not filter
+        // such a leg out, so any subset of the four bounds can be `None`
+        // here. `decision::commit_check_window` classifies that subset;
+        // read its doc comment for the "due from midnight, so committed to
+        // an overnight train at the first tick after midnight" bug that
+        // replaced `unwrap_or(NaiveTime::MIN)` with this.
+        let window = decision::commit_check_window(
+            leg.depart_after,
+            leg.depart_before,
+            leg.arrive_after,
+            leg.arrive_before,
+        );
+        let due_bound_utc = match window.due_check_bound() {
+            Some(bound) => {
+                let Some(bound_utc) = london_to_utc(leg.service_date.and_time(bound)) else {
+                    continue; // nonexistent local time (spring-forward gap) -- best-effort, skip this tick
+                };
+                bound_utc
+            }
+            // Fully open: there is no stated time to wait for, so this leg
+            // is due whenever the sweep looks -- and `now`, not midnight, is
+            // what "nearest/next" is then measured against below.
+            None => now,
         };
-        if !decision::is_due_for_commit_check(now, earliest_bound_utc, auto_commit_lead_minutes) {
+        if !decision::is_due_for_commit_check(now, due_bound_utc, auto_commit_lead_minutes) {
             continue;
         }
 
@@ -487,6 +545,27 @@ async fn run_template_sweep_cycle(
         .await?;
 
         if candidates.is_empty() {
+            // "No service was found" is only honest if we actually HAVE
+            // today's timetable. Zero candidates against an unpublished day
+            // (a fresh environment, a schedule-reference outage, a late CIF
+            // delivery) is indistinguishable at this point from zero
+            // candidates against a real, complete timetable -- and this
+            // notification fires AT MOST ONCE per leg, ever
+            // (`decide_unmatched_notification`), so a false one sent now
+            // permanently silences the genuine one a real problem would
+            // warrant later this morning. Same "an empty result set can't
+            // tell you which of the two it is, so probe the day" reasoning
+            // `api::data::queries::schedule_destination_departures_published_for`
+            // already encodes for its own 404-versus-`200 []` split.
+            if !queries::schedule_published_for(pool, leg.service_date).await? {
+                tracing::info!(
+                    journey_leg_id = leg.journey_leg_id,
+                    service_date = %leg.service_date,
+                    "no schedule published for this leg's service date yet; deferring the \
+                     no-service-found determination to a later tick rather than notifying"
+                );
+                continue;
+            }
             let already_notified =
                 queries::unmatched_notification_state(pool, &leg.user_id, leg.journey_leg_id)
                     .await?
@@ -537,27 +616,69 @@ async fn run_template_sweep_cycle(
             .iter()
             .map(|(_, day_offset, t)| (*day_offset, *t))
             .collect();
-        let Some(winner_idx) =
+        // A leg that names its own earliest time keeps nearest-to-now (an
+        // already-departed candidate is a legitimate answer there -- the
+        // sweep may just be running behind the window the user chose). A leg
+        // with NO lower bound instead takes the next candidate still
+        // upcoming, so "any train" can never resolve to one that has already
+        // left. See `decision::commit_check_window`.
+        let winner_idx = if window.names_an_earliest_time() {
             decision::pick_nearest_to_now_candidate(&day_offset_times, now_local)
-        else {
-            continue; // unreachable given the is_empty() check above, defensive only
+        } else {
+            decision::pick_next_upcoming_candidate(&day_offset_times, now_local)
+        };
+        let Some(winner_idx) = winner_idx else {
+            // Only reachable for an open-ended leg whose every candidate has
+            // already departed (nearest-to-now is `None` for an empty slice
+            // alone, already excluded above). Deliberately silent: candidates
+            // DO exist for this route today, so this is not the
+            // "no service found" case either -- there is simply nothing left
+            // to board today, and nothing worth pushing about.
+            tracing::debug!(
+                journey_leg_id = leg.journey_leg_id,
+                candidates = candidates.len(),
+                "every candidate for this open-ended leg has already departed; leaving it \
+                 unmatched rather than committing it to a train that has left"
+            );
+            continue;
         };
         let (train_uid, _, _) = &candidates[winner_idx];
 
-        let trains_id = queries::find_or_create_train(pool, train_uid, leg.service_date).await?;
-        let tracking_id =
-            queries::create_subscription_for_train(pool, trains_id, &leg.user_id).await?;
-        if !queries::commit_leg_to_train(pool, leg.journey_leg_id, tracking_id).await? {
-            tracing::warn!(
+        // Enriching find-or-create, NOT the bare one: a bare `trains` row
+        // leaves `origin_crs`/`destination_crs`/`scheduled_departure` NULL,
+        // which `create_subscription_for_train` then copies (as NULLs) into
+        // the new subscription's own `pin_*` columns -- and with
+        // `pin_destination_crs` NULL, `skip_check::leg_is_skipped` has no
+        // Darwin departure to match against, so station-skip detection could
+        // never fire for an auto-committed leg at all. This is the
+        // auto-commit path's counterpart to the enrichment the MANUAL pick
+        // route already runs (`api::routes::journeys::post_leg_train` ->
+        // `routes::train::enrich_shared_train`); see
+        // `queries::find_or_create_train_with_cif_schedule` for why the
+        // notifier does the CIF half itself rather than reaching into that
+        // (unreachable, api-crate) function.
+        let trains_id =
+            queries::find_or_create_train_with_cif_schedule(pool, train_uid, leg.service_date)
+                .await?;
+        // Subscribe-and-commit as ONE transaction: on the no-op path (the
+        // user picked a train by hand at the same moment) the subscription
+        // this would otherwise have left behind is rolled back with it,
+        // instead of lingering and pushing notifications for a train they
+        // never chose. See `queries::auto_commit_leg_to_train`.
+        match queries::auto_commit_leg_to_train(pool, leg.journey_leg_id, trains_id, &leg.user_id)
+            .await?
+        {
+            Some(tracking_id) => tracing::info!(
                 journey_leg_id = leg.journey_leg_id,
-                "leg was committed by a concurrent tick before this one finished; skipping"
-            );
-        } else {
-            tracing::info!(
-                journey_leg_id = leg.journey_leg_id,
+                tracking_id,
                 train_uid,
-                "auto-committed leg to nearest-to-now candidate"
-            );
+                "auto-committed leg to its chosen candidate"
+            ),
+            None => tracing::warn!(
+                journey_leg_id = leg.journey_leg_id,
+                "leg was committed by a concurrent actor before this tick finished; rolled back \
+                 the subscription created for it rather than orphaning it"
+            ),
         }
     }
 
@@ -825,7 +946,13 @@ mod db_tests {
             .expect("seed second (transitioned) history row");
 
         let cooldown = chrono::Duration::minutes(20);
-        run_cycle(&pool, cooldown, 15, "not-a-real-vapid-key", "mailto:test@example.invalid")
+        // `Duration::zero()` grace: this test asserts the line-notification
+        // side effect of a single cycle, and a real grace window would hold
+        // the watermark back for the whole of it -- the grace window's own
+        // behavior is asserted directly by
+        // `queries::tests::advance_cursor_with_grace_*` instead.
+        let grace = chrono::Duration::zero();
+        run_cycle(&pool, Utc::now(), cooldown, 15, grace, "not-a-real-vapid-key", "mailto:test@example.invalid")
             .await
             .expect("run_cycle must return Ok even though the send itself fails against an invalid endpoint");
 
@@ -839,8 +966,10 @@ mod db_tests {
         // leave the state unchanged.
         run_cycle(
             &pool,
+            Utc::now(),
             cooldown,
             15,
+            grace,
             "not-a-real-vapid-key",
             "mailto:test@example.invalid",
         )
@@ -891,6 +1020,146 @@ mod sweep_cycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// A fixed Europe/London wall-clock instant on `date`, as the UTC
+    /// `now` `run_template_sweep_cycle` takes. The whole point of injecting
+    /// `now` is that WHICH candidate an open-window leg commits to is a
+    /// function of the time of day the sweep runs at, so these tests pin
+    /// that time instead of inheriting whatever the clock reads.
+    fn london_now(date: chrono::NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
+        london_to_utc(
+            date.and_hms_opt(hour, minute, 0)
+                .expect("valid wall-clock time"),
+        )
+        .expect("a real (non-spring-forward-gap) London local time")
+    }
+
+    /// Seeds one `'auto'`-mode, active, due-today template with ONE leg
+    /// carrying exactly the four window bounds given (all `None` = the
+    /// fully-open leg today's time-flexible-templates feature added support
+    /// for). Returns the template id.
+    async fn seed_auto_template(
+        pool: &PgPool,
+        user_id: &str,
+        name: &str,
+        today: chrono::NaiveDate,
+        depart_after: Option<chrono::NaiveTime>,
+        depart_before: Option<chrono::NaiveTime>,
+    ) -> i64 {
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates \
+                (user_id, custom_name, default_match_mode, days_of_week, active) \
+             VALUES ($1, $2, 'auto', $3, TRUE) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(name)
+        .bind(decision::weekday_bit(today))
+        .fetch_one(pool)
+        .await
+        .expect("seed template");
+
+        sqlx::query(
+            "INSERT INTO journey_template_legs \
+                (template_id, leg_order, origin_crs, destination_crs, depart_after, depart_before) \
+             VALUES ($1, 1, 'RDG', 'WOK', $2, $3)",
+        )
+        .bind(template_id)
+        .bind(depart_after)
+        .bind(depart_before)
+        .execute(pool)
+        .await
+        .expect("seed template leg");
+
+        template_id
+    }
+
+    /// One published RDG -> WOK departure for `today` at `(hour, minute)`,
+    /// `day_offset` 0 -- the shape `queries::schedule_candidates_for_leg`
+    /// matches (`main.destination_crs = 'WOK'` satisfies its reachability
+    /// arm directly).
+    async fn seed_departure(
+        pool: &PgPool,
+        today: chrono::NaiveDate,
+        train_uid: &str,
+        hour: u32,
+        minute: u32,
+    ) {
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, day_offset, train_uid, origin_crs, \
+                 true_origin_crs, destination_arrival, destination_arrival_day_offset) \
+             VALUES ($1, 'WOK', $2, 0, $3, 'RDG', 'RDG', $2, 0)",
+        )
+        .bind(today)
+        .bind(chrono::NaiveTime::from_hms_opt(hour, minute, 0).expect("valid scheduled departure"))
+        .bind(train_uid)
+        .execute(pool)
+        .await
+        .expect("seed published schedule row");
+    }
+
+    /// Reads back the `train_uid` an auto-committed leg actually ended up
+    /// bound to, following `journey_legs -> train_subscriptions -> trains`.
+    async fn committed_train_uid(pool: &PgPool, template_id: i64) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT t.train_uid FROM journeys j \
+             JOIN journey_legs jl ON jl.journey_id = j.id \
+             JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+             JOIN trains t ON t.id = ts.trains_id \
+             WHERE j.source_template_id = $1",
+        )
+        .bind(template_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read the committed train's own uid")
+    }
+
+    /// Full teardown for one template-driven fixture: the minted journey (and
+    /// its legs/notification-state, by cascade), the subscription and
+    /// `trains` rows the auto-commit created, every seeded schedule row, the
+    /// template, its tombstones, and the user.
+    async fn cleanup_template_fixture(pool: &PgPool, user_id: &str, template_id: i64) {
+        sqlx::query(
+            "DELETE FROM train_subscriptions WHERE user_id = $1 AND trains_id IN ( \
+                 SELECT id FROM trains WHERE train_uid LIKE 'TEST-SWEEP-%' \
+             )",
+        )
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM journeys WHERE source_template_id = $1")
+            .bind(template_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE train_uid LIKE 'TEST-SWEEP-%'")
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "DELETE FROM schedule_destination_departures WHERE train_uid LIKE 'TEST-SWEEP-%'",
+        )
+        .execute(pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM journey_template_skipped_dates WHERE template_id = $1")
+            .bind(template_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_user(pool, user_id).await;
     }
 
     /// Today's own Europe/London calendar date -- must match exactly what
@@ -957,6 +1226,7 @@ mod sweep_cycle_tests {
 
         run_template_sweep_cycle(
             &pool,
+            Utc::now(),
             1440, // generous lead window -- a seeded 00:00:00 depart_after is always "due" by the time this test runs
             "not-a-real-vapid-key",
             "mailto:test@example.invalid",
@@ -987,6 +1257,7 @@ mod sweep_cycle_tests {
 
         run_template_sweep_cycle(
             &pool,
+            Utc::now(),
             1440,
             "not-a-real-vapid-key",
             "mailto:test@example.invalid",
@@ -1151,6 +1422,7 @@ mod sweep_cycle_tests {
 
         run_template_sweep_cycle(
             &pool,
+            Utc::now(),
             120, // the spec's own suggested default -- irrelevant here since a fully-open leg is always due
             "not-a-real-vapid-key",
             "mailto:test@example.invalid",
@@ -1265,11 +1537,28 @@ mod sweep_cycle_tests {
         .expect("seed template leg");
 
         // Deliberately zero schedule_destination_departures rows for this
-        // route/date -- this is the "genuinely nothing published" case
-        // this test exercises.
+        // ROUTE -- but one row for an unrelated route on the same date, so
+        // the day itself IS published. That distinction is load-bearing as of
+        // the `schedule_published_for` guard added for review finding 7:
+        // "zero candidates for this leg's route on a day we genuinely have
+        // the timetable for" is the real no-service-found case this test
+        // exercises, and it is now deliberately different from "zero
+        // candidates because today's CIF delivery hasn't landed" (covered by
+        // `no_service_found_is_not_notified_while_the_days_schedule_is_unpublished`,
+        // which asserts the opposite outcome).
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, train_uid, origin_crs) \
+             VALUES ($1, 'PAD', '11:00:00', 'TEST-SWEEP-UNMATCHED-OTHER-ROUTE-UID', 'SLO')",
+        )
+        .bind(today)
+        .execute(&pool)
+        .await
+        .expect("seed an unrelated published row so the DAY counts as published");
 
         run_template_sweep_cycle(
             &pool,
+            Utc::now(),
             1440,
             "not-a-real-vapid-key",
             "mailto:test@example.invalid",
@@ -1307,6 +1596,7 @@ mod sweep_cycle_tests {
 
         run_template_sweep_cycle(
             &pool,
+            Utc::now(),
             1440,
             "not-a-real-vapid-key",
             "mailto:test@example.invalid",
@@ -1335,11 +1625,384 @@ mod sweep_cycle_tests {
             .execute(&pool)
             .await
             .ok(); // cascades journey_legs + journey_leg_notification_state
+        sqlx::query(
+            "DELETE FROM schedule_destination_departures \
+             WHERE train_uid = 'TEST-SWEEP-UNMATCHED-OTHER-ROUTE-UID'",
+        )
+        .execute(&pool)
+        .await
+        .ok();
         sqlx::query("DELETE FROM journey_templates WHERE id = $1")
             .bind(template_id)
             .execute(&pool)
             .await
             .ok(); // cascades journey_template_legs
         cleanup_user(&pool, user_id).await;
+    }
+
+    /// Finding 1's regression test, at the real reported hour: the FIRST
+    /// sweep tick after midnight, against a template leg with no time window
+    /// at all ("RDG to PAD, no specific time" -- the shape today's
+    /// time-flexible-templates feature made auto-committable).
+    ///
+    /// Before this fix, `main.rs` derived the leg's "earliest bound" as
+    /// `depart_after.or(arrive_after).unwrap_or(NaiveTime::MIN)`, i.e. LONDON
+    /// MIDNIGHT, so the leg was due from the very first tick of the day and
+    /// `pick_nearest_to_now_candidate` was asked which candidate was nearest
+    /// to 00:37. That is the 00:34 overnight service -- which has ALREADY
+    /// DEPARTED, 3 minutes ago, and beats the 07:15 commuter service 6.5
+    /// hours ahead on pure absolute distance. The leg was then flagged
+    /// `'auto'` and never re-evaluated, so the user got delay/cancellation/
+    /// skip pushes all day for a train they were never on.
+    ///
+    /// Asserts the sensible near-future service wins instead. Fails on the
+    /// pre-fix code (which commits `...-OVERNIGHT-UID`), and the assertion is
+    /// a real one rather than vacuous: there are two genuine candidates and
+    /// the "wrong" one is the one absolute nearness prefers.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                the_first_tick_after_midnight_does_not_bind_an_open_window_leg_to_a_departed_overnight_service \
+                -- --ignored --test-threads=1`"]
+    async fn the_first_tick_after_midnight_does_not_bind_an_open_window_leg_to_a_departed_overnight_service()
+     {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-MIDNIGHT-USER";
+        let overnight_uid = "TEST-SWEEP-MIDNIGHT-OVERNIGHT-UID";
+        let commuter_uid = "TEST-SWEEP-MIDNIGHT-COMMUTER-UID";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Midnight Open Window",
+            today,
+            None, // no depart_after
+            None, // no depart_before either -- fully open, every bound NULL
+        )
+        .await;
+        seed_departure(&pool, today, overnight_uid, 0, 34).await;
+        seed_departure(&pool, today, commuter_uid, 7, 15).await;
+
+        // 00:37 -- an hourly sweep's first tick after midnight, exactly the
+        // reported scenario.
+        run_template_sweep_cycle(
+            &pool,
+            london_now(today, 0, 37),
+            120,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_template_sweep_cycle must succeed");
+
+        assert_eq!(
+            committed_train_uid(&pool, template_id).await.as_deref(),
+            Some(commuter_uid),
+            "an open-window leg must be committed to the next UPCOMING service (07:15), never to \
+             the 00:34 overnight one that had already departed 3 minutes before this tick -- \
+             being nearest in absolute clock distance is not being the right train"
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Finding 1's regression test at a mid-morning tick, with THREE
+    /// candidates -- the "realistic multi-candidate scenario" half of the
+    /// same fix, and the one that proves the rule is "next upcoming", not
+    /// merely "not an overnight train":
+    ///
+    /// * 00:34 -- last night's overnight service (what the pre-fix code
+    ///   committed to at the first tick after midnight),
+    /// * 09:10 -- departed 20 minutes ago, and therefore the NEAREST
+    ///   candidate to a 09:30 `now` by absolute distance,
+    /// * 10:15 -- the next service that has not yet left, 45 minutes out.
+    ///
+    /// Pre-fix selection picks 09:10 (20 < 45) and binds the user to a train
+    /// that has already gone; post-fix picks 10:15.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                a_mid_morning_sweep_commits_an_open_window_leg_to_the_next_upcoming_service \
+                -- --ignored --test-threads=1`"]
+    async fn a_mid_morning_sweep_commits_an_open_window_leg_to_the_next_upcoming_service() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-MIDMORNING-USER";
+        let overnight_uid = "TEST-SWEEP-MIDMORNING-OVERNIGHT-UID";
+        let departed_uid = "TEST-SWEEP-MIDMORNING-DEPARTED-UID";
+        let upcoming_uid = "TEST-SWEEP-MIDMORNING-UPCOMING-UID";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Mid-morning Open Window",
+            today,
+            None,
+            None,
+        )
+        .await;
+        seed_departure(&pool, today, overnight_uid, 0, 34).await;
+        seed_departure(&pool, today, departed_uid, 9, 10).await;
+        seed_departure(&pool, today, upcoming_uid, 10, 15).await;
+
+        run_template_sweep_cycle(
+            &pool,
+            london_now(today, 9, 30),
+            120,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_template_sweep_cycle must succeed");
+
+        assert_eq!(
+            committed_train_uid(&pool, template_id).await.as_deref(),
+            Some(upcoming_uid),
+            "with no window bound at all, the sweep must pick the next service still to depart \
+             (10:15) -- not the 09:10 that left 20 minutes ago (nearest by absolute distance), \
+             and not last night's 00:34"
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Finding 1's other half: a leg that names ONLY an upper bound
+    /// (`depart_before = 09:00` -- "any train, as long as it leaves before
+    /// nine") was also swallowed by the `unwrap_or(NaiveTime::MIN)` fallback,
+    /// so it too was due from midnight rather than from `lead_minutes` before
+    /// the user's own latest acceptable time.
+    ///
+    /// Runs the sweep at 04:00 with a 120-minute lead window: the leg's real
+    /// anchor is 09:00, so 04:00 is 5 hours early and NOTHING may be
+    /// committed yet. Pre-fix, the leg was due at midnight and this tick
+    /// would have bound it to the 05:50 -- a 5am train for someone who said
+    /// "before 9".
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                an_upper_bound_only_leg_is_not_due_until_its_own_bound_is_within_the_lead_window \
+                -- --ignored --test-threads=1`"]
+    async fn an_upper_bound_only_leg_is_not_due_until_its_own_bound_is_within_the_lead_window() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-UPPERBOUND-USER";
+        let early_uid = "TEST-SWEEP-UPPERBOUND-EARLY-UID";
+        let commuter_uid = "TEST-SWEEP-UPPERBOUND-COMMUTER-UID";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Upper Bound Only",
+            today,
+            None,                                     // no depart_after
+            chrono::NaiveTime::from_hms_opt(9, 0, 0), // "before 09:00"
+        )
+        .await;
+        seed_departure(&pool, today, early_uid, 5, 50).await;
+        seed_departure(&pool, today, commuter_uid, 8, 20).await;
+
+        run_template_sweep_cycle(
+            &pool,
+            london_now(today, 4, 0),
+            120,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_template_sweep_cycle must succeed");
+
+        assert_eq!(
+            committed_train_uid(&pool, template_id).await,
+            None,
+            "a leg whose only bound is 'before 09:00' must not be committed at 04:00 -- its \
+             commit-check is anchored on 09:00 minus the lead window, not on midnight"
+        );
+
+        // Now inside the lead window (07:30 is within 120 minutes of 09:00):
+        // the same leg commits, and to the 08:20 rather than the 05:50 that
+        // has already gone.
+        run_template_sweep_cycle(
+            &pool,
+            london_now(today, 7, 30),
+            120,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("second run_template_sweep_cycle must succeed");
+
+        assert_eq!(
+            committed_train_uid(&pool, template_id).await.as_deref(),
+            Some(commuter_uid),
+            "once inside the lead window the leg commits to the next upcoming service still \
+             satisfying its own 'before 09:00' bound"
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Finding 5: an auto-committed leg's shared `trains` row must carry
+    /// CIF's own schedule, and the subscription minted for it must carry the
+    /// matching `pin_*` values -- `pin_destination_crs` above all, since
+    /// `skip_check::leg_is_skipped` matches a live Darwin departure board by
+    /// exactly that column and could never fire while it was NULL.
+    ///
+    /// Before this fix the auto-commit called the BARE `find_or_create_train`
+    /// (the manual "pick a train" route runs `enrich_shared_train` instead),
+    /// so every one of these assertions read back NULL.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                an_auto_committed_leg_gets_an_enriched_trains_row_and_a_pinned_subscription \
+                -- --ignored --test-threads=1`"]
+    async fn an_auto_committed_leg_gets_an_enriched_trains_row_and_a_pinned_subscription() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-ENRICH-USER";
+        let train_uid = "TEST-SWEEP-ENRICH-UID";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id =
+            seed_auto_template(&pool, user_id, "E2E Enrichment", today, None, None).await;
+        seed_departure(&pool, today, train_uid, 23, 30).await;
+
+        run_template_sweep_cycle(
+            &pool,
+            london_now(today, 9, 30),
+            120,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_template_sweep_cycle must succeed");
+
+        let (origin_crs, destination_crs, scheduled_departure): (
+            Option<String>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT origin_crs, destination_crs, scheduled_departure FROM trains \
+             WHERE train_uid = $1 AND service_date = $2",
+        )
+        .bind(train_uid)
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("the auto-commit must have created a trains row");
+        assert_eq!(
+            origin_crs.as_deref(),
+            Some("RDG"),
+            "the shared trains row must carry CIF's own true origin"
+        );
+        assert_eq!(
+            destination_crs.as_deref(),
+            Some("WOK"),
+            "...and CIF's own terminus -- this is what create_subscription_for_train copies into \
+             pin_destination_crs, which station-skip detection matches Darwin against"
+        );
+        assert_eq!(
+            scheduled_departure,
+            Some(london_now(today, 23, 30)),
+            "...and the booked departure, as a real UTC instant"
+        );
+
+        let (pin_origin_crs, pin_destination_crs): (Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT ts.pin_origin_crs, ts.pin_destination_crs FROM journeys j \
+                 JOIN journey_legs jl ON jl.journey_id = j.id \
+                 JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+                 WHERE j.source_template_id = $1",
+            )
+            .bind(template_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the auto-committed leg's subscription must exist");
+        assert_eq!(pin_origin_crs.as_deref(), Some("RDG"));
+        assert_eq!(
+            pin_destination_crs.as_deref(),
+            Some("WOK"),
+            "the pin columns are copied from the trains row AT SUBSCRIPTION-CREATION TIME, so \
+             enrichment has to happen before it -- with this NULL, skip detection is dead"
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Finding 7: the zero-candidates branch must not claim "no service was
+    /// found" on a day whose schedule has not published yet.
+    ///
+    /// Seeds an `'auto'` template whose route has no departures at all AND
+    /// leaves the whole `service_date` unpublished (every
+    /// `schedule_destination_departures` row for today is deleted first), then
+    /// asserts NO `journey_leg_notification_state` row was written. That
+    /// notification fires at most once per leg for ever
+    /// (`decide_unmatched_notification`), so a false one sent at 00:37 -- before
+    /// the day's CIF delivery has even landed -- permanently silences the
+    /// genuine one a real problem would warrant later the same morning.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                no_service_found_is_not_notified_while_the_days_schedule_is_unpublished \
+                -- --ignored --test-threads=1`"]
+    async fn no_service_found_is_not_notified_while_the_days_schedule_is_unpublished() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-UNPUBLISHED-USER";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id =
+            seed_auto_template(&pool, user_id, "E2E Unpublished Day", today, None, None).await;
+
+        // The day is genuinely unpublished: no rows at all for this
+        // service_date, which is what a fresh environment, a
+        // schedule-reference outage or a late CIF delivery looks like.
+        // Clears this suite's OWN leftovers first (a previous run that
+        // panicked before its cleanup), never anything it didn't seed.
+        sqlx::query(
+            "DELETE FROM schedule_destination_departures \
+             WHERE service_date = $1 AND train_uid LIKE 'TEST-%'",
+        )
+        .bind(today)
+        .execute(&pool)
+        .await
+        .ok();
+        let published_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedule_destination_departures WHERE service_date = $1",
+        )
+        .bind(today)
+        .fetch_one(&pool)
+        .await
+        .expect("count today's published rows");
+        assert_eq!(
+            published_before, 0,
+            "this test needs an unpublished day; another fixture has left rows for today behind"
+        );
+
+        run_template_sweep_cycle(
+            &pool,
+            london_now(today, 0, 37),
+            120,
+            "not-a-real-vapid-key",
+            "mailto:test@example.invalid",
+        )
+        .await
+        .expect("run_template_sweep_cycle must succeed");
+
+        let notified: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM journey_leg_notification_state s \
+             JOIN journey_legs jl ON jl.id = s.journey_leg_id \
+             JOIN journeys j ON j.id = jl.journey_id \
+             WHERE j.source_template_id = $1 AND s.last_notified_unmatched",
+        )
+        .bind(template_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count unmatched notifications");
+        assert_eq!(
+            notified, 0,
+            "'No RDG to WOK service was found for today' must not be sent while we simply do not \
+             have today's timetable yet -- it can never be taken back"
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
     }
 }

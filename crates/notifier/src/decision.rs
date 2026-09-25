@@ -132,6 +132,103 @@ pub fn is_due_for_commit_check(
     now >= earliest_bound_utc - Duration::minutes(lead_minutes)
 }
 
+/// What time information a commit-check leg actually carries -- the input
+/// to BOTH "when does this leg become due for a commit-check" and "which
+/// candidate should win it."
+///
+/// A journey leg materialized from a template leg can legitimately carry
+/// any subset of the four window bounds, including none at all (see
+/// `api::data::journey_templates::validate_template_leg`'s own doc
+/// comment). Collapsing that to one `NaiveTime` with `NaiveTime::MIN` as
+/// the fallback -- which is what this code did before -- is what caused the
+/// bug described on [`commit_check_window`] below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitCheckWindow {
+    /// The leg names its own EARLIEST acceptable time (`depart_after`, else
+    /// `arrive_after`). The user has told us when they want to travel, so
+    /// "nearest to now" is measured against that intent and a candidate
+    /// that has already departed is still a legitimate answer (the sweep
+    /// may simply be running a little late).
+    EarliestKnown(chrono::NaiveTime),
+    /// The leg names only a LATEST acceptable time (`depart_before`, else
+    /// `arrive_before`) -- "any train, as long as it's before X."
+    LatestOnly(chrono::NaiveTime),
+    /// No time bound at all -- "any train, whenever."
+    Open,
+}
+
+impl CommitCheckWindow {
+    /// Whether the user named an earliest time of their own. `false` means
+    /// this leg has NO lower bound, and so must be anchored on the sweep's
+    /// own `now` instead -- see [`commit_check_window`].
+    pub fn names_an_earliest_time(self) -> bool {
+        matches!(self, Self::EarliestKnown(_))
+    }
+
+    /// The local time this leg's due-check should be measured against, or
+    /// `None` for [`CommitCheckWindow::Open`] (the caller substitutes `now`
+    /// -- there is no wall-clock time on the leg to convert).
+    pub fn due_check_bound(self) -> Option<chrono::NaiveTime> {
+        match self {
+            Self::EarliestKnown(t) | Self::LatestOnly(t) => Some(t),
+            Self::Open => None,
+        }
+    }
+}
+
+/// Classifies a commit-check leg's four (all-`Option`) window bounds.
+///
+/// **The bug this exists to fix.** This used to be
+/// `depart_after.or(arrive_after).unwrap_or(NaiveTime::MIN)` -- i.e. a leg
+/// with no LOWER bound was treated as due from LONDON MIDNIGHT. Since such
+/// a leg's `service_date` is always today, `is_due_for_commit_check` was
+/// then unconditionally true from the first sweep tick of the day, and
+/// `pick_nearest_to_now_candidate` was asked to pick the candidate nearest
+/// to THAT tick's own clock reading. With the sweep on its hourly default
+/// that tick is somewhere in the 00:00-01:00 hour, so a commuter's "RDG to
+/// PAD, no particular time" template got permanently committed -- flagged
+/// `'auto'`, never re-evaluated -- to whatever overnight service happened to
+/// run around then, and the user got delay/cancellation/skip pushes all day
+/// for a train they were never on. Worse than the pre-fix behavior of never
+/// committing such a leg at all: wrong AND loud. Note that the midnight
+/// fallback also swallowed the leg that names only `depart_before`/
+/// `arrive_before` -- "get me there before 09:00" is real, usable
+/// information, and it was being discarded.
+///
+/// **The policy this implements instead.**
+/// * A lower bound (`depart_after`, else `arrive_after`) is used exactly as
+///   before -- [`CommitCheckWindow::EarliestKnown`], unchanged behavior.
+/// * Only an upper bound (`depart_before`, else `arrive_before`) means the
+///   leg becomes due `auto_commit_lead_minutes` before the user's LATEST
+///   acceptable time, not at midnight -- and, having no lower bound, it
+///   picks the next candidate UPCOMING at that point
+///   ([`pick_next_upcoming_candidate`]), never one that has already
+///   departed. Deliberately not "the latest candidate still inside the
+///   window," which would also be defensible ("I need to be there by 9, so
+///   give me the 08:40"): that is a product decision about what a
+///   `*_before`-only template MEANS, and this fix is not the place to make
+///   it. The next upcoming train inside the window satisfies the constraint
+///   the user actually wrote down.
+/// * No bound at all is [`CommitCheckWindow::Open`]: due whenever the sweep
+///   looks (there is nothing to wait for), and committed to the next
+///   UPCOMING candidate relative to that moment -- "the user wants any
+///   train from here on," evaluated against when we are actually looking
+///   rather than against midnight.
+pub fn commit_check_window(
+    depart_after: Option<chrono::NaiveTime>,
+    depart_before: Option<chrono::NaiveTime>,
+    arrive_after: Option<chrono::NaiveTime>,
+    arrive_before: Option<chrono::NaiveTime>,
+) -> CommitCheckWindow {
+    if let Some(earliest) = depart_after.or(arrive_after) {
+        return CommitCheckWindow::EarliestKnown(earliest);
+    }
+    match depart_before.or(arrive_before) {
+        Some(latest) => CommitCheckWindow::LatestOnly(latest),
+        None => CommitCheckWindow::Open,
+    }
+}
+
 /// Picks the index of the candidate `(day_offset, scheduled_time)` closest
 /// to `now_local` by absolute distance -- ties broken toward the EARLIER
 /// candidate (a deterministic, arbitrary-but-documented choice; the spec
@@ -171,14 +268,59 @@ pub fn pick_nearest_to_now_candidate(
         .iter()
         .enumerate()
         .min_by_key(|(_, (day_offset, t))| {
-            let candidate_secs =
-                i64::from(*day_offset) * 86_400 + i64::from(t.num_seconds_from_midnight());
-            let delta = (candidate_secs - now_secs).abs();
+            let delta = (candidate_secs(*day_offset, *t) - now_secs).abs();
             // Tie-break: (delta, day_offset, scheduled_time) ordering makes
             // the chronologically earlier candidate win a tie, not just the
             // one with the smaller bare clock time.
             (delta, *day_offset, *t)
         })
+        .map(|(i, _)| i)
+}
+
+/// Candidate seconds past midnight on the leg's own `service_date` --
+/// `day_offset * 86_400 + seconds_from_midnight`, the shared arithmetic
+/// [`pick_nearest_to_now_candidate`] and [`pick_next_upcoming_candidate`]
+/// both measure against `now_local` (itself always `day_offset` 0; see
+/// either function's doc comment).
+fn candidate_secs(day_offset: u8, at: chrono::NaiveTime) -> i64 {
+    use chrono::Timelike;
+    i64::from(day_offset) * 86_400 + i64::from(at.num_seconds_from_midnight())
+}
+
+/// Picks the index of the EARLIEST candidate that has not already departed
+/// by `now_local` -- the selection rule for a leg with no lower time bound
+/// of its own ([`CommitCheckWindow::names_an_earliest_time`] is `false`).
+///
+/// Distinct from [`pick_nearest_to_now_candidate`] in exactly one way, and
+/// it is the way that matters for such a leg: absolute nearness is
+/// direction-blind, so at 00:37 the nearest candidate to now can be the
+/// 00:34 service that has ALREADY LEFT. For a leg whose only stated intent
+/// is "any train," binding it to a departed train is never the right answer
+/// -- the user is asking for the next reasonable service relative to when
+/// we are actually looking. A leg that DOES name an earliest time keeps
+/// using nearest-to-now, where an already-departed candidate remains
+/// legitimate (the sweep may just be running a few minutes behind the
+/// window the user chose).
+///
+/// `None` when every candidate is already in the past. The caller must then
+/// leave the leg `'unmatched'` for this tick rather than committing it to a
+/// departed train -- and must NOT treat that as "no service found" either
+/// (candidates existed; they have simply all gone), so no push fires.
+/// Day-offset-aware, same `(day_offset, time)` arithmetic and same
+/// "`now_local` is always day 0" contract as
+/// [`pick_nearest_to_now_candidate`].
+pub fn pick_next_upcoming_candidate(
+    candidates: &[(u8, chrono::NaiveTime)],
+    now_local: chrono::NaiveTime,
+) -> Option<usize> {
+    use chrono::Timelike;
+
+    let now_secs = i64::from(now_local.num_seconds_from_midnight());
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (day_offset, at))| candidate_secs(*day_offset, *at) >= now_secs)
+        .min_by_key(|(_, (day_offset, at))| candidate_secs(*day_offset, *at))
         .map(|(i, _)| i)
 }
 
@@ -463,6 +605,167 @@ mod sweep_tests {
              nearer than the day_offset-0 08:00 candidate's ~16 real hours, even though 08:00's \
              bare clock time looks closer to 23:58 than 00:05's does"
         );
+    }
+
+    // --- commit_check_window / open-ended-leg selection (finding 1) -------
+
+    #[test]
+    fn a_leg_with_depart_after_names_its_own_earliest_time() {
+        let window = commit_check_window(
+            Some(NaiveTime::from_hms_opt(8, 30, 0).unwrap()),
+            Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            None,
+            None,
+        );
+        assert_eq!(
+            window,
+            CommitCheckWindow::EarliestKnown(NaiveTime::from_hms_opt(8, 30, 0).unwrap())
+        );
+        assert!(window.names_an_earliest_time());
+    }
+
+    #[test]
+    fn arrive_after_is_the_fallback_earliest_time() {
+        let window = commit_check_window(
+            None,
+            None,
+            Some(NaiveTime::from_hms_opt(9, 15, 0).unwrap()),
+            None,
+        );
+        assert_eq!(
+            window,
+            CommitCheckWindow::EarliestKnown(NaiveTime::from_hms_opt(9, 15, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_leg_with_only_an_upper_bound_is_anchored_on_that_bound_not_on_midnight() {
+        // The pre-fix code collapsed this to `NaiveTime::MIN` via
+        // `depart_after.or(arrive_after).unwrap_or(MIN)`, so "any train that
+        // gets me there before 09:00" became "due from midnight" and was
+        // committed at the first tick after midnight. The upper bound is real
+        // information and is now what the due-check is measured against.
+        let window = commit_check_window(
+            None,
+            Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            None,
+            None,
+        );
+        assert_eq!(
+            window,
+            CommitCheckWindow::LatestOnly(NaiveTime::from_hms_opt(9, 0, 0).unwrap())
+        );
+        assert!(
+            !window.names_an_earliest_time(),
+            "an upper bound is not an earliest time, so this leg must use next-upcoming selection"
+        );
+        assert_eq!(
+            window.due_check_bound(),
+            Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            "NOT NaiveTime::MIN -- that is the whole bug"
+        );
+        assert_eq!(
+            commit_check_window(
+                None,
+                None,
+                None,
+                Some(NaiveTime::from_hms_opt(9, 30, 0).unwrap())
+            ),
+            CommitCheckWindow::LatestOnly(NaiveTime::from_hms_opt(9, 30, 0).unwrap()),
+            "arrive_before is the fallback upper bound"
+        );
+    }
+
+    #[test]
+    fn a_fully_open_leg_has_no_wall_clock_bound_at_all() {
+        let window = commit_check_window(None, None, None, None);
+        assert_eq!(window, CommitCheckWindow::Open);
+        assert!(!window.names_an_earliest_time());
+        assert_eq!(
+            window.due_check_bound(),
+            None,
+            "the caller must substitute `now` here -- midnight is exactly the wrong answer"
+        );
+    }
+
+    #[test]
+    fn next_upcoming_candidate_never_picks_one_that_has_already_departed() {
+        // The reported production shape, reduced: the sweep's first tick
+        // after midnight (00:37) against an overnight 00:34 departure and the
+        // next real service at 01:05. Nearest-to-now picks the 00:34 that has
+        // ALREADY LEFT (3 minutes behind beats 28 minutes ahead); for a leg
+        // whose only stated intent is "any train," that is never right.
+        let candidates = [
+            (0, NaiveTime::from_hms_opt(0, 34, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(1, 5, 0).unwrap()),
+        ];
+        let now = NaiveTime::from_hms_opt(0, 37, 0).unwrap();
+        assert_eq!(
+            pick_nearest_to_now_candidate(&candidates, now),
+            Some(0),
+            "nearest-to-now is direction-blind -- this is the behavior that bound a commuter's \
+             template to a departed overnight service"
+        );
+        assert_eq!(
+            pick_next_upcoming_candidate(&candidates, now),
+            Some(1),
+            "next-upcoming must skip the already-departed 00:34 and take the 01:05"
+        );
+    }
+
+    #[test]
+    fn next_upcoming_candidate_takes_the_soonest_of_several_future_candidates() {
+        let candidates = [
+            (0, NaiveTime::from_hms_opt(17, 0, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(9, 12, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(12, 30, 0).unwrap()),
+        ];
+        let now = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert_eq!(pick_next_upcoming_candidate(&candidates, now), Some(1));
+    }
+
+    #[test]
+    fn next_upcoming_candidate_counts_a_candidate_at_exactly_now_as_upcoming() {
+        let candidates = [(0, NaiveTime::from_hms_opt(9, 0, 0).unwrap())];
+        let now = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        assert_eq!(pick_next_upcoming_candidate(&candidates, now), Some(0));
+    }
+
+    #[test]
+    fn next_upcoming_candidate_is_day_offset_aware() {
+        // Same overnight shape as
+        // `nearest_to_now_candidate_is_day_offset_aware_across_a_midnight_boundary`:
+        // at 23:58 the day_offset-1 00:05 departure is genuinely 7 minutes
+        // AWAY (upcoming), while the day_offset-0 08:00 one is long gone --
+        // a bare-clock-time comparison would read 00:05 as being in the past.
+        let candidates = [
+            (0, NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
+            (1, NaiveTime::from_hms_opt(0, 5, 0).unwrap()),
+        ];
+        let now = NaiveTime::from_hms_opt(23, 58, 0).unwrap();
+        assert_eq!(pick_next_upcoming_candidate(&candidates, now), Some(1));
+    }
+
+    #[test]
+    fn next_upcoming_candidate_is_none_when_every_candidate_has_departed() {
+        let candidates = [
+            (0, NaiveTime::from_hms_opt(6, 0, 0).unwrap()),
+            (0, NaiveTime::from_hms_opt(7, 30, 0).unwrap()),
+        ];
+        let now = NaiveTime::from_hms_opt(23, 0, 0).unwrap();
+        assert_eq!(
+            pick_next_upcoming_candidate(&candidates, now),
+            None,
+            "the caller must leave the leg unmatched for this tick, NOT commit it to a train that \
+             ran this morning and NOT fire 'no service found'"
+        );
+    }
+
+    #[test]
+    fn next_upcoming_candidate_empty_slice_returns_none() {
+        let candidates: &[(u8, NaiveTime)] = &[];
+        let now = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        assert_eq!(pick_next_upcoming_candidate(candidates, now), None);
     }
 
     #[test]
