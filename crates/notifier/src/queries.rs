@@ -277,6 +277,17 @@ pub struct TrainCandidate {
 /// cooldown/escalation state in `train_notification_state` (still keyed by
 /// `(user_id, tracked_train_id)` -- unchanged, since that's still each
 /// user's own private escalation history for their own subscription row).
+///
+/// `AND notifications_enabled` on the subscriber query: 2026-09 security/
+/// bug review finding (Medium) -- `train_subscriptions.notifications_enabled`
+/// existed in the schema since `20260906100000_trains.sql` but was never
+/// actually consulted anywhere before this fix, so it was pure dead
+/// weight. The API's `journeys::set_leg_train_subscription` (a "Change
+/// train" re-pick) now sets it `FALSE` on a leg's old subscription once it
+/// becomes unreferenced, specifically so that subscription stops
+/// generating notifications -- this filter is the other, equally
+/// necessary half of that fix: without it, a deactivated subscription
+/// would still show up here and get notified exactly as before.
 pub async fn candidates_for_trains_id(
     pool: &PgPool,
     trains_id: i64,
@@ -295,11 +306,12 @@ pub async fn candidates_for_trains_id(
     let delay_minutes: Option<i32> = current.try_get("delay_minutes")?;
     let new_rank = train_severity_rank(&status, delay_minutes, delay_threshold_minutes);
 
-    let subscribers =
-        sqlx::query("SELECT id, user_id FROM train_subscriptions WHERE trains_id = $1")
-            .bind(trains_id)
-            .fetch_all(pool)
-            .await?;
+    let subscribers = sqlx::query(
+        "SELECT id, user_id FROM train_subscriptions WHERE trains_id = $1 AND notifications_enabled",
+    )
+    .bind(trains_id)
+    .fetch_all(pool)
+    .await?;
     let mut candidates = Vec::new();
     for subscriber in subscribers {
         let tracked_train_id: i64 = subscriber.try_get("id")?;
@@ -2134,6 +2146,118 @@ mod tests {
             .await
             .ok();
         for user_id in ["TEST-FANOUT-USER-A", "TEST-FANOUT-USER-B"] {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                candidates_for_trains_id_excludes_a_deactivated_subscription \
+                -- --ignored --test-threads=1`"]
+    async fn candidates_for_trains_id_excludes_a_deactivated_subscription() {
+        // 2026-09 review finding (Medium), the notifier-side half of the
+        // "Change train" orphan-subscription fix: `journeys::
+        // set_leg_train_subscription` (crates/api) now sets
+        // `notifications_enabled = FALSE` on a leg's old subscription once
+        // it becomes unreferenced. This pins down that this query actually
+        // honours that flag -- before this fix, the column was never
+        // consulted here at all, so a "deactivated" subscription would
+        // still generate notifications forever.
+        let pool = connect().await;
+        let service_date: chrono::NaiveDate = "2026-09-06".parse().unwrap();
+        let trains_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-DISABLED-SUB-UID', $1) \
+             RETURNING id",
+        )
+        .bind(service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+
+        for user_id in [
+            "TEST-DISABLED-SUB-USER-ENABLED",
+            "TEST-DISABLED-SUB-USER-DISABLED",
+        ] {
+            sqlx::query(
+                "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(format!("{user_id}@example.com"))
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fixture user");
+        }
+        sqlx::query(
+            "INSERT INTO train_subscriptions \
+                (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
+             VALUES ($1, $2, 'EUS', $3, $4, 'resolved')",
+        )
+        .bind("TEST-DISABLED-SUB-USER-ENABLED")
+        .bind(service_date)
+        .bind(service_date.and_hms_opt(19, 15, 0).unwrap().and_utc())
+        .bind(trains_id)
+        .execute(&pool)
+        .await
+        .expect("seed the still-enabled subscription");
+        let (disabled_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO train_subscriptions \
+                (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status, notifications_enabled) \
+             VALUES ($1, $2, 'EUS', $3, $4, 'resolved', FALSE) RETURNING id",
+        )
+        .bind("TEST-DISABLED-SUB-USER-DISABLED")
+        .bind(service_date)
+        .bind(service_date.and_hms_opt(19, 15, 0).unwrap().and_utc())
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed the deactivated (orphaned) subscription");
+
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status, delay_minutes) VALUES ($1, 'en_route', 20)",
+        )
+        .bind(trains_id)
+        .execute(&pool)
+        .await
+        .expect("seed current state showing a real delay");
+
+        let candidates = candidates_for_trains_id(&pool, trains_id, 15)
+            .await
+            .expect("candidates_for_trains_id");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the deactivated subscription must not produce a candidate"
+        );
+        assert_eq!(candidates[0].user_id, "TEST-DISABLED-SUB-USER-ENABLED");
+        assert!(
+            candidates.iter().all(|c| c.tracked_train_id != disabled_id),
+            "the deactivated subscription's own id must not appear at all"
+        );
+
+        sqlx::query("DELETE FROM train_current_state WHERE trains_id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE trains_id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        for user_id in [
+            "TEST-DISABLED-SUB-USER-ENABLED",
+            "TEST-DISABLED-SUB-USER-DISABLED",
+        ] {
             sqlx::query("DELETE FROM users WHERE id = $1")
                 .bind(user_id)
                 .execute(&pool)
