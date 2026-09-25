@@ -409,18 +409,48 @@ async fn process_incident(
         }
     };
 
-    if let Err(err) = queries::write_extraction(
+    match queries::write_extraction(
         pool,
         incident_id,
         &primary.category,
         &periods,
         model_version,
         &text_hash,
+        &summary,
+        &description,
     )
     .await
     {
-        tracing::error!(error = ?err, incident_id, "failed to write extraction result");
-        return false;
+        Ok(true) => {}
+        Ok(false) => {
+            // The incident's text moved between `fetch_incident_state`
+            // above and this write -- see `queries::write_extraction`'s
+            // doc. This attempt's result is computed from text that's no
+            // longer current, so it must be discarded rather than written
+            // over whatever a fresher concurrent extraction (or the text
+            // change itself) already produced/queued. The text change that
+            // caused this race is itself what published a fresh
+            // `incident-text-changed` stream entry for this same
+            // `incident_id` (see `crates/api/src/data/queries.rs`'s
+            // publish path), and failing that, the hourly sweep will still
+            // re-select this incident on its next tick since
+            // `source_text_hash` was never advanced to match the current
+            // text -- so there is nothing left for *this* stream entry to
+            // do. Returning `true` acks it rather than leaving it pending
+            // for the reclaim loop to retry a result that would just be
+            // discarded again.
+            tracing::warn!(
+                incident_id,
+                "incident text changed since extraction started; discarding stale result \
+                 instead of overwriting a possibly fresher one (a fresh extraction for the \
+                 new text has already been triggered)"
+            );
+            return true;
+        }
+        Err(err) => {
+            tracing::error!(error = ?err, incident_id, "failed to write extraction result");
+            return false;
+        }
     }
 
     tracing::info!(
