@@ -1487,7 +1487,6 @@ mod tests {
             match_keywords: vec![],
             excluded_keywords: vec![],
             severity_overrides: HashMap::new(),
-            exclusive_segments: vec![],
             destination_crs_filter: vec!["AON".to_string()],
             headcode_prefixes: vec![],
             full_coverage_enabled: false,
