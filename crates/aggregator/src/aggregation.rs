@@ -292,16 +292,52 @@ fn severity_from_incident(incident: &IncidentMessage) -> Severity {
     Severity::MinorDelays
 }
 
-/// Weaker evidence -> milder reported status. Lower severity numbers are
-/// more disruptive, so capping "at Minor Delays or milder" means picking
-/// whichever of (severity, floor) sorts later (higher number = milder).
+/// Weaker evidence -> milder reported status: a keyword-only match is
+/// capped at Severe Delays, an operator-wide match at Minor Delays, while a
+/// match backed by real route/station evidence is left exactly as
+/// classified.
+///
+/// Measured with `common::severity_rank`, NOT `Severity`'s discriminant.
+/// This used to read `severity.max(Severity::SevereDelays)`, which is the
+/// same non-monotonic-ordering bug `apply_extraction` below was already
+/// fixed for (see `severity_rank`'s own docs): TfL's `statusSeverity` codes
+/// aren't monotonic with real severity, so `Diverted = 21` and
+/// `PartClosed = 11` compare as "mild" against `SevereDelays = 16` /
+/// `MinorDelays = 19` and escaped demotion entirely -- an operator-wide
+/// keyword match on weak evidence could show a fully severe status. The
+/// same raw `.max()` also *escalated* in the other direction, turning a
+/// genuinely mild `GoodService = 10` or `PlannedClosure = 14` into
+/// `SevereDelays` purely because of where its number happened to sit.
 fn demote_for_scope(severity: Severity, scope: MatchScope) -> Severity {
     match scope {
         MatchScope::ExclusiveSegment | MatchScope::StationHit | MatchScope::SharedSegment => {
             severity
         }
-        MatchScope::KeywordOnly => severity.max(Severity::SevereDelays),
-        MatchScope::OperatorOnly => severity.max(Severity::MinorDelays),
+        MatchScope::KeywordOnly => demote_to_floor(severity, Severity::SevereDelays),
+        MatchScope::OperatorOnly => demote_to_floor(severity, Severity::MinorDelays),
+    }
+}
+
+/// Demote-only cap on the `common::severity_rank` scale, shared by
+/// `demote_for_scope` above and `apply_extraction` below so the two can't
+/// drift: if `severity` is already strictly milder than `floor`, it is left
+/// alone; otherwise -- whether it is more severe than `floor` or merely at
+/// the *same* rank -- the result is `floor` itself, the specific named
+/// severity the calling rule asks for. Never raises the rank.
+///
+/// Equal rank landing on `floor` is load-bearing in both callers. Every
+/// genuinely-severe variant (`Suspended`, `PartSuspended`, `PartClosed`,
+/// `Diverted`, `NotRunning`, ...) shares rank 4 with `SevereDelays`, so a
+/// "keep it if the ranks tie" rule would make `demote_for_scope`'s
+/// keyword-only cap a complete no-op for exactly the statuses it exists to
+/// cap; `apply_extraction` needs it so a `resolved` extraction against a
+/// `ReducedService` base still lands on the `MinorDelays` its annotation
+/// was written for.
+fn demote_to_floor(severity: Severity, floor: Severity) -> Severity {
+    if severity_rank(severity) < severity_rank(floor) {
+        severity
+    } else {
+        floor
     }
 }
 
@@ -701,12 +737,10 @@ fn apply_extraction(
     // keeps a "showing residual impact" annotation stapled to a severity the
     // annotation wasn't actually written for. Never raises the rank, exactly
     // the intent the old `severity.max(floor)` had before the non-monotonic
-    // discriminants broke it for Diverted/PartClosed.
-    let demoted = if severity_rank(severity) < severity_rank(binding_floor) {
-        severity
-    } else {
-        binding_floor
-    };
+    // discriminants broke it for Diverted/PartClosed. Shared with
+    // `demote_for_scope` via `demote_to_floor` so the two demotion sites
+    // cannot drift back apart.
+    let demoted = demote_to_floor(severity, binding_floor);
 
     (demoted, Some(annotations.join("; ")))
 }
@@ -761,6 +795,80 @@ fn routes_from_stations(line: &LineDefinition, stations: &[String]) -> Vec<Affec
 }
 
 // --- Inference path ---
+
+/// How old a `station_samples` row may be and still count as live data.
+///
+/// `poller-ldbws` polls on a 60-second interval by default
+/// (`POLL_INTERVAL_SECS_LDBWS`, docker-compose.yml) and re-writes every
+/// sampled station each cycle, so a healthy row is at most a couple of
+/// minutes old even allowing for a slow full sweep of the ~280 stations in
+/// `lines/*.toml`'s `sample_stations`. 15 minutes is therefore many
+/// multiples of the normal cadence -- a station that quiet is not "sampled
+/// slowly", it is not being sampled at all -- while still leaving ample room
+/// for a single degraded sweep, an RDM rate-limit backoff, or a poller
+/// restart without a station flapping in and out of coverage.
+const MAX_SAMPLE_AGE_MINUTES: i64 = 15;
+
+/// Drops every `station_samples` entry whose `polled_at` is older than
+/// [`MAX_SAMPLE_AGE_MINUTES`], returning how many were dropped.
+///
+/// # Why this exists
+///
+/// `station_samples` is keyed by CRS and UPSERTed in place, so a stalled
+/// `poller-ldbws` leaves its last snapshot sitting in the table forever with
+/// no outward sign of being dead. `polled_at` was loaded but never checked
+/// against the clock, and both consumers treated that frozen snapshot as
+/// live traffic indefinitely:
+///
+/// - `infer_from_samples` kept publishing severities derived from hours-old
+///   departures -- delays and cancellations long since resolved, or a "Good
+///   Service" computed from a board nobody is updating.
+/// - `dedup::dedup_new_sample_stats` keys its "already counted" ledger by
+///   (line, London calendar day), so at every midnight rollover every
+///   still-frozen departure counted again as a brand-new distinct train --
+///   fabricating a full day's traffic stats out of a dead feed, every day it
+///   stayed down.
+///
+/// Filtering the map once, per cycle, before anything reads it means a stale
+/// station is simply absent, which both consumers already handle correctly:
+/// `compute_sample_availability` reports `NoCoverage`/`BelowThreshold` (and
+/// `infer_from_samples` falls back to `good_service()` carrying that
+/// availability, rather than inventing a severity), and
+/// `dedup_new_sample_stats` finds no relevant departures and contributes
+/// nothing. No new branch is needed in either.
+pub(crate) fn drop_stale_samples(
+    samples: &mut HashMap<String, StationSample>,
+    now: DateTime<Utc>,
+) -> usize {
+    let cutoff = now - Duration::minutes(MAX_SAMPLE_AGE_MINUTES);
+    let before = samples.len();
+    let mut oldest: Option<DateTime<Utc>> = None;
+    samples.retain(|_, sample| {
+        if sample.polled_at >= cutoff {
+            return true;
+        }
+        oldest = Some(match oldest {
+            Some(current) => current.min(sample.polled_at),
+            None => sample.polled_at,
+        });
+        false
+    });
+    let dropped = before - samples.len();
+    if dropped > 0 {
+        // One aggregated warning per cycle, not one per station: a fully
+        // stalled poller means every sampled station is stale at once, and
+        // ~280 identical warnings a cycle would bury everything else.
+        tracing::warn!(
+            dropped,
+            remaining = samples.len(),
+            max_age_minutes = MAX_SAMPLE_AGE_MINUTES,
+            oldest_polled_at = ?oldest,
+            "ignoring stale station_samples rows -- treating those stations as having no live \
+             data rather than inferring from a frozen LDBWS snapshot"
+        );
+    }
+    dropped
+}
 
 /// Raw sample-derived numbers for a line: how many recently-sampled
 /// departures were delayed/cancelled, and by how much on average. Computed
@@ -1153,6 +1261,37 @@ fn escalate_from_coverage_stats(
 /// takes the escalate-only branch instead, preserving its original
 /// provenance -- identical posture to `escalate_from_sample_stats`'s
 /// existing behavior for LDBWS.
+///
+/// # The "no incident present" branch ESCALATES ONLY
+///
+/// It used to overwrite `severity`/`reason` unconditionally whenever the
+/// full-coverage classification was anything but `GoodService`, which could
+/// *demote* a real, already-computed LDBWS-inferred severity -- flatly
+/// contradicting the escalate-only posture this whole layer documents (see
+/// `escalate_from_coverage_stats` above and the design doc's "never demoting
+/// below whatever Knowledgebase/Planned already established"). Concretely: a
+/// line whose live departure boards show severe cancellations
+/// (`SevereDelays`, rank 4) would be knocked down to `MinorDelays` (rank 3)
+/// by a full-coverage population that merely looked mildly late, publishing
+/// the milder of two real signals.
+///
+/// This was NOT hypothetical scaffolding. `lines/tfw-conwy-valley.toml` set
+/// `full_coverage_enabled = true` on 2026-09-21, `crates/full-coverage-consumer`
+/// writes the `full_coverage_line_stats` rows `run_cycle` reads, and that
+/// line's statuses have been taking this branch in production ever since --
+/// notwithstanding the "always a no-op"/"always empty in production today"
+/// comments that this codebase still carried at `main.rs`'s coverage-stats
+/// pass and on `merge_full_coverage` below (both now corrected).
+///
+/// So the branch now requires a strictly higher `severity_rank` than the
+/// status already carries -- the exact gate `escalate_from_coverage_stats`
+/// uses -- and otherwise falls through to that escalate-only helper, which
+/// is a no-op at an equal or lower rank and leaves the LDBWS severity,
+/// reason and `LdbwsInferred` provenance intact (correctly: the severity on
+/// display is still the one LDBWS computed). The old
+/// `coverage_severity != GoodService` guard is subsumed by the rank check --
+/// `GoodService` has rank 0, so it can never be strictly higher than
+/// anything.
 fn merge_full_coverage_stats(
     report: &mut LineStatusReport,
     stats: &SampleStats,
@@ -1164,7 +1303,8 @@ fn merge_full_coverage_stats(
         status.full_coverage_availability = FullCoverageAvailability::Available(stats.clone());
 
         let no_incident_present = status.data_quality == DataQuality::LdbwsInferred;
-        if no_incident_present && coverage_severity != Severity::GoodService {
+        if no_incident_present && severity_rank(coverage_severity) > severity_rank(status.severity)
+        {
             status.severity = coverage_severity;
             status.reason = coverage_reason.clone();
             status.data_quality = DataQuality::TrustInferred;
@@ -1181,18 +1321,19 @@ fn merge_full_coverage_stats(
 
 /// Post-`aggregate()` pass merging a per-line materialized full-coverage
 /// signal onto already-built reports -- see `merge_full_coverage_stats`'s
-/// doc comment for the merge rule itself. `full_coverage` is the
-/// per-line signal a dedicated TRUST-vs-schedule consumer ("Option B")
-/// would provide -- always empty in production today, since that
-/// consumer does not exist yet (building it is explicitly out of scope
-/// for this scaffolding; see
-/// docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md's
-/// own "Explicitly out of scope"). This function and its call site in
-/// `main.rs::run_cycle` are the integration point a future consumer
-/// would use -- kept as a SEPARATE pass called after `aggregate()`, not a
-/// new parameter on `aggregate()` itself, specifically so this addition
-/// doesn't touch `aggregate()`'s existing signature or its many existing
-/// call sites/tests.
+/// doc comment for the merge rule itself. `full_coverage` is the per-line
+/// signal the dedicated TRUST-vs-schedule consumer ("Option B") provides.
+///
+/// NOT scaffolding, and no longer "always empty in production today" as this
+/// comment used to claim: that consumer shipped as
+/// `crates/full-coverage-consumer`, it writes the `full_coverage_line_stats`
+/// rows `queries::load_full_coverage_line_stats` reads, and
+/// `lines/tfw-conwy-valley.toml` has carried `full_coverage_enabled = true`
+/// since 2026-09-21, so this pass really does rewrite a live line's
+/// severity/`DataQuality` every cycle. Kept as a SEPARATE pass called after
+/// `aggregate()`, not a new parameter on `aggregate()` itself, so it doesn't
+/// touch `aggregate()`'s existing signature or its many existing call
+/// sites/tests.
 ///
 /// Only touches lines with `LineDefinition.full_coverage_enabled` set
 /// (Decision 3's per-line TOML rollout gate) OR `full_coverage_enabled_default`
@@ -1592,6 +1733,136 @@ mod tests {
         assert!(belongs_to_line(&southern, bml));
         assert!(belongs_to_line(&gatwick_express, bml));
         assert!(!belongs_to_line(&wrong_operator, bml));
+    }
+
+    // --- Sample staleness (drop_stale_samples) ---
+
+    /// One `station_samples` row for `crs`, polled `age_minutes` ago, with
+    /// enough relevant departures to clear `min_sample_size` and enough
+    /// cancellations to classify as disruption -- so a test can tell
+    /// "inferred from this row" apart from "ignored this row" by severity
+    /// alone.
+    fn sample_polled_minutes_ago(crs: &str, age_minutes: i64) -> StationSample {
+        StationSample {
+            crs: crs.to_string(),
+            polled_at: Utc::now() - Duration::minutes(age_minutes),
+            departures: vec![
+                departure("AON", 0, true),
+                departure("AON", 0, true),
+                departure("AON", 0, true),
+                departure("AON", 0, false),
+            ],
+        }
+    }
+
+    #[test]
+    fn drop_stale_samples_keeps_fresh_rows_and_drops_only_stale_ones() {
+        let now = Utc::now();
+        let mut samples: HashMap<String, StationSample> = HashMap::from([
+            // Just polled.
+            ("AHT".to_string(), sample_polled_minutes_ago("AHT", 0)),
+            // A slow sweep / one missed cycle -- still live.
+            ("FRM".to_string(), sample_polled_minutes_ago("FRM", 5)),
+            // Exactly on the cutoff -- inclusive, still live.
+            (
+                "AON".to_string(),
+                sample_polled_minutes_ago("AON", MAX_SAMPLE_AGE_MINUTES),
+            ),
+            // A poller that died an hour ago.
+            ("WOK".to_string(), sample_polled_minutes_ago("WOK", 60)),
+            // ...and one that died yesterday, the case that re-counted its
+            // frozen departures as new trains at every midnight rollover.
+            ("PAD".to_string(), sample_polled_minutes_ago("PAD", 26 * 60)),
+        ]);
+
+        let dropped = drop_stale_samples(&mut samples, now);
+
+        assert_eq!(dropped, 2);
+        let mut kept: Vec<&str> = samples.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["AHT", "AON", "FRM"]);
+    }
+
+    #[test]
+    fn drop_stale_samples_is_a_no_op_on_a_healthy_feed() {
+        let now = Utc::now();
+        let mut samples: HashMap<String, StationSample> =
+            HashMap::from([("AHT".to_string(), sample_polled_minutes_ago("AHT", 1))]);
+        assert_eq!(drop_stale_samples(&mut samples, now), 0);
+        assert_eq!(samples.len(), 1);
+    }
+
+    #[test]
+    fn a_stalled_poller_stops_producing_inferred_severities_instead_of_freezing_one() {
+        // The real failure shape: `poller-ldbws` stalls, `station_samples`
+        // keeps its last snapshot (UPSERT by CRS, nothing expires it), and
+        // `infer_from_samples` used to keep publishing a severity derived
+        // from those hours-old departures forever. Same row, same line, only
+        // `polled_at` differs between the two halves of this test.
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let now = Utc::now();
+
+        // Fresh: 3 of 4 cancelled is real, current disruption and must still
+        // be reported.
+        let mut fresh: HashMap<String, StationSample> =
+            HashMap::from([("AHT".to_string(), sample_polled_minutes_ago("AHT", 1))]);
+        assert_eq!(drop_stale_samples(&mut fresh, now), 0);
+        let status = infer_from_samples(alton, &fresh, &defaults);
+        assert_ne!(
+            status.severity,
+            Severity::GoodService,
+            "a live feed showing 75% cancellations must still produce a severity"
+        );
+
+        // The identical snapshot, three hours stale: no live data, so no
+        // inferred severity and no sample stats -- exactly the `NoCoverage`
+        // shape `infer_from_samples` already produces for a station that
+        // never reported at all.
+        let mut stale: HashMap<String, StationSample> =
+            HashMap::from([("AHT".to_string(), sample_polled_minutes_ago("AHT", 180))]);
+        assert_eq!(drop_stale_samples(&mut stale, now), 1);
+        let status = infer_from_samples(alton, &stale, &defaults);
+        assert_eq!(status.severity, Severity::GoodService);
+        assert_eq!(status.sample_availability, SampleAvailability::NoCoverage);
+        assert_eq!(
+            status.sample_stats, None,
+            "a frozen snapshot must not be published as live traffic stats"
+        );
+    }
+
+    #[test]
+    fn a_stalled_poller_contributes_no_departures_to_the_daily_dedup_rollup() {
+        // The other half of the staleness bug: `dedup_new_sample_stats` keys
+        // its ledger by (line, London calendar day), so every midnight
+        // rollover re-counted a frozen snapshot's departures as brand-new
+        // distinct trains -- a full day of fabricated traffic stats from a
+        // dead feed, every day it stayed down. Filtering the map before
+        // dedup sees it means there is nothing left to re-count.
+        let lines = load_all_lines();
+        let alton = &lines["swr-alton"];
+        let defaults = Defaults::default();
+        let now = Utc::now();
+        let today = crate::queries::london_calendar_day(now);
+
+        let mut samples: HashMap<String, StationSample> =
+            HashMap::from([("AHT".to_string(), sample_polled_minutes_ago("AHT", 180))]);
+        assert_eq!(drop_stale_samples(&mut samples, now), 1);
+
+        let mut ledger = crate::dedup::SeenServiceLedger::new();
+        let deduped = crate::dedup::dedup_new_sample_stats(
+            &mut ledger,
+            "swr-alton",
+            today,
+            alton,
+            &samples,
+            &defaults,
+        );
+        assert!(
+            deduped.is_none(),
+            "a stale snapshot must contribute no new distinct trains"
+        );
     }
 
     #[test]
@@ -2416,6 +2687,101 @@ mod tests {
                 Severity::GoodService,
                 "{line_id} should fall back to Good Service once the incident is stale"
             );
+        }
+    }
+
+    // --- demote_for_scope (rank-based, not discriminant-based) ---
+
+    #[test]
+    fn demote_for_scope_demotes_the_severities_the_raw_discriminant_missed() {
+        // The regression this fix exists for: `severity.max(FLOOR)` compared
+        // raw discriminants, and TfL's `statusSeverity` numbering is not
+        // monotonic with real severity. `Diverted = 21` sits ABOVE both
+        // floors numerically (`SevereDelays = 16`, `MinorDelays = 19`), so
+        // `.max()` returned it unchanged -- weak, operator-wide or
+        // keyword-only evidence could publish a fully severe status. Every
+        // severity below shares `severity_rank` 4 with `SevereDelays`, so
+        // all of them must land exactly on the scope's floor.
+        for severity in [
+            Severity::Diverted,
+            Severity::PartClosed,
+            Severity::Suspended,
+            Severity::Closed,
+            Severity::PartSuspended,
+            Severity::BusService,
+            Severity::NotRunning,
+            Severity::SevereDelays,
+        ] {
+            assert_eq!(
+                demote_for_scope(severity, MatchScope::KeywordOnly),
+                Severity::SevereDelays,
+                "{severity:?} under a keyword-only match must be capped at Severe Delays"
+            );
+            assert_eq!(
+                demote_for_scope(severity, MatchScope::OperatorOnly),
+                Severity::MinorDelays,
+                "{severity:?} under an operator-wide match must be capped at Minor Delays"
+            );
+        }
+    }
+
+    #[test]
+    fn demote_for_scope_never_escalates_an_already_mild_severity() {
+        // The other direction of the same discriminant bug: `GoodService = 10`
+        // and `PlannedClosure = 14` are numerically BELOW `SevereDelays = 16`,
+        // so `severity.max(Severity::SevereDelays)` silently *escalated* them
+        // to Severe Delays. Demotion must never raise the rank.
+        for severity in [
+            Severity::GoodService,
+            Severity::NoIssues,
+            Severity::PlannedClosure,
+            Severity::PartClosure,
+            Severity::Information,
+            Severity::MinorDelays,
+            Severity::Recovering,
+        ] {
+            assert_eq!(
+                demote_for_scope(severity, MatchScope::KeywordOnly),
+                severity,
+                "{severity:?} is already milder than Severe Delays and must be left alone"
+            );
+        }
+        // Rank 3 ties with the operator-wide floor, so it lands on the
+        // floor's specific named severity (same convention
+        // `apply_extraction` uses); rank 0/1/2 stay strictly milder.
+        assert_eq!(
+            demote_for_scope(Severity::GoodService, MatchScope::OperatorOnly),
+            Severity::GoodService
+        );
+        assert_eq!(
+            demote_for_scope(Severity::PlannedClosure, MatchScope::OperatorOnly),
+            Severity::PlannedClosure
+        );
+        assert_eq!(
+            demote_for_scope(Severity::Recovering, MatchScope::OperatorOnly),
+            Severity::MinorDelays
+        );
+    }
+
+    #[test]
+    fn demote_for_scope_leaves_evidence_backed_scopes_untouched() {
+        for scope in [
+            MatchScope::ExclusiveSegment,
+            MatchScope::SharedSegment,
+            MatchScope::StationHit,
+        ] {
+            for severity in [
+                Severity::Diverted,
+                Severity::Suspended,
+                Severity::GoodService,
+                Severity::PartClosed,
+            ] {
+                assert_eq!(
+                    demote_for_scope(severity, scope),
+                    severity,
+                    "{scope:?} is real route/station evidence -- no demotion"
+                );
+            }
         }
     }
 
@@ -3583,6 +3949,88 @@ mod tests {
         // existing behavior for an incident-derived status.
         assert_eq!(status.data_quality, DataQuality::Knowledgebase);
         assert!(status.reason.contains("full-coverage data shows: "));
+    }
+
+    #[test]
+    fn merge_full_coverage_stats_never_demotes_an_ldbws_inferred_severity() {
+        // The regression this fix exists for, and it is LIVE:
+        // `lines/tfw-conwy-valley.toml` sets `full_coverage_enabled = true`,
+        // so a real line's LDBWS-inferred statuses take this branch every
+        // cycle. The branch used to overwrite `severity` unconditionally
+        // whenever the coverage classification was anything but
+        // `GoodService`, so a full-coverage population that merely looked
+        // mildly late DEMOTED a genuinely severe live-sample severity --
+        // publishing the milder of two real signals, against this layer's
+        // documented escalate-only posture.
+        let defaults = Defaults::default();
+        let thresholds = thresholds_for(&defaults, &HashMap::new());
+        let mut report = LineStatusReport {
+            id: "tfw-conwy-valley".to_string(),
+            name: "Conwy Valley".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec![],
+            statuses: vec![{
+                let mut status = ldbws_status(Severity::PartSuspended);
+                status.reason = "6 of 10 sampled services cancelled.".to_string();
+                status
+            }],
+        };
+        // 30% delayed -> MinorDelays (rank 3), strictly milder than the
+        // PartSuspended (rank 4) the live samples already established.
+        let stats = coverage_stats(10, 3, 0);
+
+        merge_full_coverage_stats(&mut report, &stats, &thresholds);
+
+        let status = &report.statuses[0];
+        assert_eq!(
+            status.severity,
+            Severity::PartSuspended,
+            "a milder full-coverage read must never demote an LDBWS-inferred severity"
+        );
+        assert_eq!(
+            status.reason, "6 of 10 sampled services cancelled.",
+            "the LDBWS reason describes the severity on display and must survive"
+        );
+        assert_eq!(
+            status.data_quality,
+            DataQuality::LdbwsInferred,
+            "provenance must stay with whichever signal actually determined the severity"
+        );
+        // The full-coverage numbers are still attached -- only the severity
+        // overwrite is suppressed.
+        assert_eq!(
+            status.full_coverage_availability,
+            FullCoverageAvailability::Available(stats.clone())
+        );
+        assert_eq!(status.full_coverage_stats, Some(stats));
+    }
+
+    #[test]
+    fn merge_full_coverage_stats_leaves_an_equal_rank_ldbws_severity_alone() {
+        // Equal rank is not an escalation, matching
+        // `escalate_from_coverage_stats`' strictly-higher-rank gate:
+        // SevereDelays and PartSuspended are both rank 4, so a coverage read
+        // at the same rank must not rewrite the status (or its provenance).
+        let defaults = Defaults::default();
+        let thresholds = thresholds_for(&defaults, &HashMap::new());
+        let mut report = LineStatusReport {
+            id: "tfw-conwy-valley".to_string(),
+            name: "Conwy Valley".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec![],
+            statuses: vec![ldbws_status(Severity::PartSuspended)],
+        };
+        // 60% cancelled -> PartSuspended, same rank AND same severity.
+        let stats = coverage_stats(10, 0, 6);
+
+        merge_full_coverage_stats(&mut report, &stats, &thresholds);
+
+        assert_eq!(report.statuses[0].severity, Severity::PartSuspended);
+        assert_eq!(
+            report.statuses[0].data_quality,
+            DataQuality::LdbwsInferred,
+            "no escalation happened, so nothing was TRUST-determined"
+        );
     }
 
     #[test]

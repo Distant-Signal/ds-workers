@@ -28,6 +28,64 @@ pub struct LoadedIncident {
     pub extracted_periods: Option<serde_json::Value>,
 }
 
+/// Per-row resilience for every loader below.
+///
+/// # Why a bad row is skipped, not propagated
+///
+/// These loaders used to build their result with `.map(...).collect()` over
+/// a closure returning `Result`, so ONE malformed JSONB row -- a
+/// `validity_periods` or `departures` value some other service wrote in a
+/// shape `serde_json::from_value` can't accept -- failed the deserialization
+/// of the WHOLE batch. `run_cycle` (main.rs) is a straight `?`-chain, so
+/// that single row took down every line's status write for the cycle AND
+/// (before this change) every retention prune queued behind it, including
+/// `trust_event_backlog`'s RDM-licensing-mandated 1-day window. Skipping the
+/// one row loses exactly one incident/station/custom line -- visible, loud,
+/// and per-row in the logs -- instead of the entire cycle.
+///
+/// Returns `None` after logging, so callers can `filter_map` over it.
+fn skip_bad_row<T>(table: &'static str, key: Option<String>, result: Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(
+                table,
+                key = key.as_deref().unwrap_or("<unreadable>"),
+                error = ?err,
+                "skipping a malformed row rather than failing the whole aggregation cycle"
+            );
+            metrics::counter!(common::metrics::metric_name(
+                "aggregator_malformed_rows_skipped_total"
+            ))
+            .increment(1);
+            None
+        }
+    }
+}
+
+/// Deserializes one `incidents` row. Split out of `load_incidents` so the
+/// `?` shorthand stays usable per row while the caller decides, per row,
+/// whether a failure is fatal -- see `skip_bad_row`.
+fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
+    let validity_json: serde_json::Value = row.try_get("validity_periods")?;
+    let message = IncidentMessage {
+        incident_id: row.try_get("incident_id")?,
+        summary: row.try_get("summary")?,
+        description: row.try_get("description")?,
+        operators: row.try_get("operators")?,
+        affected_stations: row.try_get("affected_stations")?,
+        priority: row.try_get("priority")?,
+        validity: serde_json::from_value(validity_json)?,
+        is_planned: row.try_get("is_planned")?,
+        is_cleared: row.try_get("is_cleared")?,
+    };
+    Ok(LoadedIncident {
+        message,
+        first_seen_at: row.try_get("first_seen_at")?,
+        extracted_periods: row.try_get("extracted_periods")?,
+    })
+}
+
 pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
@@ -39,27 +97,28 @@ pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            let validity_json: serde_json::Value = row.try_get("validity_periods")?;
-            let message = IncidentMessage {
-                incident_id: row.try_get("incident_id")?,
-                summary: row.try_get("summary")?,
-                description: row.try_get("description")?,
-                operators: row.try_get("operators")?,
-                affected_stations: row.try_get("affected_stations")?,
-                priority: row.try_get("priority")?,
-                validity: serde_json::from_value(validity_json)?,
-                is_planned: row.try_get("is_planned")?,
-                is_cleared: row.try_get("is_cleared")?,
-            };
-            Ok(LoadedIncident {
-                message,
-                first_seen_at: row.try_get("first_seen_at")?,
-                extracted_periods: row.try_get("extracted_periods")?,
-            })
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            skip_bad_row(
+                "incidents",
+                row.try_get("incident_id").ok(),
+                incident_from_row(&row),
+            )
         })
-        .collect()
+        .collect())
+}
+
+/// Deserializes one `station_samples` row -- see `incident_from_row`.
+fn station_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<(String, StationSample)> {
+    let crs: String = row.try_get("crs")?;
+    let departures_json: serde_json::Value = row.try_get("departures")?;
+    let sample = StationSample {
+        crs: crs.clone(),
+        polled_at: row.try_get("polled_at")?,
+        departures: serde_json::from_value(departures_json)?,
+    };
+    Ok((crs, sample))
 }
 
 pub async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, StationSample>> {
@@ -67,18 +126,28 @@ pub async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, Stati
         .fetch_all(pool)
         .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            let crs: String = row.try_get("crs")?;
-            let departures_json: serde_json::Value = row.try_get("departures")?;
-            let sample = StationSample {
-                crs: crs.clone(),
-                polled_at: row.try_get("polled_at")?,
-                departures: serde_json::from_value(departures_json)?,
-            };
-            Ok((crs, sample))
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            skip_bad_row(
+                "station_samples",
+                row.try_get("crs").ok(),
+                station_sample_from_row(&row),
+            )
         })
-        .collect()
+        .collect())
+}
+
+/// Deserializes one `custom_lines` row -- see `incident_from_row`.
+fn custom_line_from_row(row: &sqlx::postgres::PgRow) -> Result<common::CustomLine> {
+    Ok(common::CustomLine {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        operators: row.try_get("operators")?,
+        stations: row.try_get("stations")?,
+        headcode_prefixes: row.try_get("headcode_prefixes")?,
+        destination_crs_filter: row.try_get("destination_crs_filter")?,
+    })
 }
 
 pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>> {
@@ -89,18 +158,16 @@ pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>>
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(common::CustomLine {
-                id: row.try_get("id")?,
-                name: row.try_get("name")?,
-                operators: row.try_get("operators")?,
-                stations: row.try_get("stations")?,
-                headcode_prefixes: row.try_get("headcode_prefixes")?,
-                destination_crs_filter: row.try_get("destination_crs_filter")?,
-            })
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            skip_bad_row(
+                "custom_lines",
+                row.try_get("id").ok(),
+                custom_line_from_row(&row),
+            )
         })
-        .collect()
+        .collect())
 }
 
 /// Every `full_coverage_line_stats` row with `availability = 'available'`
@@ -140,19 +207,36 @@ pub async fn load_full_coverage_line_stats(
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            let line_id: String = row.try_get("line_id")?;
-            let stats = common::SampleStats {
-                total: row.try_get::<i32, _>("total")? as usize,
-                delayed: row.try_get::<i32, _>("delayed")? as usize,
-                cancelled: row.try_get::<i32, _>("cancelled")? as usize,
-                skipped: row.try_get::<i32, _>("skipped")? as usize,
-                avg_delay_minutes: row.try_get("avg_delay_minutes")?,
-            };
-            Ok((line_id, stats))
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            skip_bad_row(
+                "full_coverage_line_stats",
+                row.try_get("line_id").ok(),
+                full_coverage_stats_from_row(&row),
+            )
         })
-        .collect()
+        .collect())
+}
+
+/// Deserializes one `full_coverage_line_stats` row -- see
+/// `incident_from_row`. Per-row skipping matters here for the same reason
+/// even though this loader's caller already fails open on an `Err`: failing
+/// open discards EVERY line's full-coverage signal for the cycle, where a
+/// single unreadable row (a NULL `avg_delay_minutes` a future writer
+/// permits, say) should only cost that one line's.
+fn full_coverage_stats_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<(String, common::SampleStats)> {
+    let line_id: String = row.try_get("line_id")?;
+    let stats = common::SampleStats {
+        total: row.try_get::<i32, _>("total")? as usize,
+        delayed: row.try_get::<i32, _>("delayed")? as usize,
+        cancelled: row.try_get::<i32, _>("cancelled")? as usize,
+        skipped: row.try_get::<i32, _>("skipped")? as usize,
+        avg_delay_minutes: row.try_get("avg_delay_minutes")?,
+    };
+    Ok((line_id, stats))
 }
 
 /// Deletes `line_status` rows for any `line_id` not in `current_line_ids`.
@@ -264,21 +348,49 @@ fn normalize_entry_for_diff(entry: &serde_json::Value) -> serde_json::Value {
     entry
 }
 
-/// The one `DataQuality` value affected by the `Utc::now()`-every-cycle bug
-/// this exists to work around. See
+/// The `DataQuality` values affected by the `Utc::now()`-every-cycle bug
+/// this exists to work around: an inferred status has no incident of its own
+/// to take a stable `validity.from_date` from, so `aggregation.rs` stamps it
+/// with a fresh `Utc::now()` on every single cycle. See
 /// docs/superpowers/specs/2026-08-30-inferred-time-ranges-design.md.
-const LDBWS_INFERRED: &str = "ldbws-inferred";
+///
+/// `"trust-inferred"` belongs here alongside `"ldbws-inferred"` for exactly
+/// the same reason, and is not speculative: `aggregation::merge_full_coverage_stats`
+/// really does stamp `DataQuality::TrustInferred` on a live line's status
+/// (`lines/tfw-conwy-valley.toml` has `full_coverage_enabled = true`), whose
+/// `validity.from_date` came from the same `Utc::now()`-per-cycle
+/// `good_service()`/`infer_from_samples` construction. Recognizing only
+/// `"ldbws-inferred"` meant such a status re-stamped its "since" timestamp
+/// every cycle -- the passenger-facing "disrupted since" clock permanently
+/// reading "just now" -- which is the precise bug this function exists to
+/// prevent.
+const INFERRED_DATA_QUALITIES: [&str; 2] = ["ldbws-inferred", "trust-inferred"];
+
+/// Whether a stored/fresh status entry's `data_quality` is one of the
+/// inferred kinds whose `from_date` needs carrying forward.
+fn inferred_data_quality(entry: &serde_json::Value) -> Option<&str> {
+    let quality = entry.get("data_quality").and_then(|v| v.as_str())?;
+    INFERRED_DATA_QUALITIES
+        .contains(&quality)
+        .then_some(quality)
+}
 
 /// Given the previous cycle's stored `statuses` JSON array (`existing`) and
 /// this cycle's freshly-computed one (`fresh`), returns a copy of `fresh`
-/// with each `"ldbws-inferred"` entry's `validity.from_date` overwritten by
-/// the positionally-corresponding entry in `existing`, provided that entry
-/// is also `"ldbws-inferred"` and the two entries are equal once run
-/// through `normalize_entry_for_diff` (i.e. "same underlying disruption,
-/// just a fresh poll of it" -- `sample_stats`, the live-sample-count reason
-/// suffix, and the live counts baked directly into a sample-inferred
-/// `reason` are all allowed to churn without defeating the carry-forward,
-/// since `normalize_entry_for_diff` already strips all three).
+/// with each inferred entry's (`INFERRED_DATA_QUALITIES`)
+/// `validity.from_date` overwritten by the positionally-corresponding entry
+/// in `existing`, provided that entry carries the SAME `data_quality` and
+/// the two entries are equal once run through `normalize_entry_for_diff`
+/// (i.e. "same underlying disruption, just a fresh poll of it" --
+/// `sample_stats`, the live-sample-count reason suffix, and the live counts
+/// baked directly into a sample-inferred `reason` are all allowed to churn
+/// without defeating the carry-forward, since `normalize_entry_for_diff`
+/// already strips all three).
+///
+/// The two `data_quality` values must MATCH, not merely both be inferred: a
+/// line crossing from `ldbws-inferred` to `trust-inferred` (or back) has had
+/// the provenance of its published severity change, which is a genuine
+/// status change deserving its own fresh timestamp and history row.
 ///
 /// Positional matching (`existing[i]` vs. `fresh[i]`) is safe today because
 /// `infer_from_samples`/`good_service()` (`aggregation.rs`) only ever
@@ -301,13 +413,13 @@ fn carry_forward_ldbws_from_date(
     };
 
     for (i, entry) in fresh_entries.iter_mut().enumerate() {
-        if entry.get("data_quality").and_then(|v| v.as_str()) != Some(LDBWS_INFERRED) {
+        let Some(quality) = inferred_data_quality(entry) else {
             continue;
-        }
+        };
         let Some(existing_entry) = existing_entries.and_then(|arr| arr.get(i)) else {
             continue;
         };
-        if existing_entry.get("data_quality").and_then(|v| v.as_str()) != Some(LDBWS_INFERRED) {
+        if inferred_data_quality(existing_entry) != Some(quality) {
             continue;
         }
         if normalize_entry_for_diff(entry) != normalize_entry_for_diff(existing_entry) {
@@ -364,6 +476,29 @@ fn strip_live_sample_annotation(reason: &str) -> &str {
 /// real change behind this fix meant only to suppress noise. See
 /// `normalize_entry_for_diff`'s regression tests for both directions of
 /// this.
+///
+/// # UTF-8 safety
+///
+/// Every index this function computes must land on a `char` boundary, and
+/// `reason` is raw free-text: the Knowledgebase incident summary, or
+/// LDBWS-inferred Darwin text, both of which routinely carry en dashes,
+/// `£`, curly quotes and accented place names. An earlier version derived
+/// the start of the leading digit run with
+/// `before.rfind(|c| !c.is_ascii_digit()).map_or(0, |p| p + 1)`, which
+/// assumes the character before the digits is exactly one byte wide --
+/// `rfind` returns the *start* byte of that character, so `p + 1` lands
+/// mid-character for any multi-byte one and the following slice panicked
+/// the whole process ("byte index is not a char boundary"). Real National
+/// Rail prose hits that on strings as ordinary as `"Platforms 1–3 of 5
+/// closed"`. Since `normalize_sample_counts` runs inside
+/// `normalize_entry_for_diff` -> `write_line_status`, awaited straight from
+/// `main`, the panic unwound `main` itself and the pod crash-looped on the
+/// same live incident every cycle, freezing line-status updates *and* all
+/// retention pruning for as long as the incident stayed uncleared. The
+/// backwards scan below therefore walks `char_indices()` and advances by
+/// the found character's own `len_utf8()`, so a multi-byte character can
+/// never produce a non-boundary index. See
+/// `normalize_sample_counts_is_utf8_safe_for_real_national_rail_prose`.
 fn normalize_sample_counts(reason: &str) -> String {
     const OF_MARKER: &str = " of ";
     const SERVICES_MARKER: &str = " sampled services";
@@ -377,11 +512,18 @@ fn normalize_sample_counts(reason: &str) -> String {
 
         // Digit run immediately preceding " of ", scanning back only as far
         // as `copied_to` (text already emitted for an earlier match).
+        // Walked with `char_indices().rev()` -- NOT `rfind` plus a `+ 1`
+        // byte bump -- so the boundary always lands after the *whole*
+        // preceding character however many bytes it occupies; see this
+        // function's "UTF-8 safety" doc section for the panic that shape
+        // used to cause.
         let before = &reason[copied_to..of_idx];
         let first_digits_start = copied_to
             + before
-                .rfind(|c: char| !c.is_ascii_digit())
-                .map_or(0, |p| p + 1);
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map_or(0, |(p, c)| p + c.len_utf8());
         let first_digits = &reason[first_digits_start..of_idx];
 
         // Digit run immediately following " of ".
@@ -1082,6 +1224,106 @@ mod tests {
         assert!(
             !ids.contains(&"TEST-CLEARED"),
             "cleared incident should be excluded"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                load_incidents_skips_one_malformed_row_instead_of_failing_the_batch -- --ignored`"]
+    async fn load_incidents_skips_one_malformed_row_instead_of_failing_the_batch() {
+        // The real failure shape: `validity_periods` is JSONB, so Postgres
+        // accepts any valid JSON in it, but `serde_json::from_value` into
+        // `Vec<ValidityPeriod>` rejects anything that isn't an array of
+        // periods with the right fields. One such row used to fail the WHOLE
+        // batch -- every line's status write for the cycle, plus (before
+        // retention was split out) every prune behind it, including
+        // `trust_event_backlog`'s licensing-mandated window.
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        sqlx::query(
+            "INSERT INTO incidents \
+                (incident_id, summary, description, operators, affected_stations, priority, validity_periods, is_planned, is_cleared) \
+             VALUES \
+                ('TEST-GOOD-1', 'good', 'fine', '{}', '{}', 0, '[]', false, false), \
+                ('TEST-BAD-JSONB', 'bad', 'malformed', '{}', '{}', 0, '{\"not\": \"an array of periods\"}', false, false), \
+                ('TEST-GOOD-2', 'good', 'fine', '{}', '{}', 0, '[]', false, false) \
+             ON CONFLICT (incident_id) DO UPDATE SET validity_periods = EXCLUDED.validity_periods",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        let loaded = load_incidents(&pool).await;
+
+        sqlx::query(
+            "DELETE FROM incidents WHERE incident_id IN \
+             ('TEST-GOOD-1', 'TEST-BAD-JSONB', 'TEST-GOOD-2')",
+        )
+        .execute(&pool)
+        .await
+        .expect("cleanup fixture rows");
+
+        let loaded = loaded.expect("one malformed row must not fail the whole load");
+        let ids: Vec<&str> = loaded
+            .iter()
+            .map(|i| i.message.incident_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"TEST-GOOD-1") && ids.contains(&"TEST-GOOD-2"),
+            "both well-formed rows must survive alongside the bad one, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"TEST-BAD-JSONB"),
+            "the malformed row must be skipped, not silently coerced"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                load_station_samples_skips_one_malformed_row_instead_of_failing_the_batch \
+                -- --ignored`"]
+    async fn load_station_samples_skips_one_malformed_row_instead_of_failing_the_batch() {
+        // Same shape as the incidents case, for the other JSONB loader: a
+        // `departures` value that isn't a `Vec<StationDeparture>` must cost
+        // that one station's coverage for the cycle, not every station's.
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        sqlx::query(
+            "INSERT INTO station_samples (crs, polled_at, departures) VALUES \
+                ('ZZG', NOW(), '[]'), \
+                ('ZZB', NOW(), '[{\"service_id\": 42}]') \
+             ON CONFLICT (crs) DO UPDATE SET departures = EXCLUDED.departures, \
+                polled_at = EXCLUDED.polled_at",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        let loaded = load_station_samples(&pool).await;
+
+        sqlx::query("DELETE FROM station_samples WHERE crs IN ('ZZG', 'ZZB')")
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture rows");
+
+        let loaded = loaded.expect("one malformed row must not fail the whole load");
+        assert!(
+            loaded.contains_key("ZZG"),
+            "the well-formed station sample must survive"
+        );
+        assert!(
+            !loaded.contains_key("ZZB"),
+            "the malformed station sample must be skipped"
         );
     }
 
@@ -1823,6 +2065,82 @@ mod tests {
     }
 
     #[test]
+    fn normalize_sample_counts_is_utf8_safe_for_real_national_rail_prose() {
+        // Real reproductions, not synthetic edge cases: every string below
+        // is the shape of live free text this function is fed (a
+        // Knowledgebase incident summary, or LDBWS-inferred Darwin text),
+        // and each one panicked the WHOLE aggregator process -- "byte index
+        // is not a char boundary" -- before the `char_indices()` rewrite.
+        // A panic here unwinds `main` (normalize_sample_counts <-
+        // normalize_entry_for_diff <- write_line_status <- run_cycle <-
+        // main), so the pod crash-looped on the same uncleared incident
+        // every cycle, freezing line-status writes AND retention pruning.
+        // These assert the *pass-through* behavior each string should have
+        // had all along: none of them is a "<n> of <m> sampled services"
+        // count clause, so none should be rewritten.
+        for text in [
+            // en dash in a platform range, immediately before " of "
+            "Platforms 1–3 of 5 closed",
+            // accented place name immediately before " of "
+            "café of 9 sampled services",
+            // curly apostrophe/quotes
+            "Queen’s Park of 4 platforms closed",
+            "“Platform 2” of 6 out of use",
+            // currency symbol
+            "Compensation of £10 available",
+            // non-breaking space and a degree sign
+            "Speed restriction of 20 mph (rails at 50°C)",
+            // multi-byte character directly abutting a real digit run that
+            // is NOT followed by " sampled services"
+            "Lines blocked –3 of 5 platforms affected",
+        ] {
+            assert_eq!(
+                normalize_sample_counts(text),
+                text,
+                "non-ASCII text must pass through untouched, never panic: {text:?}"
+            );
+        }
+
+        // The same non-ASCII prose combined with a genuine count clause:
+        // the clause is still normalized, the multi-byte text around it is
+        // preserved byte-for-byte.
+        assert_eq!(
+            normalize_sample_counts(
+                "Platforms 1–3 closed at Queen’s Park — 5 of 9 sampled services delayed. \
+                 (most cited: Signal failure)"
+            ),
+            "Platforms 1–3 closed at Queen’s Park — N of M sampled services delayed. \
+             (most cited: Signal failure)",
+        );
+        // A count clause whose leading digit run is immediately preceded by
+        // a multi-byte character (an em dash with no space, worst case for
+        // the old `p + 1` byte bump) still normalizes.
+        assert_eq!(
+            normalize_sample_counts("Severe delays—5 of 9 sampled services delayed."),
+            "Severe delays—N of M sampled services delayed.",
+        );
+    }
+
+    #[test]
+    fn normalize_entry_for_diff_survives_non_ascii_incident_text() {
+        // The end-to-end shape of the production crash-loop: a real
+        // incident summary with an en dash flowing through the actual
+        // diff-normalization entry point `write_line_status` calls.
+        let entry = serde_json::json!({
+            "severity": "part-closed",
+            "reason": "Platforms 1–3 of 5 closed at Llandudno Junction",
+            "validity": {"from_date": "2026-09-24T10:00:00Z"},
+            "data_quality": "knowledgebase"
+        });
+        assert_eq!(
+            normalize_entry_for_diff(&entry)["reason"],
+            serde_json::Value::String(
+                "Platforms 1–3 of 5 closed at Llandudno Junction".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn normalize_entry_for_diff_ignores_sample_derived_count_churn() {
         // The write-side regression this fix exists for: two cycles of the
         // exact same underlying situation, live counts wobbling, must
@@ -2027,6 +2345,70 @@ mod tests {
         assert_eq!(
             result, fresh,
             "non-ldbws-inferred entries must pass through untouched"
+        );
+    }
+
+    /// `ldbws_status`'s sibling for the other inferred provenance -- the one
+    /// `aggregation::merge_full_coverage_stats` stamps when full-coverage
+    /// data determines a line's severity with no incident present.
+    fn trust_status(from_date: &str, severity: &str, reason: &str) -> serde_json::Value {
+        let mut statuses = ldbws_status(from_date, severity, reason);
+        statuses[0]["data_quality"] = serde_json::Value::String("trust-inferred".to_string());
+        statuses
+    }
+
+    #[test]
+    fn carry_forward_also_covers_trust_inferred_entries() {
+        // `trust-inferred` has exactly the same problem `ldbws-inferred` does:
+        // no incident of its own to take a stable `from_date` from, so
+        // `aggregation.rs` re-stamps it with `Utc::now()` every cycle.
+        // Recognizing only `ldbws-inferred` meant a `TrustInferred` status
+        // (live today -- `lines/tfw-conwy-valley.toml` sets
+        // `full_coverage_enabled = true`) reported "disrupted since just now"
+        // forever, no matter how long the disruption had actually been
+        // running.
+        let existing = trust_status(
+            "2026-09-24T06:00:00Z",
+            "part-suspended",
+            "6 of 10 sampled services cancelled.",
+        );
+        let fresh = trust_status(
+            "2026-09-24T09:30:00Z",
+            "part-suspended",
+            "6 of 10 sampled services cancelled.",
+        );
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], existing[0]["validity"]["from_date"],
+            "an unchanged trust-inferred status must keep its original since-timestamp"
+        );
+    }
+
+    #[test]
+    fn carry_forward_treats_a_provenance_change_between_inferred_kinds_as_a_new_status() {
+        // Both sides are inferred, but the signal that determined the
+        // published severity changed (LDBWS sampling -> full-coverage TRUST
+        // data, or back). That is a real change in what the status means, so
+        // it gets a fresh stamp rather than silently inheriting the other
+        // provenance's clock.
+        let existing = ldbws_status(
+            "2026-09-24T06:00:00Z",
+            "part-suspended",
+            "6 of 10 sampled services cancelled.",
+        );
+        let fresh = trust_status(
+            "2026-09-24T09:30:00Z",
+            "part-suspended",
+            "6 of 10 sampled services cancelled.",
+        );
+
+        let result = carry_forward_ldbws_from_date(&existing, &fresh);
+
+        assert_eq!(
+            result[0]["validity"]["from_date"], fresh[0]["validity"]["from_date"],
+            "a provenance change must not carry the old from_date forward"
         );
     }
 
