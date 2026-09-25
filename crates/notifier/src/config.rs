@@ -102,6 +102,22 @@ pub struct Config {
     #[arg(long, env)]
     pub vapid_subject: String,
 
+    /// `main.rs` builds `tracing_subscriber::fmt().with_env_filter(...)`
+    /// directly from THIS field's value, NOT from
+    /// `EnvFilter::from_default_env()` (which every other binary in this
+    /// workspace uses, and which reads `RUST_LOG`) -- so the env var clap
+    /// actually populates this field from is `LOG_LEVEL`, not `RUST_LOG`.
+    ///
+    /// 2026-09-25 Signal Box Audit Low finding: `notifier-deployment.yaml`
+    /// set `RUST_LOG` here, which clap silently ignores (it isn't the env
+    /// name this field declares) -- so `notifier.logLevel` in the Helm
+    /// chart had no effect at all, and this crate's log level was
+    /// permanently stuck at this field's own `"info"` default in every
+    /// Helm-deployed environment, regardless of what an operator set. Fixed
+    /// by setting `LOG_LEVEL` in the chart instead -- see
+    /// `chart_env_wiring_tests` below, which now guards every one of this
+    /// struct's declared env vars (this one included) against silently
+    /// drifting out of sync with the chart again.
     #[arg(long, env, default_value = "info")]
     pub log_level: String,
 }
@@ -212,5 +228,128 @@ mod tests {
             ..valid_config()
         };
         assert!(config.validate().is_err());
+    }
+}
+
+/// The one invariant this crate cannot check at compile time and that was
+/// already broken in production: **every env var this `Config` declares
+/// (except `DATABASE_URL`, wired via the shared `distant-signal.databaseEnv`
+/// helper rather than a literal line in this template -- see below) must
+/// also be set on the `notifier` container in
+/// `charts/distant-signal/templates/notifier-deployment.yaml`.**
+///
+/// Same class of bug `crates/api/src/data/config.rs`'s and
+/// `crates/schedule-reference/src/config.rs`'s own `chart_env_wiring_tests`
+/// modules already guard against, and this crate had TWO real instances of
+/// it as of the 2026-09-25 Signal Box Audit Low pass: `log_level` was wired
+/// under the wrong env var name (`RUST_LOG` instead of `LOG_LEVEL` -- see
+/// that field's own doc comment for the full story), and
+/// `cursor_grace_seconds`/`skip_check_poll_interval_secs`/
+/// `template_sweep_poll_interval_secs`/`auto_commit_lead_minutes` were
+/// declared with a working default but never wired into the chart at all --
+/// each masked only because clap's own default happened to be what every
+/// deployment wanted, exactly like `crates/schedule-reference`'s own
+/// `TIPLOC_CRS_URL` gap before it was caught by hand.
+///
+/// A test is what makes the next one impossible to ship.
+#[cfg(test)]
+mod chart_env_wiring_tests {
+    use clap::CommandFactory;
+
+    use super::Config;
+
+    /// Wired via `{{- include "distant-signal.databaseEnv" . }}` in
+    /// `_helpers.tpl`, not a literal `- name: DATABASE_URL` line in
+    /// `notifier-deployment.yaml` itself -- this test greps the raw
+    /// template TEXT (no full Helm render), so a helper-included var can
+    /// never be found this way. Excluded rather than reported as a false
+    /// "missing" positive.
+    const EXCLUDED_ENV_VARS: &[&str] = &["DATABASE_URL"];
+
+    /// The `notifier` container's own slice of the notifier Deployment
+    /// template. Scoped from its `- name: notifier` line to EOF rather than
+    /// matching the whole file, matching
+    /// `crates/api/src/data/config.rs`'s/`crates/schedule-reference/src/config.rs`'s
+    /// equivalent helper -- so a var that only ever appears in one of this
+    /// template's leading comment blocks cannot satisfy the check by
+    /// accident. `notifier` is the only container in this template, so "to
+    /// EOF" is the whole block.
+    fn notifier_container_block() -> String {
+        let chart = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../charts/distant-signal/templates/notifier-deployment.yaml");
+        let rendered = std::fs::read_to_string(&chart)
+            .unwrap_or_else(|err| panic!("read {}: {err}", chart.display()));
+        let marker = "- name: notifier\n";
+        let start = rendered.find(marker).expect(
+            "the notifier Deployment must still declare a container named `notifier`; if it was \
+             renamed, update this test's marker",
+        );
+        rendered[start..].to_string()
+    }
+
+    #[test]
+    fn every_env_var_this_config_declares_is_set_on_the_charts_notifier_container() {
+        let block = notifier_container_block();
+        let command = Config::command();
+
+        let declared: Vec<String> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_env().and_then(|env| env.to_str()))
+            .map(str::to_string)
+            .filter(|env| !EXCLUDED_ENV_VARS.contains(&env.as_str()))
+            .collect();
+        assert!(
+            declared.len() >= 12,
+            "sanity check: this Config declares 13 env vars total (DATABASE_URL excluded above, \
+             see EXCLUDED_ENV_VARS); got {declared:?}"
+        );
+
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|env| !block.contains(&format!("- name: {env}")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these env vars are declared by crates/notifier/src/config.rs but never set on the \
+             `notifier` container in charts/distant-signal/templates/notifier-deployment.yaml, so \
+             under Helm notifier silently falls back to this crate's own default for each -- \
+             which for log_level in particular means the chart's notifier.logLevel value has no \
+             effect at all: {missing:?}"
+        );
+    }
+
+    /// The chart must not set an env var this struct no longer declares
+    /// either: a stale entry in the template is a value an operator can
+    /// configure that silently does nothing, and it is the same drift in
+    /// the opposite direction. `DATABASE_URL` never appears as a literal
+    /// `- name:` line in the raw template text (see
+    /// `EXCLUDED_ENV_VARS`'s own comment), so it can never trip this check
+    /// -- no exclusion needed on this side.
+    #[test]
+    fn the_chart_sets_no_env_var_this_config_does_not_declare() {
+        let block = notifier_container_block();
+        let command = Config::command();
+
+        let declared: Vec<String> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_env().and_then(|env| env.to_str()))
+            .map(str::to_string)
+            .collect();
+
+        let stale: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- name: "))
+            .filter(|env| env.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+            .filter(|env| !declared.iter().any(|d| d == env))
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "charts/distant-signal/templates/notifier-deployment.yaml sets these env vars on the \
+             notifier container, but crates/notifier/src/config.rs no longer declares them, so \
+             clap ignores them and any operator who configures one gets no effect at all: \
+             {stale:?}"
+        );
     }
 }
