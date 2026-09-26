@@ -19,6 +19,12 @@ pub struct IncidentState {
     /// `first_seen_at`, always populated (`NOT NULL DEFAULT NOW()` since
     /// `20260716180000_incident_first_seen.sql`).
     pub first_seen_at: DateTime<Utc>,
+    /// The previous extraction's output, read only so `churn` can compare
+    /// it with its replacement before `write_extraction` overwrites it.
+    /// Kept as raw JSON here (parsed leniently in `churn`) so a stored value
+    /// that no longer deserializes can never fail this fetch.
+    pub extracted_category: Option<String>,
+    pub extracted_periods: Option<serde_json::Value>,
 }
 
 /// Fetches the extractable prose for one incident, plus what it was last
@@ -32,6 +38,8 @@ type IncidentStateRow = (
     Option<String>,
     Option<String>,
     DateTime<Utc>,
+    Option<String>,
+    Option<serde_json::Value>,
 );
 
 pub async fn fetch_incident_state(
@@ -39,21 +47,30 @@ pub async fn fetch_incident_state(
     incident_id: &str,
 ) -> anyhow::Result<Option<IncidentState>> {
     let row: Option<IncidentStateRow> = sqlx::query_as(
-        "SELECT summary, description, source_text_hash, extraction_model_version, first_seen_at \
+        "SELECT summary, description, source_text_hash, extraction_model_version, first_seen_at, \
+                extracted_category, extracted_periods \
          FROM incidents WHERE incident_id = $1",
     )
     .bind(incident_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(summary, description, source_text_hash, extraction_model_version, first_seen_at)| {
-            IncidentState {
-                summary,
-                description,
-                source_text_hash,
-                extraction_model_version,
-                first_seen_at,
-            }
+        |(
+            summary,
+            description,
+            source_text_hash,
+            extraction_model_version,
+            first_seen_at,
+            extracted_category,
+            extracted_periods,
+        )| IncidentState {
+            summary,
+            description,
+            source_text_hash,
+            extraction_model_version,
+            first_seen_at,
+            extracted_category,
+            extracted_periods,
         },
     ))
 }

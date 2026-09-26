@@ -4,6 +4,7 @@
 //! docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md and
 //! docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md.
 
+mod churn;
 mod combine;
 mod config;
 mod llm;
@@ -338,9 +339,14 @@ async fn process_incident(
             return false;
         }
     };
+    let text_hash = common::text_hash::text_hash(&state.summary, &state.description);
+    // Churn measurement baseline (instrumentation only -- see `churn`'s
+    // module doc): `Some` only for a text-change re-run under the current
+    // model version. Captured now, before `write_extraction` overwrites it.
+    let churn_baseline =
+        churn::baseline_for_text_change_rerun(incident_id, &state, &text_hash, model_version);
     let (summary, description, first_seen_at) =
         (state.summary, state.description, state.first_seen_at);
-    let text_hash = common::text_hash::text_hash(&summary, &description);
 
     // Guards every caller (stream loop, sweep, reclaim) against running the
     // LLM again over text it already successfully extracted -- e.g. a
@@ -486,6 +492,18 @@ async fn process_incident(
         }
     };
 
+    // Compared before the write (cheap, pure, panic-free) but only
+    // reported once the write has actually landed, so a stale-result
+    // discard below is never counted as a re-run.
+    let churn_report = churn_baseline.map(|baseline| {
+        churn::compare(
+            baseline.category.as_deref(),
+            &baseline.periods,
+            &primary.category,
+            &periods,
+        )
+    });
+
     match queries::write_extraction(
         pool,
         incident_id,
@@ -535,6 +553,9 @@ async fn process_incident(
         period_count = periods.len(),
         "extraction written"
     );
+    if let Some(report) = &churn_report {
+        churn::record(incident_id, report);
+    }
     true
 }
 
