@@ -269,12 +269,70 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
     })
 }
 
-/// One correlated subquery per row to find "the immediately preceding
-/// line_status_history row for this same line_id" (Decision 3's guard --
-/// NULL previous_statuses means none exists). This workspace's existing
-/// data-volume scale ("single trusted personal instance", per DESIGN.md)
-/// doesn't justify a window-function rewrite for this; revisit if line
-/// count/history volume ever grows enough to matter.
+/// Finds "the immediately preceding line_status_history row for this same
+/// line_id" (Decision 3's guard -- NULL previous_statuses means none
+/// exists) via a window function, bounded to the rows this poll actually
+/// needs rather than a per-row correlated subquery over the whole table.
+///
+/// **2026-09-26 perf incident.** This used to be a correlated subquery
+/// (`(SELECT h2.statuses FROM line_status_history h2 WHERE h2.line_id =
+/// h.line_id AND h2.id < h.id ORDER BY h2.id DESC LIMIT 1)`), run once per
+/// row in the polled range. Confirmed live in the cluster as a >1s
+/// slow-query WARNING on every single 60s poll cycle (2.1-2.4s over ~6500
+/// rows each time), with no index able to serve that per-row `ORDER BY id
+/// DESC LIMIT 1` lookup at all (the only index on this table was
+/// `(line_id, computed_at DESC)` -- see migration
+/// `20260926120000_line_status_history_line_id_id_index.sql`, added
+/// alongside this rewrite since the anchor lookup below needs the same
+/// access path). The doc comment this replaced argued the workspace's
+/// data-volume scale didn't justify a window-function rewrite; the live
+/// slow-query evidence supersedes that.
+///
+/// A naive `LAG(statuses) OVER (PARTITION BY line_id ORDER BY id)` is NOT a
+/// faithful replacement on its own: computed only over rows with
+/// `id > $1`, it would return NULL for the FIRST post-cursor row of every
+/// line, even when that line genuinely has an earlier row (with
+/// `id <= $1`) whose statuses the correlated subquery would have found.
+/// That would silently manufacture a false "no previous state" cold start
+/// on every cycle boundary, hiding a real transition or wrongly filtering
+/// one out via `is_severity_transition`'s `None` guard.
+///
+/// The fix: union each line's own "anchor" row -- the single most recent
+/// row at or before the cursor (`id <= $1`, `DISTINCT ON (line_id) ...
+/// ORDER BY line_id, id DESC`) -- onto the polled rows (`id > $1`) before
+/// windowing, then filter the windowed result back down to `id > $1` for
+/// the actual output. Per line_id, `anchor ∪ candidates` is exactly the
+/// contiguous run of every row from the anchor onward (nothing else can
+/// exist between them: the anchor is by construction the highest id not
+/// greater than `$1`, and `candidates` already contains every row with a
+/// higher id), so `LAG` over that combined, ordered set produces exactly
+/// the same "max id less than mine, same line_id" row the old correlated
+/// subquery computed for every candidate row -- including a bare `NULL`
+/// when a line has no anchor at all (a brand-new line, or a poll starting
+/// at `since_id = 0`), matching the subquery's own "no earlier row exists"
+/// case. Only touched lines get an anchor lookup at all (the `line_id IN
+/// (...)` filter), so this scales with the poll's own candidate count, not
+/// with total history depth. Proven identical to the old subquery's output
+/// by `poll_line_candidates_previous_statuses_matches_the_old_correlated_subquery_semantics`
+/// below, including the cursor-boundary (anchor) case a naive `LAG` gets
+/// wrong.
+///
+/// **The `windowed` CTE is NOT decorative -- do not "simplify" it away by
+/// moving `WHERE id > $1` onto `combined` directly.** SQL's logical
+/// processing order applies `WHERE` to a query's `FROM` relation BEFORE any
+/// window function in its `SELECT` list runs, so `SELECT ..., LAG(...)
+/// OVER (...) FROM combined WHERE id > $1` filters the anchor row (whose
+/// id is by construction `<= $1`) out of the partition BEFORE `LAG` ever
+/// sees it -- silently reproducing the exact bug this whole rewrite exists
+/// to avoid. Confirmed with `EXPLAIN`: Postgres inlines the non-recursive
+/// `combined` CTE and pushes `id > $1` into the `anchors` arm of the
+/// `UNION ALL`, below the `WindowAgg` node. The extra `windowed` CTE gives
+/// the window function its own subquery boundary, so the outer `WHERE`
+/// filters `windowed`'s already-computed OUTPUT rows instead -- this is
+/// the one and only reason it exists, and the first version of this fix
+/// omitted it and failed
+/// `poll_line_candidates_previous_statuses_matches_the_old_correlated_subquery_semantics`
+/// below for exactly this reason before being caught.
 ///
 /// Returns `(candidates, observed_max_id)`. The second element is the
 /// highest id this poll actually SAW, not the highest id that turned out to
@@ -291,13 +349,29 @@ pub async fn poll_line_candidates(
     since_id: i64,
 ) -> anyhow::Result<(Vec<LineCandidate>, i64)> {
     let rows = sqlx::query_as::<_, LineHistoryRow>(
-        "SELECT h.id, h.line_id, h.statuses AS statuses, \
-                (SELECT h2.statuses FROM line_status_history h2 \
-                   WHERE h2.line_id = h.line_id AND h2.id < h.id \
-                   ORDER BY h2.id DESC LIMIT 1) AS previous_statuses \
-         FROM line_status_history h \
-         WHERE h.id > $1 \
-         ORDER BY h.id",
+        "WITH candidates AS ( \
+             SELECT id, line_id, statuses FROM line_status_history WHERE id > $1 \
+         ), \
+         anchors AS ( \
+             SELECT DISTINCT ON (line_id) id, line_id, statuses \
+             FROM line_status_history \
+             WHERE id <= $1 AND line_id IN (SELECT DISTINCT line_id FROM candidates) \
+             ORDER BY line_id, id DESC \
+         ), \
+         combined AS ( \
+             SELECT id, line_id, statuses FROM candidates \
+             UNION ALL \
+             SELECT id, line_id, statuses FROM anchors \
+         ), \
+         windowed AS ( \
+             SELECT id, line_id, statuses, \
+                    LAG(statuses) OVER (PARTITION BY line_id ORDER BY id) AS previous_statuses \
+             FROM combined \
+         ) \
+         SELECT id, line_id, statuses, previous_statuses \
+         FROM windowed \
+         WHERE id > $1 \
+         ORDER BY id",
     )
     .bind(since_id)
     .fetch_all(pool)
@@ -1713,6 +1787,212 @@ mod tests {
 
         cleanup_line_history(&pool, bad_line).await;
         cleanup_line_history(&pool, good_line).await;
+    }
+
+    /// Regression test for the 2026-09-26 perf rewrite of
+    /// `poll_line_candidates`'s `previous_statuses` lookup (correlated
+    /// subquery -> window function over a `candidates ∪ per-line anchor
+    /// row` CTE, see that function's own doc comment for the full
+    /// mechanism and the live slow-query evidence). Proves the new query
+    /// returns BYTE-IDENTICAL `previous_statuses` to the old correlated
+    /// subquery it replaced, for every row shape that matters:
+    ///
+    /// * `a2`: the FIRST row past the cursor for a line that has real
+    ///   history strictly BEFORE the cursor (`a1`, at `since_id` itself).
+    ///   This is exactly the case a naive `LAG(...) OVER (PARTITION BY
+    ///   line_id ORDER BY id)` computed only over `id > $1` gets wrong: it
+    ///   would return NULL here (no earlier row inside its own window),
+    ///   while the old subquery (and this rewrite's anchor row) correctly
+    ///   finds `a1`.
+    /// * `a3`: chains off `a2` (the immediately preceding row within the
+    ///   candidate set itself), not off the anchor -- proves the window
+    ///   function doesn't just always fall back to the anchor.
+    /// * `b1`: a brand-new line with NO row at all before the cursor -- the
+    ///   cold-start case, `previous_statuses` must stay NULL for both
+    ///   versions, and `poll_line_candidates` must not surface it as a
+    ///   candidate at all (Decision 3's guard, `is_severity_transition`'s
+    ///   `None` branch).
+    #[derive(Debug, sqlx::FromRow, PartialEq)]
+    struct RawPrevRow {
+        id: i64,
+        previous_statuses: Option<serde_json::Value>,
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                poll_line_candidates_previous_statuses_matches_the_old_correlated_subquery_semantics \
+                -- --ignored --test-threads=1`"]
+    async fn poll_line_candidates_previous_statuses_matches_the_old_correlated_subquery_semantics()
+    {
+        let pool = connect().await;
+        let line_a = "TEST-NOTIFIER-WINDOWFN-LINE-A";
+        let line_b = "TEST-NOTIFIER-WINDOWFN-LINE-B";
+        cleanup_line_history(&pool, line_a).await;
+        cleanup_line_history(&pool, line_b).await;
+
+        let good_json = status_json(common::Severity::GoodService);
+        let minor_json = status_json(common::Severity::MinorDelays);
+        let severe_json = status_json(common::Severity::SevereDelays);
+
+        // Line A: one row BEFORE the cursor (the anchor), then two rows
+        // after it.
+        let a1: i64 = sqlx::query_scalar(
+            "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+             VALUES ($1, $2, NOW()) RETURNING id",
+        )
+        .bind(line_a)
+        .bind(&good_json)
+        .fetch_one(&pool)
+        .await
+        .expect("seed line A anchor row");
+        let since_id = a1; // the cursor sits right after the anchor row
+
+        let a2: i64 = sqlx::query_scalar(
+            "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+             VALUES ($1, $2, NOW()) RETURNING id",
+        )
+        .bind(line_a)
+        .bind(&minor_json)
+        .fetch_one(&pool)
+        .await
+        .expect("seed line A first post-cursor row");
+
+        let a3: i64 = sqlx::query_scalar(
+            "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+             VALUES ($1, $2, NOW()) RETURNING id",
+        )
+        .bind(line_a)
+        .bind(&severe_json)
+        .fetch_one(&pool)
+        .await
+        .expect("seed line A second post-cursor row");
+
+        // Line B: no row at all before the cursor -- the cold-start case.
+        let b1: i64 = sqlx::query_scalar(
+            "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+             VALUES ($1, $2, NOW()) RETURNING id",
+        )
+        .bind(line_b)
+        .bind(&good_json)
+        .fetch_one(&pool)
+        .await
+        .expect("seed line B first-ever row");
+
+        let old_rows: Vec<RawPrevRow> = sqlx::query_as(
+            "SELECT h.id, \
+                    (SELECT h2.statuses FROM line_status_history h2 \
+                       WHERE h2.line_id = h.line_id AND h2.id < h.id \
+                       ORDER BY h2.id DESC LIMIT 1) AS previous_statuses \
+             FROM line_status_history h \
+             WHERE h.id > $1 AND h.line_id IN ($2, $3) \
+             ORDER BY h.id",
+        )
+        .bind(since_id)
+        .bind(line_a)
+        .bind(line_b)
+        .fetch_all(&pool)
+        .await
+        .expect("run the OLD correlated-subquery version");
+
+        let new_rows: Vec<RawPrevRow> = sqlx::query_as(
+            "WITH candidates AS ( \
+                 SELECT id, line_id, statuses FROM line_status_history \
+                 WHERE id > $1 AND line_id IN ($2, $3) \
+             ), \
+             anchors AS ( \
+                 SELECT DISTINCT ON (line_id) id, line_id, statuses \
+                 FROM line_status_history \
+                 WHERE id <= $1 AND line_id IN (SELECT DISTINCT line_id FROM candidates) \
+                 ORDER BY line_id, id DESC \
+             ), \
+             combined AS ( \
+                 SELECT id, line_id, statuses FROM candidates \
+                 UNION ALL \
+                 SELECT id, line_id, statuses FROM anchors \
+             ), \
+             windowed AS ( \
+                 SELECT id, line_id, statuses, \
+                        LAG(statuses) OVER (PARTITION BY line_id ORDER BY id) AS previous_statuses \
+                 FROM combined \
+             ) \
+             SELECT id, previous_statuses FROM windowed WHERE id > $1 ORDER BY id",
+        )
+        .bind(since_id)
+        .bind(line_a)
+        .bind(line_b)
+        .fetch_all(&pool)
+        .await
+        .expect("run the NEW window-function version (same SQL poll_line_candidates uses)");
+
+        assert_eq!(
+            new_rows, old_rows,
+            "the window-function rewrite must return byte-identical previous_statuses to the \
+             old correlated subquery for every row, including the cursor-boundary anchor case"
+        );
+        assert_eq!(
+            old_rows.len(),
+            3,
+            "sanity: exactly a2, a3, b1 are past since_id"
+        );
+        assert_eq!(
+            old_rows
+                .iter()
+                .find(|r| r.id == a2)
+                .unwrap()
+                .previous_statuses,
+            Some(good_json.clone()),
+            "a2's previous_statuses must be the ANCHOR row's statuses (id <= since_id), not NULL \
+             -- this is exactly what a naive LAG() computed only over id > $1 would get wrong"
+        );
+        assert_eq!(
+            old_rows
+                .iter()
+                .find(|r| r.id == a3)
+                .unwrap()
+                .previous_statuses,
+            Some(minor_json.clone()),
+            "a3 must chain off a2 (the immediately preceding row), not the anchor"
+        );
+        assert_eq!(
+            old_rows
+                .iter()
+                .find(|r| r.id == b1)
+                .unwrap()
+                .previous_statuses,
+            None,
+            "b1 has no earlier row at all -- previous_statuses must be NULL"
+        );
+
+        // Confirm the real entry point agrees: a2 (GoodService ->
+        // MinorDelays) and a3 (MinorDelays -> SevereDelays) are both
+        // severity transitions and must surface with the matching
+        // previous_rank; b1 (cold start) must never be a candidate.
+        let (found, _) = poll_line_candidates(&pool, since_id)
+            .await
+            .expect("poll_line_candidates");
+        let found_a2 = found
+            .iter()
+            .find(|c| c.id == a2)
+            .expect("a2 must be a candidate");
+        assert_eq!(
+            found_a2.previous_rank,
+            severity_rank(common::Severity::GoodService)
+        );
+        let found_a3 = found
+            .iter()
+            .find(|c| c.id == a3)
+            .expect("a3 must be a candidate");
+        assert_eq!(
+            found_a3.previous_rank,
+            severity_rank(common::Severity::MinorDelays)
+        );
+        assert!(
+            found.iter().all(|c| c.id != b1),
+            "b1 is a cold start (no previous history) and must never be a candidate"
+        );
+
+        cleanup_line_history(&pool, line_a).await;
+        cleanup_line_history(&pool, line_b).await;
     }
 
     /// Finding 6's regression test: the cursor must not jump straight to the
