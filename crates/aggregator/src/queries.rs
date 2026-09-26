@@ -25,7 +25,61 @@ pub struct LoadedIncident {
     /// `aggregation::apply_extraction`/`has_recurring_schedule` -- not here,
     /// so this crate's DB layer stays agnostic to the JSON shape those
     /// functions consume.
+    ///
+    /// Only ever `Some` when the extraction describes the incident's
+    /// CURRENT text -- see [`LoadedIncident::new`]. A stored extraction
+    /// whose `source_text_hash` no longer matches `message`'s
+    /// summary/description is dropped to `None` at load time.
     pub extracted_periods: Option<serde_json::Value>,
+}
+
+impl LoadedIncident {
+    /// Builds a `LoadedIncident`, keeping `extracted_periods` only if the
+    /// extraction was computed from the incident's current text.
+    ///
+    /// # Why stale extraction is dropped rather than applied
+    ///
+    /// `poller-incidents` overwrites `summary`/`description` as soon as the
+    /// feed's text changes, but the enricher only rewrites
+    /// `extracted_periods` (and `source_text_hash`) once its LLM calls over
+    /// the NEW text finish -- minutes, with a slow local model. Until then
+    /// the stored periods describe prose that no longer exists: an old
+    /// "resolved"/"residual delays only" reading would demote a disruption
+    /// the new text says is live, an old "severe" escalation would outlast
+    /// an update that downgraded it, and an old `impact_type`/annotations
+    /// would keep being shown. Comparing `source_text_hash` against
+    /// `common::text_hash::text_hash` of the current text (the exact digest
+    /// the enricher stamps) and treating a mismatch -- or a missing hash,
+    /// which proves nothing -- as `None` makes such an incident behave
+    /// exactly like one that has never been enriched, and makes the new
+    /// extraction apply the instant the enricher writes it.
+    ///
+    /// `extraction_model_version` is deliberately NOT part of this check:
+    /// extraction from an older model over the *current* text is still a
+    /// valid reading of that text, and keeps being used until the enricher's
+    /// sweep replaces it -- same as before a model bump.
+    ///
+    /// Gated here, at the one place a DB row becomes a `LoadedIncident`,
+    /// rather than inside each consumer, so every reader of
+    /// `extracted_periods` (`apply_extraction`, `governing_impact_type`,
+    /// `has_recurring_schedule`) is covered by construction.
+    pub fn new(
+        message: IncidentMessage,
+        first_seen_at: DateTime<Utc>,
+        source_text_hash: Option<&str>,
+        extracted_periods: Option<serde_json::Value>,
+    ) -> Self {
+        let extracted_periods = extracted_periods.filter(|_| {
+            source_text_hash.is_some_and(|stored| {
+                stored == common::text_hash::text_hash(&message.summary, &message.description)
+            })
+        });
+        LoadedIncident {
+            message,
+            first_seen_at,
+            extracted_periods,
+        }
+    }
 }
 
 /// Per-row resilience for every loader below.
@@ -79,18 +133,20 @@ fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
         is_planned: row.try_get("is_planned")?,
         is_cleared: row.try_get("is_cleared")?,
     };
-    Ok(LoadedIncident {
+    let source_text_hash: Option<String> = row.try_get("source_text_hash")?;
+    Ok(LoadedIncident::new(
         message,
-        first_seen_at: row.try_get("first_seen_at")?,
-        extracted_periods: row.try_get("extracted_periods")?,
-    })
+        row.try_get("first_seen_at")?,
+        source_text_hash.as_deref(),
+        row.try_get("extracted_periods")?,
+    ))
 }
 
 pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
                 priority, validity_periods, is_planned, is_cleared, first_seen_at, \
-                extracted_periods \
+                source_text_hash, extracted_periods \
          FROM incidents \
          WHERE NOT is_cleared",
     )
@@ -1376,6 +1432,104 @@ mod tests {
         assert!(
             !ids.contains(&"TEST-BAD-JSONB"),
             "the malformed row must be skipped, not silently coerced"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                load_incidents_ignores_extraction_stamped_for_superseded_text -- --ignored`"]
+    async fn load_incidents_ignores_extraction_stamped_for_superseded_text() {
+        // End-to-end over the real columns: extraction written for text A
+        // (by an OLDER model version -- which must not matter) is loaded;
+        // once `summary`/`description` move to text B without the enricher
+        // having re-run, `extracted_periods` must load as `None` (the
+        // never-enriched state); once periods stamped for B are written,
+        // they load again.
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+
+        let id = "TEST-STALE-EXTRACTION";
+        let periods_a = serde_json::json!([{ "resolution_status": "resolved", "marker": "A" }]);
+        let periods_b = serde_json::json!([{ "resolution_status": "ongoing", "marker": "B" }]);
+        let hash_a = common::text_hash::text_hash("summary", "text A");
+        let hash_b = common::text_hash::text_hash("summary", "text B");
+
+        async fn loaded_periods(pool: &PgPool, id: &str) -> Option<serde_json::Value> {
+            load_incidents(pool)
+                .await
+                .expect("load_incidents")
+                .into_iter()
+                .find(|i| i.message.incident_id == id)
+                .expect("fixture incident must load")
+                .extracted_periods
+        }
+
+        sqlx::query(
+            "INSERT INTO incidents \
+                (incident_id, summary, description, operators, affected_stations, priority, \
+                 validity_periods, is_planned, is_cleared, source_text_hash, extracted_periods, \
+                 extraction_model_version) \
+             VALUES ($1, 'summary', 'text A', '{}', '{}', 0, '[]', false, false, $2, $3, \
+                     'an-older-model-version') \
+             ON CONFLICT (incident_id) DO UPDATE SET \
+                summary = EXCLUDED.summary, description = EXCLUDED.description, \
+                is_cleared = false, source_text_hash = EXCLUDED.source_text_hash, \
+                extracted_periods = EXCLUDED.extracted_periods, \
+                extraction_model_version = EXCLUDED.extraction_model_version",
+        )
+        .bind(id)
+        .bind(&hash_a)
+        .bind(&periods_a)
+        .execute(&pool)
+        .await
+        .expect("seed fixture row");
+
+        let with_matching_text = loaded_periods(&pool, id).await;
+
+        // The feed's text changes; the enricher hasn't caught up yet.
+        sqlx::query("UPDATE incidents SET description = 'text B' WHERE incident_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("change text");
+        let after_text_change = loaded_periods(&pool, id).await;
+
+        // The enricher lands re-extraction for the new text.
+        sqlx::query(
+            "UPDATE incidents SET source_text_hash = $2, extracted_periods = $3 \
+             WHERE incident_id = $1",
+        )
+        .bind(id)
+        .bind(&hash_b)
+        .bind(&periods_b)
+        .execute(&pool)
+        .await
+        .expect("write re-extraction");
+        let after_re_extraction = loaded_periods(&pool, id).await;
+
+        sqlx::query("DELETE FROM incidents WHERE incident_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture row");
+
+        assert_eq!(
+            with_matching_text,
+            Some(periods_a),
+            "extraction matching the current text applies, even from an older model version"
+        );
+        assert_eq!(
+            after_text_change, None,
+            "extraction stamped for superseded text must load as absent"
+        );
+        assert_eq!(
+            after_re_extraction,
+            Some(periods_b),
+            "re-extraction for the new text must apply as soon as it is written"
         );
     }
 

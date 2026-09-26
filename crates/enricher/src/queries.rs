@@ -86,8 +86,8 @@ pub async fn fetch_incident_state(
 /// read at extraction start. Comparing the raw text (rather than, say,
 /// adding a new "current live text hash" column and comparing hashes) needs
 /// no schema change and no risk of a hash-algorithm drift between this
-/// query and `hash::text_hash` -- it's a strictly stronger check than a
-/// hash comparison would be, since it can't false-positive on a collision.
+/// query and `common::text_hash::text_hash` -- it's a strictly stronger
+/// check than a hash comparison would be, since it can't false-positive on a collision.
 /// Returns `Ok(false)` (nothing written) when the guard rejects the write,
 /// distinguishing "this extraction is stale, discard it" from "the DB call
 /// itself failed" -- the caller uses this to decide how to log/ack rather
@@ -196,7 +196,7 @@ mod tests {
         .expect("seed fixture incident row");
 
         // The "slow" extraction read this text at its extraction start.
-        let stale_hash = crate::hash::text_hash(original_summary, original_description);
+        let stale_hash = common::text_hash::text_hash(original_summary, original_description);
 
         // A faster, concurrent extraction (or a direct edit) changes the
         // row's text before the slow extraction above gets to write --
@@ -257,7 +257,7 @@ mod tests {
         // Sanity check the positive case in the same test: a write whose
         // expected text DOES match the row's current text must still apply
         // normally.
-        let current_hash = crate::hash::text_hash(updated_summary, updated_description);
+        let current_hash = common::text_hash::text_hash(updated_summary, updated_description);
         let applied = write_extraction(
             &pool,
             incident_id,

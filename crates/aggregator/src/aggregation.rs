@@ -4409,4 +4409,241 @@ mod tests {
         );
         assert_eq!(reports["enabled"].statuses[0].full_coverage_stats, None);
     }
+
+    // ---- Stale-extraction gate (`LoadedIncident::new`) ----
+    //
+    // When an incident's text changes, `poller-incidents` rewrites
+    // `summary`/`description` immediately but the enricher only replaces
+    // `extracted_periods` once its (slow) LLM calls over the new text finish.
+    // These tests build every `LoadedIncident` through the same
+    // `LoadedIncident::new` gate `queries::load_incidents` uses, and pin that
+    // periods extracted from OLD text contribute nothing -- exactly the
+    // behaviour of an incident that has never been enriched.
+
+    const STALE_SUMMARY: &str = "Disruption between A and B";
+    const OLD_DESCRIPTION: &str = "Earlier fault: all lines are blocked";
+    const NEW_DESCRIPTION: &str = "Lines have reopened, minor delays only";
+
+    fn one_period(fields: serde_json::Value) -> serde_json::Value {
+        let mut period = serde_json::json!({
+            "scope_description": null,
+            "date_range": null,
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "normal",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "high",
+            "impact_type": null,
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            period[key] = value.clone();
+        }
+        serde_json::json!([period])
+    }
+
+    /// An incident whose CURRENT text is `(STALE_SUMMARY, current_description)`,
+    /// carrying `periods` stamped with the hash of `(STALE_SUMMARY,
+    /// extracted_from_description)` -- i.e. extracted from whatever text the
+    /// enricher last read -- built through the production gate.
+    fn loaded_through_gate(
+        current_description: &str,
+        extracted_from_description: &str,
+        periods: serde_json::Value,
+        first_seen_at: DateTime<Utc>,
+    ) -> LoadedIncident {
+        let stamped = common::text_hash::text_hash(STALE_SUMMARY, extracted_from_description);
+        LoadedIncident::new(
+            incident("STALE1", STALE_SUMMARY, current_description, &[], &[]),
+            first_seen_at,
+            Some(&stamped),
+            Some(periods),
+        )
+    }
+
+    fn never_enriched(current_description: &str, first_seen_at: DateTime<Utc>) -> LoadedIncident {
+        LoadedIncident::new(
+            incident("STALE1", STALE_SUMMARY, current_description, &[], &[]),
+            first_seen_at,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn stale_resolved_extraction_does_not_demote_or_annotate_after_a_text_change() {
+        // Old text was read as "resolved"; the new text describes a live
+        // suspension. Applying the old reading would demote a live
+        // disruption to MinorDelays with a "reported resolved" annotation.
+        let now = Utc::now();
+        let periods = one_period(serde_json::json!({ "resolution_status": "resolved" }));
+        let stale = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, periods.clone(), now);
+        assert_eq!(stale.extracted_periods, None);
+        assert_eq!(
+            apply_extraction(Severity::Suspended, &stale, now),
+            apply_extraction(
+                Severity::Suspended,
+                &never_enriched(NEW_DESCRIPTION, now),
+                now
+            ),
+        );
+        assert_eq!(
+            apply_extraction(Severity::Suspended, &stale, now),
+            (Severity::Suspended, None)
+        );
+
+        // Control: the same periods stamped for the current text do apply.
+        let fresh = loaded_through_gate(NEW_DESCRIPTION, NEW_DESCRIPTION, periods, now);
+        let (severity, annotation) = apply_extraction(Severity::Suspended, &fresh, now);
+        assert_eq!(severity, Severity::MinorDelays);
+        assert!(annotation.unwrap().contains("resolved"));
+    }
+
+    #[test]
+    fn stale_residual_and_schedule_window_extraction_does_not_demote_after_a_text_change() {
+        let now = Utc::now();
+        // Residual floor.
+        let residual = one_period(serde_json::json!({ "resolution_status": "residual" }));
+        let stale = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, residual, now);
+        assert_eq!(
+            apply_extraction(Severity::SevereDelays, &stale, now),
+            (Severity::SevereDelays, None)
+        );
+        // Schedule window that excludes now: an all-day window on every
+        // weekday except today's (Europe/London).
+        let today = now
+            .with_timezone(&chrono_tz::Europe::London)
+            .weekday()
+            .number_from_monday() as u8;
+        let other_days: Vec<u8> = (1..=7).filter(|d| *d != today).collect();
+        let window = one_period(serde_json::json!({
+            "schedule_window": { "days_of_week": other_days, "start_time": "00:00", "end_time": "23:59" }
+        }));
+        let fresh = loaded_through_gate(NEW_DESCRIPTION, NEW_DESCRIPTION, window.clone(), now);
+        assert_eq!(
+            apply_extraction(Severity::SevereDelays, &fresh, now).0,
+            Severity::MinorDelays,
+            "control: a current-text window excluding now demotes"
+        );
+        let stale = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, window, now);
+        assert_eq!(
+            apply_extraction(Severity::SevereDelays, &stale, now),
+            (Severity::SevereDelays, None)
+        );
+    }
+
+    #[test]
+    fn stale_severe_escalation_does_not_persist_after_a_downgrading_text_change() {
+        // Old text: "all lines are blocked" -> blocked_or_suspended at high
+        // confidence. The update downgrades to minor delays; the old
+        // escalation must not keep holding the line at PartSuspended.
+        let now = Utc::now();
+        let periods =
+            one_period(serde_json::json!({ "apparent_severity": "blocked_or_suspended" }));
+        let stale = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, periods.clone(), now);
+        assert_eq!(
+            apply_extraction(Severity::MinorDelays, &stale, now),
+            (Severity::MinorDelays, None)
+        );
+
+        // Control: while the text still matched, the escalation applied.
+        let fresh = loaded_through_gate(OLD_DESCRIPTION, OLD_DESCRIPTION, periods, now);
+        assert_eq!(
+            apply_extraction(Severity::MinorDelays, &fresh, now).0,
+            Severity::PartSuspended
+        );
+    }
+
+    #[test]
+    fn stale_impact_type_is_not_surfaced_after_a_text_change() {
+        let now = Utc::now();
+        let periods = one_period(serde_json::json!({ "impact_type": "rail_replacement_bus" }));
+        let stale = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, periods.clone(), now);
+        assert_eq!(governing_impact_type(&stale, now), None);
+
+        let fresh = loaded_through_gate(NEW_DESCRIPTION, NEW_DESCRIPTION, periods, now);
+        assert_eq!(
+            governing_impact_type(&fresh, now).as_deref(),
+            Some("rail_replacement_bus")
+        );
+    }
+
+    #[test]
+    fn stale_schedule_window_does_not_grant_the_age_cutoff_exemption() {
+        // `has_recurring_schedule` is the third extraction consumer: a
+        // high-confidence schedule window exempts a non-planned incident
+        // from the age cutoff. A window read from old text must not.
+        let now = Utc::now();
+        let periods = one_period(serde_json::json!({
+            "schedule_window": { "days_of_week": [1, 2, 3, 4, 5, 6, 7], "start_time": "00:00", "end_time": "23:59" }
+        }));
+        let aged = now - Duration::days(10);
+        let stale = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, periods.clone(), aged);
+        assert_eq!(
+            is_active(&stale, now),
+            is_active(&never_enriched(NEW_DESCRIPTION, aged), now)
+        );
+        assert!(!is_active(&stale, now));
+
+        let fresh = loaded_through_gate(NEW_DESCRIPTION, NEW_DESCRIPTION, periods, aged);
+        assert!(is_active(&fresh, now));
+    }
+
+    #[test]
+    fn extraction_applies_again_once_re_extraction_for_the_new_text_lands() {
+        // The full sequence: extraction for text A applies; the text changes
+        // to B and the old periods are ignored; the enricher writes periods
+        // stamped for B and those apply immediately.
+        let now = Utc::now();
+        let old = one_period(serde_json::json!({ "apparent_severity": "blocked_or_suspended" }));
+        let new = one_period(serde_json::json!({ "resolution_status": "residual" }));
+
+        let before = loaded_through_gate(OLD_DESCRIPTION, OLD_DESCRIPTION, old.clone(), now);
+        assert_eq!(
+            apply_extraction(Severity::MinorDelays, &before, now).0,
+            Severity::PartSuspended
+        );
+
+        let in_between = loaded_through_gate(NEW_DESCRIPTION, OLD_DESCRIPTION, old, now);
+        assert_eq!(
+            apply_extraction(Severity::SevereDelays, &in_between, now),
+            (Severity::SevereDelays, None)
+        );
+
+        let after = loaded_through_gate(NEW_DESCRIPTION, NEW_DESCRIPTION, new, now);
+        let (severity, annotation) = apply_extraction(Severity::SevereDelays, &after, now);
+        assert_eq!(severity, Severity::Recovering);
+        assert!(annotation.unwrap().contains("residual"));
+    }
+
+    #[test]
+    fn extraction_with_periods_but_no_source_text_hash_is_treated_as_absent() {
+        // A hash-less row can't be shown to describe the current text; the
+        // enricher always stamps one alongside `extracted_periods`, so this
+        // only guards against hand-edited/foreign rows.
+        let now = Utc::now();
+        let loaded = LoadedIncident::new(
+            incident("STALE1", STALE_SUMMARY, NEW_DESCRIPTION, &[], &[]),
+            now,
+            None,
+            Some(one_period(
+                serde_json::json!({ "resolution_status": "resolved" }),
+            )),
+        );
+        assert_eq!(loaded.extracted_periods, None);
+    }
+
+    #[test]
+    fn a_summary_only_change_also_invalidates_extraction() {
+        let now = Utc::now();
+        let stamped = common::text_hash::text_hash("Old summary", NEW_DESCRIPTION);
+        let loaded = LoadedIncident::new(
+            incident("STALE1", "New summary", NEW_DESCRIPTION, &[], &[]),
+            now,
+            Some(&stamped),
+            Some(one_period(
+                serde_json::json!({ "resolution_status": "resolved" }),
+            )),
+        );
+        assert_eq!(loaded.extracted_periods, None);
+    }
 }

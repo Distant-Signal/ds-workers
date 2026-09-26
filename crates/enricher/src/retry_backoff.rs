@@ -80,10 +80,10 @@ fn backoff_for(consecutive_failures: u32) -> Duration {
 }
 
 struct BackoffEntry {
-    /// The `hash::text_hash` this failure count applies to -- a text change
-    /// (this incident's summary/description were edited) resets the count,
-    /// since whatever made the old text fail may not apply to the new text
-    /// at all.
+    /// The `common::text_hash::text_hash` this failure count applies to -- a
+    /// text change (this incident's summary/description were edited) resets
+    /// the count, since whatever made the old text fail may not apply to the
+    /// new text at all.
     text_hash: String,
     consecutive_failures: u32,
     /// Not eligible for another attempt until this instant.

@@ -6,7 +6,6 @@
 
 mod combine;
 mod config;
-mod hash;
 mod llm;
 mod queries;
 mod retry_backoff;
@@ -341,7 +340,7 @@ async fn process_incident(
     };
     let (summary, description, first_seen_at) =
         (state.summary, state.description, state.first_seen_at);
-    let text_hash = hash::text_hash(&summary, &description);
+    let text_hash = common::text_hash::text_hash(&summary, &description);
 
     // Guards every caller (stream loop, sweep, reclaim) against running the
     // LLM again over text it already successfully extracted -- e.g. a
@@ -757,7 +756,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("fetch written row");
-        let expected_hash = hash::text_hash(summary, description);
+        let expected_hash = common::text_hash::text_hash(summary, description);
         assert_eq!(
             row.0.as_deref(),
             Some(expected_hash.as_str()),
@@ -778,7 +777,7 @@ mod tests {
         // The actual retry-forever-loop-is-closed assertion: re-running
         // sweep::incidents_needing_extraction's own comparison against
         // what was just written must NOT re-select this incident.
-        let current_hash = hash::text_hash(summary, description);
+        let current_hash = common::text_hash::text_hash(summary, description);
         assert!(
             row.0.as_deref() == Some(current_hash.as_str())
                 && row.1.as_deref() == Some(model_version),

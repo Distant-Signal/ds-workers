@@ -8,7 +8,7 @@
 
 use sqlx::PgPool;
 
-use crate::hash::text_hash;
+use common::text_hash::text_hash;
 
 pub struct SweepRow {
     pub incident_id: String,
