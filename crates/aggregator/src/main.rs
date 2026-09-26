@@ -7,6 +7,7 @@
 //! for the custom-lines addition.
 
 mod aggregation;
+mod archive;
 mod config;
 mod dedup;
 mod queries;
@@ -30,6 +31,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    // Fails startup on an enabled-but-incomplete archive config; `None`
+    // (the default) keeps every prune delete-only, exactly as before.
+    let archiver = archive::Archiver::from_args(&config.archive)?;
+    if let Some(archiver) = &archiver {
+        tracing::info!(?archiver, "cold archive enabled for retention prunes");
+    }
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
@@ -91,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             config.untracked_trains_retention_days,
             config.schedule_destination_departures_retention_days,
             config.schedule_derived_products_retention_days,
+            archiver.as_ref(),
         )
         .await
         {
@@ -462,6 +470,7 @@ async fn run_retention(
     untracked_trains_retention_days: i64,
     schedule_destination_departures_retention_days: i64,
     schedule_derived_products_retention_days: i64,
+    archiver: Option<&archive::Archiver>,
 ) -> anyhow::Result<()> {
     let pruned = queries::prune_history(pool, retention_days).await?;
     metrics::counter!(common::metrics::metric_name(
@@ -501,8 +510,36 @@ async fn run_retention(
     // Config::untracked_trains_retention_days's own doc comment and
     // queries::prune_trains's doc comment for the two-tier query
     // structure.
-    let trains_pruned =
-        queries::prune_trains(pool, trains_retention_days, untracked_trains_retention_days).await?;
+    //
+    // With `trains` opted into the cold archive, the same two tiers are
+    // archived to object storage batch by batch before each delete; see
+    // archive::archive_and_prune_trains. An upload failure there is logged
+    // and counted rather than returned, so it never skips the LDBWS-ceiling
+    // prunes below.
+    let trains_pruned = match archiver.filter(|a| a.archives("trains")) {
+        Some(archiver) => {
+            let outcome = archive::archive_and_prune_trains(
+                pool,
+                archiver,
+                trains_retention_days,
+                untracked_trains_retention_days,
+                archive::ARCHIVE_TRAINS_BATCH,
+            )
+            .await?;
+            tracing::info!(
+                pruned = outcome.pruned,
+                objects_written = outcome.objects_written,
+                archived_rows = ?outcome.archived_rows,
+                upload_failed = outcome.upload_failed,
+                "trains archive-then-prune complete"
+            );
+            outcome.pruned
+        }
+        None => {
+            queries::prune_trains(pool, trains_retention_days, untracked_trains_retention_days)
+                .await?
+        }
+    };
     metrics::counter!(common::metrics::metric_name(
         "aggregator_trains_rows_pruned_total"
     ))

@@ -268,6 +268,11 @@ pub struct Config {
     /// value.
     #[arg(long, env, default_value_t = false)]
     pub full_coverage_enabled_default: bool,
+
+    /// Optional archive-then-delete cold storage for retention prunes
+    /// (`ARCHIVE_*` env vars). Off by default; see `crate::archive`.
+    #[command(flatten)]
+    pub archive: crate::archive::ArchiveArgs,
 }
 
 #[cfg(test)]
@@ -349,5 +354,9 @@ mod tests {
         assert_eq!(config.schedule_destination_departures_retention_days, 8);
         assert_eq!(config.schedule_derived_products_retention_days, 8);
         assert_eq!(config.untracked_trains_retention_days, 14);
+        assert!(
+            !config.archive.archive_enabled,
+            "archiving must be off unless explicitly enabled"
+        );
     }
 }
