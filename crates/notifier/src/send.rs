@@ -17,12 +17,37 @@
 //!      `WebPushMessageBuilder`/`WebPushMessage` from the same payload
 //!      bytes and a cloned signature on each attempt instead.
 
+use std::time::Duration;
+
 use serde::Serialize;
 use web_push::{
     ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder,
 };
 
 use crate::queries::PushSubscriptionRow;
+
+/// Bound on a single web-push send attempt -- 2026-09 security/bug review
+/// Medium finding M2: `web_push::HyperWebPushClient` configures no
+/// connect/request timeout of its own, and every send below runs
+/// sequentially inside the notifier's one main `select!` loop (see this
+/// crate's `main.rs`), so a single hanging push endpoint stalled the WHOLE
+/// notification cycle -- every other user's notifications too -- for as
+/// long as that endpoint stayed silent. Worse, a push endpoint is exactly
+/// `endpoint: String` on a subscription an AUTHENTICATED USER registers
+/// themselves (`PushSubscriptionRow`/the subscribe route), so any user
+/// could point it at their own tarpit server (accept the TCP connection,
+/// never respond) and stall every OTHER user's notifications on demand,
+/// indefinitely, with no rate limit or auth needed beyond their own
+/// account.
+///
+/// 15s, matching this codebase's existing precedent for an outbound HTTP
+/// call with no natural response-size bound of its own --
+/// `common::oauth_client::TOKEN_FETCH_TIMEOUT`, also `Duration::from_secs(15)`.
+/// A real push service (FCM/Mozilla autopush/etc.) resolves a send in low
+/// hundreds of milliseconds; 15s is generous headroom for a slow-but-alive
+/// endpoint while still bounding the damage a tarpit endpoint can do to one
+/// send attempt.
+const PUSH_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Exactly the SW contract this plan's Global Constraints section fixes.
 /// Any change to this shape must be reflected in Task 9's push-handler
@@ -104,12 +129,27 @@ pub async fn send_to_subscription(
             }
         };
 
-        match client.send(message).await {
-            Ok(_) => return SendOutcome::Sent,
-            Err(err) => match classify_web_push_error(&err) {
+        // Wrapped in `tokio::time::timeout` (see `PUSH_SEND_TIMEOUT`'s own
+        // doc comment for the tarpit-endpoint bug this closes). A timed-out
+        // attempt carries no `WebPushError` to classify, so it is folded
+        // into the exact same "log and retry" branch an ordinary
+        // `TransientFailure` already takes below -- not a new outcome or a
+        // new branch -- since a timeout is already documented as one of
+        // `SendOutcome::TransientFailure`'s own cases ("5xx, timeout,
+        // etc.").
+        match tokio::time::timeout(PUSH_SEND_TIMEOUT, client.send(message)).await {
+            Ok(Ok(_)) => return SendOutcome::Sent,
+            Ok(Err(err)) => match classify_web_push_error(&err) {
                 SendOutcome::Expired => return SendOutcome::Expired,
                 _ => tracing::warn!(error = ?err, attempt, "web push send failed, retrying"),
             },
+            Err(_elapsed) => {
+                tracing::warn!(
+                    attempt,
+                    timeout_secs = PUSH_SEND_TIMEOUT.as_secs(),
+                    "web push send timed out, retrying"
+                );
+            }
         }
     }
     SendOutcome::TransientFailure
@@ -214,6 +254,91 @@ mod tests {
         assert_eq!(
             classify_web_push_error(&web_push_error_for(http::StatusCode::BAD_REQUEST)),
             SendOutcome::TransientFailure
+        );
+    }
+
+    // A real (freshly generated, single-purpose-for-this-test) P-256 EC
+    // private key, `openssl ecparam -name prime256v1 -genkey -noout`
+    // output verbatim -- `VapidSignatureBuilder::from_pem` needs a real,
+    // parseable SEC1 EC key to get past signature-building and actually
+    // reach the network call this test means to exercise; a bogus/empty
+    // string would fail at `signature_builder.build()`, before
+    // `PUSH_SEND_TIMEOUT` is ever in play, and the test would pass for the
+    // wrong reason.
+    const TEST_VAPID_PRIVATE_KEY_PEM: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEINajp+9GEKgTlNQuPdFvXAHS31oSZgBg8YnjOLkOKSkVoAoGCCqGSM49
+AwEHoUQDQgAEZGCEGdhU+lVKPN9eP0esU1lUjQS/QenHXBw2+YsPSjQ28Tq+6trX
+MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
+-----END EC PRIVATE KEY-----
+";
+
+    // A real, correctly-shaped P-256 uncompressed point (65 bytes, leading
+    // 0x04) / 16-byte auth secret, base64url-no-padding -- same reasoning
+    // as `TEST_VAPID_PRIVATE_KEY_PEM` above: `set_payload`'s AES-128-GCM
+    // encryption step needs real-shaped key material to get past message
+    // building and actually reach the network call.
+    const TEST_P256DH: &str =
+        "BElgNxkQ0haRG9SKY_JeamLar9TZiJi-17S3_yCr7BfS8e2CU0ahMb3FiZEfdtvc-cdK2euyDsiOYvbsRdrZ7ug";
+    const TEST_AUTH: &str = "sXOd9HnSDnFaPZIqFzICvw";
+
+    /// M2 regression (2026-09 security/bug review): before this fix,
+    /// nothing wrapped `HyperWebPushClient::send` -- whose own doc comment
+    /// literally says "Never times out" -- so a subscription endpoint that
+    /// accepted the connection and then never responded (exactly what an
+    /// authenticated user's own tarpit server can do on demand, per
+    /// `PUSH_SEND_TIMEOUT`'s own doc comment) hung this call forever,
+    /// stalling the whole notification cycle for every user behind it.
+    ///
+    /// Same wiremock-mock-server + `set_delay` + paused-clock pattern as
+    /// `common::oauth_client`'s own
+    /// `fetch_token_times_out_instead_of_hanging_forever` test -- asserts
+    /// the real `PUSH_SEND_TIMEOUT` deterministically and instantly,
+    /// rather than either waiting it out for real (3 attempts * 15s) or
+    /// weakening the test to a shorter, made-up delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_push_endpoint_times_out_instead_of_stalling_forever() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201)
+                    .set_delay(PUSH_SEND_TIMEOUT + Duration::from_secs(5)),
+            )
+            // Every one of the 3 bounded attempts must actually REACH the
+            // endpoint (verified on drop) -- proves the key material above
+            // got this test past signing/encryption to the real network
+            // call, so the `TransientFailure` below comes from the timeout
+            // and not from an earlier build failure.
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let subscription = PushSubscriptionRow {
+            id: 1,
+            endpoint: format!("{}/push-endpoint", server.uri()),
+            p256dh: TEST_P256DH.to_string(),
+            auth: TEST_AUTH.to_string(),
+        };
+        let payload = NotificationPayload {
+            title: "title".to_string(),
+            body: "body".to_string(),
+            url: "/".to_string(),
+            tag: "tag".to_string(),
+        };
+
+        let outcome = send_to_subscription(
+            TEST_VAPID_PRIVATE_KEY_PEM,
+            "mailto:test@example.com",
+            &subscription,
+            &payload,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            SendOutcome::TransientFailure,
+            "a send whose response never arrives must time out -- and be folded into the \
+             same TransientFailure outcome an ordinary failed send already gets -- not hang \
+             this call (and the whole notification cycle behind it) forever"
         );
     }
 }

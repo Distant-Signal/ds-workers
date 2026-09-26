@@ -957,11 +957,26 @@ pub async fn materialize_due_template_occurrence(
         arrive_before,
     ) in legs
     {
+        // `window_searched = TRUE` unconditionally -- 2026-09 security/bug
+        // review (Repeater Signal), Medium finding M4: this INSERT used to
+        // omit the column entirely, defaulting to the schema's own `FALSE`
+        // (`20260925090000_journey_legs_window_searched.sql`). A
+        // sweep-minted recurring leg is exactly the same "always a search,
+        // never a direct pin/known-train pick" case
+        // `data::journey_templates::materialize_template`'s own INSERT
+        // already writes `TRUE` for -- this module's own header doc
+        // comment says its SQL was diffed against that function's and
+        // found no divergence, but this one had drifted regardless.
+        // `JourneyLegCard.tsx`'s `hasWindow`/"Change train" gate reads
+        // this column directly, so the omission silently hid "Change
+        // train" forever for every template-sweep-minted leg, matched or
+        // not.
         sqlx::query(
             "INSERT INTO journey_legs \
                 (journey_id, leg_order, origin_crs, destination_crs, service_date, \
-                 depart_after, depart_before, arrive_after, arrive_before, match_mode) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unmatched')",
+                 depart_after, depart_before, arrive_after, arrive_before, match_mode, \
+                 window_searched) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unmatched', TRUE)",
         )
         .bind(journey_id)
         .bind(leg_order)
@@ -3644,6 +3659,94 @@ mod sweep_tests {
         assert_eq!(
             legs_count, 1,
             "exactly one journey_legs row must exist after two calls"
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE journey_id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_template_legs WHERE template_id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// M4 regression (2026-09 security/bug review, Repeater Signal): this
+    /// INSERT used to omit `window_searched` entirely, silently defaulting
+    /// to the schema's own `FALSE`
+    /// (`20260925090000_journey_legs_window_searched.sql`), while
+    /// `api::data::journey_templates::materialize_template`'s equivalent
+    /// INSERT (the non-sweep "Run now" path for the exact same template
+    /// shape) always wrote `TRUE`. A sweep-minted leg is exactly the same
+    /// "always a search, never a direct pin/known-train pick" case that
+    /// function's own `TRUE` is for -- so every template-sweep-minted leg
+    /// had `JourneyLegCard.tsx`'s `hasWindow`/"Change train" gate
+    /// permanently hidden, matched or not, with no way for the user to
+    /// ever see it.
+    #[tokio::test]
+    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                materialize_due_template_occurrence_writes_window_searched_true \
+                -- --ignored --test-threads=1`"]
+    async fn materialize_due_template_occurrence_writes_window_searched_true() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-WINDOWSEARCHED-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name) \
+             VALUES ($1, 'Test Window Searched Template') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_templates row");
+
+        // Every window bound left unset -- a deliberate "any train, any
+        // time" search, the exact case whose "still a search" semantics
+        // this finding is about (mirrors
+        // `materialize_template_with_no_window_bounds_produces_a_fully_open_leg`'s
+        // own regression test in `api::data::journey_templates`).
+        sqlx::query(
+            "INSERT INTO journey_template_legs (template_id, leg_order, origin_crs, destination_crs) \
+             VALUES ($1, 1, 'RDG', 'WOK')",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed journey_template_legs row");
+
+        let journey_id =
+            materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
+                .await
+                .expect("materialize call")
+                .expect("the call must mint a journey");
+
+        let window_searched: bool =
+            sqlx::query_scalar("SELECT window_searched FROM journey_legs WHERE journey_id = $1")
+                .bind(journey_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read back the minted leg's window_searched");
+        assert!(
+            window_searched,
+            "a sweep-minted leg must have window_searched = TRUE, matching api::materialize_template's \
+             own INSERT, so \"Change train\" survives -- even though every window bound was left \
+             unset here"
         );
 
         sqlx::query("DELETE FROM journey_legs WHERE journey_id = $1")
