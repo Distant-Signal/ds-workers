@@ -17,6 +17,33 @@ use config::Config;
 use send::{NotificationPayload, SendOutcome, send_to_subscription};
 use sqlx::PgPool;
 
+/// Builds one of the four poll-cycle `tokio::time::Interval`s ticked in
+/// `main`'s own `select!`, ticking every `interval_secs` -- with
+/// `MissedTickBehavior::Delay` rather than the default `Burst`.
+///
+/// `Burst` fires every missed tick back-to-back with zero gap once a cycle
+/// overruns its own interval (a slow DB query, a slow Web Push send) --
+/// exactly when the database or push service is already struggling, it
+/// would pile up a burst of immediate follow-up cycles instead of settling
+/// back into its normal cadence. `Delay` instead waits a fresh
+/// `interval_secs` from whenever the overrun tick actually completes, so a
+/// slow cycle degrades to a slower cadence, never a thundering-herd burst.
+/// Each of the four intervals below is its own independent `Interval`
+/// value (they tick on different cadences inside one `select!`), so each
+/// needs this set individually -- there is no single shared `Interval` to
+/// configure once. Same fix, same rationale, as `common::poller_loop`'s
+/// own `poll_interval_with_delay_on_overrun`/`aggregator`'s own
+/// `cycle_interval`/`enricher`'s own `ticking_interval`. Split into its own
+/// function so the configuration is directly assertable in a unit test via
+/// `Interval::missed_tick_behavior()`, since the missed-tick BEHAVIOR
+/// itself (skipping ticks under a real overrun) isn't practically
+/// observable without a slow, flaky, real-time test.
+fn poll_interval(interval_secs: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -54,14 +81,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cooldown = chrono::Duration::minutes(config.cooldown_minutes);
     let cursor_grace = chrono::Duration::seconds(config.cursor_grace_seconds);
-    let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
-    let mut forward_interval =
-        tokio::time::interval(Duration::from_secs(config.forward_queue_poll_interval_secs));
-    let mut skip_check_interval =
-        tokio::time::interval(Duration::from_secs(config.skip_check_poll_interval_secs));
-    let mut template_sweep_interval = tokio::time::interval(Duration::from_secs(
-        config.template_sweep_poll_interval_secs,
-    ));
+    let mut interval = poll_interval(config.poll_interval_secs);
+    let mut forward_interval = poll_interval(config.forward_queue_poll_interval_secs);
+    let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
+    let mut template_sweep_interval = poll_interval(config.template_sweep_poll_interval_secs);
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -766,6 +789,27 @@ async fn send_to_all_subscriptions(
         }
     }
     Ok(any_ok)
+}
+
+#[cfg(test)]
+mod poll_interval_tests {
+    use super::poll_interval;
+
+    /// Regression for the "L1 -- MissedTickBehavior::Burst still default"
+    /// finding: `poll_interval` backs all four of `main`'s independent
+    /// `select!` intervals (`interval`/`forward_interval`/
+    /// `skip_check_interval`/`template_sweep_interval`), so asserting it
+    /// here covers all four -- each must opt into `Delay`, not leave
+    /// `Burst` as the default, so an overrun cycle doesn't fire a burst of
+    /// back-to-back catch-up cycles.
+    #[tokio::test]
+    async fn poll_interval_defaults_to_delay_not_burst_on_a_missed_tick() {
+        let interval = poll_interval(60);
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
+    }
 }
 
 #[cfg(test)]
