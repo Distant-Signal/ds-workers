@@ -36,8 +36,6 @@ web-push = { version = "0.11", default-features = false, features = ["hyper-clie
 # code its 410/404/401 classification cares about.
 http = "0.2"
 # `PUSH_SEND_TIMEOUT` regression test (M2, 2026-09 security/bug review):
-# same wiremock-mock-server + `set_delay` + paused-clock pattern as
-# `common::oauth_client`'s own `fetch_token_times_out_instead_of_hanging_forever`
-# test, pinned to the identical versions that crate already uses.
+# a local wiremock server whose delayed response outlasts a short injected
+# per-attempt timeout. Same version `common` already uses.
 wiremock = "0.6"
-tokio = { version = "1.52.3", features = ["test-util"] }

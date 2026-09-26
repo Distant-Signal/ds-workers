@@ -76,6 +76,30 @@ pub async fn send_to_subscription(
     subscription: &PushSubscriptionRow,
     payload: &NotificationPayload,
 ) -> SendOutcome {
+    send_to_subscription_with_timeout(
+        vapid_private_key,
+        vapid_subject,
+        subscription,
+        payload,
+        PUSH_SEND_TIMEOUT,
+    )
+    .await
+}
+
+/// [`send_to_subscription`] with the per-attempt timeout injectable. Every
+/// production call goes through that wrapper with `PUSH_SEND_TIMEOUT`;
+/// this exists so the timeout regression test can use a short timeout in
+/// REAL time. It cannot use a paused tokio clock instead: this path does
+/// real network IO against a local mock server, and paused time
+/// auto-advances while the runtime waits on that real TCP connect, so the
+/// timeout could fire before any request ever reached the mock.
+async fn send_to_subscription_with_timeout(
+    vapid_private_key: &str,
+    vapid_subject: &str,
+    subscription: &PushSubscriptionRow,
+    payload: &NotificationPayload,
+    per_attempt_timeout: Duration,
+) -> SendOutcome {
     let subscription_info = SubscriptionInfo::new(
         subscription.endpoint.clone(),
         subscription.p256dh.clone(),
@@ -137,7 +161,7 @@ pub async fn send_to_subscription(
         // new branch -- since a timeout is already documented as one of
         // `SendOutcome::TransientFailure`'s own cases ("5xx, timeout,
         // etc.").
-        match tokio::time::timeout(PUSH_SEND_TIMEOUT, client.send(message)).await {
+        match tokio::time::timeout(per_attempt_timeout, client.send(message)).await {
             Ok(Ok(_)) => return SendOutcome::Sent,
             Ok(Err(err)) => match classify_web_push_error(&err) {
                 SendOutcome::Expired => return SendOutcome::Expired,
@@ -146,7 +170,7 @@ pub async fn send_to_subscription(
             Err(_elapsed) => {
                 tracing::warn!(
                     attempt,
-                    timeout_secs = PUSH_SEND_TIMEOUT.as_secs(),
+                    timeout_ms = per_attempt_timeout.as_millis() as u64,
                     "web push send timed out, retrying"
                 );
             }
@@ -289,20 +313,29 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
     /// `PUSH_SEND_TIMEOUT`'s own doc comment) hung this call forever,
     /// stalling the whole notification cycle for every user behind it.
     ///
-    /// Same wiremock-mock-server + `set_delay` + paused-clock pattern as
-    /// `common::oauth_client`'s own
-    /// `fetch_token_times_out_instead_of_hanging_forever` test -- asserts
-    /// the real `PUSH_SEND_TIMEOUT` deterministically and instantly,
-    /// rather than either waiting it out for real (3 attempts * 15s) or
-    /// weakening the test to a shorter, made-up delay.
-    #[tokio::test(start_paused = true)]
+    /// Runs in REAL time with a short injected per-attempt timeout
+    /// (`TEST_PER_ATTEMPT_TIMEOUT`) against a mock whose response delay is
+    /// far longer, via `send_to_subscription_with_timeout` -- the same code
+    /// path production runs, just with a different bound (production's
+    /// `send_to_subscription` always passes `PUSH_SEND_TIMEOUT`). An
+    /// earlier version used a paused tokio clock with the real 15s
+    /// timeout and was flaky: this test does real TCP IO to the wiremock
+    /// server, and paused time auto-advances while the runtime waits on
+    /// that IO, so under load the timeout could fire before any request
+    /// reached the mock ("matched 0").
+    ///
+    /// If the timeout did NOT cut each attempt off, the mock's 201 would
+    /// eventually arrive and the outcome would be `Sent` -- so
+    /// `TransientFailure` plus `.expect(3)` together prove all three
+    /// attempts reached the endpoint and were each ended by the timeout.
+    #[tokio::test]
     async fn a_hanging_push_endpoint_times_out_instead_of_stalling_forever() {
+        // Long enough that a request always reaches the local mock even on
+        // a heavily loaded machine; far shorter than the mock's delay.
+        const TEST_PER_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(201)
-                    .set_delay(PUSH_SEND_TIMEOUT + Duration::from_secs(5)),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(201).set_delay(Duration::from_secs(10)))
             // Every one of the 3 bounded attempts must actually REACH the
             // endpoint (verified on drop) -- proves the key material above
             // got this test past signing/encryption to the real network
@@ -325,11 +358,12 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             tag: "tag".to_string(),
         };
 
-        let outcome = send_to_subscription(
+        let outcome = send_to_subscription_with_timeout(
             TEST_VAPID_PRIVATE_KEY_PEM,
             "mailto:test@example.com",
             &subscription,
             &payload,
+            TEST_PER_ATTEMPT_TIMEOUT,
         )
         .await;
 
