@@ -1375,7 +1375,14 @@ pub async fn find_or_create_train_with_cif_schedule(
 
 /// Duplicates `crates/api::data::train_tracking::create_subscription_for_train`
 /// -- same CTE idempotency idiom, same accepted "ordinary repeat case
-/// only" concurrency caveat as the original's own doc comment states.
+/// only" concurrency caveat as the original's own doc comment states, and
+/// (2026-09-26 review, Medium finding 10) the same re-activation of a
+/// previously-deactivated row: [`auto_commit_leg_to_train`] can auto-match
+/// an unrelated leg onto a physical train whose subscription a prior
+/// "Change train" already disabled, and that re-establishment is exactly
+/// the "new use case" that should bring notifications back, not a reason to
+/// hand back a silently-dead subscription. See the original's own doc
+/// comment for the full reasoning.
 ///
 /// Generic over the executor (not `&PgPool`) so
 /// [`auto_commit_leg_to_train`] can run it inside its own transaction
@@ -1392,6 +1399,9 @@ where
         "WITH existing AS ( \
              SELECT id FROM train_subscriptions \
              WHERE user_id = $1 AND trains_id = $2 ORDER BY id LIMIT 1 \
+         ), reactivated AS ( \
+             UPDATE train_subscriptions SET notifications_enabled = TRUE \
+             WHERE id IN (SELECT id FROM existing) AND notifications_enabled = FALSE \
          ), inserted AS ( \
              INSERT INTO train_subscriptions \
                  (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure, pin_destination_crs) \
