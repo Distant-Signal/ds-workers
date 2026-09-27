@@ -18,7 +18,7 @@ use crate::queries::{self, CommittedLeg};
 /// skipped calling points, per the live Darwin sample(s) currently on
 /// file. `Ok(false)` (never an error) when there's simply no sample yet to
 /// check against -- a genuine "don't know" degrades to "assume not
-/// skipped," matching `station_skip::leg_skip_status`'s own best-effort
+/// skipped," matching `station_skip::leg_skip_status_from_samples`'s own best-effort
 /// posture on the API side. A real DB connectivity failure still
 /// propagates via `?`, same as every other query in this crate -- the
 /// caller (`run_skip_check_cycle`) lets that fail the whole cycle, retried

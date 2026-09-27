@@ -708,7 +708,21 @@ pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusRepor
 }
 
 /// Deletes `line_status_history` rows older than `retention_days`.
+///
+/// Probes `MIN(computed_at)` first (one descent of
+/// `line_status_history_computed_at`) and skips the `DELETE` when nothing is
+/// old enough, which is every cycle but the few after a row ages out.
 pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let due: Option<bool> = sqlx::query_scalar(
+        "SELECT (SELECT MIN(computed_at) FROM line_status_history) \
+                < NOW() - ($1 || ' days')::interval",
+    )
+    .bind(retention_days.to_string())
+    .fetch_one(pool)
+    .await?;
+    if due != Some(true) {
+        return Ok(0);
+    }
     let result = sqlx::query(
         "DELETE FROM line_status_history WHERE computed_at < NOW() - ($1 || ' days')::interval",
     )
@@ -718,19 +732,57 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// Batch size for `prune_trust_event_backlog`'s delete loop. Same order as
+/// `PRUNE_TRAINS_BATCH`; the backlog's steady state deletes about 1/24 of a
+/// ~550k-row table per hour of backlog, so a cycle after downtime can have
+/// tens of thousands of rows to remove.
+const PRUNE_TRUST_EVENT_BACKLOG_BATCH: i64 = 5000;
+
 /// Prunes `trust_event_backlog` rows older than `retention_days`. See
 /// `Config::trust_event_backlog_retention_days`'s own doc comment for
 /// the licensing safeguard this default (1) exists to enforce -- this
 /// function itself has no opinion on the value passed in; it prunes
 /// whatever it's told to.
+///
+/// Probes `MIN(received_at)` first (one descent of
+/// `trust_event_backlog_received_at`) and returns without deleting when
+/// nothing is past the cutoff. Otherwise deletes in
+/// `PRUNE_TRUST_EVENT_BACKLOG_BATCH`-row statements, oldest first, like
+/// `prune_trains`, and stops as soon as a batch comes back short. The
+/// cutoff is fixed once per call so a long prune never chases rows that
+/// only aged out while it ran.
 pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM trust_event_backlog WHERE received_at < NOW() - ($1 || ' days')::interval",
+    let (oldest, cutoff): (Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT (SELECT MIN(received_at) FROM trust_event_backlog), \
+                NOW() - ($1 || ' days')::interval",
     )
     .bind(retention_days.to_string())
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(result.rows_affected())
+    if !oldest.is_some_and(|oldest| oldest < cutoff) {
+        return Ok(0);
+    }
+    let mut pruned = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM trust_event_backlog WHERE id IN ( \
+                SELECT id FROM trust_event_backlog \
+                WHERE received_at < $1 \
+                ORDER BY received_at \
+                LIMIT $2 \
+             )",
+        )
+        .bind(cutoff)
+        .bind(PRUNE_TRUST_EVENT_BACKLOG_BATCH)
+        .execute(pool)
+        .await?;
+        let rows_affected = result.rows_affected();
+        pruned += rows_affected;
+        if rows_affected < PRUNE_TRUST_EVENT_BACKLOG_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(pruned)
 }
 
 /// Prunes `schedule_destination_departures` rows for service dates older
@@ -877,64 +929,94 @@ const PRUNE_TRAINS_BATCH: i64 = 1000;
 /// one (`EXISTS`), so neither loop can delete a row the other tier owns
 /// regardless of which runs first or how the two retention windows
 /// compare. Both loops delete in bounded batches (`PRUNE_TRAINS_BATCH`
-/// rows per statement, looped until a batch deletes zero rows) rather
+/// rows per statement, looped until a batch comes back short) rather
 /// than one unbounded `DELETE`, so a national-scale prune never holds one
 /// long lock / one large WAL burst across potentially millions of rows --
 /// see this fix's own review note. Each batch is still its own standalone
 /// statement/transaction (same as the loop this mirrors in
 /// `legacy_backfill.rs`), so a crash mid-prune loses at most one batch's
-/// worth of progress, never the whole run.
+/// worth of progress, never the whole run. A tier whose cutoff is older
+/// than every row's `service_date` is skipped without issuing its `DELETE`
+/// at all (see `trains_prune_due`). Each batch takes the OLDEST eligible
+/// rows (`ORDER BY service_date`), which also pins the plan to a range scan
+/// of `trains_service_date`: without it, a stale row estimate plus `LIMIT`
+/// made the planner pick a whole-table seq scan it expected to stop early
+/// (DB review part 2, DB2-6).
 pub async fn prune_trains(
     pool: &PgPool,
     retention_days: i64,
     untracked_retention_days: i64,
 ) -> Result<u64> {
+    let (untracked_due, tracked_due) =
+        trains_prune_due(pool, retention_days, untracked_retention_days).await?;
     let mut pruned = 0u64;
-    loop {
-        let result = sqlx::query(
-            "DELETE FROM trains WHERE id IN ( \
-                SELECT id FROM trains \
-                WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
-                  AND NOT EXISTS ( \
-                      SELECT 1 FROM train_subscriptions \
-                      WHERE train_subscriptions.trains_id = trains.id \
-                  ) \
-                LIMIT $2 \
-             )",
-        )
-        .bind(untracked_retention_days.to_string())
-        .bind(PRUNE_TRAINS_BATCH)
-        .execute(pool)
-        .await?;
-        let rows_affected = result.rows_affected();
-        pruned += rows_affected;
-        if rows_affected == 0 {
-            break;
-        }
+    if untracked_due {
+        pruned += prune_trains_tier(pool, untracked_retention_days, "NOT EXISTS").await?;
     }
-    loop {
-        let result = sqlx::query(
-            "DELETE FROM trains WHERE id IN ( \
-                SELECT id FROM trains \
-                WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
-                  AND EXISTS ( \
-                      SELECT 1 FROM train_subscriptions \
-                      WHERE train_subscriptions.trains_id = trains.id \
-                  ) \
-                LIMIT $2 \
-             )",
-        )
-        .bind(retention_days.to_string())
-        .bind(PRUNE_TRAINS_BATCH)
-        .execute(pool)
-        .await?;
-        let rows_affected = result.rows_affected();
-        pruned += rows_affected;
-        if rows_affected == 0 {
-            break;
-        }
+    if tracked_due {
+        pruned += prune_trains_tier(pool, retention_days, "EXISTS").await?;
     }
     Ok(pruned)
+}
+
+/// One `prune_trains` tier: batches of the oldest eligible rows until a
+/// batch comes back short. `subscription_test` is `EXISTS` (tracked) or
+/// `NOT EXISTS` (untracked).
+async fn prune_trains_tier(
+    pool: &PgPool,
+    retention_days: i64,
+    subscription_test: &'static str,
+) -> Result<u64> {
+    let sql = format!(
+        "DELETE FROM trains WHERE id IN ( \
+            SELECT id FROM trains \
+            WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
+              AND {subscription_test} ( \
+                  SELECT 1 FROM train_subscriptions \
+                  WHERE train_subscriptions.trains_id = trains.id \
+              ) \
+            ORDER BY service_date \
+            LIMIT $2 \
+         )"
+    );
+    let mut pruned = 0u64;
+    loop {
+        let rows_affected = sqlx::query(&sql)
+            .bind(retention_days.to_string())
+            .bind(PRUNE_TRAINS_BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        pruned += rows_affected;
+        if rows_affected < PRUNE_TRAINS_BATCH as u64 {
+            return Ok(pruned);
+        }
+    }
+}
+
+/// Whether either `trains` retention tier can have anything to delete,
+/// as `(untracked_due, tracked_due)`: `MIN(service_date)` (one descent of
+/// `trains_service_date`) against each tier's cutoff. Lets
+/// `prune_trains` and `archive::archive_and_prune_trains` skip their
+/// delete loops entirely on the ~every cycle where no train is old enough,
+/// instead of paying one `DELETE ... LIMIT` per tier whose plan depends on
+/// how stale `trains`' statistics are (DB review part 2, DB2-6).
+pub(crate) async fn trains_prune_due(
+    pool: &PgPool,
+    retention_days: i64,
+    untracked_retention_days: i64,
+) -> Result<(bool, bool)> {
+    let (untracked_due, tracked_due): (Option<bool>, Option<bool>) = sqlx::query_as(
+        "WITH oldest AS (SELECT MIN(service_date) AS d FROM trains) \
+         SELECT d < CURRENT_DATE - ($1 || ' days')::interval, \
+                d < CURRENT_DATE - ($2 || ' days')::interval \
+         FROM oldest",
+    )
+    .bind(untracked_retention_days.to_string())
+    .bind(retention_days.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok((untracked_due == Some(true), tracked_due == Some(true)))
 }
 
 /// The plain Europe/London CALENDAR day (midnight-to-midnight) `instant`
@@ -4751,5 +4833,201 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    // ---- Retention prunes: skip-when-nothing-due, short-batch stop, and
+    // index use (DB review F10 / part 2 DB2-6). ----
+
+    async fn count_queries<F, T>(fut: F) -> (T, usize)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(SqlxQueryCounter(query_count.clone()));
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = fut.await;
+        drop(guard);
+        (out, query_count.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// `EXPLAIN` text for `sql` with sequential scans disabled, so the plan
+    /// shows whether the predicate can use an index at all (tiny test
+    /// tables would otherwise always seq-scan).
+    async fn explain_without_seqscan(pool: &PgPool, sql: &str) -> String {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let lines: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {sql}"))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        lines.join("\n")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                retention_prunes_skip_their_delete_when_nothing_is_due -- --ignored --test-threads=1`"]
+    async fn retention_prunes_skip_their_delete_when_nothing_is_due() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        // Windows no fixture row could be older than: each prune must issue
+        // exactly its one MIN probe and no DELETE.
+        let (pruned, queries) = count_queries(prune_history(&pool, 100_000)).await;
+        assert_eq!(pruned.expect("prune_history"), 0);
+        assert_eq!(queries, 1, "prune_history must stop after its MIN probe");
+
+        let (pruned, queries) = count_queries(prune_trust_event_backlog(&pool, 100_000)).await;
+        assert_eq!(pruned.expect("prune_trust_event_backlog"), 0);
+        assert_eq!(
+            queries, 1,
+            "prune_trust_event_backlog must stop after its MIN probe"
+        );
+
+        let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 100_000)).await;
+        assert_eq!(pruned.expect("prune_trains"), 0);
+        assert_eq!(queries, 1, "prune_trains must stop after its MIN probe");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_stops_on_a_short_batch_and_skips_a_tier_with_nothing_due -- --ignored --test-threads=1`"]
+    async fn prune_trains_stops_on_a_short_batch_and_skips_a_tier_with_nothing_due() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let old_date = chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        sqlx::query("DELETE FROM trains WHERE train_uid LIKE 'TEST-PRUNE-SHORT-%'")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO trains (train_uid, service_date) \
+             SELECT 'TEST-PRUNE-SHORT-' || gs, $1 FROM generate_series(1, 1500) AS gs",
+        )
+        .bind(old_date)
+        .execute(&pool)
+        .await
+        .expect("seed trains");
+
+        // Untracked tier 30 days: 1500 rows = one full batch + one short
+        // one, then stop. Tracked tier 100000 days: nothing due, no DELETE.
+        // Probe + 2 DELETEs = 3 statements (the old loop needed 4).
+        let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 30)).await;
+        let pruned = pruned.expect("prune_trains");
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trains WHERE train_uid LIKE 'TEST-PRUNE-SHORT-%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(pruned >= 1500, "pruned {pruned}");
+        if pruned == 1500 {
+            assert_eq!(queries, 3, "probe + one full batch + one short batch");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trust_event_backlog_deletes_in_batches_oldest_first -- --ignored --test-threads=1`"]
+    async fn prune_trust_event_backlog_deletes_in_batches_oldest_first() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::query("DELETE FROM trust_event_backlog WHERE train_id LIKE 'TEST-PRUNE-BATCH-%'")
+            .execute(&pool)
+            .await
+            .ok();
+        let rows = 2 * PRUNE_TRUST_EVENT_BACKLOG_BATCH + 7;
+        sqlx::query(
+            "INSERT INTO trust_event_backlog (train_id, service_date, msg_type, received_at, dedup_key) \
+             SELECT 'TEST-PRUNE-BATCH-' || gs, CURRENT_DATE - 3, '0001', \
+                    NOW() - interval '2 days' - gs * interval '1 second', 'test-prune-batch-' || gs \
+             FROM generate_series(1, $1) AS gs",
+        )
+        .bind(rows)
+        .execute(&pool)
+        .await
+        .expect("seed backlog rows");
+        sqlx::query(
+            "INSERT INTO trust_event_backlog (train_id, service_date, msg_type, received_at, dedup_key) \
+             VALUES ('TEST-PRUNE-BATCH-KEEP', CURRENT_DATE, '0001', NOW(), 'test-prune-batch-keep')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed a fresh row");
+
+        let (pruned, queries) = count_queries(prune_trust_event_backlog(&pool, 1)).await;
+        let pruned = pruned.expect("prune_trust_event_backlog");
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT train_id FROM trust_event_backlog WHERE train_id LIKE 'TEST-PRUNE-BATCH-%'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM trust_event_backlog WHERE train_id LIKE 'TEST-PRUNE-BATCH-%'")
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(remaining, vec!["TEST-PRUNE-BATCH-KEEP".to_string()]);
+        assert!(pruned >= rows as u64, "pruned {pruned}");
+        if pruned == rows as u64 {
+            assert_eq!(queries, 4, "probe + two full batches + one short batch");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                retention_prune_predicates_can_use_their_indexes -- --ignored --test-threads=1`"]
+    async fn retention_prune_predicates_can_use_their_indexes() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        for (sql, index) in [
+            (
+                "SELECT (SELECT MIN(received_at) FROM trust_event_backlog)",
+                "trust_event_backlog_received_at",
+            ),
+            (
+                "DELETE FROM trust_event_backlog WHERE id IN (SELECT id FROM trust_event_backlog \
+                 WHERE received_at < NOW() - interval '1 day' ORDER BY received_at LIMIT 5000)",
+                "trust_event_backlog_received_at",
+            ),
+            (
+                "WITH oldest AS (SELECT MIN(service_date) AS d FROM trains) \
+                 SELECT d < CURRENT_DATE - interval '14 days' FROM oldest",
+                "trains_service_date",
+            ),
+            (
+                "DELETE FROM trains WHERE id IN (SELECT id FROM trains \
+                 WHERE service_date < CURRENT_DATE - interval '14 days' \
+                   AND NOT EXISTS (SELECT 1 FROM train_subscriptions \
+                                   WHERE train_subscriptions.trains_id = trains.id) \
+                 ORDER BY service_date LIMIT 1000)",
+                "trains_service_date",
+            ),
+            (
+                "SELECT (SELECT MIN(computed_at) FROM line_status_history)",
+                "line_status_history_computed_at",
+            ),
+            (
+                "DELETE FROM line_status_history WHERE computed_at < NOW() - interval '30 days'",
+                "line_status_history_computed_at",
+            ),
+        ] {
+            let plan = explain_without_seqscan(&pool, sql).await;
+            assert!(
+                plan.contains(index),
+                "expected {index} in the plan for {sql}:\n{plan}"
+            );
+        }
     }
 }

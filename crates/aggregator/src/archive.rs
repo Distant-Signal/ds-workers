@@ -473,6 +473,14 @@ pub async fn archive_and_prune_trains(
     let mut outcome = TrainsArchiveOutcome::default();
     let mut skip_uploads = false;
 
+    // One MIN(service_date) probe: when neither tier has anything old
+    // enough (almost every cycle) skip the FOR UPDATE candidate scan.
+    let (untracked_due, tracked_due) =
+        crate::queries::trains_prune_due(pool, retention_days, untracked_retention_days).await?;
+    if !untracked_due && !tracked_due {
+        return Ok(outcome);
+    }
+
     loop {
         let mut tx = pool.begin().await?;
         // Oldest eligible date first, lowest ids first: deterministic, so a
@@ -482,10 +490,11 @@ pub async fn archive_and_prune_trains(
         // (their FK takes a KEY SHARE lock) until we commit or roll back.
         let candidates: Vec<(i64, NaiveDate)> = sqlx::query_as(
             "SELECT t.id, t.service_date FROM trains t \
-             WHERE (t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
-                    AND NOT EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id)) \
-                OR (t.service_date < CURRENT_DATE - ($2 || ' days')::interval \
-                    AND EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id)) \
+             WHERE t.service_date < CURRENT_DATE - ($4 || ' days')::interval \
+               AND ((t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
+                     AND NOT EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id)) \
+                 OR (t.service_date < CURRENT_DATE - ($2 || ' days')::interval \
+                     AND EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id))) \
              ORDER BY t.service_date, t.id \
              LIMIT $3 \
              FOR UPDATE OF t",
@@ -493,6 +502,9 @@ pub async fn archive_and_prune_trains(
         .bind(untracked_retention_days.to_string())
         .bind(retention_days.to_string())
         .bind(batch_size)
+        // The later of the two cutoffs, as a plain range the planner can
+        // serve from `trains_service_date` (the OR alone cannot be).
+        .bind(retention_days.min(untracked_retention_days).to_string())
         .fetch_all(&mut *tx)
         .await?;
 
@@ -567,6 +579,13 @@ pub async fn archive_and_prune_trains(
             .rows_affected();
         tx.commit().await?;
         outcome.pruned += deleted;
+
+        // A short candidate list that this batch consumed whole means
+        // nothing eligible is left: stop without another candidate scan.
+        // (A batch cut at a service-date boundary is not "whole" and loops.)
+        if (candidates.len() as i64) < batch_size && ids.len() == candidates.len() {
+            break;
+        }
     }
 
     Ok(outcome)

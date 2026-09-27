@@ -709,10 +709,15 @@ pub async fn station_sample_for_crs(
     pool: &PgPool,
     crs: &str,
 ) -> anyhow::Result<Option<common::StationSample>> {
-    let row = sqlx::query("SELECT crs, polled_at, departures FROM station_samples WHERE crs = $1")
-        .bind(crs)
-        .fetch_optional(pool)
-        .await?;
+    // Normalised and compared as `bpchar` like the api's copy: the column is
+    // `CHAR(3)`, and a bare `text` parameter would cast the column instead,
+    // so `station_samples_pkey` could not serve the lookup.
+    let row = sqlx::query(
+        "SELECT crs, polled_at, departures FROM station_samples WHERE crs = $1::bpchar",
+    )
+    .bind(crs.trim().to_ascii_uppercase())
+    .fetch_optional(pool)
+    .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -1232,10 +1237,18 @@ pub async fn find_or_create_train<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
+    // Read-first, as in `crates/api`'s copy: no row rewrite when the train
+    // already exists; the `DO UPDATE` only covers a concurrent insert.
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO trains (train_uid, service_date) VALUES ($1, $2) \
-         ON CONFLICT (train_uid, service_date) DO UPDATE SET train_uid = EXCLUDED.train_uid \
-         RETURNING id",
+        "WITH existing AS ( \
+             SELECT id FROM trains WHERE train_uid = $1 AND service_date = $2 \
+         ), inserted AS ( \
+             INSERT INTO trains (train_uid, service_date) \
+             SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM existing) \
+             ON CONFLICT (train_uid, service_date) DO UPDATE SET train_uid = EXCLUDED.train_uid \
+             RETURNING id \
+         ) \
+         SELECT id FROM existing UNION ALL SELECT id FROM inserted",
     )
     .bind(train_uid)
     .bind(service_date)
