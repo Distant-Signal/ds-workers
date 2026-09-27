@@ -13,6 +13,12 @@ pub struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub redis_url: Secret,
 
+    /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
+    /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
+    /// `common::redis_auth::redis_url_with_password`, never logged.
+    #[arg(long, env, hide_env_values = true)]
+    pub redis_password: Option<Secret>,
+
     /// Base URL of an OpenAI-compatible Chat Completions endpoint, e.g.
     /// `http://localhost:8080/v1` for a local server. No vendor is assumed.
     #[arg(long, env)]

@@ -75,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
         .connect(config.database_url.expose())
         .await?;
 
-    let redis_client = redis::Client::open(config.redis_url.expose())?;
+    let redis_url = common::redis_auth::redis_url_with_password(
+        config.redis_url.expose(),
+        config.redis_password.as_ref(),
+    )?;
+    let redis_client = redis::Client::open(redis_url.expose())?;
     let mut redis = common::startup::retry_until_ready(
         "Redis",
         common::startup::CONNECT_BACKOFF,
