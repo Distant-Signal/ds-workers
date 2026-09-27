@@ -2698,7 +2698,10 @@ mod tests {
     #[test]
     fn is_active_true_when_a_validity_period_covers_now() {
         let mut inc = incident("T3", "Delay", "Delay description", &[], &[]);
-        let now = Utc::now();
+        // A fixed midday instant, not `Utc::now()`: "loaded an hour ago"
+        // crosses the 02:00 London rail-day boundary when the suite runs
+        // between 02:00 and 03:00 London, which made this fail by clock.
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 6, 15, 11, 0, 0).unwrap();
         inc.validity = vec![ValidityPeriod {
             from_date: now - Duration::hours(1),
             to_date: None,
