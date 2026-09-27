@@ -28,9 +28,10 @@ use crate::queries::PushSubscriptionRow;
 
 /// Bound on a single web-push send attempt -- 2026-09 security/bug review
 /// Medium finding M2: `web_push::HyperWebPushClient` configures no
-/// connect/request timeout of its own, and every send below runs
-/// sequentially inside the notifier's one main `select!` loop (see this
-/// crate's `main.rs`), so a single hanging push endpoint stalled the WHOLE
+/// connect/request timeout of its own, and every send below then ran
+/// sequentially inside the notifier's one main `select!` loop (sends now
+/// run on `push_queue`'s workers instead, SVC-02), so a single hanging push
+/// endpoint stalled the WHOLE
 /// notification cycle -- every other user's notifications too -- for as
 /// long as that endpoint stayed silent. Worse, a push endpoint is exactly
 /// `endpoint: String` on a subscription an AUTHENTICATED USER registers
@@ -65,9 +66,94 @@ pub enum SendOutcome {
     Sent,
     /// 404/410 from the push service -- caller must delete the subscription.
     Expired,
-    /// Anything else (5xx, timeout, etc.) -- caller logs and moves on, no
-    /// retry queue (Error handling section, spec).
+    /// The endpoint stayed silent for a whole attempt (`PUSH_SEND_TIMEOUT`)
+    /// or, in `push_queue`, for the whole per-subscription budget. Kept
+    /// apart from [`SendOutcome::TransientFailure`] because it is the
+    /// signature of a dead or deliberately tarpitting endpoint: `push_queue`
+    /// counts consecutive timeouts per subscription and prunes the
+    /// subscription after `push_prune_after_timeouts` of them (SVC-02).
+    TimedOut,
+    /// Anything else (5xx, connect refused, a refused send-time endpoint
+    /// re-validation, a local signing error) -- caller logs and moves on;
+    /// the notification is re-decided only if its source row is polled
+    /// again (see `push_queue`'s module doc for the delivery semantics).
     TransientFailure,
+}
+
+/// The configured sender every production push goes through: the VAPID
+/// credentials plus the per-attempt timeout. `Clone` is cheap (two `Arc`s),
+/// so each `push_queue` worker can hold one.
+#[derive(Clone)]
+pub struct Pusher {
+    vapid_private_key: std::sync::Arc<str>,
+    vapid_subject: std::sync::Arc<str>,
+    per_attempt_timeout: Duration,
+    /// `false` only for tests that target a local `http://127.0.0.1` mock,
+    /// which the L9 send-time re-validation would (correctly) refuse.
+    revalidate_endpoint: bool,
+}
+
+impl std::fmt::Debug for Pusher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pusher")
+            .field("vapid_private_key", &"<redacted>")
+            .field("vapid_subject", &self.vapid_subject)
+            .field("per_attempt_timeout", &self.per_attempt_timeout)
+            .field("revalidate_endpoint", &self.revalidate_endpoint)
+            .finish()
+    }
+}
+
+impl Pusher {
+    /// The production sender: L9 send-time re-validation on, and
+    /// `PUSH_SEND_TIMEOUT` per attempt.
+    pub fn new(vapid_private_key: &str, vapid_subject: &str) -> Self {
+        Self {
+            vapid_private_key: vapid_private_key.into(),
+            vapid_subject: vapid_subject.into(),
+            per_attempt_timeout: PUSH_SEND_TIMEOUT,
+            revalidate_endpoint: true,
+        }
+    }
+
+    /// A sender for tests against a local wiremock server: no L9 send-time
+    /// re-validation (a `127.0.0.1` endpoint would fail it) and a short,
+    /// injected per-attempt timeout. Everything else is the production path.
+    #[cfg(test)]
+    pub fn for_local_tests(per_attempt_timeout: Duration) -> Self {
+        Self {
+            vapid_private_key: tests::TEST_VAPID_PRIVATE_KEY_PEM.into(),
+            vapid_subject: "mailto:test@example.com".into(),
+            per_attempt_timeout,
+            revalidate_endpoint: false,
+        }
+    }
+
+    pub async fn send(
+        &self,
+        subscription: &PushSubscriptionRow,
+        payload: &NotificationPayload,
+    ) -> SendOutcome {
+        if self.revalidate_endpoint {
+            // Production: `new` always pairs this with `PUSH_SEND_TIMEOUT`,
+            // which `send_to_subscription` applies itself.
+            return send_to_subscription(
+                &self.vapid_private_key,
+                &self.vapid_subject,
+                subscription,
+                payload,
+            )
+            .await;
+        }
+        send_to_subscription_with_timeout(
+            &self.vapid_private_key,
+            &self.vapid_subject,
+            subscription,
+            payload,
+            self.per_attempt_timeout,
+        )
+        .await
+    }
 }
 
 pub async fn send_to_subscription(
@@ -217,7 +303,7 @@ async fn send_to_subscription_with_timeout(
                     timeout_ms = per_attempt_timeout.as_millis() as u64,
                     "web push send timed out; not retrying"
                 );
-                return SendOutcome::TransientFailure;
+                return SendOutcome::TimedOut;
             }
         }
     }
@@ -329,7 +415,7 @@ fn classify_web_push_error(err: &web_push::WebPushError) -> SendOutcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A real `WebPushError` for `status`, straight from `web-push`'s own
@@ -399,7 +485,7 @@ mod tests {
     // string would fail at `signature_builder.build()`, before
     // `PUSH_SEND_TIMEOUT` is ever in play, and the test would pass for the
     // wrong reason.
-    const TEST_VAPID_PRIVATE_KEY_PEM: &str = "-----BEGIN EC PRIVATE KEY-----
+    pub(crate) const TEST_VAPID_PRIVATE_KEY_PEM: &str = "-----BEGIN EC PRIVATE KEY-----
 MHcCAQEEINajp+9GEKgTlNQuPdFvXAHS31oSZgBg8YnjOLkOKSkVoAoGCCqGSM49
 AwEHoUQDQgAEZGCEGdhU+lVKPN9eP0esU1lUjQS/QenHXBw2+YsPSjQ28Tq+6trX
 MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
@@ -411,9 +497,9 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
     // as `TEST_VAPID_PRIVATE_KEY_PEM` above: `set_payload`'s AES-128-GCM
     // encryption step needs real-shaped key material to get past message
     // building and actually reach the network call.
-    const TEST_P256DH: &str =
+    pub(crate) const TEST_P256DH: &str =
         "BElgNxkQ0haRG9SKY_JeamLar9TZiJi-17S3_yCr7BfS8e2CU0ahMb3FiZEfdtvc-cdK2euyDsiOYvbsRdrZ7ug";
-    const TEST_AUTH: &str = "sXOd9HnSDnFaPZIqFzICvw";
+    pub(crate) const TEST_AUTH: &str = "sXOd9HnSDnFaPZIqFzICvw";
 
     /// M2 regression (2026-09 security/bug review): before this fix,
     /// nothing wrapped `HyperWebPushClient::send` -- whose own doc comment
@@ -436,7 +522,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
     ///
     /// If the timeout did NOT cut the attempt off, the mock's 201 would
     /// eventually arrive and the outcome would be `Sent` -- so
-    /// `TransientFailure` plus `.expect(1)` together prove the attempt
+    /// `TimedOut` plus `.expect(1)` together prove the attempt
     /// reached the endpoint, was ended by the timeout, and was not retried
     /// (a timed-out attempt is not retried; see the `Err(_elapsed)` arm).
     #[tokio::test]
@@ -450,7 +536,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             // Exactly one attempt must REACH the endpoint (verified on
             // drop): proves the key material above got this test past
             // signing/encryption to the real network call, so the
-            // `TransientFailure` below comes from the timeout and not from
+            // `TimedOut` below comes from the timeout and not from
             // an earlier build failure, and that the timed-out attempt was
             // not retried.
             .expect(1)
@@ -481,10 +567,9 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
 
         assert_eq!(
             outcome,
-            SendOutcome::TransientFailure,
-            "a send whose response never arrives must time out -- and be folded into the \
-             same TransientFailure outcome an ordinary failed send already gets -- not hang \
-             this call (and the whole notification cycle behind it) forever"
+            SendOutcome::TimedOut,
+            "a send whose response never arrives must time out -- reported as TimedOut so \
+             push_queue can count it towards pruning -- not hang this call forever"
         );
     }
 

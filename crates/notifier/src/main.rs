@@ -5,6 +5,7 @@
 
 mod config;
 mod decision;
+mod push_queue;
 mod queries;
 mod send;
 mod skip_check;
@@ -14,8 +15,12 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use config::Config;
-use send::{NotificationPayload, SendOutcome, send_to_subscription};
+use push_queue::{Delivered, PgBackend, PushJob, PushQueue};
+use send::{NotificationPayload, Pusher};
 use sqlx::PgPool;
+
+/// The queue every cycle hands its notifications to. See `push_queue`.
+type Queue = PushQueue<PgBackend>;
 
 /// Builds one of the four poll-cycle `tokio::time::Interval`s ticked in
 /// `main`'s own `select!`, ticking every `interval_secs` -- with
@@ -74,10 +79,25 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(&config.log_level))
         .init();
 
+    if config.metrics_enabled {
+        common::metrics::install(config.metrics_port)?;
+    }
+
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .connect(&config.database_url)
         .await?;
+
+    // Sends run on this pool's workers, never inline in the loop below
+    // (SVC-02): a cycle only decides and enqueues, so a slow or tarpitting
+    // push endpoint can no longer hold up any cycle.
+    let queue = PushQueue::start(
+        PgBackend::new(
+            pool.clone(),
+            Pusher::new(&config.vapid_private_key, &config.vapid_subject),
+        ),
+        config.push_queue_config(),
+    );
 
     let cooldown = chrono::Duration::minutes(config.cooldown_minutes);
     let cursor_grace = chrono::Duration::seconds(config.cursor_grace_seconds);
@@ -85,17 +105,22 @@ async fn main() -> anyhow::Result<()> {
     let mut forward_interval = poll_interval(config.forward_queue_poll_interval_secs);
     let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
     let mut template_sweep_interval = poll_interval(config.template_sweep_poll_interval_secs);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
+            () = &mut shutdown => {
+                tracing::info!("shutdown signal received; draining the push queue");
+                break;
+            }
             _ = interval.tick() => {
                 let result = run_cycle(
                     &pool,
+                    &queue,
                     Utc::now(),
                     cooldown,
                     config.train_delay_threshold_minutes,
                     cursor_grace,
-                    &config.vapid_private_key,
-                    &config.vapid_subject,
                 )
                 .await;
                 if let Err(err) = result {
@@ -105,11 +130,10 @@ async fn main() -> anyhow::Result<()> {
             _ = forward_interval.tick() => {
                 let result = run_forward_queue_cycle(
                     &pool,
+                    &queue,
                     Utc::now(),
                     config.train_delay_threshold_minutes,
                     cursor_grace,
-                    &config.vapid_private_key,
-                    &config.vapid_subject,
                 )
                 .await;
                 if let Err(err) = result {
@@ -117,13 +141,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             _ = skip_check_interval.tick() => {
-                let result = run_skip_check_cycle(
-                    &pool,
-                    Utc::now(),
-                    &config.vapid_private_key,
-                    &config.vapid_subject,
-                )
-                .await;
+                let result = run_skip_check_cycle(&pool, &queue, Utc::now()).await;
                 if let Err(err) = result {
                     tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
                 }
@@ -131,10 +149,9 @@ async fn main() -> anyhow::Result<()> {
             _ = template_sweep_interval.tick() => {
                 let result = run_template_sweep_cycle(
                     &pool,
+                    &queue,
                     Utc::now(),
                     config.auto_commit_lead_minutes,
-                    &config.vapid_private_key,
-                    &config.vapid_subject,
                 )
                 .await;
                 if let Err(err) = result {
@@ -143,16 +160,69 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    let report = queue
+        .shutdown(Duration::from_secs(config.push_shutdown_grace_secs))
+        .await;
+    if report.drained {
+        tracing::info!("push queue drained; exiting");
+    } else {
+        tracing::warn!(
+            abandoned = report.abandoned,
+            "push queue did not drain within push_shutdown_grace_secs; abandoned the rest \
+             (not recorded as sent, so re-decided after restart if still in the poll window)"
+        );
+    }
+    Ok(())
+}
+
+/// Resolves on SIGTERM (what Kubernetes sends) or Ctrl-C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "could not install a SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Hands one decided notification to the push queue. Never blocks; see
+/// `push_queue`'s module doc for what happens when the queue refuses it.
+fn enqueue_push(
+    queue: &Queue,
+    user_id: &str,
+    payload: NotificationPayload,
+    delivered: Delivered,
+    now: DateTime<Utc>,
+) {
+    queue.enqueue(PushJob {
+        user_id: user_id.to_string(),
+        payload,
+        delivered,
+        decided_at: now,
+    });
 }
 
 async fn run_cycle(
     pool: &PgPool,
+    queue: &Queue,
     now: DateTime<Utc>,
     cooldown: chrono::Duration,
     train_delay_threshold_minutes: i32,
     cursor_grace: chrono::Duration,
-    vapid_private_key: &str,
-    vapid_subject: &str,
 ) -> anyhow::Result<()> {
     // --- Lines (Decision 2/3/5) ---
     let line_cursor = queries::read_cursor(pool, "line_status_history").await?;
@@ -199,18 +269,16 @@ async fn run_cycle(
                 url: format!("/lines/{}", candidate.line_id),
                 tag: format!("line-{}", candidate.line_id),
             };
-            if send_to_all_subscriptions(pool, &user_id, &payload, vapid_private_key, vapid_subject)
-                .await?
-            {
-                queries::upsert_line_notification_state(
-                    pool,
-                    &user_id,
-                    &candidate.line_id,
-                    candidate.new_rank,
-                    now,
-                )
-                .await?;
-            }
+            enqueue_push(
+                queue,
+                &user_id,
+                payload,
+                Delivered::Line {
+                    line_id: candidate.line_id.clone(),
+                    rank: candidate.new_rank,
+                },
+                now,
+            );
         }
     }
     queries::advance_cursor_with_grace(
@@ -231,14 +299,7 @@ async fn run_cycle(
         train_delay_threshold_minutes,
     )
     .await?;
-    notify_train_candidates(
-        pool,
-        &train_candidates,
-        vapid_private_key,
-        vapid_subject,
-        now,
-    )
-    .await?;
+    notify_train_candidates(pool, queue, &train_candidates, now).await?;
     queries::advance_cursor_with_grace(
         pool,
         "train_movement_events",
@@ -260,9 +321,8 @@ async fn run_cycle(
 /// logic).
 async fn notify_train_candidates(
     pool: &PgPool,
+    queue: &Queue,
     candidates: &[queries::TrainCandidate],
-    vapid_private_key: &str,
-    vapid_subject: &str,
     now: chrono::DateTime<Utc>,
 ) -> anyhow::Result<()> {
     for candidate in candidates {
@@ -282,25 +342,17 @@ async fn notify_train_candidates(
             delay_minutes,
             journey_context.as_ref(),
         );
-        if send_to_all_subscriptions(
-            pool,
+        enqueue_push(
+            queue,
             &candidate.user_id,
-            &payload,
-            vapid_private_key,
-            vapid_subject,
-        )
-        .await?
-        {
-            queries::upsert_train_notification_state(
-                pool,
-                &candidate.user_id,
-                candidate.tracked_train_id,
-                &status,
+            payload,
+            Delivered::Train {
+                tracked_train_id: candidate.tracked_train_id,
+                status,
                 delay_minutes,
-                now,
-            )
-            .await?;
-        }
+            },
+            now,
+        );
     }
     Ok(())
 }
@@ -380,11 +432,10 @@ fn build_train_notification_payload(
 /// `"train_movement_events"` cursor.
 async fn run_forward_queue_cycle(
     pool: &PgPool,
+    queue: &Queue,
     now: DateTime<Utc>,
     train_delay_threshold_minutes: i32,
     cursor_grace: chrono::Duration,
-    vapid_private_key: &str,
-    vapid_subject: &str,
 ) -> anyhow::Result<()> {
     let cursor = queries::read_cursor(pool, "notifier_forward_queue").await?;
     let (touched_trains_ids, max_id) =
@@ -393,7 +444,7 @@ async fn run_forward_queue_cycle(
         let candidates =
             queries::candidates_for_trains_id(pool, trains_id, train_delay_threshold_minutes)
                 .await?;
-        notify_train_candidates(pool, &candidates, vapid_private_key, vapid_subject, now).await?;
+        notify_train_candidates(pool, queue, &candidates, now).await?;
     }
     queries::advance_cursor_with_grace(
         pool,
@@ -422,9 +473,8 @@ async fn run_forward_queue_cycle(
 /// date (see below), so that has to be controllable from a test.
 async fn run_skip_check_cycle(
     pool: &PgPool,
+    queue: &Queue,
     now: DateTime<Utc>,
-    vapid_private_key: &str,
-    vapid_subject: &str,
 ) -> anyhow::Result<()> {
     // London-local calendar date, NOT `now.date_naive()` (bare UTC) --
     // `journey_legs.service_date` is always a London-local calendar date
@@ -476,24 +526,15 @@ async fn run_skip_check_cycle(
             tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
         };
 
-        if send_to_all_subscriptions(
-            pool,
+        enqueue_push(
+            queue,
             &leg.user_id,
-            &payload,
-            vapid_private_key,
-            vapid_subject,
-        )
-        .await?
-        {
-            queries::upsert_skip_notification_state(
-                pool,
-                &leg.user_id,
-                leg.journey_leg_id,
-                true,
-                now,
-            )
-            .await?;
-        }
+            payload,
+            Delivered::SkippedStop {
+                journey_leg_id: leg.journey_leg_id,
+            },
+            now,
+        );
     }
 
     Ok(())
@@ -514,10 +555,9 @@ async fn run_skip_check_cycle(
 /// read while the suite ran.
 async fn run_template_sweep_cycle(
     pool: &PgPool,
+    queue: &Queue,
     now: DateTime<Utc>,
     auto_commit_lead_minutes: i64,
-    vapid_private_key: &str,
-    vapid_subject: &str,
 ) -> anyhow::Result<()> {
     let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
 
@@ -629,23 +669,15 @@ async fn run_template_sweep_cycle(
                 url: format!("/journeys/{}", leg.journey_id),
                 tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
             };
-            if send_to_all_subscriptions(
-                pool,
+            enqueue_push(
+                queue,
                 &leg.user_id,
-                &payload,
-                vapid_private_key,
-                vapid_subject,
-            )
-            .await?
-            {
-                queries::upsert_unmatched_notification_state(
-                    pool,
-                    &leg.user_id,
-                    leg.journey_leg_id,
-                    now,
-                )
-                .await?;
-            }
+                payload,
+                Delivered::Unmatched {
+                    journey_leg_id: leg.journey_leg_id,
+                },
+                now,
+            );
             continue;
         }
 
@@ -756,48 +788,78 @@ async fn current_train_state(
     Ok((row.try_get("status")?, row.try_get("delay_minutes")?))
 }
 
-/// Sends to every device this user has subscribed on (Decision 5's
-/// per-user, not per-subscription, fan-out). Returns true if at least one
-/// send succeeded (or the user has zero subscriptions -- see below) --
-/// callers use this to decide whether to update notification_state.
-///
-/// A user with zero push_subscriptions rows still counts as "handled" (not
-/// a failure) -- notification_state still advances so a later real
-/// subscription doesn't immediately fire a backlog of stale transitions.
-async fn send_to_all_subscriptions(
-    pool: &PgPool,
-    user_id: &str,
-    payload: &NotificationPayload,
-    vapid_private_key: &str,
-    vapid_subject: &str,
-) -> anyhow::Result<bool> {
-    let subscriptions = queries::push_subscriptions_for_user(pool, user_id).await?;
-    if subscriptions.is_empty() {
-        return Ok(true);
+/// Test-only drivers for the DB-gated cycle tests: run one cycle against a
+/// fresh push queue (local-test sender), then wait for every push it
+/// enqueued to finish -- so a test asserting a `*_notification_state` row
+/// sees the worker's bookkeeping, exactly as a synchronous send used to
+/// leave it.
+#[cfg(test)]
+mod drain_support {
+    use super::*;
+
+    pub(crate) fn test_queue(pool: &PgPool) -> Queue {
+        PushQueue::start(
+            PgBackend::new(
+                pool.clone(),
+                Pusher::for_local_tests(Duration::from_millis(500)),
+            ),
+            push_queue::PushQueueConfig {
+                workers: 4,
+                capacity: 64,
+                per_user_in_flight: 2,
+                per_user_queued: 16,
+                prune_after_timeouts: 3,
+            },
+        )
     }
-    // Sent concurrently (M2 follow-up, 2026-09-27): sequentially, a user
-    // with many unresponsive endpoints (up to
-    // MAX_PUSH_SUBSCRIPTIONS_PER_USER = 20) held up the whole notification
-    // cycle for the sum of their timeouts. Concurrently, one notification
-    // costs at most one send's worst case, however many devices the user
-    // has. Bounded by that per-user subscription cap.
-    let outcomes = futures_util::future::join_all(subscriptions.iter().map(|subscription| {
-        send_to_subscription(vapid_private_key, vapid_subject, subscription, payload)
-    }))
-    .await;
-    let mut any_ok = false;
-    for (subscription, outcome) in subscriptions.iter().zip(outcomes) {
-        match outcome {
-            SendOutcome::Sent => any_ok = true,
-            SendOutcome::Expired => {
-                queries::delete_push_subscription(pool, subscription.id).await?;
-            }
-            SendOutcome::TransientFailure => {
-                tracing::warn!(user_id, endpoint = %subscription.endpoint, "transient push send failure, will retry next real transition");
-            }
-        }
+
+    async fn drain(queue: Queue) {
+        queue.wait_idle().await;
+        let report = queue.shutdown(Duration::from_secs(5)).await;
+        assert!(report.drained, "the test push queue must drain");
     }
-    Ok(any_ok)
+
+    pub(crate) async fn cycle_and_drain(
+        pool: &PgPool,
+        now: DateTime<Utc>,
+        cooldown: chrono::Duration,
+        train_delay_threshold_minutes: i32,
+        cursor_grace: chrono::Duration,
+    ) -> anyhow::Result<()> {
+        let queue = test_queue(pool);
+        let result = run_cycle(
+            pool,
+            &queue,
+            now,
+            cooldown,
+            train_delay_threshold_minutes,
+            cursor_grace,
+        )
+        .await;
+        drain(queue).await;
+        result
+    }
+
+    pub(crate) async fn sweep_and_drain(
+        pool: &PgPool,
+        now: DateTime<Utc>,
+        auto_commit_lead_minutes: i64,
+    ) -> anyhow::Result<()> {
+        let queue = test_queue(pool);
+        let result = run_template_sweep_cycle(pool, &queue, now, auto_commit_lead_minutes).await;
+        drain(queue).await;
+        result
+    }
+
+    pub(crate) async fn skip_check_and_drain(
+        pool: &PgPool,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let queue = test_queue(pool);
+        let result = run_skip_check_cycle(pool, &queue, now).await;
+        drain(queue).await;
+        result
+    }
 }
 
 #[cfg(test)]
@@ -896,6 +958,7 @@ mod copy_tests {
 
 #[cfg(test)]
 mod db_tests {
+    use super::drain_support::*;
     use super::*;
     use sqlx::postgres::PgPoolOptions;
 
@@ -979,10 +1042,10 @@ mod db_tests {
     /// Testing section). A second `run_cycle` with no new data must not
     /// panic and must leave the state unchanged (idempotent).
     ///
-    /// Deliberately seeds NO `push_subscriptions` row: `send_to_all_subscriptions`
-    /// only advances `line_notification_state` when a send actually
+    /// Deliberately seeds NO `push_subscriptions` row: the push queue's
+    /// worker only advances `line_notification_state` when a send actually
     /// succeeds OR the user has zero subscriptions ("still counts as
-    /// handled" -- see that function's own doc comment) -- a subscription
+    /// handled" -- see `push_queue`'s module doc) -- a subscription
     /// pointed at an invalid endpoint would genuinely fail the send and
     /// (correctly) leave the state untouched, which would make this test
     /// non-deterministic about what it's actually checking. The
@@ -1028,7 +1091,7 @@ mod db_tests {
         // behavior is asserted directly by
         // `queries::tests::advance_cursor_with_grace_*` instead.
         let grace = chrono::Duration::zero();
-        run_cycle(&pool, Utc::now(), cooldown, 15, grace, "not-a-real-vapid-key", "mailto:test@example.invalid")
+        cycle_and_drain(&pool, Utc::now(), cooldown, 15, grace)
             .await
             .expect("run_cycle must return Ok even though the send itself fails against an invalid endpoint");
 
@@ -1040,17 +1103,9 @@ mod db_tests {
 
         // Idempotent replay: no new history, must not panic and must
         // leave the state unchanged.
-        run_cycle(
-            &pool,
-            Utc::now(),
-            cooldown,
-            15,
-            grace,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("second run_cycle must also return Ok");
+        cycle_and_drain(&pool, Utc::now(), cooldown, 15, grace)
+            .await
+            .expect("second run_cycle must also return Ok");
         let (rank_after_replay, _) = queries::line_notification_state(&pool, user_id, line_id)
             .await
             .expect("read state again")
@@ -1062,10 +1117,196 @@ mod db_tests {
 
         cleanup(&pool, user_id, line_id).await;
     }
+
+    async fn seed_line_transition(pool: &PgPool, line_id: &str, user_ids: &[&str]) -> i64 {
+        for user_id in user_ids {
+            seed_user(pool, user_id).await;
+            sqlx::query(
+                "INSERT INTO pinned_lines (user_id, line_id, pinned_at) VALUES ($1, $2, NOW())",
+            )
+            .bind(user_id)
+            .bind(line_id)
+            .execute(pool)
+            .await
+            .expect("seed pin");
+        }
+        let mut last_id = 0;
+        for severity in [
+            common::Severity::GoodService,
+            common::Severity::SevereDelays,
+        ] {
+            last_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+                 VALUES ($1, $2, NOW()) RETURNING id",
+            )
+            .bind(line_id)
+            .bind(status_json(severity))
+            .fetch_one(pool)
+            .await
+            .expect("seed history row");
+        }
+        last_id
+    }
+
+    async fn seed_subscription(pool: &PgPool, user_id: &str, endpoint: &str) {
+        sqlx::query(
+            "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(user_id)
+        .bind(endpoint)
+        .bind(send::tests::TEST_P256DH)
+        .bind(send::tests::TEST_AUTH)
+        .execute(pool)
+        .await
+        .expect("seed push subscription");
+    }
+
+    /// SVC-02 end to end: a user whose 20 subscriptions all point at a
+    /// tarpit is notified in the same cycle as a user with a healthy
+    /// endpoint. The cycle itself returns without waiting on either send,
+    /// and the healthy user's push is delivered and recorded while the
+    /// tarpit user's is still hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_tarpit_user -- --ignored --test-threads=1`"]
+    async fn a_tarpit_user_delays_neither_the_cycle_nor_another_users_push() {
+        const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+        let pool = connect().await;
+        let (tarpit_user, fine_user) = ("TEST-NOTIFIER-TARPIT-USER", "TEST-NOTIFIER-FINE-USER");
+        let line_id = "TEST-NOTIFIER-TARPIT-LINE";
+        cleanup(&pool, tarpit_user, line_id).await;
+        cleanup(&pool, fine_user, line_id).await;
+        seed_line_transition(&pool, line_id, &[tarpit_user, fine_user]).await;
+
+        let tarpit = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_delay(Duration::from_secs(60)))
+            .mount(&tarpit)
+            .await;
+        let fine = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&fine)
+            .await;
+        for i in 0..20 {
+            seed_subscription(&pool, tarpit_user, &format!("{}/tarpit-{i}", tarpit.uri())).await;
+        }
+        seed_subscription(&pool, fine_user, &format!("{}/fine", fine.uri())).await;
+
+        let queue = PushQueue::start(
+            PgBackend::new(pool.clone(), Pusher::for_local_tests(PER_ATTEMPT_TIMEOUT)),
+            push_queue::PushQueueConfig {
+                workers: 8,
+                capacity: 64,
+                per_user_in_flight: 2,
+                per_user_queued: 16,
+                prune_after_timeouts: 3,
+            },
+        );
+        let started = std::time::Instant::now();
+        run_cycle(
+            &pool,
+            &queue,
+            Utc::now(),
+            chrono::Duration::minutes(20),
+            15,
+            chrono::Duration::zero(),
+        )
+        .await
+        .expect("run_cycle");
+        let cycle_took = started.elapsed();
+        assert!(
+            cycle_took < Duration::from_secs(2),
+            "the cycle must not wait on any push send (took {cycle_took:?})"
+        );
+
+        let deadline = std::time::Instant::now() + PER_ATTEMPT_TIMEOUT / 2;
+        loop {
+            if queries::line_notification_state(&pool, fine_user, line_id)
+                .await
+                .expect("read state")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the healthy user's push must land well inside the tarpit's timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            queries::line_notification_state(&pool, tarpit_user, line_id)
+                .await
+                .expect("read state")
+                .is_none(),
+            "nothing is recorded for the tarpit user while its sends hang"
+        );
+
+        queue.shutdown(Duration::from_millis(10)).await;
+        cleanup(&pool, tarpit_user, line_id).await;
+        cleanup(&pool, fine_user, line_id).await;
+    }
+
+    /// DB2-25, made explicit: when every send for a notification fails, no
+    /// state row is written, the cursor still advances, and the row is
+    /// retried only while the cursor's grace window keeps re-reading it --
+    /// here, with a zero grace window, exactly one more cycle. After that
+    /// the transition is not re-sent (no re-sending forever).
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_failed_line_push -- --ignored --test-threads=1`"]
+    async fn a_failed_line_push_is_retried_within_the_grace_window_then_dropped() {
+        let pool = connect().await;
+        let user_id = "TEST-NOTIFIER-FAILING-USER";
+        let line_id = "TEST-NOTIFIER-FAILING-LINE";
+        cleanup(&pool, user_id, line_id).await;
+        let last_history_id = seed_line_transition(&pool, line_id, &[user_id]).await;
+
+        let failing = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            // Two cycles see the row, each makes 3 fast attempts at a 5xx.
+            .expect(6)
+            .mount(&failing)
+            .await;
+        seed_subscription(&pool, user_id, &format!("{}/p", failing.uri())).await;
+
+        for _ in 0..3 {
+            cycle_and_drain(
+                &pool,
+                Utc::now(),
+                chrono::Duration::minutes(20),
+                15,
+                chrono::Duration::zero(),
+            )
+            .await
+            .expect("run_cycle");
+        }
+
+        assert!(
+            queries::line_notification_state(&pool, user_id, line_id)
+                .await
+                .expect("read state")
+                .is_none(),
+            "an undelivered notification is never recorded as sent"
+        );
+        let cursor = queries::read_cursor(&pool, "line_status_history")
+            .await
+            .expect("read cursor");
+        assert!(
+            cursor.last_processed_id >= last_history_id,
+            "the cursor advances past the rows even though the push failed"
+        );
+        failing.verify().await;
+        cleanup(&pool, user_id, line_id).await;
+    }
 }
 
 #[cfg(test)]
 mod sweep_cycle_tests {
+    use super::drain_support::*;
     use super::*;
     use sqlx::postgres::PgPoolOptions;
 
@@ -1300,12 +1541,10 @@ mod sweep_cycle_tests {
         .await
         .expect("seed published schedule row");
 
-        run_template_sweep_cycle(
+        sweep_and_drain(
             &pool,
             Utc::now(),
             1440, // generous lead window -- a seeded 00:00:00 depart_after is always "due" by the time this test runs
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
         )
         .await
         .expect("first run_template_sweep_cycle must succeed");
@@ -1331,15 +1570,9 @@ mod sweep_cycle_tests {
         let train_subscription_id =
             train_subscription_id.expect("a train_subscription_id must be set on auto-commit");
 
-        run_template_sweep_cycle(
-            &pool,
-            Utc::now(),
-            1440,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("second run_template_sweep_cycle must also succeed");
+        sweep_and_drain(&pool, Utc::now(), 1440)
+            .await
+            .expect("second run_template_sweep_cycle must also succeed");
 
         let journeys_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM journeys WHERE source_template_id = $1")
@@ -1496,12 +1729,10 @@ mod sweep_cycle_tests {
         .await
         .expect("seed published schedule rows");
 
-        run_template_sweep_cycle(
+        sweep_and_drain(
             &pool,
             Utc::now(),
             120, // the spec's own suggested default -- irrelevant here since a fully-open leg is always due
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
         )
         .await
         .expect("run_template_sweep_cycle must succeed for a fully-open-window leg");
@@ -1632,15 +1863,9 @@ mod sweep_cycle_tests {
         .await
         .expect("seed an unrelated published row so the DAY counts as published");
 
-        run_template_sweep_cycle(
-            &pool,
-            Utc::now(),
-            1440,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("first run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, Utc::now(), 1440)
+            .await
+            .expect("first run_template_sweep_cycle must succeed");
 
         let journey_id: i64 =
             sqlx::query_scalar("SELECT id FROM journeys WHERE source_template_id = $1")
@@ -1670,15 +1895,9 @@ mod sweep_cycle_tests {
         assert_eq!(last_notified_unmatched, Some(true));
         let first_at = last_notified_unmatched_at.expect("last_notified_unmatched_at must be set");
 
-        run_template_sweep_cycle(
-            &pool,
-            Utc::now(),
-            1440,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("second run_template_sweep_cycle must also succeed");
+        sweep_and_drain(&pool, Utc::now(), 1440)
+            .await
+            .expect("second run_template_sweep_cycle must also succeed");
 
         let (_, last_notified_unmatched_at_after): (Option<bool>, Option<DateTime<Utc>>) =
             sqlx::query_as(
@@ -1762,15 +1981,9 @@ mod sweep_cycle_tests {
 
         // 00:37 -- an hourly sweep's first tick after midnight, exactly the
         // reported scenario.
-        run_template_sweep_cycle(
-            &pool,
-            london_now(today, 0, 37),
-            120,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, london_now(today, 0, 37), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
 
         assert_eq!(
             committed_train_uid(&pool, template_id).await.as_deref(),
@@ -1822,15 +2035,9 @@ mod sweep_cycle_tests {
         seed_departure(&pool, today, departed_uid, 9, 10).await;
         seed_departure(&pool, today, upcoming_uid, 10, 15).await;
 
-        run_template_sweep_cycle(
-            &pool,
-            london_now(today, 9, 30),
-            120,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, london_now(today, 9, 30), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
 
         assert_eq!(
             committed_train_uid(&pool, template_id).await.as_deref(),
@@ -1878,15 +2085,9 @@ mod sweep_cycle_tests {
         seed_departure(&pool, today, early_uid, 5, 50).await;
         seed_departure(&pool, today, commuter_uid, 8, 20).await;
 
-        run_template_sweep_cycle(
-            &pool,
-            london_now(today, 4, 0),
-            120,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, london_now(today, 4, 0), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
 
         assert_eq!(
             committed_train_uid(&pool, template_id).await,
@@ -1898,15 +2099,9 @@ mod sweep_cycle_tests {
         // Now inside the lead window (07:30 is within 120 minutes of 09:00):
         // the same leg commits, and to the 08:20 rather than the 05:50 that
         // has already gone.
-        run_template_sweep_cycle(
-            &pool,
-            london_now(today, 7, 30),
-            120,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("second run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, london_now(today, 7, 30), 120)
+            .await
+            .expect("second run_template_sweep_cycle must succeed");
 
         assert_eq!(
             committed_train_uid(&pool, template_id).await.as_deref(),
@@ -1942,15 +2137,9 @@ mod sweep_cycle_tests {
             seed_auto_template(&pool, user_id, "E2E Enrichment", today, None, None).await;
         seed_departure(&pool, today, train_uid, 23, 30).await;
 
-        run_template_sweep_cycle(
-            &pool,
-            london_now(today, 9, 30),
-            120,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, london_now(today, 9, 30), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
 
         let (origin_crs, destination_crs, scheduled_departure): (
             Option<String>,
@@ -2053,15 +2242,9 @@ mod sweep_cycle_tests {
             "this test needs an unpublished day; another fixture has left rows for today behind"
         );
 
-        run_template_sweep_cycle(
-            &pool,
-            london_now(today, 0, 37),
-            120,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("run_template_sweep_cycle must succeed");
+        sweep_and_drain(&pool, london_now(today, 0, 37), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
 
         let notified: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM journey_leg_notification_state s \
@@ -2096,9 +2279,9 @@ mod sweep_cycle_tests {
     /// nothing, silently skipping every skip-check for this leg for the
     /// whole BST gap hour.
     ///
-    /// No `push_subscriptions` row is seeded for this user, so
-    /// `send_to_all_subscriptions` takes its own documented "zero
-    /// subscriptions still counts as handled" branch and
+    /// No `push_subscriptions` row is seeded for this user, so the push
+    /// queue's worker takes its documented "zero subscriptions still counts
+    /// as handled" branch and
     /// `journey_leg_notification_state` gets written regardless of whether
     /// a real push was ever attempted -- letting this test observe "the leg
     /// was found and judged skipped" without needing a live push endpoint.
@@ -2197,14 +2380,9 @@ mod sweep_cycle_tests {
         .await
         .expect("seed station_samples row");
 
-        run_skip_check_cycle(
-            &pool,
-            now,
-            "not-a-real-vapid-key",
-            "mailto:test@example.invalid",
-        )
-        .await
-        .expect("run_skip_check_cycle must succeed");
+        skip_check_and_drain(&pool, now)
+            .await
+            .expect("run_skip_check_cycle must succeed");
 
         let last_notified_skipped: Option<bool> = sqlx::query_scalar(
             "SELECT last_notified_skipped FROM journey_leg_notification_state \

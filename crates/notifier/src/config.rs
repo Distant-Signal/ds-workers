@@ -120,6 +120,53 @@ pub struct Config {
     /// drifting out of sync with the chart again.
     #[arg(long, env, default_value = "info")]
     pub log_level: String,
+
+    /// Push worker pool size (SVC-02): how many notifications are being
+    /// sent at once. Each one fans out to all of its user's subscriptions
+    /// concurrently. See `push_queue`'s module doc.
+    #[arg(long, env, default_value_t = 8)]
+    pub push_workers: usize,
+
+    /// Bound on notifications waiting for a worker. When it is full a new
+    /// notification is dropped (counted in
+    /// `distant_signal_notifier_push_dropped_total{reason="queue_full"}`)
+    /// and re-decided only if its source row is polled again.
+    #[arg(long, env, default_value_t = 1024)]
+    pub push_queue_capacity: usize,
+
+    /// At most this many of ONE user's notifications are sent at once, so a
+    /// user whose endpoints are slow or tarpitting holds at most this many
+    /// of `push_workers`.
+    #[arg(long, env, default_value_t = 2)]
+    pub push_per_user_in_flight: usize,
+
+    /// At most this many of ONE user's notifications wait in the queue, so
+    /// one user can't fill `push_queue_capacity` either (excess dropped,
+    /// `reason="user_queue_full"`).
+    #[arg(long, env, default_value_t = 64)]
+    pub push_per_user_queued: usize,
+
+    /// A push subscription that times out this many times in a row (no
+    /// successful delivery in between) is deleted, like a 404/410 one.
+    /// Counted in memory, so the count restarts with the pod.
+    #[arg(long, env, default_value_t = 3)]
+    pub push_prune_after_timeouts: u32,
+
+    /// On SIGTERM/SIGINT, how long queued and in-flight pushes get to finish
+    /// before they are abandoned. Keep it under the pod's
+    /// terminationGracePeriodSeconds (30 s by default).
+    #[arg(long, env, default_value_t = 20)]
+    pub push_shutdown_grace_secs: u64,
+
+    /// Port for this service's Prometheus `/metrics` listener (same default
+    /// as aggregator/enricher; the chart sets it from `metrics.port`).
+    #[arg(long, env, default_value_t = 9091)]
+    pub metrics_port: u16,
+
+    /// Whether to start the `/metrics` listener at all. The chart always
+    /// renders this from `metrics.enabled`, same as enricher.
+    #[arg(long, env, default_value_t = true)]
+    pub metrics_enabled: bool,
 }
 
 impl Config {
@@ -158,7 +205,41 @@ impl Config {
             "template_sweep_poll_interval_secs (--template-sweep-poll-interval-secs / \
              TEMPLATE_SWEEP_POLL_INTERVAL_SECS) must be greater than zero"
         );
+        anyhow::ensure!(
+            self.push_workers > 0,
+            "push_workers (--push-workers / PUSH_WORKERS) must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.push_queue_capacity > 0,
+            "push_queue_capacity (--push-queue-capacity / PUSH_QUEUE_CAPACITY) must be greater \
+             than zero"
+        );
+        anyhow::ensure!(
+            self.push_per_user_in_flight > 0,
+            "push_per_user_in_flight (--push-per-user-in-flight / PUSH_PER_USER_IN_FLIGHT) must \
+             be greater than zero"
+        );
+        anyhow::ensure!(
+            self.push_per_user_queued > 0,
+            "push_per_user_queued (--push-per-user-queued / PUSH_PER_USER_QUEUED) must be \
+             greater than zero"
+        );
+        anyhow::ensure!(
+            self.push_prune_after_timeouts > 0,
+            "push_prune_after_timeouts (--push-prune-after-timeouts / \
+             PUSH_PRUNE_AFTER_TIMEOUTS) must be greater than zero"
+        );
         Ok(())
+    }
+
+    pub fn push_queue_config(&self) -> crate::push_queue::PushQueueConfig {
+        crate::push_queue::PushQueueConfig {
+            workers: self.push_workers,
+            capacity: self.push_queue_capacity,
+            per_user_in_flight: self.push_per_user_in_flight,
+            per_user_queued: self.push_per_user_queued,
+            prune_after_timeouts: self.push_prune_after_timeouts,
+        }
     }
 }
 
@@ -183,6 +264,42 @@ mod tests {
             vapid_public_key: "test".to_string(),
             vapid_subject: "mailto:test@example.invalid".to_string(),
             log_level: "info".to_string(),
+            push_workers: 8,
+            push_queue_capacity: 1024,
+            push_per_user_in_flight: 2,
+            push_per_user_queued: 64,
+            push_prune_after_timeouts: 3,
+            push_shutdown_grace_secs: 20,
+            metrics_port: 9091,
+            metrics_enabled: true,
+        }
+    }
+
+    #[test]
+    fn zero_push_pool_settings_are_rejected() {
+        for config in [
+            Config {
+                push_workers: 0,
+                ..valid_config()
+            },
+            Config {
+                push_queue_capacity: 0,
+                ..valid_config()
+            },
+            Config {
+                push_per_user_in_flight: 0,
+                ..valid_config()
+            },
+            Config {
+                push_per_user_queued: 0,
+                ..valid_config()
+            },
+            Config {
+                push_prune_after_timeouts: 0,
+                ..valid_config()
+            },
+        ] {
+            assert!(config.validate().is_err());
         }
     }
 
@@ -299,8 +416,8 @@ mod chart_env_wiring_tests {
             .filter(|env| !EXCLUDED_ENV_VARS.contains(&env.as_str()))
             .collect();
         assert!(
-            declared.len() >= 12,
-            "sanity check: this Config declares 13 env vars total (DATABASE_URL excluded above, \
+            declared.len() >= 20,
+            "sanity check: this Config declares 21 env vars total (DATABASE_URL excluded above, \
              see EXCLUDED_ENV_VARS); got {declared:?}"
         );
 
