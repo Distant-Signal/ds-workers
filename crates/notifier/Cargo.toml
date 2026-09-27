@@ -17,25 +17,20 @@ sqlx = { version = "0.8.6", features = ["chrono", "json", "macros", "postgres", 
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# `hyper-client`, not the `isahc` default -- isahc is a libcurl wrapper, and
-# pulling in libcurl as a second, separate C HTTP stack (beyond OpenSSL,
-# which every service in this workspace already needs) for one crate is
-# avoidable; `hyper-client` needs no new system library beyond what
-# `native-tls`/OpenSSL already requires. Re-verified against
-# https://docs.rs/crate/web-push/0.11.0/source/Cargo.toml this session:
-# `default = ["isahc-client"]`, so `default-features = false` is required
-# to actually drop isahc, not just add hyper-client alongside it.
-web-push = { version = "0.11", default-features = false, features = ["hyper-client"] }
+# No client feature at all: `default-features = false` drops the default
+# `isahc-client` (a libcurl wrapper), and `hyper-client` is no longer used
+# either -- sends go through `reqwest` below via web-push's own
+# client-agnostic `request_builder` (see `send.rs::send_message` for why:
+# L9, the transport's resolver must enforce the SSRF guard itself).
+web-push = { version = "0.11", default-features = false }
+# The push transport itself (L9 follow-up): `common`'s public-only-resolver
+# client. Same version/features `common` already builds, so no new crate.
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
+# `web_push::request_builder::build_request`/`parse_response` speak
+# http 0.2 types; same `0.2` web-push itself pins.
+http = "0.2"
 
 [dev-dependencies]
-# Same `0.2` `web-push 0.11.0` itself pins (its own `parse_response(status,
-# body)` takes this crate's `StatusCode`, not a re-export of its own) --
-# `send.rs`'s own test module drives that real function directly (rather
-# than constructing a `web_push::WebPushError` by hand, which is impossible
-# from outside that crate: its `ErrorInfo` payload type is not
-# publicly reachable) to get a genuine `WebPushError` value for each status
-# code its 410/404/401 classification cares about.
-http = "0.2"
 # `PUSH_SEND_TIMEOUT` regression test (M2, 2026-09 security/bug review):
 # a local wiremock server whose delayed response outlasts a short injected
 # per-attempt timeout. Same version `common` already uses.

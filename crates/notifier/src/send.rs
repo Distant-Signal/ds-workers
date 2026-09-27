@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use web_push::{
-    ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushClient, WebPushMessageBuilder,
+    ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessage, WebPushMessageBuilder,
 };
 
 use crate::queries::PushSubscriptionRow;
@@ -166,7 +166,7 @@ async fn send_to_subscription_with_timeout(
         }
     };
 
-    let client = web_push::HyperWebPushClient::new();
+    let client = push_http_client();
     // Two bounded retries on a transient failure, per the spec's Error
     // handling section -- no dead-letter queue, no retry-after-restart
     // mechanism; a genuinely persistent change is picked up again next
@@ -196,12 +196,15 @@ async fn send_to_subscription_with_timeout(
         // new branch -- since a timeout is already documented as one of
         // `SendOutcome::TransientFailure`'s own cases ("5xx, timeout,
         // etc.").
-        match tokio::time::timeout(per_attempt_timeout, client.send(message)).await {
-            Ok(Ok(_)) => return SendOutcome::Sent,
-            Ok(Err(err)) => match classify_web_push_error(&err) {
+        match tokio::time::timeout(per_attempt_timeout, send_message(client, message)).await {
+            Ok(Ok(())) => return SendOutcome::Sent,
+            Ok(Err(PushSendError::Push(err))) => match classify_web_push_error(&err) {
                 SendOutcome::Expired => return SendOutcome::Expired,
                 _ => tracing::warn!(error = ?err, attempt, "web push send failed, retrying"),
             },
+            Ok(Err(PushSendError::Transport(err))) => {
+                tracing::warn!(error = ?err, attempt, "web push send failed, retrying");
+            }
             // A timed-out attempt is NOT retried (M2 follow-up, 2026-09-27):
             // an endpoint that sat silent for the whole timeout is either
             // down or a deliberate tarpit, and retrying it only tripled the
@@ -219,6 +222,71 @@ async fn send_to_subscription_with_timeout(
         }
     }
     SendOutcome::TransientFailure
+}
+
+/// The HTTP client every push send goes through (L9 follow-up,
+/// 2026-09-27): `common::outbound_endpoint_guard::public_only_client_builder`,
+/// i.e. a resolver that refuses private/internal/loopback answers at
+/// CONNECT time, plus no redirects. This replaces
+/// `web_push::HyperWebPushClient`, whose connector resolves the endpoint's
+/// name a second time after [`send_to_subscription`]'s own
+/// `validate_outbound_url` check -- and a 0-TTL rebinding name can answer
+/// differently the second time, so that check alone never constrained
+/// where the POST actually went. Built once and reused (connection pool).
+fn push_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        common::outbound_endpoint_guard::public_only_client_builder()
+            .build()
+            .expect("the push HTTP client's static configuration is always valid")
+    })
+}
+
+/// Largest push-service response body read back, same bound
+/// `web_push::HyperWebPushClient` applied (`MAX_RESPONSE_SIZE`, 64 KiB).
+const MAX_PUSH_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+enum PushSendError {
+    /// Resolution (including a [`common::outbound_endpoint_guard::PublicOnlyResolver`]
+    /// refusal), connect, TLS or body-read failure -- always transient.
+    Transport(reqwest::Error),
+    /// The push service answered with a non-success status (or an
+    /// oversized body), classified by `web_push`'s own `parse_response`.
+    Push(web_push::WebPushError),
+}
+
+/// One push POST: `web_push`'s own `build_request` (headers, encrypted
+/// body) sent through [`push_http_client`], and its own `parse_response`
+/// on the result -- the same two halves `HyperWebPushClient::send` used,
+/// with only the transport swapped.
+async fn send_message(
+    client: &reqwest::Client,
+    message: WebPushMessage,
+) -> Result<(), PushSendError> {
+    let request: http::Request<Vec<u8>> = web_push::request_builder::build_request(message);
+    let (parts, body) = request.into_parts();
+    let mut builder = client.post(parts.uri.to_string());
+    for (name, value) in &parts.headers {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    let mut response = builder
+        .body(body)
+        .send()
+        .await
+        .map_err(PushSendError::Transport)?;
+    let status = http::StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response_body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(PushSendError::Transport)? {
+        response_body.extend_from_slice(&chunk);
+        if response_body.len() > MAX_PUSH_RESPONSE_BYTES {
+            return Err(PushSendError::Push(
+                web_push::WebPushError::ResponseTooLarge,
+            ));
+        }
+    }
+    web_push::request_builder::parse_response(status, response_body).map_err(PushSendError::Push)
 }
 
 /// Whether a single push attempt's `WebPushError` means this SUBSCRIPTION
@@ -418,6 +486,71 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
              same TransientFailure outcome an ordinary failed send already gets -- not hang \
              this call (and the whole notification cycle behind it) forever"
         );
+    }
+
+    /// L9 follow-up: the send path's OWN connector refuses a name that
+    /// resolves to loopback, independently of `send_to_subscription`'s
+    /// up-front `validate_outbound_url` (which this entry point skips) --
+    /// so a rebinding name that passed that check can't be dialled at a
+    /// private address on the second resolution. The mock listens on
+    /// 127.0.0.1; addressing it as `localhost` must never reach it.
+    #[tokio::test]
+    async fn the_send_connector_refuses_a_name_that_resolves_to_loopback() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let subscription = PushSubscriptionRow {
+            id: 1,
+            endpoint: format!("http://localhost:{port}/push-endpoint"),
+            p256dh: TEST_P256DH.to_string(),
+            auth: TEST_AUTH.to_string(),
+        };
+
+        let outcome = send_to_subscription_with_timeout(
+            TEST_VAPID_PRIVATE_KEY_PEM,
+            "mailto:test@example.com",
+            &subscription,
+            &payload(),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(outcome, SendOutcome::TransientFailure);
+    }
+
+    /// The swapped-in transport still speaks the protocol: a 201 is Sent
+    /// and a 410 is Expired, straight through `web_push::parse_response`.
+    #[tokio::test]
+    async fn the_reqwest_transport_classifies_success_and_gone() {
+        for (status, expected) in [(201, SendOutcome::Sent), (410, SendOutcome::Expired)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::header("content-encoding", "aes128gcm"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let subscription = PushSubscriptionRow {
+                id: 1,
+                endpoint: format!("{}/push-endpoint", server.uri()),
+                p256dh: TEST_P256DH.to_string(),
+                auth: TEST_AUTH.to_string(),
+            };
+            let outcome = send_to_subscription_with_timeout(
+                TEST_VAPID_PRIVATE_KEY_PEM,
+                "mailto:test@example.com",
+                &subscription,
+                &payload(),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(outcome, expected, "status {status}");
+        }
     }
 
     fn payload() -> NotificationPayload {
