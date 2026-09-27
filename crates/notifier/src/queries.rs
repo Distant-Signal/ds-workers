@@ -1615,14 +1615,20 @@ pub async fn find_or_create_train_with_cif_schedule(
 /// Generic over the executor (not `&PgPool`) so
 /// [`auto_commit_leg_to_train`] can run it inside its own transaction
 /// alongside the commit it must be atomic with.
-pub async fn create_subscription_for_train<'e, E>(
-    executor: E,
+///
+/// Takes the same `(user_id, trains_id)` advisory lock as the original
+/// (DB2-21, `common::pg::lock_user_train_subscription`), so this copy and
+/// the api's serialise against each other too.
+pub async fn create_subscription_for_train<'e, A>(
+    conn: A,
     trains_id: i64,
     user_id: &str,
 ) -> anyhow::Result<i64>
 where
-    E: sqlx::PgExecutor<'e>,
+    A: sqlx::Acquire<'e, Database = sqlx::Postgres>,
 {
+    let mut tx = conn.begin().await?;
+    common::pg::lock_user_train_subscription(&mut tx, user_id, trains_id).await?;
     let row: (i64,) = sqlx::query_as(
         "WITH existing AS ( \
              SELECT id FROM train_subscriptions \
@@ -1641,8 +1647,9 @@ where
     )
     .bind(user_id)
     .bind(trains_id)
-    .fetch_one(executor)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.0)
 }
 
