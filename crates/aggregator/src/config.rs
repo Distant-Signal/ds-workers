@@ -292,6 +292,11 @@ pub struct Config {
     /// (`ARCHIVE_*` env vars). Off by default; see `crate::archive`.
     #[command(flatten)]
     pub archive: crate::archive::ArchiveArgs,
+
+    /// Windowed full-coverage severity (`FULL_COVERAGE_WINDOW_*`). Off by
+    /// default; see `crate::full_coverage_window`.
+    #[command(flatten)]
+    pub full_coverage_window: crate::full_coverage_window::WindowArgs,
 }
 
 #[cfg(test)]
@@ -377,6 +382,33 @@ mod tests {
         assert!(
             !config.archive.archive_enabled,
             "archiving must be off unless explicitly enabled"
+        );
+        let window = &config.full_coverage_window;
+        assert_eq!(
+            window.mode,
+            crate::full_coverage_window::WindowMode::Off,
+            "windowed full coverage is off unless explicitly enabled"
+        );
+        assert_eq!(window.full_coverage_window_enforce_lines, "");
+        assert_eq!(window.full_coverage_window_min_escalation_rank, 4);
+        assert_eq!(window.full_coverage_window_stats_retention_days, 14);
+    }
+
+    #[test]
+    fn the_window_mode_and_allowlist_parse() {
+        let config = Config::try_parse_from(minimal_args(&[
+            "--full-coverage-window-mode",
+            "shadow",
+            "--full-coverage-window-enforce-lines",
+            "a,b",
+        ]))
+        .unwrap();
+        assert_eq!(
+            config.full_coverage_window.mode,
+            crate::full_coverage_window::WindowMode::Shadow
+        );
+        assert!(
+            Config::try_parse_from(minimal_args(&["--full-coverage-window-mode", "on"])).is_err()
         );
     }
 }

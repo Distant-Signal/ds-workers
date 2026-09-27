@@ -719,7 +719,7 @@ pub const RETENTION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration
 /// Runs one retention `DELETE` in its own transaction under
 /// [`RETENTION_STATEMENT_TIMEOUT`]. Same autocommit-per-statement semantics
 /// the prunes always had, just with the longer budget.
-async fn execute_retention_delete<'q>(
+pub(crate) async fn execute_retention_delete<'q>(
     pool: &PgPool,
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
 ) -> Result<sqlx::postgres::PgQueryResult> {

@@ -10,6 +10,7 @@ mod aggregation;
 mod archive;
 mod config;
 mod dedup;
+mod full_coverage_window;
 mod queries;
 
 use std::collections::HashMap;
@@ -39,6 +40,15 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
+    full_coverage_window::init_metrics();
+    let window_settings =
+        full_coverage_window::WindowSettings::from_args(&config.full_coverage_window);
+    tracing::info!(
+        mode = window_settings.mode.as_str(),
+        allowlist = ?window_settings.allowlist,
+        min_rank = window_settings.min_rank,
+        "windowed full-coverage severity"
+    );
     let (ready, progress) = health_http::spawn_worker(&config.health);
     // INF-5: wait for Postgres (e.g. still in crash recovery after a node
     // reboot) instead of exiting into CrashLoopBackOff. `/healthz` stays
@@ -93,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             &defaults,
             &mut dedup_ledger,
             config.full_coverage_enabled_default,
+            &window_settings,
         )
         .await;
 
@@ -123,6 +134,27 @@ async fn main() -> anyhow::Result<()> {
         .await
         {
             tracing::error!(error = ?err, "retention pruning failed; will retry next interval");
+        }
+        // In its own error scope, after every other prune: the tables come
+        // from an api migration, so an aggregator deployed before it must
+        // not lose its other prunes to "relation does not exist".
+        match full_coverage_window::prune_full_coverage_window_stats(
+            &pool,
+            config
+                .full_coverage_window
+                .full_coverage_window_stats_retention_days,
+        )
+        .await
+        {
+            Ok(pruned) => {
+                metrics::counter!(common::metrics::metric_name(
+                    "aggregator_full_coverage_window_stats_pruned_total"
+                ))
+                .increment(pruned);
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to prune full-coverage window stats; will retry next interval");
+            }
         }
 
         // Records the whole iteration -- aggregation AND retention -- which
@@ -254,6 +286,7 @@ async fn run_cycle(
     defaults: &Defaults,
     dedup_ledger: &mut SeenServiceLedger,
     full_coverage_enabled_default: bool,
+    window_settings: &full_coverage_window::WindowSettings,
 ) -> anyhow::Result<()> {
     // Every custom line loaded here is merged into the global catalogue and
     // then fully re-evaluated below -- matcher pass against every active
@@ -298,13 +331,55 @@ async fn run_cycle(
             tracing::error!(error = ?err, "failed to load full_coverage_line_stats; treating every enabled line as Pending this cycle");
             HashMap::new()
         });
+    // Windowed full coverage (off by default). In `enforce`, the lines it
+    // may change drop out of the legacy whole-day merge above (which never
+    // matched: design section 1) and take the window verdict instead; every
+    // other line -- and every line in `off`/`shadow` -- merges exactly as
+    // before.
+    let enforced_lines: std::collections::HashSet<String> = lines
+        .values()
+        .filter(|line| window_settings.enforces(line, full_coverage_enabled_default))
+        .map(|line| line.id.clone())
+        .collect();
+    let legacy_lines: HashMap<String, LineDefinition> = if enforced_lines.is_empty() {
+        lines.clone()
+    } else {
+        lines
+            .iter()
+            .filter(|(id, _)| !enforced_lines.contains(*id))
+            .map(|(id, line)| (id.clone(), line.clone()))
+            .collect()
+    };
     aggregation::merge_full_coverage(
         &mut reports,
-        &lines,
+        &legacy_lines,
         &full_coverage,
         defaults,
         full_coverage_enabled_default,
     );
+    if window_settings.mode != full_coverage_window::WindowMode::Off {
+        let now = chrono::Utc::now();
+        // Fails open, like the legacy read above: an api/schema without the
+        // window table means no windows, so every verdict is "missing".
+        let windows = full_coverage_window::load_full_coverage_windows(pool, now)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::error!(error = ?err, "failed to load full-coverage windows; no window verdicts this cycle");
+                HashMap::new()
+            });
+        let records = full_coverage_window::apply_windows(
+            &mut reports,
+            &lines,
+            &windows,
+            defaults,
+            window_settings,
+            full_coverage_enabled_default,
+            now,
+        );
+        if let Err(err) = full_coverage_window::write_verdicts(pool, &records).await {
+            tracing::error!(error = ?err, "failed to record full-coverage window verdicts; will retry next cycle");
+        }
+    }
 
     // Batched into `WRITE_CHUNK_SIZE`-sized transactions rather than one
     // autocommitted statement per line -- see `WRITE_CHUNK_SIZE`'s doc
@@ -395,7 +470,11 @@ async fn run_cycle(
     // `merge_full_coverage_stats`'s severity-overwrite branch could not
     // affect production (it can -- see that function's own doc comment for
     // the demotion bug that reached live traffic through this path).
-    let coverage_lines = lines_with_full_coverage(&reports);
+    // A line enforced by windowed full coverage carries a 60-minute window
+    // in `full_coverage_stats`, which these day/half-hour rollups would
+    // re-add every cycle -- meaningless; `full_coverage_line_window_stats`
+    // is that history instead.
+    let coverage_lines = coverage_rollup_lines(&reports, &enforced_lines);
     let mut coverage_stats_recorded = 0u64;
     for chunk in coverage_lines.chunks(WRITE_CHUNK_SIZE) {
         let mut tx = pool.begin().await?;
@@ -724,6 +803,19 @@ fn lines_with_full_coverage(
         .collect()
 }
 
+/// [`lines_with_full_coverage`], less the lines windowed full coverage
+/// enforces (their `full_coverage_stats` is a 60-minute window, which the
+/// day/half-hour coverage rollups must not re-add every cycle).
+fn coverage_rollup_lines<'a>(
+    reports: &'a HashMap<String, LineStatusReport>,
+    enforced_lines: &std::collections::HashSet<String>,
+) -> Vec<(&'a str, &'a LineStatus)> {
+    lines_with_full_coverage(reports)
+        .into_iter()
+        .filter(|(line_id, _)| !enforced_lines.contains(*line_id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use common::{
@@ -966,5 +1058,32 @@ mod tests {
         let selected = lines_with_full_coverage(&reports);
 
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn coverage_rollups_skip_the_lines_windowed_full_coverage_enforces() {
+        let reports: HashMap<String, LineStatusReport> = ["central", "victoria"]
+            .iter()
+            .map(|id| {
+                (
+                    id.to_string(),
+                    LineStatusReport {
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        mode_name: "tube".to_string(),
+                        operators: vec![],
+                        statuses: vec![status_with_full_coverage_stats(Some(sample_stats()))],
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            coverage_rollup_lines(&reports, &Default::default()).len(),
+            2
+        );
+        let enforced = ["central".to_string()].into_iter().collect();
+        let selected = coverage_rollup_lines(&reports, &enforced);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, "victoria");
     }
 }
