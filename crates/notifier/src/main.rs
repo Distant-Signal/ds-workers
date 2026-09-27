@@ -83,8 +83,9 @@ async fn main() -> anyhow::Result<()> {
         common::metrics::install(config.metrics_port)?;
     }
 
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
+    // application_name, statement/idle-in-transaction timeouts and a short
+    // acquire_timeout; see `common::pg`.
+    let pool = common::pg::PoolSettings::from_env("distant-signal-notifier", 5)?
         .connect(&config.database_url)
         .await?;
 

@@ -25,7 +25,6 @@ use config::Config;
 use llm::LlmClient;
 use retry_backoff::RetryBackoff;
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 
 /// Bare (unprefixed) name of the LLM-call duration histogram, shared by the
 /// `install_with_buckets` bucket override in `main` and the `histogram!`
@@ -52,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
+    // application_name, statement/idle-in-transaction timeouts and a short
+    // acquire_timeout; see `common::pg`.
+    let pool = common::pg::PoolSettings::from_env("distant-signal-enricher", 5)?
         .connect(&config.database_url)
         .await?;
 

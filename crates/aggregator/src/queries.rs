@@ -333,11 +333,13 @@ pub async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> 
         return Ok(0);
     }
 
-    let result = sqlx::query(
-        "DELETE FROM line_status WHERE source = 'aggregator' AND NOT (line_id = ANY($1))",
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM line_status WHERE source = 'aggregator' AND NOT (line_id = ANY($1))",
+        )
+        .bind(current_line_ids),
     )
-    .bind(current_line_ids)
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -707,6 +709,27 @@ pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusRepor
     Ok(())
 }
 
+/// `statement_timeout` for each retention prune statement, raised with
+/// `SET LOCAL` above the pool's 60s default (`common::pg`). The unbatched
+/// `schedule_*` prunes delete a whole service date at a time
+/// (`schedule_calling_points_full`: ~1M rows), which can legitimately take
+/// minutes; 10 minutes still bounds a runaway well inside the cycle.
+pub const RETENTION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Runs one retention `DELETE` in its own transaction under
+/// [`RETENTION_STATEMENT_TIMEOUT`]. Same autocommit-per-statement semantics
+/// the prunes always had, just with the longer budget.
+async fn execute_retention_delete<'q>(
+    pool: &PgPool,
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+) -> Result<sqlx::postgres::PgQueryResult> {
+    let mut tx = pool.begin().await?;
+    common::pg::set_local_statement_timeout(&mut tx, RETENTION_STATEMENT_TIMEOUT).await?;
+    let result = query.execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
 /// Deletes `line_status_history` rows older than `retention_days`.
 ///
 /// Probes `MIN(computed_at)` first (one descent of
@@ -723,11 +746,13 @@ pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
     if due != Some(true) {
         return Ok(0);
     }
-    let result = sqlx::query(
-        "DELETE FROM line_status_history WHERE computed_at < NOW() - ($1 || ' days')::interval",
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM line_status_history WHERE computed_at < NOW() - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
     )
-    .bind(retention_days.to_string())
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -764,17 +789,19 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
     }
     let mut pruned = 0u64;
     loop {
-        let result = sqlx::query(
-            "DELETE FROM trust_event_backlog WHERE id IN ( \
-                SELECT id FROM trust_event_backlog \
-                WHERE received_at < $1 \
-                ORDER BY received_at \
-                LIMIT $2 \
-             )",
+        let result = execute_retention_delete(
+            pool,
+            sqlx::query(
+                "DELETE FROM trust_event_backlog WHERE id IN ( \
+                    SELECT id FROM trust_event_backlog \
+                    WHERE received_at < $1 \
+                    ORDER BY received_at \
+                    LIMIT $2 \
+                 )",
+            )
+            .bind(cutoff)
+            .bind(PRUNE_TRUST_EVENT_BACKLOG_BATCH),
         )
-        .bind(cutoff)
-        .bind(PRUNE_TRUST_EVENT_BACKLOG_BATCH)
-        .execute(pool)
         .await?;
         let rows_affected = result.rows_affected();
         pruned += rows_affected;
@@ -822,12 +849,14 @@ pub async fn prune_schedule_destination_departures(
     pool: &PgPool,
     retention_days: i64,
 ) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM schedule_destination_departures \
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_destination_departures \
          WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
     )
-    .bind(retention_days.to_string())
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -850,12 +879,14 @@ pub async fn prune_schedule_destination_departures(
 /// See `Config::schedule_derived_products_retention_days` for the window and
 /// for the one reader whose reach this deliberately bounds.
 pub async fn prune_schedule_calling_points_full(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM schedule_calling_points_full \
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_calling_points_full \
          WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
     )
-    .bind(retention_days.to_string())
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -872,12 +903,14 @@ pub async fn prune_schedule_calling_points_full(pool: &PgPool, retention_days: i
 /// the window (`queries::get_schedule_network_departures` is a single-date
 /// lookup for a board being rendered now).
 pub async fn prune_schedule_network_departures(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM schedule_network_departures \
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_network_departures \
          WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
     )
-    .bind(retention_days.to_string())
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -893,12 +926,14 @@ pub async fn prune_schedule_network_departures(pool: &PgPool, retention_days: i6
 /// (`full-coverage-consumer`'s reload via `GET /private/schedule-line-population`,
 /// which asks for one `(line_id, service_date)` it is gating right now).
 pub async fn prune_schedule_line_population(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM schedule_line_population \
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_line_population \
          WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
     )
-    .bind(retention_days.to_string())
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -981,12 +1016,14 @@ async fn prune_trains_tier(
     );
     let mut pruned = 0u64;
     loop {
-        let rows_affected = sqlx::query(&sql)
-            .bind(retention_days.to_string())
-            .bind(PRUNE_TRAINS_BATCH)
-            .execute(pool)
-            .await?
-            .rows_affected();
+        let rows_affected = execute_retention_delete(
+            pool,
+            sqlx::query(&sql)
+                .bind(retention_days.to_string())
+                .bind(PRUNE_TRAINS_BATCH),
+        )
+        .await?
+        .rows_affected();
         pruned += rows_affected;
         if rows_affected < PRUNE_TRAINS_BATCH as u64 {
             return Ok(pruned);
@@ -1148,11 +1185,12 @@ where
 /// `daily_stats_retention_days` always carries a real value (see
 /// `config.rs` and docs/superpowers/plans/2026-09-01-ldbws-data-retention.md).
 pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result =
+    let result = execute_retention_delete(
+        pool,
         sqlx::query("DELETE FROM line_status_daily_stats WHERE day < (CURRENT_DATE - $1::int)")
-            .bind(retention_days as i32)
-            .execute(pool)
-            .await?;
+            .bind(retention_days as i32),
+    )
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -1241,12 +1279,10 @@ where
 /// to touch this default or its unit. See `config.rs`'s doc comment on
 /// this field for the full reasoning.
 pub async fn prune_half_hourly_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
-    let result = sqlx::query(
+    let result = execute_retention_delete(pool, sqlx::query(
         "DELETE FROM line_status_half_hourly_stats WHERE half_hour_start < NOW() - ($1 || ' hours')::interval",
     )
-    .bind(retention_hours.to_string())
-    .execute(pool)
-    .await?;
+    .bind(retention_hours.to_string())).await?;
     Ok(result.rows_affected())
 }
 
@@ -1336,11 +1372,13 @@ where
 /// and no real data yet to suggest it needs a different window; revisit
 /// once a real producer exists.
 pub async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM line_status_daily_coverage_stats WHERE day < (CURRENT_DATE - $1::int)",
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM line_status_daily_coverage_stats WHERE day < (CURRENT_DATE - $1::int)",
+        )
+        .bind(retention_days as i32),
     )
-    .bind(retention_days as i32)
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -1352,11 +1390,13 @@ pub async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> R
 /// predicate on a `(line_id, service_date)` key is a sequential scan, which
 /// is fine at ~250 rows per day.
 pub async fn prune_full_coverage_line_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM full_coverage_line_stats WHERE service_date < (CURRENT_DATE - $1::int)",
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM full_coverage_line_stats WHERE service_date < (CURRENT_DATE - $1::int)",
+        )
+        .bind(retention_days as i32),
     )
-    .bind(retention_days as i32)
-    .execute(pool)
     .await?;
     Ok(result.rows_affected())
 }
@@ -1419,12 +1459,10 @@ where
 /// reuses the same `half_hourly_stats_retention_hours` config knob -- same
 /// reasoning as `prune_daily_coverage_stats`'s own note.
 pub async fn prune_half_hourly_coverage_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
-    let result = sqlx::query(
+    let result = execute_retention_delete(pool, sqlx::query(
         "DELETE FROM line_status_half_hourly_coverage_stats WHERE half_hour_start < NOW() - ($1 || ' hours')::interval",
     )
-    .bind(retention_hours.to_string())
-    .execute(pool)
-    .await?;
+    .bind(retention_hours.to_string())).await?;
     Ok(result.rows_affected())
 }
 

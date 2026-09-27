@@ -102,6 +102,17 @@ const LICENSING_EXCLUDED_TABLES: &[(&str, &str)] = &[
 /// which is what is held in memory before the upload.
 pub const ARCHIVE_TRAINS_BATCH: i64 = 1000;
 
+/// `statement_timeout` for each archive batch's transaction; see
+/// `archive_and_prune_trains`. Matches the retention prunes'
+/// `queries::RETENTION_STATEMENT_TIMEOUT`.
+const ARCHIVE_BATCH_STATEMENT_TIMEOUT: Duration = crate::queries::RETENTION_STATEMENT_TIMEOUT;
+
+/// `idle_in_transaction_session_timeout` for each archive batch's
+/// transaction, which waits on object storage between statements: three
+/// objects x (120s request timeout + 60s of retries), plus verification,
+/// with room to spare. Still ends a transaction whose task has hung.
+const ARCHIVE_BATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// zstd level: 3 is zstd's own default, a good speed/ratio trade-off for
 /// JSON text.
 const ZSTD_LEVEL: i32 = 3;
@@ -483,6 +494,14 @@ pub async fn archive_and_prune_trains(
 
     loop {
         let mut tx = pool.begin().await?;
+        // The pool's defaults (`common::pg`: 60s statement, 30s idle in
+        // transaction) are too tight here: the batch's transaction stays
+        // open, idle from Postgres's point of view, while `export_batch`
+        // uploads and verifies up to three objects (each request up to 120s,
+        // retried for up to 60s). Raised for this transaction only.
+        common::pg::set_local_statement_timeout(&mut tx, ARCHIVE_BATCH_STATEMENT_TIMEOUT).await?;
+        common::pg::set_local_idle_in_transaction_timeout(&mut tx, ARCHIVE_BATCH_IDLE_TIMEOUT)
+            .await?;
         // Oldest eligible date first, lowest ids first: deterministic, so a
         // retried batch re-selects the same rows and overwrites the same
         // keys. `FOR UPDATE OF t` also blocks a concurrent

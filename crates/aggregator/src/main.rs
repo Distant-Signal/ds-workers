@@ -20,7 +20,6 @@ use common::segments::SegmentRegistry;
 use common::{Defaults, LineDefinition, LineStatus, LineStatusReport};
 use config::Config;
 use dedup::SeenServiceLedger;
-use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,8 +39,10 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
+    // application_name, statement/idle-in-transaction timeouts and a short
+    // acquire_timeout; see `common::pg`. The retention prunes and archive
+    // batches raise the statement timeout for their own transactions.
+    let pool = common::pg::PoolSettings::from_env("distant-signal-aggregator", 10)?
         .connect(&config.database_url)
         .await?;
 
