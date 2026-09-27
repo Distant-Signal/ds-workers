@@ -101,6 +101,11 @@ pub struct Config {
     /// churn metrics (measurement only).
     #[arg(long, env, default_value_t = false)]
     pub carry_forward_semantic_noops: bool,
+
+    /// `/livez` (liveness: loop progress) and `/healthz` (readiness: also
+    /// false until the initial database connection is up) -- SVC-08/INF-5.
+    #[command(flatten)]
+    pub health: common::service_args::HealthArgs,
 }
 
 /// Per-provider request/retry knobs, flattened into [`Config`] and also

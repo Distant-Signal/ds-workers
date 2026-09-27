@@ -167,6 +167,11 @@ pub struct Config {
     /// renders this from `metrics.enabled`, same as enricher.
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
+
+    /// `/livez` (liveness: loop progress) and `/healthz` (readiness: also
+    /// false until the initial database connection is up) -- SVC-08/INF-5.
+    #[command(flatten)]
+    pub health: common::service_args::HealthArgs,
 }
 
 impl Config {
@@ -272,6 +277,10 @@ mod tests {
             push_shutdown_grace_secs: 20,
             metrics_port: 9091,
             metrics_enabled: true,
+            health: common::service_args::HealthArgs {
+                health_bind_url: "127.0.0.1:0".to_string(),
+                progress_stall_secs: 3600,
+            },
         }
     }
 

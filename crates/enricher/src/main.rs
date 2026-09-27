@@ -51,6 +51,24 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
+    let (ready, progress) = health_http::spawn_worker(&config.health);
+    // INF-5: wait for Postgres and Redis (Postgres in crash recovery, Redis
+    // still loading its AOF after a node reboot) instead of exiting into
+    // CrashLoopBackOff. `/healthz` stays 503 until all three steps below
+    // are done; `/livez` stays 200 while they retry.
+    common::startup::retry_until_ready(
+        "Postgres",
+        common::startup::CONNECT_BACKOFF,
+        Some(&progress),
+        || async {
+            use sqlx::Connection;
+            sqlx::PgConnection::connect(&config.database_url)
+                .await?
+                .close()
+                .await
+        },
+    )
+    .await;
     // application_name, statement/idle-in-transaction timeouts and a short
     // acquire_timeout; see `common::pg`.
     let pool = common::pg::PoolSettings::from_env("distant-signal-enricher", 5)?
@@ -58,8 +76,24 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let redis_client = redis::Client::open(config.redis_url.clone())?;
-    let mut redis = redis_client.get_connection_manager().await?;
-    stream::ensure_group(&mut redis).await?;
+    let mut redis = common::startup::retry_until_ready(
+        "Redis",
+        common::startup::CONNECT_BACKOFF,
+        Some(&progress),
+        || redis_client.get_connection_manager(),
+    )
+    .await;
+    common::startup::retry_until_ready(
+        "Redis consumer group",
+        common::startup::CONNECT_BACKOFF,
+        Some(&progress),
+        || {
+            let mut conn = redis.clone();
+            async move { stream::ensure_group(&mut conn).await }
+        },
+    )
+    .await;
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // `config.llm_model` is the ONLY thing ever sent to the endpoint as the
     // literal `model` field of a chat-completion request. `model_version`
@@ -97,7 +131,13 @@ async fn main() -> anyhow::Result<()> {
         config.sweep_interval_secs,
     ));
 
-    let reclaim_redis = redis_client.get_connection_manager().await?;
+    let reclaim_redis = common::startup::retry_until_ready(
+        "Redis (reclaim connection)",
+        common::startup::CONNECT_BACKOFF,
+        Some(&progress),
+        || redis_client.get_connection_manager(),
+    )
+    .await;
     tokio::spawn(reclaim_loop(
         Arc::clone(&enricher),
         reclaim_redis,
@@ -106,6 +146,10 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     loop {
+        // One iteration: a blocking read of at most 5s, then (maybe) one
+        // incident's extraction -- up to three LLM calls, each bounded by
+        // llm_request_timeout_secs. PROGRESS_STALL_SECS must exceed that.
+        progress.beat();
         match stream::read_one(&mut redis).await {
             Ok(Some((entry_id, incident_id))) => {
                 if process_stream_entry(&enricher, &entry_id, &incident_id).await

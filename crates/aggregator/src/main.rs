@@ -39,12 +39,30 @@ async fn main() -> anyhow::Result<()> {
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
     }
+    let (ready, progress) = health_http::spawn_worker(&config.health);
+    // INF-5: wait for Postgres (e.g. still in crash recovery after a node
+    // reboot) instead of exiting into CrashLoopBackOff. `/healthz` stays
+    // 503 until this returns; `/livez` stays 200 while it retries.
+    common::startup::retry_until_ready(
+        "Postgres",
+        common::startup::CONNECT_BACKOFF,
+        Some(&progress),
+        || async {
+            use sqlx::Connection;
+            sqlx::PgConnection::connect(&config.database_url)
+                .await?
+                .close()
+                .await
+        },
+    )
+    .await;
     // application_name, statement/idle-in-transaction timeouts and a short
     // acquire_timeout; see `common::pg`. The retention prunes and archive
     // batches raise the statement timeout for their own transactions.
     let pool = common::pg::PoolSettings::from_env("distant-signal-aggregator", 10)?
         .connect(&config.database_url)
         .await?;
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let static_lines: HashMap<String, LineDefinition> = config
         .lines
@@ -66,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     let mut interval = cycle_interval(Duration::from_secs(config.poll_interval_secs));
 
     loop {
-        interval.tick().await;
+        progress.idle(interval.tick()).await;
 
         let cycle_start = std::time::Instant::now();
         let result = run_cycle(
@@ -114,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
             "aggregator_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
+        progress.beat();
     }
 }
 
