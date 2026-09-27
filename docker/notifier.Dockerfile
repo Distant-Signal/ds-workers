@@ -22,7 +22,7 @@
 # exact Debian bookworm package name/version resolves the same way.
 ARG CARGO_PROFILE=release
 
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 ARG CARGO_PROFILE
 
 RUN apt-get update \
@@ -41,7 +41,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     fi \
     && cp /app/target/${CARGO_PROFILE}/notifier /usr/local/bin/notifier
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
