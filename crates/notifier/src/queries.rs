@@ -1910,7 +1910,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; see the plan's Global Constraints for the \
                 DATABASE_URL incantation, then run with `cargo test -p notifier \
-                a_second_poll_over_an_unchanged_table_finds_no_new_candidates -- --ignored`"]
+                a_second_poll_over_an_unchanged_table_finds_no_new_candidates -- --ignored --test-threads=1`"]
     async fn a_second_poll_over_an_unchanged_table_finds_no_new_candidates() {
         let pool = connect().await;
         let line_id = "TEST-NOTIFIER-CURSOR-LINE";
@@ -2991,7 +2991,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; see the plan's Global Constraints for the \
                 DATABASE_URL incantation, then run with `cargo test -p notifier \
-                push_subscriptions_round_trip_and_self_cleanup_on_delete -- --ignored`"]
+                push_subscriptions_round_trip_and_self_cleanup_on_delete -- --ignored --test-threads=1`"]
     async fn push_subscriptions_round_trip_and_self_cleanup_on_delete() {
         // Mirrors users.rs's own session_round_trip_creates_looks_up_and_deletes
         // shape -- this is the automated half of the 404/410 self-cleanup

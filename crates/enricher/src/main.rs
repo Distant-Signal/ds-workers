@@ -1026,7 +1026,7 @@ mod tests {
     /// -- matching what extract_primary's own truncation guarantees
     /// process_incident will actually send them.
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored --test-threads=1`"]
     async fn process_incident_writes_successfully_and_advances_hash_and_version_when_primary_extraction_is_truncated()
      {
         let pool = test_pool().await;
@@ -1162,7 +1162,7 @@ mod tests {
     /// proving the backoff actually suppresses the wasted call rather than
     /// merely logging about it.
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored --test-threads=1`"]
     async fn process_incident_backs_off_a_second_consecutive_deterministic_failure_without_another_llm_call()
      {
         let pool = test_pool().await;
@@ -1409,7 +1409,7 @@ mod tests {
     /// acked with no LLM call, while an in-flight incident's entry is left
     /// pending and never extracted a second time.
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher reclaim -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher reclaim -- --ignored --test-threads=1`"]
     async fn reclaim_acks_finished_entries_and_skips_in_flight_ones() {
         let pool = test_pool().await;
         let (done, busy) = ("TEST-ENRICHER-RECLAIM-DONE", "TEST-ENRICHER-RECLAIM-BUSY");
@@ -1456,7 +1456,7 @@ mod tests {
     /// requests and advances `source_text_hash` with the flag on, and runs
     /// the full 3-call extraction with it off (the default).
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher carry_forward -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher carry_forward -- --ignored --test-threads=1`"]
     async fn carry_forward_skips_the_llm_for_a_semantic_noop_only_when_enabled() {
         let pool = test_pool().await;
         let incident_id = "TEST-ENRICHER-CARRY-FORWARD-1";

@@ -1473,7 +1473,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                load_incidents_excludes_cleared_rows -- --ignored` against docker compose's postgres"]
+                load_incidents_excludes_cleared_rows -- --ignored --test-threads=1` against docker compose's postgres"]
     async fn load_incidents_excludes_cleared_rows() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
@@ -1517,7 +1517,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                load_incidents_skips_one_malformed_row_instead_of_failing_the_batch -- --ignored`"]
+                load_incidents_skips_one_malformed_row_instead_of_failing_the_batch -- --ignored --test-threads=1`"]
     async fn load_incidents_skips_one_malformed_row_instead_of_failing_the_batch() {
         // The real failure shape: `validity_periods` is JSONB, so Postgres
         // accepts any valid JSON in it, but `serde_json::from_value` into
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                load_incidents_ignores_extraction_stamped_for_superseded_text -- --ignored`"]
+                load_incidents_ignores_extraction_stamped_for_superseded_text -- --ignored --test-threads=1`"]
     async fn load_incidents_ignores_extraction_stamped_for_superseded_text() {
         // End-to-end over the real columns: extraction written for text A
         // (by an OLDER model version -- which must not matter) is loaded;
@@ -1672,7 +1672,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 load_station_samples_skips_one_malformed_row_instead_of_failing_the_batch \
-                -- --ignored`"]
+                -- --ignored --test-threads=1`"]
     async fn load_station_samples_skips_one_malformed_row_instead_of_failing_the_batch() {
         // Same shape as the incidents case, for the other JSONB loader: a
         // `departures` value that isn't a `Vec<StationDeparture>` must cost
@@ -1716,7 +1716,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; see the plan's Global Constraints for the \
                 DATABASE_URL incantation, then run with `cargo test -p aggregator \
-                prune_removed_lines_leaves_other_sources_alone -- --ignored`"]
+                prune_removed_lines_leaves_other_sources_alone -- --ignored --test-threads=1`"]
     async fn prune_removed_lines_leaves_other_sources_alone() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
@@ -1772,7 +1772,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; see the plan's Global Constraints for the \
                 DATABASE_URL incantation, then run with `cargo test -p aggregator \
-                prune_removed_lines_no_ops_on_an_empty_line_id_list -- --ignored`"]
+                prune_removed_lines_no_ops_on_an_empty_line_id_list -- --ignored --test-threads=1`"]
     async fn prune_removed_lines_no_ops_on_an_empty_line_id_list() {
         // Signal Box Audit Low finding: an EMPTY `current_line_ids` (e.g.
         // from a misconfigured or failed-to-load line catalogue) must not
@@ -1822,7 +1822,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; see the plan's Global Constraints for the \
                 DATABASE_URL incantation, then run with `cargo test -p aggregator \
-                a_stable_ldbws_inferred_status_carries_its_from_date_across_two_cycles -- --ignored`"]
+                a_stable_ldbws_inferred_status_carries_its_from_date_across_two_cycles -- --ignored --test-threads=1`"]
     async fn a_stable_ldbws_inferred_status_carries_its_from_date_across_two_cycles() {
         // Real two-cycle aggregate() -> write_line_status() sequence, per
         // docs/superpowers/specs/2026-08-30-inferred-time-ranges-design.md's
@@ -1992,7 +1992,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 a_mid_chunk_failure_rolls_back_every_write_in_that_chunk_but_not_earlier_committed_chunks \
-                -- --ignored` against docker compose's postgres"]
+                -- --ignored --test-threads=1` against docker compose's postgres"]
     async fn a_mid_chunk_failure_rolls_back_every_write_in_that_chunk_but_not_earlier_committed_chunks()
      {
         // Pins down the exact batching semantics `run_cycle`'s
@@ -2129,7 +2129,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 writing_more_lines_than_one_chunk_holds_writes_every_line_exactly_once_with_none_lost_or_duplicated \
-                -- --ignored` against docker compose's postgres"]
+                -- --ignored --test-threads=1` against docker compose's postgres"]
     async fn writing_more_lines_than_one_chunk_holds_writes_every_line_exactly_once_with_none_lost_or_duplicated()
      {
         // Complements `a_mid_chunk_failure_rolls_back_every_write_in_that_chunk_but_not_earlier_committed_chunks`,
@@ -3052,7 +3052,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_daily_stats_accumulates_deduped_contributions_across_a_day -- --ignored` \
+                record_daily_stats_accumulates_deduped_contributions_across_a_day -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_daily_stats_accumulates_deduped_contributions_across_a_day() {
         let database_url =
@@ -3131,7 +3131,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_daily_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored` \
+                record_daily_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_daily_stats_none_still_counts_the_cycle_but_adds_nothing() {
         let database_url =
@@ -3175,7 +3175,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_daily_stats_a_new_day_starts_a_fresh_row -- --ignored` against docker \
+                record_daily_stats_a_new_day_starts_a_fresh_row -- --ignored --test-threads=1` against docker \
                 compose's postgres"]
     async fn record_daily_stats_a_new_day_starts_a_fresh_row() {
         let database_url =
@@ -3223,7 +3223,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_daily_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                prune_daily_stats_deletes_only_rows_older_than_the_retention_window -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn prune_daily_stats_deletes_only_rows_older_than_the_retention_window() {
         let database_url =
@@ -3293,7 +3293,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_half_hourly_stats_accumulates_deduped_contributions_within_a_bucket -- --ignored` \
+                record_half_hourly_stats_accumulates_deduped_contributions_within_a_bucket -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_half_hourly_stats_accumulates_deduped_contributions_within_a_bucket() {
         let database_url =
@@ -3354,7 +3354,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_half_hourly_stats_a_new_bucket_starts_a_fresh_row -- --ignored` against docker \
+                record_half_hourly_stats_a_new_bucket_starts_a_fresh_row -- --ignored --test-threads=1` against docker \
                 compose's postgres"]
     async fn record_half_hourly_stats_a_new_bucket_starts_a_fresh_row() {
         let database_url =
@@ -3402,7 +3402,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_half_hourly_stats_a_bucket_boundary_crossing_a_day_boundary_is_unaffected -- --ignored` \
+                record_half_hourly_stats_a_bucket_boundary_crossing_a_day_boundary_is_unaffected -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_half_hourly_stats_a_bucket_boundary_crossing_a_day_boundary_is_unaffected() {
         // 23:30Z and the next day's 00:00Z are adjacent buckets that also cross
@@ -3453,7 +3453,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_half_hourly_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                prune_half_hourly_stats_deletes_only_rows_older_than_the_retention_window -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn prune_half_hourly_stats_deletes_only_rows_older_than_the_retention_window() {
         let database_url =
@@ -3520,7 +3520,7 @@ mod tests {
     /// sharing one.
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period -- --ignored` \
+                half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn half_hourly_and_daily_stats_reconcile_for_a_single_line_and_period() {
         let database_url =
@@ -3610,7 +3610,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_daily_coverage_stats_accumulates_across_a_day -- --ignored` \
+                record_daily_coverage_stats_accumulates_across_a_day -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_daily_coverage_stats_accumulates_across_a_day() {
         let database_url =
@@ -3671,7 +3671,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored` \
+                record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing() {
         let database_url =
@@ -3715,7 +3715,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_daily_coverage_stats_a_new_day_starts_a_fresh_row -- --ignored` against \
+                record_daily_coverage_stats_a_new_day_starts_a_fresh_row -- --ignored --test-threads=1` against \
                 docker compose's postgres"]
     async fn record_daily_coverage_stats_a_new_day_starts_a_fresh_row() {
         let database_url =
@@ -3766,7 +3766,7 @@ mod tests {
     /// OTHER days of the same line.
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_full_coverage_line_stats -- --ignored`"]
+                prune_full_coverage_line_stats -- --ignored --test-threads=1`"]
     async fn prune_full_coverage_line_stats_deletes_only_days_older_than_the_window() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
@@ -3824,7 +3824,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_daily_coverage_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                prune_daily_coverage_stats_deletes_only_rows_older_than_the_retention_window -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn prune_daily_coverage_stats_deletes_only_rows_older_than_the_retention_window() {
         let database_url =
@@ -3880,7 +3880,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                record_half_hourly_coverage_stats_accumulates_within_a_bucket -- --ignored` \
+                record_half_hourly_coverage_stats_accumulates_within_a_bucket -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn record_half_hourly_coverage_stats_accumulates_within_a_bucket() {
         let database_url =
@@ -3941,7 +3941,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_half_hourly_coverage_stats_deletes_only_rows_older_than_the_retention_window -- --ignored` \
+                prune_half_hourly_coverage_stats_deletes_only_rows_older_than_the_retention_window -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
     async fn prune_half_hourly_coverage_stats_deletes_only_rows_older_than_the_retention_window() {
         let database_url =

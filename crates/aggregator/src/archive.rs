@@ -1208,7 +1208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn archives_every_row_to_expected_keys_then_deletes() {
         let pool = pool().await;
         let date = NaiveDate::from_ymd_opt(2001, 2, 3).unwrap();
@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn failed_upload_keeps_rows_under_retain() {
         let pool = pool().await;
         let date = NaiveDate::from_ymd_opt(2001, 3, 4).unwrap();
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn failed_verification_rolls_back_and_retry_overwrites_same_keys() {
         let pool = pool().await;
         let date = NaiveDate::from_ymd_opt(2001, 4, 5).unwrap();
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn failed_upload_deletes_anyway_under_delete_policy() {
         let pool = pool().await;
         let date = NaiveDate::from_ymd_opt(2001, 5, 6).unwrap();
@@ -1359,7 +1359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn keeps_rows_inside_their_retention_tier() {
         let pool = pool().await;
         // 20 days old: past the 14-day untracked tier, inside the 30-day
@@ -1427,7 +1427,7 @@ mod tests {
     /// SVC-06: no row lock is held while an object is uploaded -- another
     /// connection can lock the batch's rows (NOWAIT) during every PUT.
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn uploads_run_without_holding_the_batch_row_locks() {
         let pool = pool().await;
         let date = NaiveDate::from_ymd_opt(2001, 6, 7).unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
     /// between its export and its delete must not be deleted (its archive
     /// would be stale); the next run re-exports and deletes it.
     #[tokio::test]
-    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored"]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn a_batch_changed_during_upload_is_kept_then_re_exported() {
         let pool = pool().await;
         let date = NaiveDate::from_ymd_opt(2001, 7, 8).unwrap();

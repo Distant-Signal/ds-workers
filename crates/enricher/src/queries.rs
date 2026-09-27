@@ -258,7 +258,7 @@ mod tests {
     /// `write_extraction` must report that via `Ok(false)`, not an error
     /// and not a silent, indistinguishable success.
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher write_extraction -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher write_extraction -- --ignored --test-threads=1`"]
     async fn write_extraction_discards_a_stale_write_when_the_text_moved_underneath_it() {
         let pool = test_pool().await;
         let incident_id = "TEST-ENRICHER-RACE-GUARD-1";
@@ -416,7 +416,7 @@ mod tests {
     /// for byte, including non-ASCII text -- otherwise no old text is ever
     /// recovered and every edit is labelled `unknown`.
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher fetch_extracted_source_text -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher fetch_extracted_source_text -- --ignored --test-threads=1`"]
     async fn fetch_extracted_source_text_recovers_the_hashed_version_from_history() {
         let pool = test_pool().await;
         let incident_id = "TEST-ENRICHER-HISTORY-TEXT-1";
@@ -454,7 +454,7 @@ mod tests {
     /// text, the extraction being carried and the model version are all
     /// still what the caller classified against.
     #[tokio::test]
-    #[ignore = "requires a live database; run with `cargo test -p enricher carry_forward_extraction -- --ignored`"]
+    #[ignore = "requires a live database; run with `cargo test -p enricher carry_forward_extraction -- --ignored --test-threads=1`"]
     async fn carry_forward_extraction_applies_only_when_every_guard_holds() {
         let pool = test_pool().await;
         let incident_id = "TEST-ENRICHER-CARRY-FORWARD-GUARDS-1";
