@@ -4876,6 +4876,11 @@ mod tests {
     // ---- Retention prunes: skip-when-nothing-due, short-batch stop, and
     // index use (DB review F10 / part 2 DB2-6). ----
 
+    /// Statements `count_queries` sees per [`execute_retention_delete`]
+    /// call: its `BEGIN`, the `SET LOCAL statement_timeout` and the `DELETE`
+    /// itself (the one transaction per batch that raises the timeout).
+    const QUERIES_PER_RETENTION_DELETE: usize = 3;
+
     async fn count_queries<F, T>(fut: F) -> (T, usize)
     where
         F: std::future::Future<Output = T>,
@@ -4955,7 +4960,8 @@ mod tests {
 
         // Untracked tier 30 days: 1500 rows = one full batch + one short
         // one, then stop. Tracked tier 100000 days: nothing due, no DELETE.
-        // Probe + 2 DELETEs = 3 statements (the old loop needed 4).
+        // Probe + 2 DELETEs (the old loop needed 3 DELETEs), each DELETE
+        // in its own `execute_retention_delete` transaction.
         let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 30)).await;
         let pruned = pruned.expect("prune_trains");
         let remaining: i64 = sqlx::query_scalar(
@@ -4967,7 +4973,11 @@ mod tests {
         assert_eq!(remaining, 0);
         assert!(pruned >= 1500, "pruned {pruned}");
         if pruned == 1500 {
-            assert_eq!(queries, 3, "probe + one full batch + one short batch");
+            assert_eq!(
+                queries,
+                1 + 2 * QUERIES_PER_RETENTION_DELETE,
+                "probe + one full batch + one short batch"
+            );
         }
     }
 
@@ -5017,7 +5027,11 @@ mod tests {
         assert_eq!(remaining, vec!["TEST-PRUNE-BATCH-KEEP".to_string()]);
         assert!(pruned >= rows as u64, "pruned {pruned}");
         if pruned == rows as u64 {
-            assert_eq!(queries, 4, "probe + two full batches + one short batch");
+            assert_eq!(
+                queries,
+                1 + 3 * QUERIES_PER_RETENTION_DELETE,
+                "probe + two full batches + one short batch"
+            );
         }
     }
 
