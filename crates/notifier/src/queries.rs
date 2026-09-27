@@ -883,13 +883,40 @@ pub async fn upsert_skip_notification_state(
 ///
 /// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 1) --
 /// also exercised directly by this module's own `sweep_tests`.
+///
+/// **M12 (Repeater Signal, 2026-09-26), notifier half.** The template row is
+/// locked (`FOR UPDATE`) and re-checked as still existing and `active`
+/// BEFORE its name or legs are read, and both are read inside the same
+/// transaction that mints the journey -- the same ordering
+/// `api::data::journey_templates::materialize_template` adopted for the
+/// "Run now" path. `api`'s `replace_template`/`delete_template`/pause all
+/// need that row lock too, so they either land before this lock (and we
+/// read their result) or wait until this commits. Previously the legs were
+/// read against the pool before the transaction existed and the name came
+/// from the earlier `due_templates_for` listing, so a concurrent edit could
+/// mint a journey mixing the old name with new legs, and a template paused
+/// or deleted after the listing was still minted.
 pub async fn materialize_due_template_occurrence(
     pool: &PgPool,
     template_id: i64,
     user_id: &str,
-    custom_name: Option<&str>,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Option<i64>> {
+    let mut tx = pool.begin().await?;
+    let locked: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT custom_name FROM journey_templates \
+         WHERE id = $1 AND user_id = $2 AND active \
+         FOR UPDATE",
+    )
+    .bind(template_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((custom_name,)) = locked else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
     #[allow(clippy::type_complexity)]
     let legs: Vec<(
         i32,
@@ -905,13 +932,13 @@ pub async fn materialize_due_template_occurrence(
          FROM journey_template_legs WHERE template_id = $1 ORDER BY leg_order",
     )
     .bind(template_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     if legs.is_empty() {
+        tx.rollback().await?;
         return Ok(None);
     }
 
-    let mut tx = pool.begin().await?;
     let journey_id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO journeys (user_id, custom_name, source_template_id) \
          SELECT $1, $2, $3 \
@@ -926,7 +953,7 @@ pub async fn materialize_due_template_occurrence(
          RETURNING id",
     )
     .bind(user_id)
-    .bind(custom_name)
+    .bind(custom_name.as_deref())
     .bind(template_id)
     .bind(today)
     .fetch_optional(&mut *tx)
@@ -999,7 +1026,6 @@ pub async fn materialize_due_template_occurrence(
 pub struct DueTemplate {
     pub id: i64,
     pub user_id: String,
-    pub custom_name: Option<String>,
 }
 
 pub async fn due_templates_for(
@@ -1007,7 +1033,7 @@ pub async fn due_templates_for(
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<DueTemplate>> {
     let rows = sqlx::query_as::<_, DueTemplate>(
-        "SELECT id, user_id, custom_name FROM journey_templates \
+        "SELECT id, user_id FROM journey_templates \
          WHERE active \
            AND days_of_week IS NOT NULL \
            AND (days_of_week & (1 << (EXTRACT(ISODOW FROM $1::date)::int - 1))) != 0 \
@@ -3269,11 +3295,10 @@ mod sweep_tests {
         .await
         .expect("seed journey_template_legs row");
 
-        let journey_id =
-            materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
-                .await
-                .expect("first materialize call")
-                .expect("the first call must mint a journey");
+        let journey_id = materialize_due_template_occurrence(&pool, template_id, user_id, today)
+            .await
+            .expect("first materialize call")
+            .expect("the first call must mint a journey");
 
         // The user discards today's occurrence. This is exactly what
         // `journeys::delete_journey` does, in one transaction: tombstone the
@@ -3293,10 +3318,9 @@ mod sweep_tests {
             .await
             .expect("delete the occurrence");
 
-        let reminted =
-            materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
-                .await
-                .expect("the post-delete materialize call must not error");
+        let reminted = materialize_due_template_occurrence(&pool, template_id, user_id, today)
+            .await
+            .expect("the post-delete materialize call must not error");
         assert_eq!(
             reminted, None,
             "a deleted occurrence must stay deleted -- re-minting it is what made the user get \
@@ -3310,10 +3334,9 @@ mod sweep_tests {
                 .expect("count journeys");
         assert_eq!(journeys_count, 0, "and no journeys row may exist for it");
 
-        let tomorrows =
-            materialize_due_template_occurrence(&pool, template_id, user_id, None, tomorrow)
-                .await
-                .expect("tomorrow's materialize call");
+        let tomorrows = materialize_due_template_occurrence(&pool, template_id, user_id, tomorrow)
+            .await
+            .expect("tomorrow's materialize call");
         assert!(
             tomorrows.is_some(),
             "skipping TODAY must not suppress tomorrow's occurrence of the same commute -- the \
@@ -3675,12 +3698,12 @@ mod sweep_tests {
         .await
         .expect("seed journey_template_legs row");
 
-        let first = materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
+        let first = materialize_due_template_occurrence(&pool, template_id, user_id, today)
             .await
             .expect("first materialize call");
         let journey_id = first.expect("the first call must mint a journey");
 
-        let second = materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
+        let second = materialize_due_template_occurrence(&pool, template_id, user_id, today)
             .await
             .expect("second materialize call");
         assert_eq!(
@@ -3779,11 +3802,10 @@ mod sweep_tests {
         .await
         .expect("seed journey_template_legs row");
 
-        let journey_id =
-            materialize_due_template_occurrence(&pool, template_id, user_id, None, today)
-                .await
-                .expect("materialize call")
-                .expect("the call must mint a journey");
+        let journey_id = materialize_due_template_occurrence(&pool, template_id, user_id, today)
+            .await
+            .expect("materialize call")
+            .expect("the call must mint a journey");
 
         let window_searched: bool =
             sqlx::query_scalar("SELECT window_searched FROM journey_legs WHERE journey_id = $1")
@@ -3797,6 +3819,135 @@ mod sweep_tests {
              own INSERT, so \"Change train\" survives -- even though every window bound was left \
              unset here"
         );
+
+        sqlx::query("DELETE FROM journey_legs WHERE journey_id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_template_legs WHERE template_id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// M12 regression (Repeater Signal, 2026-09-26), notifier half: the
+    /// sweep's mint must read the template's name and legs under the
+    /// template row lock, inside its own transaction. A concurrent edit
+    /// (here: rename + replace legs, uncommitted and holding the row lock)
+    /// must either be fully visible or fully invisible to the minted
+    /// journey. Before the fix the legs were read against the pool before
+    /// the transaction existed and the INSERT never waited on the row lock,
+    /// so this minted the OLD leg immediately; a paused template was also
+    /// still minted.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                materialize_due_template_occurrence_reads_the_template_under_its_row_lock \
+                -- --ignored --test-threads=1`"]
+    async fn materialize_due_template_occurrence_reads_the_template_under_its_row_lock() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-M12-LOCK-USER";
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name) \
+             VALUES ($1, 'Old Name') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_templates row");
+        sqlx::query(
+            "INSERT INTO journey_template_legs (template_id, leg_order, origin_crs, destination_crs) \
+             VALUES ($1, 1, 'RDG', 'WOK')",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .expect("seed journey_template_legs row");
+
+        // A paused template is not minted, even though the caller (the
+        // sweep) listed it as due before it was paused.
+        sqlx::query("UPDATE journey_templates SET active = FALSE WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("pause template");
+        let paused = materialize_due_template_occurrence(&pool, template_id, user_id, today)
+            .await
+            .expect("materialize a paused template");
+        assert_eq!(paused, None, "a paused template must not be minted");
+        sqlx::query("UPDATE journey_templates SET active = TRUE WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("resume template");
+
+        // A concurrent replace_template-shaped edit holding the row lock.
+        let mut editor = pool.begin().await.expect("begin editor tx");
+        sqlx::query("UPDATE journey_templates SET custom_name = 'New Name' WHERE id = $1")
+            .bind(template_id)
+            .execute(&mut *editor)
+            .await
+            .expect("rename under lock");
+        sqlx::query("DELETE FROM journey_template_legs WHERE template_id = $1")
+            .bind(template_id)
+            .execute(&mut *editor)
+            .await
+            .expect("delete old legs");
+        sqlx::query(
+            "INSERT INTO journey_template_legs (template_id, leg_order, origin_crs, destination_crs) \
+             VALUES ($1, 1, 'RDG', 'PAD')",
+        )
+        .bind(template_id)
+        .execute(&mut *editor)
+        .await
+        .expect("insert new leg");
+
+        let mint_pool = pool.clone();
+        let mint = tokio::spawn(async move {
+            materialize_due_template_occurrence(&mint_pool, template_id, user_id, today).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !mint.is_finished(),
+            "the mint must wait for the template row lock instead of reading around it"
+        );
+        editor.commit().await.expect("commit editor tx");
+
+        let journey_id = mint
+            .await
+            .expect("join mint task")
+            .expect("mint")
+            .expect("the mint must produce a journey");
+        let name: Option<String> =
+            sqlx::query_scalar("SELECT custom_name FROM journeys WHERE id = $1")
+                .bind(journey_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read minted name");
+        let destinations: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT destination_crs FROM journey_legs WHERE journey_id = $1 ORDER BY leg_order",
+        )
+        .bind(journey_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read minted legs");
+        assert_eq!(name.as_deref(), Some("New Name"));
+        assert_eq!(destinations, vec![Some("PAD".to_string())]);
 
         sqlx::query("DELETE FROM journey_legs WHERE journey_id = $1")
             .bind(journey_id)

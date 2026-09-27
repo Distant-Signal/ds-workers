@@ -527,7 +527,6 @@ async fn run_template_sweep_cycle(
             pool,
             template.id,
             &template.user_id,
-            template.custom_name.as_deref(),
             today,
         )
         .await
