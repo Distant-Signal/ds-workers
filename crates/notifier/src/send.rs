@@ -202,12 +202,19 @@ async fn send_to_subscription_with_timeout(
                 SendOutcome::Expired => return SendOutcome::Expired,
                 _ => tracing::warn!(error = ?err, attempt, "web push send failed, retrying"),
             },
+            // A timed-out attempt is NOT retried (M2 follow-up, 2026-09-27):
+            // an endpoint that sat silent for the whole timeout is either
+            // down or a deliberate tarpit, and retrying it only tripled the
+            // time one subscription could hold up the notification cycle
+            // (3 x PUSH_SEND_TIMEOUT = 45s per subscription). Fast failures
+            // (5xx, connection refused) still get the bounded retries.
             Err(_elapsed) => {
                 tracing::warn!(
                     attempt,
                     timeout_ms = per_attempt_timeout.as_millis() as u64,
-                    "web push send timed out, retrying"
+                    "web push send timed out; not retrying"
                 );
+                return SendOutcome::TransientFailure;
             }
         }
     }
@@ -359,10 +366,11 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
     /// that IO, so under load the timeout could fire before any request
     /// reached the mock ("matched 0").
     ///
-    /// If the timeout did NOT cut each attempt off, the mock's 201 would
+    /// If the timeout did NOT cut the attempt off, the mock's 201 would
     /// eventually arrive and the outcome would be `Sent` -- so
-    /// `TransientFailure` plus `.expect(3)` together prove all three
-    /// attempts reached the endpoint and were each ended by the timeout.
+    /// `TransientFailure` plus `.expect(1)` together prove the attempt
+    /// reached the endpoint, was ended by the timeout, and was not retried
+    /// (a timed-out attempt is not retried; see the `Err(_elapsed)` arm).
     #[tokio::test]
     async fn a_hanging_push_endpoint_times_out_instead_of_stalling_forever() {
         // Long enough that a request always reaches the local mock even on
@@ -371,12 +379,13 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(201).set_delay(Duration::from_secs(10)))
-            // Every one of the 3 bounded attempts must actually REACH the
-            // endpoint (verified on drop) -- proves the key material above
-            // got this test past signing/encryption to the real network
-            // call, so the `TransientFailure` below comes from the timeout
-            // and not from an earlier build failure.
-            .expect(3)
+            // Exactly one attempt must REACH the endpoint (verified on
+            // drop): proves the key material above got this test past
+            // signing/encryption to the real network call, so the
+            // `TransientFailure` below comes from the timeout and not from
+            // an earlier build failure, and that the timed-out attempt was
+            // not retried.
+            .expect(1)
             .mount(&server)
             .await;
 

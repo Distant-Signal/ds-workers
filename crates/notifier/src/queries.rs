@@ -66,10 +66,12 @@ pub async fn read_cursor(pool: &PgPool, name: &str) -> anyhow::Result<CursorStat
 /// aggregator's `write_line_status`, `api`'s `upsert_tfl_line_status`, TRUST
 /// ingest, and trust-consumer's own forwarding write).
 ///
-/// The fix, two-phase: this cycle PROPOSES `observed_max_id`
-/// (`pending_id`/`pending_observed_at`), and only PROMOTES a proposal made
-/// by an earlier cycle into `last_processed_id` once that proposal has aged
-/// past `grace`. The promoting cycle has, by construction, just re-read
+/// The fix, two-phase: a cycle PROPOSES `observed_max_id`
+/// (`pending_id`/`pending_observed_at`) when no unpromoted proposal is
+/// already pending, and only PROMOTES a proposal made by an earlier cycle
+/// into `last_processed_id` once that proposal has aged past `grace`. A
+/// pending proposal is held fixed while it ages, even if newer rows keep
+/// arriving (see the H2 note in the body). The promoting cycle has, by construction, just re-read
 /// every row above the old `last_processed_id` -- so a lower-id row that
 /// committed late, inside the grace window, is in THAT read's candidate set
 /// before the cursor ever moves past it. A row can therefore be read by
@@ -102,56 +104,44 @@ pub async fn advance_cursor_with_grace(
     // stale proposal (or a deleted row shrinking `observed_max_id`) would
     // otherwise take it there.
     let new_last = promoted.max(state.last_processed_id);
-    let new_pending = observed_max_id.max(new_last);
 
-    // Bug this closes (2026-09 security/bug review, Finding H2):
-    // `pending_observed_at` must be stamped ONLY when the proposal being
-    // watched actually CHANGES value -- i.e. `new_pending` differs from
-    // the value already recorded as `state.pending_id`. This function used
-    // to bind `now` here unconditionally on every call, which reset the
-    // proposal's age to (at most) one poll interval on every single cycle,
-    // even when `observed_max_id` never moved (the ordinary, common case
-    // once a line settles or a train stops generating fresh events). With
-    // the deployed defaults (`poll_interval_secs=60`,
-    // `cursor_grace_seconds=120`), `now - observed_at` was then ALWAYS
-    // `60s`, which never reaches the `120s` grace threshold above -- so
-    // `last_processed_id` froze forever at whatever it was on the very
-    // first cycle, and every later cycle re-scanned the entire table from
-    // that same frozen watermark. Because that re-scan can return SEVERAL
-    // independent historical candidates together (not just the newest
-    // one), and `decision::decide_user_notification`'s per-candidate
-    // idempotency guard only compares against the CURRENT stored
-    // notification state (not "is this candidate stale relative to a
-    // later one"), an unbounded re-scan window let an old
-    // escalation/de-escalation pair take turns re-firing every time
-    // `cooldown_minutes` elapsed since the other's last send -- see that
-    // function's own doc comment and this crate's
-    // `notifier_cursor_stuck_at_zero_is_the_h2_regression_this_fix_closes`
-    // test below for the full mechanism. Promoting the cursor for real (as
-    // this fix does) bounds the re-scan window to the grace window itself
-    // (a couple of cycles, seconds -- not indefinitely), which is far
-    // shorter than any real `cooldown_minutes`, so that oscillation can no
-    // longer occur; see this function's own regression tests for both
-    // properties this preserves: a genuinely UNCHANGING proposal now DOES
-    // age and promote once `grace` has elapsed since it was first
-    // observed, while a proposal that keeps CHANGING every cycle correctly
-    // never promotes (it is never stable long enough to trust).
-    let new_pending_observed_at = if state.pending_id == Some(new_pending) {
-        // Same value already being watched -- keep its ORIGINAL
-        // observed-at so its age keeps accumulating across cycles, instead
-        // of resetting to "now" just because the poller happened to run
-        // again. `unwrap_or(now)` only matters for the pathological case
-        // of a `pending_id` with no recorded `pending_observed_at` (a
-        // pre-grace-window cursor row written by an older notifier build,
-        // per this module's own `CursorState` doc comment) -- treat that
-        // as freshly observed rather than panicking or back-dating it.
-        state.pending_observed_at.unwrap_or(now)
-    } else {
-        // A brand-new proposal value (including "nothing was pending
-        // before," and the value just promoted above being superseded by
-        // a fresh observation) -- this is the first cycle to see it, so it
-        // starts its own grace window now.
-        now
+    // H2, second pass (services review SVC-01, 2026-09-27): an UNPROMOTED
+    // proposal is held fixed until it promotes, instead of being replaced
+    // by every newer observation. The first H2 fix only stopped
+    // re-stamping an unchanged proposal; it still replaced the proposal
+    // (and restarted its grace window) whenever `observed_max_id` moved.
+    // On a table that gains a row in most poll intervals -- production's
+    // `train_movement_events` had inserts in 1317 of 1440 minutes on
+    // 2026-09-26 -- the proposal therefore changed every cycle, never aged
+    // past `grace`, and `last_processed_id` never promoted: the same
+    // unbounded re-scan H2 described, just on busy tables instead of idle
+    // ones.
+    //
+    // Holding the older proposal is safe. The grace window exists for rows
+    // BELOW a proposal whose inserting transaction had not committed when
+    // the proposal was observed; rows arriving ABOVE it have no bearing on
+    // whether it is safe to promote. So the watermark now advances once
+    // per grace window under continuous inserts (lagging the head by at
+    // most about `grace` plus one poll interval), and a newer observation
+    // becomes the next proposal on the cycle after the current one is
+    // promoted.
+    let (new_pending, new_pending_observed_at) = match (state.pending_id, state.pending_observed_at)
+    {
+        (Some(pending_id), Some(observed_at)) if pending_id > new_last => (pending_id, observed_at),
+        _ => {
+            let new_pending = observed_max_id.max(new_last);
+            // An unchanged value keeps its original observed-at (the
+            // first H2 fix); a new value starts its own grace window now.
+            // `unwrap_or(now)` covers a pending_id with no recorded
+            // observed-at (a cursor row written by an older notifier
+            // build, per `CursorState`'s doc comment).
+            let observed_at = if state.pending_id == Some(new_pending) {
+                state.pending_observed_at.unwrap_or(now)
+            } else {
+                now
+            };
+            (new_pending, observed_at)
+        }
     };
 
     sqlx::query(
@@ -2045,8 +2035,8 @@ mod tests {
     /// never promotes" under realistic cadence). See
     /// `notifier_cursor_stuck_at_zero_is_the_h2_regression_this_fix_closes`
     /// below for many more such cycles at this same cadence, and
-    /// `advance_cursor_with_grace_never_promotes_a_continuously_changing_proposal`
-    /// for the complementary "must NOT promote while unstable" property.
+    /// `advance_cursor_with_grace_promotes_under_continuous_inserts`
+    /// for the busy-table case (a new row in every poll interval).
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
                 advance_cursor_with_grace_only_promotes_a_proposal_once_it_has_aged -- --ignored \
@@ -2315,21 +2305,27 @@ mod tests {
             .ok();
     }
 
-    /// The complementary property to the regression test above: a proposal
-    /// that keeps CHANGING every single cycle -- never stable for as long as
-    /// `grace` -- must correctly NEVER promote, no matter how many cycles
-    /// elapse in total. This is the existing, correct "not yet safe" behavior
-    /// this fix must not break: promoting an id while rows above it are
-    /// still actively appearing would defeat the whole point of the grace
-    /// window (giving any in-flight, out-of-order-committing transaction
-    /// near that id time to land).
+    /// H2, second pass (services review SVC-01): on a busy table the
+    /// observed maximum moves on EVERY poll. The first H2 fix still replaced
+    /// the proposal (restarting its grace window) whenever the observed
+    /// value changed, so under continuous inserts `last_processed_id` never
+    /// promoted at all -- and this test used to assert exactly that as
+    /// intended behaviour. The grace window only protects rows BELOW a
+    /// proposal, so an unpromoted proposal is now held fixed while newer
+    /// rows arrive: it promotes once it has aged `grace`, and the newest
+    /// observation becomes the next proposal on the following cycle.
+    ///
+    /// Polls at the real deployed cadence (60s interval, 120s grace) with a
+    /// new row arriving every interval, and asserts the watermark keeps
+    /// advancing (never more than grace + two intervals behind the head),
+    /// only ever to a value that had been proposed at least `grace` earlier.
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
-                advance_cursor_with_grace_never_promotes_a_continuously_changing_proposal \
+                advance_cursor_with_grace_promotes_under_continuous_inserts \
                 -- --ignored --test-threads=1`"]
-    async fn advance_cursor_with_grace_never_promotes_a_continuously_changing_proposal() {
+    async fn advance_cursor_with_grace_promotes_under_continuous_inserts() {
         let pool = connect().await;
-        let cursor_name = "TEST-NOTIFIER-NEVERSTABLE-CURSOR";
+        let cursor_name = "TEST-NOTIFIER-CONTINUOUS-CURSOR";
         sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
             .bind(cursor_name)
             .execute(&pool)
@@ -2341,26 +2337,69 @@ mod tests {
         let t0 = Utc::now();
 
         let mut cursor = read_cursor(&pool, cursor_name).await.expect("read cursor");
+        // Every value observed so far, with the time it was first observed.
+        let mut observed: Vec<(i64, chrono::DateTime<Utc>)> = Vec::new();
+        let mut promotions = Vec::new();
+        let mut previous_last = 0;
 
-        // observed_max_id grows by 10 on every single tick -- new rows keep
-        // arriving every poll, so no single proposal ever survives two
-        // consecutive ticks unchanged.
-        for tick in 1..=10i64 {
+        for tick in 0..=20i64 {
             let now = t0 + poll_interval * tick as i32;
+            // A new row lands in every single poll interval.
             let observed_max_id = 100 + tick * 10;
+            observed.push((observed_max_id, now));
             let last_processed_id =
                 advance_cursor_with_grace(&pool, cursor_name, &cursor, observed_max_id, now, grace)
                     .await
                     .unwrap_or_else(|err| panic!("advance on tick {tick} failed: {err}"));
-            assert_eq!(
-                last_processed_id, 0,
-                "tick {tick}: a proposal that is superseded by a NEW, different value on every \
-                 single cycle is never stable for the full grace window, so it must never promote"
-            );
             cursor = read_cursor(&pool, cursor_name)
                 .await
                 .expect("re-read cursor");
+
+            assert!(
+                last_processed_id >= previous_last,
+                "tick {tick}: the watermark must never move backwards"
+            );
+            if last_processed_id != previous_last {
+                // Safety: only a value first observed at least `grace` ago
+                // may be promoted.
+                let first_seen = observed
+                    .iter()
+                    .find(|(id, _)| *id == last_processed_id)
+                    .map(|(_, at)| *at)
+                    .unwrap_or_else(|| panic!("tick {tick}: promoted an id never observed"));
+                assert!(
+                    now - first_seen >= grace,
+                    "tick {tick}: promoted {last_processed_id} only {}s after it was first \
+                     observed (grace is {}s)",
+                    (now - first_seen).num_seconds(),
+                    grace.num_seconds()
+                );
+                promotions.push(tick);
+            }
+            // Liveness: once warmed up, the watermark trails the head by at
+            // most grace + two poll intervals.
+            if tick >= 4 {
+                let lag_ticks = (observed_max_id - last_processed_id) / 10;
+                assert!(
+                    lag_ticks <= 4,
+                    "tick {tick}: watermark {last_processed_id} is {lag_ticks} polls behind the \
+                     head {observed_max_id}; under continuous inserts it must keep promoting"
+                );
+            }
+            previous_last = last_processed_id;
         }
+
+        assert_eq!(
+            promotions.first(),
+            Some(&2),
+            "the first proposal (tick 0) must promote as soon as it has aged the 120s grace, at \
+             tick 2, even though a newer row arrived in every interval since"
+        );
+        assert!(
+            promotions.len() >= 6,
+            "the watermark must keep promoting under continuous inserts, got promotions at \
+             {promotions:?}"
+        );
 
         sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
             .bind(cursor_name)

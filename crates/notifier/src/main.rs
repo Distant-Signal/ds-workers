@@ -776,9 +776,19 @@ async fn send_to_all_subscriptions(
     if subscriptions.is_empty() {
         return Ok(true);
     }
+    // Sent concurrently (M2 follow-up, 2026-09-27): sequentially, a user
+    // with many unresponsive endpoints (up to
+    // MAX_PUSH_SUBSCRIPTIONS_PER_USER = 20) held up the whole notification
+    // cycle for the sum of their timeouts. Concurrently, one notification
+    // costs at most one send's worst case, however many devices the user
+    // has. Bounded by that per-user subscription cap.
+    let outcomes = futures_util::future::join_all(subscriptions.iter().map(|subscription| {
+        send_to_subscription(vapid_private_key, vapid_subject, subscription, payload)
+    }))
+    .await;
     let mut any_ok = false;
-    for subscription in &subscriptions {
-        match send_to_subscription(vapid_private_key, vapid_subject, subscription, payload).await {
+    for (subscription, outcome) in subscriptions.iter().zip(outcomes) {
+        match outcome {
             SendOutcome::Sent => any_ok = true,
             SendOutcome::Expired => {
                 queries::delete_push_subscription(pool, subscription.id).await?;
