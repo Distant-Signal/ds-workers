@@ -129,7 +129,9 @@ async fn main() -> anyhow::Result<()> {
     loop {
         // Every arm is one cycle; the wait for the next tick is idle time
         // (`Progress::idle`), so only a single cycle running past
-        // PROGRESS_STALL_SECS reads as a stall.
+        // PROGRESS_STALL_SECS reads as a stall. Cycles only read/write the
+        // DB and hand pushes to `PushQueue::enqueue` (which never awaits),
+        // so the chart's 900s window is far above any healthy cycle.
         progress.beat();
         tokio::select! {
             () = &mut shutdown => {

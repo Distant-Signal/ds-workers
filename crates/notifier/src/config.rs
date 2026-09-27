@@ -279,7 +279,7 @@ mod tests {
             metrics_enabled: true,
             health: common::service_args::HealthArgs {
                 health_bind_url: "127.0.0.1:0".to_string(),
-                progress_stall_secs: 3600,
+                progress_stall_secs: 900,
             },
         }
     }
