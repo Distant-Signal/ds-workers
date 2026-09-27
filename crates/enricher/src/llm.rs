@@ -193,6 +193,139 @@ pub struct LlmClient {
     api_key: Option<String>,
     model: String,
     http: reqwest::Client,
+    /// See [`ProviderPolicy`]; the default is today's behaviour.
+    policy: ProviderPolicy,
+    /// `Some` only when `ProviderPolicy::max_in_flight` is set. Held for the duration of one
+    /// HTTP attempt only, never across a 429 back-off sleep.
+    in_flight: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+}
+
+// ---------------------------------------------------------------------------
+// Provider policy (2026-09-27): the per-provider knobs a slow, rate-limited
+// hosted endpoint needs (reasoning models, 429s, a gateway that cuts calls
+// at ~302 s). Every knob defaults to "off", so `LlmClient::new` sends
+// byte-for-byte the same request as before and never retries in-call.
+// Configured from `LLM_*` env vars in `config.rs`.
+// ---------------------------------------------------------------------------
+
+/// Longest `Retry-After` the in-call 429 retry will sleep for. A longer
+/// server-requested wait fails the call instead (as a provider-transient
+/// error), so one incident never pins a stream/sweep/reclaim loop -- and its
+/// in-flight claim -- for hours; the reclaim loop retries it later.
+pub const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Per-provider request/retry policy.
+#[derive(Debug, Clone)]
+pub struct ProviderPolicy {
+    /// Sent as `max_tokens` when `Some`. Reasoning models need an explicit
+    /// ceiling (Skye's GLM test: 8192) so a runaway reasoning trace is
+    /// bounded rather than consuming the whole gateway window.
+    pub max_tokens: Option<u32>,
+    /// Sent as `reasoning_effort` when `Some` (GLM-5.3 on NVIDIA honours
+    /// only `"low"`; its documented default is `"max"`).
+    pub reasoning_effort: Option<String>,
+    /// Cap on concurrent HTTP attempts across ALL callers sharing this
+    /// client (stream loop + sweep + reclaim). `None` = unlimited, as today.
+    pub max_in_flight: Option<usize>,
+    /// Minimum wait before retrying a 429, even if `Retry-After` is shorter
+    /// or absent.
+    pub rate_limit_min_wait: std::time::Duration,
+    /// In-call retries for 429. 0 = today's behaviour (fail the incident).
+    pub max_rate_limit_retries: u32,
+    /// In-call retries for 502/503/504 and client-side timeouts. 0 = today.
+    ///
+    /// Setting this above 0 also declares that a timeout/504 from this
+    /// provider is a provider-side condition, not something the incident's
+    /// text caused -- see [`LlmClient::is_provider_transient`].
+    pub max_gateway_retries: u32,
+}
+
+impl Default for ProviderPolicy {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            reasoning_effort: None,
+            max_in_flight: None,
+            rate_limit_min_wait: std::time::Duration::from_secs(20),
+            max_rate_limit_retries: 0,
+            max_gateway_retries: 0,
+        }
+    }
+}
+
+/// Typed classification of one failed chat-completion attempt, so callers
+/// can tell "the provider is busy" apart from "this text can't be
+/// extracted". `main.rs` still sees an `anyhow::Error`; use
+/// [`LlmClient::is_provider_transient`] to downcast.
+#[derive(Debug)]
+pub enum LlmCallError {
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
+    GatewayUnavailable {
+        status: u16,
+    },
+    ClientTimeout,
+    Status {
+        status: u16,
+    },
+    /// 200 OK but `content` was null/empty -- the typical failure of a
+    /// reasoning model that spent its whole budget thinking.
+    EmptyContent {
+        finish_reason: Option<String>,
+    },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for LlmCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RateLimited { retry_after } => {
+                write!(
+                    f,
+                    "LLM endpoint rate-limited (429, retry_after={retry_after:?})"
+                )
+            }
+            Self::GatewayUnavailable { status } => {
+                write!(f, "LLM endpoint gateway error/timeout ({status})")
+            }
+            Self::ClientTimeout => write!(f, "LLM request exceeded the client timeout"),
+            Self::Status { status } => write!(f, "LLM endpoint returned HTTP {status}"),
+            Self::EmptyContent { finish_reason } => write!(
+                f,
+                "LLM returned no content (finish_reason={finish_reason:?}); likely exhausted \
+                 max_tokens on reasoning"
+            ),
+            Self::Other(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for LlmCallError {}
+
+impl LlmCallError {
+    /// Metric label for `enricher_llm_call_total{outcome=...}`.
+    pub fn outcome_label(&self) -> &'static str {
+        match self {
+            Self::RateLimited { .. } => "rate_limited",
+            Self::GatewayUnavailable { .. } => "gateway_error",
+            Self::ClientTimeout => "timeout",
+            Self::Status { .. } => "http_error",
+            Self::EmptyContent { .. } => "empty_content",
+            Self::Other(_) => "error",
+        }
+    }
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
 }
 
 #[derive(Serialize)]
@@ -201,6 +334,12 @@ struct ChatCompletionRequest<'a> {
     messages: Vec<ChatMessage>,
     response_format: ResponseFormat,
     temperature: f32,
+    /// Omitted from the wire when `None` (the default policy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    /// Omitted from the wire when `None` (the default policy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -231,11 +370,18 @@ struct ChatCompletionResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoiceMessage {
-    content: String,
+    /// `Option`: reasoning models legitimately return
+    /// `null` content when they run out of tokens mid-reasoning; that is
+    /// now a typed `LlmCallError::EmptyContent` instead of an opaque serde
+    /// error.
+    #[serde(default)]
+    content: Option<String>,
 }
 
 const PRIMARY_SCHEMA_NAME: &str = "incident_extraction";
@@ -517,6 +663,37 @@ impl LlmClient {
             api_key,
             model,
             http,
+            policy: ProviderPolicy::default(),
+            in_flight: None,
+        }
+    }
+
+    /// Opts into a non-default [`ProviderPolicy`].
+    pub fn with_provider_policy(mut self, policy: ProviderPolicy) -> Self {
+        self.in_flight = policy
+            .max_in_flight
+            .map(|n| std::sync::Arc::new(tokio::sync::Semaphore::new(n.max(1))));
+        self.policy = policy;
+        self
+    }
+
+    /// Whether an error returned by any `extract_*` is a provider-side
+    /// transient rather than a failure attributable to the incident's text,
+    /// so it must not feed `RetryBackoff`'s per-text backoff (30 min -> 24 h):
+    ///
+    /// - 429 and 502/503 always are -- nothing about the text causes them.
+    /// - A client timeout or 504 is ambiguous: a runaway generation on one
+    ///   particular text also ends that way. Under the default policy it
+    ///   keeps backing off exactly as before; once the operator opts into
+    ///   gateway retries (`max_gateway_retries > 0`, i.e. a provider whose
+    ///   gateway is known to cut slow calls) it counts as transient.
+    pub fn is_provider_transient(&self, err: &anyhow::Error) -> bool {
+        match err.downcast_ref::<LlmCallError>() {
+            Some(LlmCallError::RateLimited { .. }) => true,
+            Some(LlmCallError::GatewayUnavailable { status: 504 })
+            | Some(LlmCallError::ClientTimeout) => self.policy.max_gateway_retries > 0,
+            Some(LlmCallError::GatewayUnavailable { .. }) => true,
+            _ => false,
         }
     }
 
@@ -548,26 +725,100 @@ impl LlmClient {
                 },
             },
             temperature: 0.0,
+            max_tokens: self.policy.max_tokens,
+            reasoning_effort: self.policy.reasoning_effort.as_deref(),
         };
 
+        // Bounded in-call retry for provider-transient failures. With the
+        // default policy both budgets are 0, so the first failure is
+        // returned exactly as before.
+        let mut rate_limit_retries = 0;
+        let mut gateway_retries = 0;
+        loop {
+            let attempt = {
+                let _permit = match &self.in_flight {
+                    Some(sem) => Some(
+                        sem.acquire()
+                            .await
+                            .map_err(|err| anyhow::anyhow!("in-flight limiter closed: {err}"))?,
+                    ),
+                    None => None,
+                };
+                self.send_once(&request).await
+            };
+            match attempt {
+                Ok(content) => return Ok(content),
+                Err(LlmCallError::RateLimited { retry_after })
+                    if rate_limit_retries < self.policy.max_rate_limit_retries
+                        && retry_after.is_none_or(|wait| wait <= MAX_RETRY_AFTER) =>
+                {
+                    rate_limit_retries += 1;
+                    let wait = retry_after
+                        .unwrap_or_default()
+                        .max(self.policy.rate_limit_min_wait);
+                    tracing::warn!(?wait, attempt = rate_limit_retries, "LLM 429; backing off");
+                    tokio::time::sleep(wait).await;
+                }
+                Err(
+                    err @ (LlmCallError::GatewayUnavailable { .. } | LlmCallError::ClientTimeout),
+                ) if gateway_retries < self.policy.max_gateway_retries => {
+                    gateway_retries += 1;
+                    tracing::warn!(error = %err, attempt = gateway_retries, "LLM gateway failure; retrying");
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// One HTTP attempt, classified.
+    async fn send_once(&self, request: &ChatCompletionRequest<'_>) -> Result<String, LlmCallError> {
         let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
-            .json(&request);
+            .json(request);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
 
-        let response = req.send().await?.error_for_status()?;
-        let body: ChatCompletionResponse = response.json().await?;
-        let content = body
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("chat completion response had no choices"))?
-            .message
-            .content;
-        Ok(content)
+        let response = req.send().await.map_err(|err| {
+            if err.is_timeout() {
+                LlmCallError::ClientTimeout
+            } else {
+                LlmCallError::Other(err.into())
+            }
+        })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(LlmCallError::RateLimited {
+                retry_after: parse_retry_after(response.headers()),
+            });
+        }
+        if matches!(status.as_u16(), 502..=504) {
+            return Err(LlmCallError::GatewayUnavailable {
+                status: status.as_u16(),
+            });
+        }
+        if !status.is_success() {
+            return Err(LlmCallError::Status {
+                status: status.as_u16(),
+            });
+        }
+        let body: ChatCompletionResponse = response.json().await.map_err(|err| {
+            if err.is_timeout() {
+                LlmCallError::ClientTimeout
+            } else {
+                LlmCallError::Other(err.into())
+            }
+        })?;
+        let choice = body.choices.into_iter().next().ok_or_else(|| {
+            LlmCallError::Other(anyhow::anyhow!("chat completion response had no choices"))
+        })?;
+        match choice.message.content {
+            Some(content) if !content.trim().is_empty() => Ok(content),
+            _ => Err(LlmCallError::EmptyContent {
+                finish_reason: choice.finish_reason,
+            }),
+        }
     }
 
     /// `reference_date` is the incident's `first_seen_at` (or, if the
@@ -733,6 +984,33 @@ fn build_period_user_content(
          this exact order, echoing period_index and scope_description exactly as given for each):\n{skeleton_json}",
         periods.len()
     ))
+}
+
+/// Test-only client for the ignored live evals (`tests::live_eval_*` here
+/// and `replay_eval`): `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`, a
+/// `LIVE_EVAL_TIMEOUT_SECS` ceiling (default 180 s -- overridable per run,
+/// e.g. to give a cold-starting model extra room), and the SAME provider
+/// policy env vars the service parses (`config::ProviderPolicyConfig`), so a
+/// reasoning model gets its `reasoning_effort`/`max_tokens` in an eval too.
+#[cfg(test)]
+pub(crate) fn live_client_from_env() -> LlmClient {
+    use clap::Parser;
+
+    let base_url = std::env::var("LLM_BASE_URL").expect("LLM_BASE_URL must be set for live eval");
+    let api_key = std::env::var("LLM_API_KEY").ok();
+    let model = std::env::var("LLM_MODEL").expect("LLM_MODEL must be set for live eval");
+    let timeout_secs: u64 = std::env::var("LIVE_EVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
+    let policy = crate::config::ProviderPolicyConfig::parse_from(["live-eval"]).policy();
+    LlmClient::new(
+        base_url,
+        api_key,
+        model,
+        std::time::Duration::from_secs(timeout_secs),
+    )
+    .with_provider_policy(policy)
 }
 
 #[cfg(test)]
@@ -1377,6 +1655,318 @@ mod tests {
         );
     }
 
+    // -- ProviderPolicy / LlmCallError --
+
+    fn flat_primary_body() -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": serde_json::json!({
+                        "category": "signal_failure",
+                        "periods": [{
+                            "scope_description": null,
+                            "date_range": null,
+                            "schedule_window": null,
+                            "resolution_status": "ongoing",
+                            "apparent_severity": "normal",
+                            "impact_type": null
+                        }]
+                    }).to_string()
+                },
+                "finish_reason": "stop"
+            }]
+        })
+    }
+
+    fn fast_retry_policy() -> ProviderPolicy {
+        ProviderPolicy {
+            max_tokens: Some(8192),
+            reasoning_effort: Some("low".to_string()),
+            max_in_flight: Some(3),
+            rate_limit_min_wait: std::time::Duration::from_millis(10),
+            max_rate_limit_retries: 3,
+            max_gateway_retries: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_policy_omits_max_tokens_and_reasoning_effort() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(server.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(!body.contains("reasoning_effort"), "{body}");
+        assert!(!body.contains("max_tokens"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn policy_sends_reasoning_effort_and_max_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("\"reasoning_effort\":\"low\""))
+            .and(body_string_contains("\"max_tokens\":8192"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_retried_within_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn gateway_timeout_retries_are_capped_and_classified_transient() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(504))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        // 1 initial attempt + max_gateway_retries (2).
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert!(client.is_provider_transient(&err), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn default_policy_does_not_retry_a_504() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(504))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        assert!(
+            client
+                .extract_primary("s", "d", reference_date())
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn null_content_is_a_typed_non_transient_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": null, "reasoning_content": "..." },
+                              "finish_reason": "length" }]
+            })))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(!client.is_provider_transient(&err));
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::EmptyContent { finish_reason: Some(r) }) if r == "length"
+            ),
+            "{err:?}"
+        );
+    }
+
+    async fn error_for_status(
+        client: &LlmClient,
+        server: &MockServer,
+        status: u16,
+    ) -> anyhow::Error {
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+        client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err()
+    }
+
+    /// 429 and 502/503 never say anything about the text, so they stay out
+    /// of the per-text backoff even under the default policy. A 504 or a
+    /// client timeout is ambiguous (a runaway generation on one text ends
+    /// the same way), so under the default policy it keeps feeding the
+    /// backoff exactly as before -- only opting into gateway retries
+    /// reclassifies it.
+    #[tokio::test]
+    async fn default_policy_keeps_timeouts_and_504_in_the_text_backoff() {
+        let server = MockServer::start().await;
+        let default_client =
+            LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        for status in [429, 502, 503] {
+            let err = error_for_status(&default_client, &server, status).await;
+            assert!(
+                default_client.is_provider_transient(&err),
+                "{status}: {err:?}"
+            );
+        }
+        let err = error_for_status(&default_client, &server, 504).await;
+        assert!(!default_client.is_provider_transient(&err), "{err:?}");
+        let err = error_for_status(&default_client, &server, 500).await;
+        assert!(!default_client.is_provider_transient(&err), "{err:?}");
+
+        let retrying_client =
+            LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+                .with_provider_policy(ProviderPolicy {
+                    max_gateway_retries: 1,
+                    ..ProviderPolicy::default()
+                });
+        let err = error_for_status(&retrying_client, &server, 504).await;
+        assert!(retrying_client.is_provider_transient(&err), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn client_timeout_is_typed_and_only_transient_when_gateway_retries_are_on() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(flat_primary_body())
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let short = std::time::Duration::from_millis(500);
+        let default_client = LlmClient::new(server.uri(), None, "m".into(), short);
+        let err = default_client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::ClientTimeout)
+            ),
+            "{err:?}"
+        );
+        assert!(!default_client.is_provider_transient(&err));
+
+        let retrying_client = LlmClient::new(server.uri(), None, "m".into(), short)
+            .with_provider_policy(ProviderPolicy {
+                max_gateway_retries: 1,
+                ..ProviderPolicy::default()
+            });
+        let err = retrying_client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(retrying_client.is_provider_transient(&err), "{err:?}");
+        // No exact request count here: a request that times out client-side
+        // may never reach the server under load. The retry budget itself is
+        // covered deterministically by the 504 test above.
+    }
+
+    /// A `Retry-After` past `MAX_RETRY_AFTER` must fail the call at once
+    /// (still provider-transient) rather than pin a loop -- and the
+    /// incident's in-flight claim -- for hours.
+    #[tokio::test]
+    async fn retry_after_beyond_the_cap_fails_fast_instead_of_sleeping() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header(
+                "retry-after",
+                (MAX_RETRY_AFTER.as_secs() + 1).to_string().as_str(),
+            ))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let started = std::time::Instant::now();
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::RateLimited {
+                    retry_after: Some(_)
+                })
+            ),
+            "{err:?}"
+        );
+        assert!(client.is_provider_transient(&err));
+    }
+
+    /// The outcome labels on `enricher_llm_call_total` are a fixed set.
+    #[test]
+    fn outcome_labels_are_distinct_per_error_kind() {
+        let labels = [
+            LlmCallError::RateLimited { retry_after: None }.outcome_label(),
+            LlmCallError::GatewayUnavailable { status: 504 }.outcome_label(),
+            LlmCallError::ClientTimeout.outcome_label(),
+            LlmCallError::Status { status: 500 }.outcome_label(),
+            LlmCallError::EmptyContent {
+                finish_reason: None,
+            }
+            .outcome_label(),
+            LlmCallError::Other(anyhow::anyhow!("x")).outcome_label(),
+        ];
+        assert_eq!(
+            labels,
+            [
+                "rate_limited",
+                "gateway_error",
+                "timeout",
+                "http_error",
+                "empty_content",
+                "error"
+            ]
+        );
+    }
+
     // -- `DateRange` wire-convention fixtures (design §1's testing-plan
     // additions). The actual year-inference/inclusivity/timezone reasoning
     // happens inside the model's response generation (per PRIMARY_PROMPT
@@ -1553,9 +2143,15 @@ mod tests {
 
     // --- Live eval against a real OpenAI-compatible endpoint ---
     //
-    // Ignored by default (no network/creds in normal CI). Run explicitly with:
+    // Ignored by default (no network/creds in normal CI). Run explicitly with
+    // (the crate is bin-only, so `--bin enricher`, not `--lib`):
     //   LLM_BASE_URL=... LLM_API_KEY=... LLM_MODEL=... \
-    //     cargo test -p enricher --lib llm::tests::live_eval -- --ignored --nocapture
+    //     cargo test -p enricher --bin enricher llm::tests::live_eval -- \
+    //       --ignored --nocapture --test-threads=1
+    // The provider-policy env vars the service reads (`LLM_REASONING_EFFORT`,
+    // `LLM_MAX_TOKENS`, `LLM_MAX_IN_FLIGHT`, `LLM_RATE_LIMIT_RETRIES`,
+    // `LLM_RATE_LIMIT_RETRY_SECS`, `LLM_GATEWAY_RETRIES`) apply here too --
+    // see `live_client_from_env`.
     // This is the design doc's own testing-plan item ("Golden corpus, run as
     // a live eval, not just fixtures") for the two central open risks: does
     // the configured model segment multi-period text correctly (risk #1),
@@ -1563,27 +2159,6 @@ mod tests {
     // on this backend (risk #2)? Also times each call, which is the
     // ground-truth data point for whether `LLM_REQUEST_TIMEOUT_SECS`'s
     // default is realistic against this specific deployment.
-
-    fn live_client_from_env() -> LlmClient {
-        let base_url =
-            std::env::var("LLM_BASE_URL").expect("LLM_BASE_URL must be set for live eval");
-        let api_key = std::env::var("LLM_API_KEY").ok();
-        let model = std::env::var("LLM_MODEL").expect("LLM_MODEL must be set for live eval");
-        // Overridable per-run via LIVE_EVAL_TIMEOUT_SECS -- useful for giving a
-        // model extra room on a cold start (first request after this server
-        // swaps a different model into memory) without changing every other
-        // candidate's ceiling.
-        let timeout_secs: u64 = std::env::var("LIVE_EVAL_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(180);
-        LlmClient::new(
-            base_url,
-            api_key,
-            model,
-            std::time::Duration::from_secs(timeout_secs),
-        )
-    }
 
     const WANDSWORTH_TOWN_SUMMARY: &str = "Platform alterations at Wandsworth Town";
     const WANDSWORTH_TOWN_DESCRIPTION: &str = "Monday 11 May to Sunday 26 July: \

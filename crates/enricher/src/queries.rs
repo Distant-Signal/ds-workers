@@ -151,6 +151,75 @@ pub async fn write_extraction(
     Ok(result.rows_affected() > 0)
 }
 
+/// The summary/description a stored extraction was
+/// computed from, recovered from `incident_history` by recomputing
+/// `common::text_hash::text_hash` in SQL (`sha256(summary || 0x00 ||
+/// description)`, hex) -- every text version is snapshotted there by
+/// `upsert_incidents`, so no schema change is needed. Verified read-only in
+/// production on 2026-09-27: all 1,801 stored `source_text_hash` values
+/// match a history row. `Ok(None)` if nothing matches (history purged, or a
+/// hash written by some other path) -- the caller then does a full
+/// extraction, exactly as today.
+pub async fn fetch_extracted_source_text(
+    pool: &PgPool,
+    incident_id: &str,
+    source_text_hash: &str,
+) -> anyhow::Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT summary, description FROM incident_history \
+         WHERE incident_id = $1 \
+           AND encode(sha256(convert_to(summary, 'UTF8') || '\\x00'::bytea \
+                             || convert_to(description, 'UTF8')), 'hex') = $2 \
+         ORDER BY recorded_at DESC, id DESC LIMIT 1",
+    )
+    .bind(incident_id)
+    .bind(source_text_hash)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Re-stamps an incident's *existing* extraction as
+/// describing its current text, for a change `text_delta::classify` judged a
+/// semantic no-op -- no LLM call, extraction columns untouched,
+/// `extracted_at` untouched (it still says when the LLM last ran).
+///
+/// Guards, all in the WHERE clause so the check and the write are atomic:
+/// - `summary = $4 AND description = $5`: the same stale-text guard as
+///   [`write_extraction`] -- the text must still be what was classified.
+/// - `source_text_hash = $3`: the extraction being carried forward must
+///   still be the one classified against (a concurrent full extraction may
+///   have replaced it; then this is a no-op and that one wins).
+/// - `extraction_model_version = $6`: never carry an old model's reading
+///   past a model bump -- the sweep must re-extract those.
+///
+/// `Ok(false)` = a guard rejected it; the caller falls back to a full
+/// extraction (or acks, if the text moved -- same as a stale write).
+pub async fn carry_forward_extraction(
+    pool: &PgPool,
+    incident_id: &str,
+    new_text_hash: &str,
+    old_text_hash: &str,
+    expected_summary: &str,
+    expected_description: &str,
+    model_version: &str,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE incidents SET source_text_hash = $2 \
+         WHERE incident_id = $1 AND source_text_hash = $3 \
+           AND summary = $4 AND description = $5 AND extraction_model_version = $6",
+    )
+    .bind(incident_id)
+    .bind(new_text_hash)
+    .bind(old_text_hash)
+    .bind(expected_summary)
+    .bind(expected_description)
+    .bind(model_version)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::postgres::PgPoolOptions;
@@ -297,5 +366,208 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+    }
+
+    async fn seed(pool: &PgPool, incident_id: &str, summary: &str, description: &str) {
+        sqlx::query("DELETE FROM incident_history WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(pool)
+            .await
+            .expect("clear history");
+        sqlx::query(
+            "INSERT INTO incidents (incident_id, summary, description, operators, affected_stations, priority) \
+             VALUES ($1, $2, $3, '{}', '{}', 3) \
+             ON CONFLICT (incident_id) DO UPDATE SET summary = EXCLUDED.summary, description = EXCLUDED.description, \
+                 source_text_hash = NULL, extraction_model_version = NULL, extracted_periods = NULL, \
+                 extracted_category = NULL",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(description)
+        .execute(pool)
+        .await
+        .expect("seed incident");
+    }
+
+    async fn add_history(pool: &PgPool, incident_id: &str, summary: &str, description: &str) {
+        sqlx::query(
+            "INSERT INTO incident_history (incident_id, summary, description, operators, affected_stations, is_planned, priority) \
+             VALUES ($1, $2, $3, '{}', '{}', false, 3)",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(description)
+        .execute(pool)
+        .await
+        .expect("seed history");
+    }
+
+    async fn cleanup(pool: &PgPool, incident_id: &str) {
+        for table in ["incident_history", "incidents"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE incident_id = $1"))
+                .bind(incident_id)
+                .execute(pool)
+                .await
+                .expect("cleanup");
+        }
+    }
+
+    /// The SQL re-computation of `text_hash` must match the Rust one, byte
+    /// for byte, including non-ASCII text -- otherwise no old text is ever
+    /// recovered and every edit is labelled `unknown`.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher fetch_extracted_source_text -- --ignored`"]
+    async fn fetch_extracted_source_text_recovers_the_hashed_version_from_history() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-HISTORY-TEXT-1";
+        seed(&pool, incident_id, "s", "d").await;
+        add_history(
+            &pool,
+            incident_id,
+            "Crewe \u{2013} Chester",
+            "Caf\u{e9} <p>closed</p>",
+        )
+        .await;
+        add_history(&pool, incident_id, "Crewe - Chester", "reopened").await;
+
+        let hash =
+            common::text_hash::text_hash("Crewe \u{2013} Chester", "Caf\u{e9} <p>closed</p>");
+        let found = fetch_extracted_source_text(&pool, incident_id, &hash)
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            Some((
+                "Crewe \u{2013} Chester".to_string(),
+                "Caf\u{e9} <p>closed</p>".to_string()
+            ))
+        );
+        let missing = fetch_extracted_source_text(&pool, incident_id, "not-a-hash")
+            .await
+            .unwrap();
+        assert_eq!(missing, None);
+
+        cleanup(&pool, incident_id).await;
+    }
+
+    /// Every guard of `carry_forward_extraction`: it applies only while the
+    /// text, the extraction being carried and the model version are all
+    /// still what the caller classified against.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher carry_forward_extraction -- --ignored`"]
+    async fn carry_forward_extraction_applies_only_when_every_guard_holds() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-CARRY-FORWARD-GUARDS-1";
+        let (summary, old_description, new_description) = ("s", "<p>closed</p>", "closed");
+        let model = "test-model@periods-v2";
+        let old_hash = common::text_hash::text_hash(summary, old_description);
+        let new_hash = common::text_hash::text_hash(summary, new_description);
+
+        // Extraction stored against the old text; the row now holds the
+        // new (semantically identical) text.
+        let reset = |pool: PgPool| {
+            let old_hash = old_hash.clone();
+            async move {
+                seed(&pool, incident_id, summary, old_description).await;
+                assert!(
+                    write_extraction(
+                        &pool,
+                        incident_id,
+                        "signal_failure",
+                        &[one_period()],
+                        model,
+                        &old_hash,
+                        summary,
+                        old_description,
+                    )
+                    .await
+                    .unwrap()
+                );
+                sqlx::query("UPDATE incidents SET description = $2 WHERE incident_id = $1")
+                    .bind(incident_id)
+                    .bind(new_description)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        let hash_now = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT source_text_hash FROM incidents WHERE incident_id = $1",
+            )
+            .bind(incident_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        // Text moved again since classification.
+        reset(pool.clone()).await;
+        assert!(
+            !carry_forward_extraction(
+                &pool,
+                incident_id,
+                &new_hash,
+                &old_hash,
+                summary,
+                "stale",
+                model
+            )
+            .await
+            .unwrap()
+        );
+        // The stored extraction was replaced since classification.
+        assert!(
+            !carry_forward_extraction(
+                &pool,
+                incident_id,
+                &new_hash,
+                "other-hash",
+                summary,
+                new_description,
+                model
+            )
+            .await
+            .unwrap()
+        );
+        // A model bump: never carry an old model's reading forward.
+        assert!(
+            !carry_forward_extraction(
+                &pool,
+                incident_id,
+                &new_hash,
+                &old_hash,
+                summary,
+                new_description,
+                "other@v"
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            hash_now(pool.clone()).await.as_deref(),
+            Some(old_hash.as_str())
+        );
+
+        // All guards hold.
+        assert!(
+            carry_forward_extraction(
+                &pool,
+                incident_id,
+                &new_hash,
+                &old_hash,
+                summary,
+                new_description,
+                model
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            hash_now(pool.clone()).await.as_deref(),
+            Some(new_hash.as_str())
+        );
+
+        cleanup(&pool, incident_id).await;
     }
 }

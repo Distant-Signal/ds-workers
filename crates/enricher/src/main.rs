@@ -9,11 +9,14 @@ mod combine;
 mod config;
 mod llm;
 mod queries;
+#[cfg(test)]
+mod replay_eval;
 mod retry_backoff;
 mod stream;
 mod sweep;
+mod text_delta;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,12 +45,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
     if config.metrics_enabled {
+        let buckets = llm_duration_buckets(config.llm_request_timeout_secs);
         common::metrics::install_with_buckets(
             config.metrics_port,
-            &[(
-                &common::metrics::metric_name(LLM_DURATION_METRIC),
-                &[1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0],
-            )],
+            &[(&common::metrics::metric_name(LLM_DURATION_METRIC), &buckets)],
         )?;
     }
 
@@ -68,33 +69,37 @@ async fn main() -> anyhow::Result<()> {
     // re-extraction via the sweep's existing mismatch check WITHOUT asking
     // the configured endpoint to serve a model name it doesn't have. See
     // docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md, §5.
-    let llm = Arc::new(LlmClient::new(
+    let llm = LlmClient::new(
         config.llm_base_url.clone(),
         config.llm_api_key.clone(),
         config.llm_model.clone(),
         Duration::from_secs(config.llm_request_timeout_secs),
-    ));
-    let model_version = format!("{}@periods-v2", config.llm_model);
-
-    let mismatch_tracker = Arc::new(MismatchTracker::default());
-    let retry_backoff = Arc::new(RetryBackoff::default());
+    )
+    // Every provider-policy knob defaults to "off" (see `ProviderPolicy`).
+    .with_provider_policy(config.provider.policy());
+    let enricher = Arc::new(Enricher {
+        pool,
+        llm,
+        model_version: format!("{}@periods-v2", config.llm_model),
+        mismatch_tracker: MismatchTracker::default(),
+        retry_backoff: RetryBackoff::default(),
+        in_flight: InFlight::default(),
+        carry_forward_noops: config.carry_forward_semantic_noops,
+    });
+    if enricher.carry_forward_noops {
+        tracing::info!(
+            "CARRY_FORWARD_SEMANTIC_NOOPS is on: semantic no-op text changes skip the LLM"
+        );
+    }
 
     tokio::spawn(sweep_loop(
-        pool.clone(),
-        Arc::clone(&llm),
-        model_version.clone(),
-        Arc::clone(&mismatch_tracker),
-        Arc::clone(&retry_backoff),
+        Arc::clone(&enricher),
         config.sweep_interval_secs,
     ));
 
     let reclaim_redis = redis_client.get_connection_manager().await?;
     tokio::spawn(reclaim_loop(
-        pool.clone(),
-        Arc::clone(&llm),
-        model_version.clone(),
-        Arc::clone(&mismatch_tracker),
-        Arc::clone(&retry_backoff),
+        Arc::clone(&enricher),
         reclaim_redis,
         config.reclaim_interval_secs,
         config.reclaim_min_idle_secs,
@@ -103,25 +108,10 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match stream::read_one(&mut redis).await {
             Ok(Some((entry_id, incident_id))) => {
-                if process_incident(
-                    &pool,
-                    &llm,
-                    &model_version,
-                    &incident_id,
-                    &mismatch_tracker,
-                    &retry_backoff,
-                )
-                .await
+                if process_stream_entry(&enricher, &entry_id, &incident_id).await
+                    && let Err(err) = stream::ack(&mut redis, &entry_id).await
                 {
-                    if let Err(err) = stream::ack(&mut redis, &entry_id).await {
-                        tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
-                    }
-                } else {
-                    tracing::warn!(
-                        entry_id,
-                        incident_id,
-                        "extraction did not complete; leaving entry pending for reclaim"
-                    );
+                    tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
                 }
             }
             Ok(None) => {}
@@ -142,6 +132,131 @@ async fn main() -> anyhow::Result<()> {
                 }
                 tokio::time::sleep(STREAM_ERROR_BACKOFF).await;
             }
+        }
+    }
+}
+
+/// Bucket boundaries for the LLM-call duration histogram: the fixed set,
+/// extended past the configured per-request timeout. A call (in-call
+/// retries included) can legitimately run to a few multiples of it, and a
+/// timeout above the old 300 s top bucket (e.g. 320 s behind a 302 s
+/// gateway) would otherwise land every slow call in `+Inf`.
+fn llm_duration_buckets(request_timeout_secs: u64) -> Vec<f64> {
+    let timeout = request_timeout_secs as f64;
+    let mut buckets = vec![1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
+    for extra in [timeout, 2.0 * timeout, 4.0 * timeout] {
+        if extra > 0.0 && !buckets.contains(&extra) {
+            buckets.push(extra);
+        }
+    }
+    buckets.sort_by(f64::total_cmp);
+    buckets
+}
+
+/// Everything the three loops (stream consumer, sweep, reclaim) share.
+struct Enricher {
+    pool: PgPool,
+    llm: LlmClient,
+    model_version: String,
+    mismatch_tracker: MismatchTracker,
+    retry_backoff: RetryBackoff,
+    in_flight: InFlight,
+    /// `CARRY_FORWARD_SEMANTIC_NOOPS` (default off).
+    carry_forward_noops: bool,
+}
+
+impl Enricher {
+    /// Runs `process_incident` unless another loop is already processing
+    /// the same incident, in which case it returns `None` without touching
+    /// the DB or the LLM. The caller decides what "busy" means for it --
+    /// see `InFlight`.
+    async fn process_exclusive(&self, incident_id: &str) -> Option<bool> {
+        let _claim = self.in_flight.try_claim(incident_id)?;
+        Some(process_incident(self, incident_id).await)
+    }
+}
+
+/// The incidents some loop is currently running `process_incident` for.
+///
+/// The three loops share one process (the chart runs `replicas: 1`, one
+/// consumer name), but each runs serially on its own, so without this they
+/// overlap on the same incident whenever an extraction is slow:
+///
+/// - The **sweep** re-selects every incident whose stored hash doesn't match
+///   yet, including the one the stream loop is extracting right now. It
+///   skips in-flight ids: the holder is already doing that work, and a
+///   failure there leaves a pending stream entry for reclaim.
+/// - **Reclaim** `XAUTOCLAIM`s any entry idle past `RECLAIM_MIN_IDLE_SECS`,
+///   and an entry the stream loop is still processing is exactly that once
+///   an attempt (retries and 429 waits included) outlasts the idle window.
+///   It skips in-flight ids and leaves the entry pending: the holder acks it
+///   (same consumer group) on success, or a later reclaim pass retries it.
+///   So min-idle is a retry delay, not a correctness bound.
+/// - The **stream loop** leaves its entry pending when the sweep or reclaim
+///   holds the incident, rather than waiting and stalling every other
+///   incident behind one slow call. A later reclaim pass then either finds
+///   the text already extracted (acked with no LLM call) or extracts it.
+#[derive(Default)]
+struct InFlight {
+    ids: Mutex<HashSet<String>>,
+}
+
+impl InFlight {
+    fn try_claim(&self, incident_id: &str) -> Option<InFlightClaim<'_>> {
+        let mut ids = self.ids.lock().expect("in-flight set mutex poisoned");
+        ids.insert(incident_id.to_string()).then(|| InFlightClaim {
+            set: self,
+            incident_id: incident_id.to_string(),
+        })
+    }
+}
+
+/// Releases its incident on drop -- including when the owning future is
+/// dropped mid-extraction.
+struct InFlightClaim<'a> {
+    set: &'a InFlight,
+    incident_id: String,
+}
+
+impl Drop for InFlightClaim<'_> {
+    fn drop(&mut self) {
+        // Never panic in drop: a poisoned mutex still holds valid data.
+        let mut ids = match self.set.ids.lock() {
+            Ok(ids) => ids,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ids.remove(&self.incident_id);
+    }
+}
+
+fn record_in_flight_skip(caller: &'static str, incident_id: &str) {
+    tracing::info!(
+        incident_id,
+        caller,
+        "incident is already being processed by another loop; skipping"
+    );
+    metrics::counter!(
+        common::metrics::metric_name("enricher_in_flight_skips_total"),
+        "caller" => caller
+    )
+    .increment(1);
+}
+
+/// One entry from the stream consumer loop. Returns whether to ack it.
+async fn process_stream_entry(enricher: &Enricher, entry_id: &str, incident_id: &str) -> bool {
+    match enricher.process_exclusive(incident_id).await {
+        Some(true) => true,
+        Some(false) => {
+            tracing::warn!(
+                entry_id,
+                incident_id,
+                "extraction did not complete; leaving entry pending for reclaim"
+            );
+            false
+        }
+        None => {
+            record_in_flight_skip("stream", incident_id);
+            false
         }
     }
 }
@@ -232,35 +347,22 @@ impl MismatchTracker {
 /// anything the Redis Stream consumer loop above missed (publish failure,
 /// consumer downtime, etc). Runs independently of that loop, processing
 /// each incident it finds through the same `process_incident` the stream
-/// loop uses.
-async fn sweep_loop(
-    pool: PgPool,
-    llm: Arc<LlmClient>,
-    model_version: String,
-    mismatch_tracker: Arc<MismatchTracker>,
-    retry_backoff: Arc<RetryBackoff>,
-    interval_secs: u64,
-) {
+/// loop uses -- skipping any another loop is processing right now (see
+/// `InFlight`).
+async fn sweep_loop(enricher: Arc<Enricher>, interval_secs: u64) {
     let mut interval = ticking_interval(interval_secs);
     loop {
         interval.tick().await;
-        match sweep::fetch_sweep_rows(&pool).await {
+        match sweep::fetch_sweep_rows(&enricher.pool).await {
             Ok(rows) => {
-                let ids = sweep::incidents_needing_extraction(&rows, &model_version);
+                let ids = sweep::incidents_needing_extraction(&rows, &enricher.model_version);
                 tracing::info!(
                     count = ids.len(),
                     "sweep found incidents needing extraction"
                 );
-                for id in ids {
-                    process_incident(
-                        &pool,
-                        &llm,
-                        &model_version,
-                        &id,
-                        &mismatch_tracker,
-                        &retry_backoff,
-                    )
-                    .await;
+                let skipped = sweep_ids(&enricher, &ids).await;
+                if skipped > 0 {
+                    tracing::info!(skipped, "sweep skipped incidents already in flight");
                 }
             }
             Err(err) => tracing::error!(error = ?err, "sweep query failed"),
@@ -268,23 +370,30 @@ async fn sweep_loop(
     }
 }
 
-/// Records one LLM call's duration and success/error outcome. `call` names
-/// the call site (`"primary"`, `"resolution_adversarial"`,
-/// `"severity_adversarial"`) as both a log field and the metric's `call`
-/// label -- a small, fixed set, not user data, so no cardinality risk.
-///
-/// `outcome` is `success`/`error` only, not the design doc's illustrative
-/// `success`/`error`/`timeout` three-way split -- `LlmClient::extract_*`
-/// returns a bare `anyhow::Result`, with no typed distinction between "the
-/// request timed out" (`config.llm_request_timeout_secs`, currently 300s)
-/// and any other request failure. Distinguishing them would need `llm.rs`
-/// to expose a typed error enum, which is out of scope for this plan --
-/// this mirrors the same restraint the aggregator/pollers' `result` label
-/// already applies (design doc Open Question 5): the histogram's own
-/// bucket boundaries (extended past the tuned timeout, see `main`'s
-/// `install_with_buckets` call) are what actually serves "is a call about
-/// to time out," not the outcome label.
-fn record_llm_call_metrics(call: &'static str, elapsed: std::time::Duration, success: bool) {
+/// Processes one sweep's worth of incident ids; returns how many were
+/// skipped because another loop was already processing them.
+async fn sweep_ids(enricher: &Enricher, ids: &[String]) -> usize {
+    let mut skipped = 0;
+    for id in ids {
+        if enricher.process_exclusive(id).await.is_none() {
+            record_in_flight_skip("sweep", id);
+            skipped += 1;
+        }
+    }
+    skipped
+}
+
+/// Records one LLM call's duration and outcome. `call` names the call site
+/// (`"primary"`, `"resolution_adversarial"`, `"severity_adversarial"`) as
+/// both a log field and the metric's `call` label -- a small, fixed set,
+/// not user data, so no cardinality risk. `outcome` is `llm_outcome`'s
+/// fixed label set. The duration covers the whole call, in-call retries and
+/// 429 waits included.
+fn record_llm_call_metrics(
+    call: &'static str,
+    elapsed: std::time::Duration,
+    outcome: &'static str,
+) {
     metrics::histogram!(
         common::metrics::metric_name(LLM_DURATION_METRIC),
         "call" => call
@@ -293,9 +402,38 @@ fn record_llm_call_metrics(call: &'static str, elapsed: std::time::Duration, suc
     metrics::counter!(
         common::metrics::metric_name("enricher_llm_call_total"),
         "call" => call,
-        "outcome" => if success { "success" } else { "error" }
+        "outcome" => outcome
     )
     .increment(1);
+}
+
+/// `success` plus the typed `llm::LlmCallError` labels (`rate_limited`,
+/// `gateway_error`, `timeout`, `http_error`, `empty_content`), falling back
+/// to `error` (malformed JSON, connection refused, ...).
+fn llm_outcome<T>(result: &anyhow::Result<T>) -> &'static str {
+    match result {
+        Ok(_) => "success",
+        Err(err) => err
+            .downcast_ref::<llm::LlmCallError>()
+            .map_or("error", llm::LlmCallError::outcome_label),
+    }
+}
+
+/// A provider-side transient (see `LlmClient::is_provider_transient`) says
+/// nothing about this incident's text, so it must not push the text into
+/// `RetryBackoff`'s 30 min -> 24 h per-text backoff; the stream entry stays
+/// pending and reclaim retries it at its normal cadence.
+fn record_extraction_failure(
+    enricher: &Enricher,
+    incident_id: &str,
+    text_hash: &str,
+    err: &anyhow::Error,
+) {
+    if !enricher.llm.is_provider_transient(err) {
+        enricher
+            .retry_backoff
+            .record_failure(incident_id, text_hash);
+    }
 }
 
 /// Runs all three extraction passes for one incident and writes the result.
@@ -320,14 +458,20 @@ fn record_llm_call_metrics(call: &'static str, elapsed: std::time::Duration, suc
 /// `false` -- see `retry_backoff::RetryBackoff`'s own doc for why a second
 /// consecutive failure against the same text is backed off rather than
 /// retried at full LLM cost on every call.
-async fn process_incident(
-    pool: &PgPool,
-    llm: &LlmClient,
-    model_version: &str,
-    incident_id: &str,
-    mismatch_tracker: &MismatchTracker,
-    retry_backoff: &RetryBackoff,
-) -> bool {
+///
+/// Callers go through `Enricher::process_exclusive`, never straight here,
+/// so two loops never run this for the same incident at once.
+async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
+    let Enricher {
+        pool,
+        llm,
+        model_version,
+        mismatch_tracker,
+        retry_backoff,
+        carry_forward_noops,
+        in_flight: _,
+    } = enricher;
+    let (model_version, carry_forward_noops) = (model_version.as_str(), *carry_forward_noops);
     let state = match queries::fetch_incident_state(pool, incident_id).await {
         Ok(Some(state)) => state,
         Ok(None) => {
@@ -366,6 +510,67 @@ async fn process_incident(
         return true;
     }
 
+    // Classify how the text moved since the stored extraction was computed -- only for a same-model
+    // text-change re-run (`churn_baseline` is `Some` exactly then). Used to
+    // label the churn metric and, behind `carry_forward_noops`, to skip the
+    // LLM for a semantic no-op. Any failure here just means "no class":
+    // measurement and the skip must never be able to block a full extraction.
+    let edit_class = match (&churn_baseline, state.source_text_hash.as_deref()) {
+        (Some(_), Some(old_hash)) => {
+            match queries::fetch_extracted_source_text(pool, incident_id, old_hash).await {
+                Ok(Some((old_summary, old_description))) => Some(text_delta::classify(
+                    &old_summary,
+                    &old_description,
+                    &summary,
+                    &description,
+                )),
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(error = ?err, incident_id, "could not fetch the previously extracted text; classifying as unknown");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if carry_forward_noops
+        && edit_class == Some(text_delta::EditClass::SemanticNoop)
+        && let Some(old_hash) = state.source_text_hash.as_deref()
+    {
+        match queries::carry_forward_extraction(
+            pool,
+            incident_id,
+            &text_hash,
+            old_hash,
+            &summary,
+            &description,
+            model_version,
+        )
+        .await
+        {
+            Ok(true) => {
+                metrics::counter!(common::metrics::metric_name(
+                    "enricher_extraction_carried_forward_total"
+                ))
+                .increment(1);
+                tracing::info!(
+                    incident_id,
+                    "semantic no-op text change; carried the previous extraction forward without an LLM call"
+                );
+                return true;
+            }
+            Ok(false) => tracing::info!(
+                incident_id,
+                "carry-forward guard rejected (text or extraction moved); falling back to a full extraction"
+            ),
+            Err(err) => tracing::warn!(
+                error = ?err,
+                incident_id,
+                "carry-forward write failed; falling back to a full extraction"
+            ),
+        }
+    }
+
     if retry_backoff.should_skip(incident_id, &text_hash) {
         // This exact text already failed extraction at least once before
         // and hasn't waited out its backoff window yet -- see
@@ -383,12 +588,16 @@ async fn process_incident(
     let primary_result = llm
         .extract_primary(&summary, &description, first_seen_at)
         .await;
-    record_llm_call_metrics("primary", primary_start.elapsed(), primary_result.is_ok());
+    record_llm_call_metrics(
+        "primary",
+        primary_start.elapsed(),
+        llm_outcome(&primary_result),
+    );
     let primary = match primary_result {
         Ok(p) => p,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "primary extraction failed");
-            retry_backoff.record_failure(incident_id, &text_hash);
+            record_extraction_failure(enricher, incident_id, &text_hash, &err);
             return false;
         }
     };
@@ -426,13 +635,13 @@ async fn process_incident(
     record_llm_call_metrics(
         "resolution_adversarial",
         resolution_adversarial_start.elapsed(),
-        resolution_adversarial_result.is_ok(),
+        llm_outcome(&resolution_adversarial_result),
     );
     let resolution_adversarial = match resolution_adversarial_result {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "adversarial extraction failed");
-            retry_backoff.record_failure(incident_id, &text_hash);
+            record_extraction_failure(enricher, incident_id, &text_hash, &err);
             return false;
         }
     };
@@ -444,13 +653,13 @@ async fn process_incident(
     record_llm_call_metrics(
         "severity_adversarial",
         severity_adversarial_start.elapsed(),
-        severity_adversarial_result.is_ok(),
+        llm_outcome(&severity_adversarial_result),
     );
     let severity_adversarial = match severity_adversarial_result {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "severity adversarial extraction failed");
-            retry_backoff.record_failure(incident_id, &text_hash);
+            record_extraction_failure(enricher, incident_id, &text_hash, &err);
             return false;
         }
     };
@@ -554,7 +763,11 @@ async fn process_incident(
         "extraction written"
     );
     if let Some(report) = &churn_report {
-        churn::record(incident_id, report);
+        churn::record(
+            incident_id,
+            report,
+            edit_class.map_or("unknown", text_delta::EditClass::label),
+        );
     }
     true
 }
@@ -564,19 +777,10 @@ async fn process_incident(
 /// acking on success and leaving a repeat failure pending for the next
 /// reclaim pass. Runs independently of the stream consumer loop and the
 /// hourly sweep -- this is the debounced retry path for a transient
-/// per-incident failure, distinct from both.
-// Same posture as `crates/common::poller_loop::run_poll_loop`,
-// `crates/aggregator`/`crates/schedule-ingest`'s own analogous top-level
-// loop functions: every per-cycle config/dependency knob threaded straight
-// through in one call, rather than introducing a config struct for a
-// single call site.
-#[allow(clippy::too_many_arguments)]
+/// per-incident failure, distinct from both. Entries whose incident another
+/// loop is still processing are skipped (see `InFlight`).
 async fn reclaim_loop(
-    pool: PgPool,
-    llm: Arc<LlmClient>,
-    model_version: String,
-    mismatch_tracker: Arc<MismatchTracker>,
-    retry_backoff: Arc<RetryBackoff>,
+    enricher: Arc<Enricher>,
     mut redis: redis::aio::ConnectionManager,
     interval_secs: u64,
     min_idle_secs: u64,
@@ -595,7 +799,7 @@ async fn reclaim_loop(
             Err(err) => tracing::warn!(error = ?err, "failed to sample stream consumer-group lag"),
         }
         metrics::gauge!(common::metrics::metric_name("enricher_mismatch_incidents"))
-            .set(mismatch_tracker.len() as f64);
+            .set(enricher.mismatch_tracker.len() as f64);
 
         match stream::claim_stale(&mut redis, min_idle).await {
             Ok(entries) => {
@@ -605,32 +809,35 @@ async fn reclaim_loop(
                         "reclaimed stale pending entries for retry"
                     );
                 }
-                for (entry_id, incident_id) in entries {
-                    if process_incident(
-                        &pool,
-                        &llm,
-                        &model_version,
-                        &incident_id,
-                        &mismatch_tracker,
-                        &retry_backoff,
-                    )
-                    .await
-                    {
-                        if let Err(err) = stream::ack(&mut redis, &entry_id).await {
-                            tracing::error!(error = ?err, entry_id, "failed to ack reclaimed stream entry");
-                        }
-                    } else {
-                        tracing::warn!(
-                            entry_id,
-                            incident_id,
-                            "reclaimed extraction failed again; will be reclaimed once more after the idle window"
-                        );
+                for entry_id in process_reclaimed(&enricher, entries).await {
+                    if let Err(err) = stream::ack(&mut redis, &entry_id).await {
+                        tracing::error!(error = ?err, entry_id, "failed to ack reclaimed stream entry");
                     }
                 }
             }
             Err(err) => tracing::error!(error = ?err, "failed to check for stale pending entries"),
         }
     }
+}
+
+/// Retries reclaimed `(entry_id, incident_id)` entries; returns the entry
+/// ids to ack. An entry whose incident is in flight elsewhere is neither
+/// processed nor acked: re-running it concurrently is exactly the double
+/// extraction `InFlight` exists to prevent.
+async fn process_reclaimed(enricher: &Enricher, entries: Vec<(String, String)>) -> Vec<String> {
+    let mut to_ack = Vec::new();
+    for (entry_id, incident_id) in entries {
+        match enricher.process_exclusive(&incident_id).await {
+            Some(true) => to_ack.push(entry_id),
+            Some(false) => tracing::warn!(
+                entry_id,
+                incident_id,
+                "reclaimed extraction failed again; will be reclaimed once more after the idle window"
+            ),
+            None => record_in_flight_skip("reclaim", &incident_id),
+        }
+    }
+    to_ack
 }
 
 #[cfg(test)]
@@ -661,6 +868,28 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect to postgres")
+    }
+
+    fn test_enricher(
+        pool: PgPool,
+        server: &MockServer,
+        model_version: &str,
+        carry_forward_noops: bool,
+    ) -> Enricher {
+        Enricher {
+            pool,
+            llm: LlmClient::new(
+                server.uri(),
+                None,
+                "test-model".to_string(),
+                Duration::from_secs(30),
+            ),
+            model_version: model_version.to_string(),
+            mismatch_tracker: MismatchTracker::default(),
+            retry_backoff: RetryBackoff::default(),
+            in_flight: InFlight::default(),
+            carry_forward_noops,
+        }
     }
 
     /// The full crux of this plan: a primary extraction that exceeds
@@ -746,25 +975,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let llm = LlmClient::new(
-            server.uri(),
-            None,
-            "test-model".to_string(),
-            Duration::from_secs(30),
-        );
         let model_version = "test-model@periods-v1";
-        let mismatch_tracker = MismatchTracker::default();
-        let retry_backoff = RetryBackoff::default();
+        let enricher = test_enricher(pool.clone(), &server, model_version, false);
 
-        let ok = process_incident(
-            &pool,
-            &llm,
-            model_version,
-            incident_id,
-            &mismatch_tracker,
-            &retry_backoff,
-        )
-        .await;
+        let ok = process_incident(&enricher, incident_id).await;
         assert!(
             ok,
             "a truncated-but-successful extraction must return true (ack the entry), not false"
@@ -862,26 +1076,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let llm = LlmClient::new(
-            server.uri(),
-            None,
-            "test-model".to_string(),
-            Duration::from_secs(30),
-        );
         let model_version = "test-model@periods-v1";
-        let mismatch_tracker = MismatchTracker::default();
-        let retry_backoff = RetryBackoff::default();
+        let enricher = test_enricher(pool.clone(), &server, model_version, false);
 
         for attempt in 1..=2 {
-            let ok = process_incident(
-                &pool,
-                &llm,
-                model_version,
-                incident_id,
-                &mismatch_tracker,
-                &retry_backoff,
-            )
-            .await;
+            let ok = process_incident(&enricher, incident_id).await;
             assert!(!ok, "a malformed response must never be treated as success");
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
@@ -893,15 +1092,7 @@ mod tests {
 
         // Third attempt, same unchanged text: `RetryBackoff` must now skip
         // it locally -- the request count must stay at 2, not become 3.
-        let ok = process_incident(
-            &pool,
-            &llm,
-            model_version,
-            incident_id,
-            &mismatch_tracker,
-            &retry_backoff,
-        )
-        .await;
+        let ok = process_incident(&enricher, incident_id).await;
         assert!(!ok, "a backed-off attempt still has nothing to ack");
         assert_eq!(
             server.received_requests().await.unwrap().len(),
@@ -915,5 +1106,307 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+    }
+
+    // -- In-flight dedupe across the stream, sweep and reclaim loops --
+
+    /// A pool that never connects (nothing listens on port 1). Anything
+    /// that reaches the DB fails fast, so a test using it proves the
+    /// in-flight skip happens before any DB (or LLM) work.
+    fn unreachable_pool() -> PgPool {
+        PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("a lazy pool never connects at construction")
+    }
+
+    #[test]
+    fn in_flight_claim_is_exclusive_and_released_on_drop() {
+        let in_flight = InFlight::default();
+        let claim = in_flight.try_claim("A").expect("first claim");
+        assert!(in_flight.try_claim("A").is_none(), "A is already claimed");
+        let other = in_flight.try_claim("B").expect("other ids are independent");
+        drop(claim);
+        assert!(in_flight.try_claim("A").is_some(), "released on drop");
+        drop(other);
+        assert!(in_flight.ids.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_flight_claim_is_released_when_the_owning_future_is_dropped() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let enricher = test_enricher(unreachable_pool(), &server, "m@v", false);
+        let claimed = async {
+            let _claim = enricher.in_flight.try_claim("A").unwrap();
+            std::future::pending::<()>().await;
+        };
+        // Cancelled mid-"extraction" (e.g. the task is aborted).
+        let _ = tokio::time::timeout(Duration::from_millis(10), claimed).await;
+        assert!(enricher.in_flight.try_claim("A").is_some());
+    }
+
+    /// Overlap fix: the sweep must not re-run an incident another loop is
+    /// already processing. With "A" claimed, the sweep skips it (no DB, no
+    /// LLM) and still attempts "B".
+    #[tokio::test]
+    async fn sweep_skips_incidents_in_flight_in_another_loop() {
+        let server = MockServer::start().await;
+        let enricher = test_enricher(unreachable_pool(), &server, "m@v", false);
+        let claim = enricher.in_flight.try_claim("A").unwrap();
+
+        let skipped = sweep_ids(&enricher, &["A".to_string(), "B".to_string()]).await;
+        assert_eq!(skipped, 1, "only the in-flight incident is skipped");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(
+            enricher.in_flight.try_claim("B").is_some(),
+            "the sweep's own claim on B was released after its attempt"
+        );
+
+        drop(claim);
+        assert_eq!(sweep_ids(&enricher, &["A".to_string()]).await, 0);
+    }
+
+    /// Overlap fix: reclaim hands back an entry the stream loop is still
+    /// processing once the attempt outlasts RECLAIM_MIN_IDLE_SECS. It must
+    /// neither re-run it nor ack it (the holder acks on success; otherwise a
+    /// later reclaim pass retries it).
+    #[tokio::test]
+    async fn reclaim_neither_processes_nor_acks_an_in_flight_incident() {
+        let server = MockServer::start().await;
+        let enricher = test_enricher(unreachable_pool(), &server, "m@v", false);
+        let _claim = enricher.in_flight.try_claim("A").unwrap();
+
+        let to_ack = process_reclaimed(
+            &enricher,
+            vec![
+                ("1-0".to_string(), "A".to_string()),
+                ("2-0".to_string(), "B".to_string()),
+            ],
+        )
+        .await;
+        // "B" was attempted (and failed on the unreachable DB), "A" skipped:
+        // neither is acked.
+        assert!(to_ack.is_empty(), "{to_ack:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_entry_is_left_pending_when_its_incident_is_in_flight() {
+        let server = MockServer::start().await;
+        let enricher = test_enricher(unreachable_pool(), &server, "m@v", false);
+        let _claim = enricher.in_flight.try_claim("A").unwrap();
+        assert!(!process_stream_entry(&enricher, "1-0", "A").await);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn llm_duration_buckets_extend_past_the_configured_timeout() {
+        let default = llm_duration_buckets(300);
+        assert_eq!(default.last(), Some(&1200.0));
+        assert!(default.contains(&600.0));
+        let gateway = llm_duration_buckets(320);
+        assert!(gateway.contains(&320.0) && gateway.contains(&640.0) && gateway.contains(&1280.0));
+        assert!(gateway.windows(2).all(|w| w[0] < w[1]), "{gateway:?}");
+    }
+
+    // -- DB-gated: reclaim/in-flight and carry-forward end to end --
+
+    async fn seed_incident(pool: &PgPool, incident_id: &str, summary: &str, description: &str) {
+        sqlx::query("DELETE FROM incident_history WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(pool)
+            .await
+            .expect("clear history");
+        sqlx::query(
+            "INSERT INTO incidents (incident_id, summary, description, operators, affected_stations, priority) \
+             VALUES ($1, $2, $3, '{}', '{}', 3) \
+             ON CONFLICT (incident_id) DO UPDATE SET summary = EXCLUDED.summary, description = EXCLUDED.description, \
+                 source_text_hash = NULL, extraction_model_version = NULL, extracted_periods = NULL, \
+                 extracted_category = NULL",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(description)
+        .execute(pool)
+        .await
+        .expect("seed fixture incident row");
+        sqlx::query(
+            "INSERT INTO incident_history (incident_id, summary, description, operators, affected_stations, is_planned, priority) \
+             VALUES ($1, $2, $3, '{}', '{}', false, 3)",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(description)
+        .execute(pool)
+        .await
+        .expect("seed history row");
+    }
+
+    async fn cleanup_incident(pool: &PgPool, incident_id: &str) {
+        for table in ["incident_history", "incidents"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE incident_id = $1"))
+                .bind(incident_id)
+                .execute(pool)
+                .await
+                .expect("cleanup");
+        }
+    }
+
+    /// Mounts a one-period answer for all three passes.
+    async fn mount_flat_extraction(server: &MockServer) {
+        let answers = [
+            (
+                "incident_extraction",
+                serde_json::json!({ "category": "signal_failure", "periods": [{
+                    "scope_description": null, "date_range": null, "schedule_window": null,
+                    "resolution_status": "ongoing", "apparent_severity": "moderate_disruption",
+                    "impact_type": null }] }),
+            ),
+            (
+                "adversarial_resolution_check",
+                serde_json::json!({ "periods": [{ "period_index": 0, "scope_description": null,
+                    "resolution_status": "ongoing" }] }),
+            ),
+            (
+                "adversarial_severity_check",
+                serde_json::json!({ "periods": [{ "period_index": 0, "scope_description": null,
+                    "apparent_severity": "moderate_disruption" }] }),
+            ),
+        ];
+        for (schema, content) in answers {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains(schema))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": content.to_string() } }]
+                })))
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// With a real DB: an already-extracted incident's reclaimed entry is
+    /// acked with no LLM call, while an in-flight incident's entry is left
+    /// pending and never extracted a second time.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher reclaim -- --ignored`"]
+    async fn reclaim_acks_finished_entries_and_skips_in_flight_ones() {
+        let pool = test_pool().await;
+        let (done, busy) = ("TEST-ENRICHER-RECLAIM-DONE", "TEST-ENRICHER-RECLAIM-BUSY");
+        let server = MockServer::start().await;
+        mount_flat_extraction(&server).await;
+        let model_version = "test-model@periods-v2";
+        let enricher = test_enricher(pool.clone(), &server, model_version, false);
+        seed_incident(&pool, done, "Signal failure", "Lines closed.").await;
+        seed_incident(&pool, busy, "Points failure", "Lines closed.").await;
+        assert!(process_incident(&enricher, done).await, "first extraction");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+        let claim = enricher.in_flight.try_claim(busy).unwrap();
+        let to_ack = process_reclaimed(
+            &enricher,
+            vec![
+                ("1-0".to_string(), done.to_string()),
+                ("2-0".to_string(), busy.to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(to_ack, ["1-0"], "done is acked, busy is left pending");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "neither entry cost another LLM call"
+        );
+
+        drop(claim);
+        let to_ack =
+            process_reclaimed(&enricher, vec![("2-0".to_string(), busy.to_string())]).await;
+        assert_eq!(
+            to_ack,
+            ["2-0"],
+            "once released, a later pass processes and acks it"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+
+        cleanup_incident(&pool, done).await;
+        cleanup_incident(&pool, busy).await;
+    }
+
+    /// Carry-forward end to end: a semantic no-op text change makes 0 LLM
+    /// requests and advances `source_text_hash` with the flag on, and runs
+    /// the full 3-call extraction with it off (the default).
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher carry_forward -- --ignored`"]
+    async fn carry_forward_skips_the_llm_for_a_semantic_noop_only_when_enabled() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-CARRY-FORWARD-1";
+        let summary = "Signal failure at Crewe";
+        let (old_description, new_description) =
+            ("<p>Lines are closed.</p>", "<h4>Lines   are closed</h4>");
+        let model_version = "test-model@periods-v2";
+
+        for carry_forward in [true, false] {
+            let server = MockServer::start().await;
+            mount_flat_extraction(&server).await;
+            let enricher = test_enricher(pool.clone(), &server, model_version, carry_forward);
+            seed_incident(&pool, incident_id, summary, old_description).await;
+            assert!(
+                process_incident(&enricher, incident_id).await,
+                "initial extraction"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
+            let before: (Option<String>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+                "SELECT extracted_category, extracted_at FROM incidents WHERE incident_id = $1",
+            )
+            .bind(incident_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            // The feed re-renders the same text with different markup.
+            sqlx::query("UPDATE incidents SET description = $2 WHERE incident_id = $1")
+                .bind(incident_id)
+                .bind(new_description)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(process_incident(&enricher, incident_id).await);
+
+            let expected_calls = if carry_forward { 3 } else { 6 };
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                expected_calls,
+                "carry_forward={carry_forward}"
+            );
+            let after: (
+                Option<String>,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ) = sqlx::query_as(
+                "SELECT source_text_hash, extracted_category, extracted_at FROM incidents \
+                     WHERE incident_id = $1",
+            )
+            .bind(incident_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                after.0.as_deref(),
+                Some(common::text_hash::text_hash(summary, new_description).as_str()),
+                "the hash advances either way"
+            );
+            assert_eq!(after.1, before.0);
+            if carry_forward {
+                assert_eq!(
+                    after.2, before.1,
+                    "extracted_at still says when the LLM last ran"
+                );
+            }
+        }
+        cleanup_incident(&pool, incident_id).await;
     }
 }

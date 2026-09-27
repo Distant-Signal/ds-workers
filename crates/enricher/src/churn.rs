@@ -256,16 +256,24 @@ pub fn compare(
 
 /// Emits the metrics and log line for one measured re-run -- see the module
 /// doc. Call only once the new extraction has actually been written.
-pub fn record(incident_id: &str, report: &ChurnReport) {
+///
+/// `edit_class` is `text_delta::EditClass::label` of how the text moved, or
+/// `"unknown"` (the previous text couldn't be recovered from
+/// `incident_history`) -- a fixed set of 7 values, so the label adds at most
+/// 7x series. It is what lets churn be read per edit
+/// class ("do small edits re-roll untouched fields?").
+pub fn record(incident_id: &str, report: &ChurnReport, edit_class: &'static str) {
     metrics::counter!(
         common::metrics::metric_name("enricher_extraction_rerun_total"),
-        "changed" => if report.changed.is_empty() { "false" } else { "true" }
+        "changed" => if report.changed.is_empty() { "false" } else { "true" },
+        "edit_class" => edit_class
     )
     .increment(1);
     for field in &report.changed {
         metrics::counter!(
             common::metrics::metric_name("enricher_extraction_churn_total"),
-            "field" => field.label()
+            "field" => field.label(),
+            "edit_class" => edit_class
         )
         .increment(1);
     }
@@ -285,6 +293,7 @@ pub fn record(incident_id: &str, report: &ChurnReport) {
         unpaired_new = report.unpaired_new,
         changed = !report.changed.is_empty(),
         changed_fields = %changed_fields,
+        edit_class,
         "extraction re-run churn"
     );
 }
