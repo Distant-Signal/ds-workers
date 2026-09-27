@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             config.untracked_trains_retention_days,
             config.schedule_destination_departures_retention_days,
             config.schedule_derived_products_retention_days,
+            config.full_coverage_line_stats_retention_days,
             archiver.as_ref(),
         )
         .await
@@ -470,6 +471,7 @@ async fn run_retention(
     untracked_trains_retention_days: i64,
     schedule_destination_departures_retention_days: i64,
     schedule_derived_products_retention_days: i64,
+    full_coverage_line_stats_retention_days: i64,
     archiver: Option<&archive::Archiver>,
 ) -> anyhow::Result<()> {
     let pruned = queries::prune_history(pool, retention_days).await?;
@@ -614,8 +616,19 @@ async fn run_retention(
     ))
     .increment(daily_coverage_stats_pruned + half_hourly_coverage_stats_pruned);
 
+    // Per-(line, rail day) full-coverage results, kept since 2026-09-27 so
+    // a day can be audited; see Config::full_coverage_line_stats_retention_days.
+    let full_coverage_line_stats_pruned =
+        queries::prune_full_coverage_line_stats(pool, full_coverage_line_stats_retention_days)
+            .await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_full_coverage_line_stats_pruned_total"
+    ))
+    .increment(full_coverage_line_stats_pruned);
+
     tracing::info!(
         pruned_history_rows = pruned,
+        full_coverage_line_stats_pruned = full_coverage_line_stats_pruned,
         trust_event_backlog_pruned = trust_event_backlog_pruned,
         trains_pruned = trains_pruned,
         schedule_destination_departures_pruned = schedule_destination_departures_pruned,

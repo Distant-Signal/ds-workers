@@ -101,6 +101,20 @@ pub struct Config {
     #[arg(long, env, default_value_t = 840, value_parser = non_negative_retention)]
     pub half_hourly_stats_retention_hours: i64,
 
+    /// How long to keep `full_coverage_line_stats` rows (one per line per
+    /// rail day since 2026-09-27; previously one overwritten row per line),
+    /// in whole service dates.
+    ///
+    /// These are per-line daily aggregates derived from TRUST movements
+    /// (counts and an average delay, no raw events), kept so a day's
+    /// full-coverage result -- and whether it was `partial` -- can be
+    /// audited against `line_status_daily_coverage_stats` before
+    /// full-coverage is ever enabled for a line. 90 days covers a quarter
+    /// of pilot evaluation at ~250 rows a day (~22k rows), well inside the
+    /// 300-day ceiling the sibling LDBWS-derived stats tables keep.
+    #[arg(long, env, default_value_t = 90, value_parser = non_negative_retention)]
+    pub full_coverage_line_stats_retention_days: i64,
+
     /// How long to keep `trust_event_backlog` rows before pruning them.
     ///
     /// DEFAULT IS 1 DAY, DELIBERATELY. The design spec this table
@@ -348,6 +362,7 @@ mod tests {
             Config::try_parse_from(minimal_args(&[])).expect("defaults alone must still parse");
         assert_eq!(config.history_retention_days, 7);
         assert_eq!(config.daily_stats_retention_days, 300);
+        assert_eq!(config.full_coverage_line_stats_retention_days, 90);
         assert_eq!(config.half_hourly_stats_retention_hours, 840);
         assert_eq!(config.trust_event_backlog_retention_days, 1);
         assert_eq!(config.trains_retention_days, 30);

@@ -1263,6 +1263,22 @@ pub async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> R
     Ok(result.rows_affected())
 }
 
+/// Deletes `full_coverage_line_stats` rows whose `service_date` is more
+/// than `retention_days` days old -- the per-day history that table keeps
+/// since 2026-09-27 (see `Config::full_coverage_line_stats_retention_days`).
+/// Same shape as `prune_daily_coverage_stats`. A `service_date`-only
+/// predicate on a `(line_id, service_date)` key is a sequential scan, which
+/// is fine at ~250 rows per day.
+pub async fn prune_full_coverage_line_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM full_coverage_line_stats WHERE service_date < (CURRENT_DATE - $1::int)",
+    )
+    .bind(retention_days as i32)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Half-hourly-granularity sibling of `record_daily_coverage_stats` --
 /// same relationship `record_half_hourly_stats` already has to
 /// `record_daily_stats`. See this section's own module doc comment for
@@ -3623,6 +3639,67 @@ mod tests {
             day2_windows, 1,
             "a new day must start its own fresh row, not accumulate into day 1's"
         );
+    }
+
+    /// The per-day `full_coverage_line_stats` history is pruned by
+    /// `service_date`, keeping every day inside the window -- including
+    /// OTHER days of the same line.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_full_coverage_line_stats -- --ignored`"]
+    async fn prune_full_coverage_line_stats_deletes_only_days_older_than_the_window() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const LINE_ID: &str = "TEST-FC-LINE-STATS-PRUNE";
+        const RETENTION_DAYS: i64 = 30;
+        let cleanup = || async {
+            sqlx::query("DELETE FROM full_coverage_line_stats WHERE line_id = $1")
+                .bind(LINE_ID)
+                .execute(&pool)
+                .await
+                .expect("cleanup");
+        };
+        cleanup().await;
+
+        sqlx::query(
+            "INSERT INTO full_coverage_line_stats (line_id, service_date, availability) VALUES \
+                ($1, CURRENT_DATE - ($2::int + 1), 'available'), \
+                ($1, CURRENT_DATE - ($2::int - 1), 'available'), \
+                ($1, CURRENT_DATE, 'pending')",
+        )
+        .bind(LINE_ID)
+        .bind(RETENTION_DAYS as i32)
+        .execute(&pool)
+        .await
+        .expect("seed three days of one line");
+
+        prune_full_coverage_line_stats(&pool, RETENTION_DAYS)
+            .await
+            .expect("prune_full_coverage_line_stats");
+
+        let survivors: Vec<chrono::NaiveDate> = sqlx::query_scalar(
+            "SELECT service_date FROM full_coverage_line_stats WHERE line_id = $1 ORDER BY service_date",
+        )
+        .bind(LINE_ID)
+        .fetch_all(&pool)
+        .await
+        .expect("survivors");
+        cleanup().await;
+
+        let today: chrono::NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+            .fetch_one(&pool)
+            .await
+            .expect("the database's own date, which the prune compares against");
+        assert_eq!(
+            survivors.len(),
+            2,
+            "only the day past the window is pruned: {survivors:?}"
+        );
+        assert_eq!(*survivors.last().unwrap(), today);
     }
 
     #[tokio::test]
