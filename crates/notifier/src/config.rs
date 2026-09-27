@@ -1,10 +1,13 @@
 use clap::Parser;
+use common::secret::Secret;
 
 /// CLI/env configuration for the `notifier` service.
+/// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
+/// (SVC-12).
 #[derive(Debug, Parser)]
 pub struct Config {
-    #[arg(long, env)]
-    pub database_url: String,
+    #[arg(long, env, hide_env_values = true)]
+    pub database_url: Secret,
 
     /// How often the notifier polls line_status_history/train_movement_events.
     /// DESIGN.md-style "reasonable round number, revisit with real usage"
@@ -93,7 +96,7 @@ pub struct Config {
     /// existing "refuse to start on a missing required secret" posture
     /// (crates/api/src/app.rs's internal_token `ensure!`).
     #[arg(long, env)]
-    pub vapid_private_key: String,
+    pub vapid_private_key: Secret,
     #[arg(long, env)]
     pub vapid_public_key: String,
     /// The `mailto:` or `https:` VAPID "subject" contact, required by the
@@ -256,7 +259,7 @@ mod tests {
     /// test below only needs to override the ONE field it's exercising.
     fn valid_config() -> Config {
         Config {
-            database_url: "postgres://test".to_string(),
+            database_url: "postgres://test".into(),
             poll_interval_secs: 60,
             cooldown_minutes: 20,
             train_delay_threshold_minutes: 15,
@@ -265,7 +268,7 @@ mod tests {
             skip_check_poll_interval_secs: 90,
             template_sweep_poll_interval_secs: 3600,
             auto_commit_lead_minutes: 120,
-            vapid_private_key: "test".to_string(),
+            vapid_private_key: "test".into(),
             vapid_public_key: "test".to_string(),
             vapid_subject: "mailto:test@example.invalid".to_string(),
             log_level: "info".to_string(),
@@ -282,6 +285,25 @@ mod tests {
                 progress_stall_secs: 900,
             },
         }
+    }
+
+    /// SVC-12: `Debug` on the config must not print the database password
+    /// or the VAPID private key.
+    #[test]
+    fn debug_output_redacts_credentials() {
+        let config = Config {
+            database_url: "postgres://notifier:hunter2@db/ds".into(),
+            vapid_private_key: "-----BEGIN PRIVATE KEY-----sekrit".into(),
+            ..valid_config()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("sekrit"), "{rendered}");
+        assert!(rendered.contains("Secret(***)"), "{rendered}");
+        assert_eq!(
+            config.database_url.expose(),
+            "postgres://notifier:hunter2@db/ds"
+        );
     }
 
     #[test]

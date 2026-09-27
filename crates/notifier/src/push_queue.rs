@@ -29,7 +29,8 @@
 //! # When the queue is full: drop, with a metric
 //!
 //! [`PushQueue::enqueue`] returns [`EnqueueOutcome::Dropped`] and
-//! increments `distant_signal_notifier_push_dropped_total{reason}`. Nothing
+//! increments `distant_signal_notifier_push_dropped_total{reason}` (see
+//! "The dropped-send metric" below for every reason). Nothing
 //! is written for a dropped job, so it is exactly as if the send had failed
 //! transiently: the notification is re-decided if and when its source row
 //! is polled again (see "Delivery semantics"). Deferring instead (an
@@ -77,6 +78,31 @@
 //! 6. **A failed bookkeeping write after a successful send** is retried a
 //!    few times in the worker. If it still fails, a grace-window re-read may
 //!    send the notification again (the other half of DB2-25).
+//!
+//! **The guarantee is at-most-once, by decision** (open-findings triage
+//! DQ9, 2026-09-27): no outbox and no pending-send marker. At about 21
+//! subscriptions a lost push is cheaper than the machinery to prevent it;
+//! revisit (a `last_attempted_at` marker re-decided until it expires) if
+//! push volume grows. What is lost is counted instead.
+//!
+//! # The dropped-send metric
+//!
+//! `distant_signal_notifier_push_dropped_total{reason}` counts every decided
+//! notification that ended without being delivered, and so may never be:
+//!
+//! * `queue_full`, `user_queue_full`, `shutting_down`: refused at enqueue.
+//! * `abandoned_on_shutdown`: still queued or in flight when the shutdown
+//!   grace ran out.
+//! * `send_failed`: sent, but no subscription accepted it (all timed out or
+//!   failed transiently).
+//! * `error`: the job could not run (loading subscriptions failed, or it
+//!   panicked).
+//!
+//! A cursor-fed notification counted here is re-decided if its source row
+//! is re-read inside the grace window, so one count is not always one lost
+//! push; a steady rate is. The chart's `DistantSignalNotifierPushDropped`
+//! alert fires on it. Every reason is registered at 0 when the queue
+//! starts, so `increase()` sees the first drop.
 //!
 //! # Shutdown
 //!
@@ -387,6 +413,10 @@ impl<B: PushBackend> PushQueue<B> {
             timeouts: Mutex::new(HashMap::new()),
         });
         publish_gauges(&lock(&shared.state));
+        for reason in DROPPED_REASONS {
+            metrics::counter!(metric("notifier_push_dropped_total"), "reason" => *reason)
+                .increment(0);
+        }
         let workers = (0..config.workers.max(1))
             .map(|_| tokio::spawn(worker(Arc::clone(&shared))))
             .collect();
@@ -682,6 +712,11 @@ async fn worker<B: PushBackend>(shared: Arc<Shared<B>>) {
             });
         metrics::counter!(metric("notifier_push_job_total"), "result" => result.label())
             .increment(1);
+        if let Some(reason) = result.dropped_reason() {
+            // DQ9: at-most-once, so an undelivered job is counted as dropped.
+            metrics::counter!(metric("notifier_push_dropped_total"), "reason" => reason)
+                .increment(1);
+        }
         finish(&shared, &key);
     }
 }
@@ -695,7 +730,32 @@ enum JobResult {
     Error,
 }
 
+/// Every `reason` label `notifier_push_dropped_total` can carry; see the
+/// module doc.
+const DROPPED_REASONS: &[&str] = &[
+    "queue_full",
+    "user_queue_full",
+    "shutting_down",
+    "abandoned_on_shutdown",
+    "send_failed",
+    "error",
+];
+
 impl JobResult {
+    /// The `notifier_push_dropped_total` reason for a job that ended without
+    /// delivering its notification, or `None` if it was delivered (or there
+    /// was nobody to deliver to). `BookkeepingFailed` was delivered; its risk
+    /// is a duplicate, not a drop.
+    fn dropped_reason(self) -> Option<&'static str> {
+        match self {
+            JobResult::Failed => Some("send_failed"),
+            JobResult::Error => Some("error"),
+            JobResult::Delivered | JobResult::NoSubscriptions | JobResult::BookkeepingFailed => {
+                None
+            }
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             JobResult::Delivered => "delivered",
@@ -1440,5 +1500,33 @@ mod tests {
             EnqueueOutcome::Dropped(DropReason::ShuttingDown)
         );
         queue.shutdown(Duration::from_secs(1)).await;
+    }
+
+    /// DQ9 (DB2-25): delivery is at-most-once, so every way a decided
+    /// notification can end undelivered is counted under a pre-registered
+    /// `notifier_push_dropped_total` reason, and a delivered one is not.
+    #[test]
+    fn every_undelivered_outcome_has_a_registered_dropped_reason() {
+        for reason in [
+            DropReason::QueueFull,
+            DropReason::UserQueueFull,
+            DropReason::ShuttingDown,
+        ] {
+            assert!(DROPPED_REASONS.contains(&reason.label()), "{reason:?}");
+        }
+        assert!(DROPPED_REASONS.contains(&"abandoned_on_shutdown"));
+        assert_eq!(JobResult::Failed.dropped_reason(), Some("send_failed"));
+        assert_eq!(JobResult::Error.dropped_reason(), Some("error"));
+        for job_result in [JobResult::Failed, JobResult::Error] {
+            let reason = job_result.dropped_reason().unwrap();
+            assert!(DROPPED_REASONS.contains(&reason), "{reason}");
+        }
+        assert_eq!(JobResult::Delivered.dropped_reason(), None);
+        assert_eq!(JobResult::NoSubscriptions.dropped_reason(), None);
+        assert_eq!(
+            JobResult::BookkeepingFailed.dropped_reason(),
+            None,
+            "delivered; the risk there is a duplicate, not a drop"
+        );
     }
 }

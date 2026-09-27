@@ -12,6 +12,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common", features = ["postgres"] }
 dotenv = "0.15.0"
 futures-util = "0.3"
+md-5 = "0.10"
 metrics = "0.24"
 object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
 serde = { version = "1.0.228", features = ["derive"] }

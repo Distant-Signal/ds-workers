@@ -399,6 +399,31 @@ const PRIMARY_SCHEMA_NAME: &str = "incident_extraction";
 /// storage.
 const MAX_PERIODS: usize = 8;
 
+/// Cap on each period's `scope_description`, in characters (SVC-13). It is
+/// model-written text that is stored and displayed, and incident text (a
+/// prompt-injection surface) goes straight into the prompt, so nothing but
+/// the model's own output limit used to bound it. Enforced here, after
+/// parsing, rather than as a schema `maxLength`: strict structured-output
+/// modes may reject that keyword. Real ones are a short phrase.
+pub(crate) const MAX_SCOPE_DESCRIPTION_CHARS: usize = 500;
+
+/// Truncates `scope` to [`MAX_SCOPE_DESCRIPTION_CHARS`] characters (never
+/// splitting a UTF-8 character), marking the cut with an ellipsis.
+fn bound_scope_description(scope: &mut Option<String>) {
+    let Some(text) = scope else {
+        return;
+    };
+    if let Some((cut, _)) = text.char_indices().nth(MAX_SCOPE_DESCRIPTION_CHARS) {
+        // Leave room for the marker so the result stays within the cap.
+        let keep = text
+            .char_indices()
+            .nth(MAX_SCOPE_DESCRIPTION_CHARS - 1)
+            .map_or(cut, |(i, _)| i);
+        text.truncate(keep);
+        text.push('\u{2026}');
+    }
+}
+
 /// JSON schema for the primary pass. Deliberately omits
 /// `resolution_status_confidence`/`severity_confidence` (design §1) --
 /// those don't exist until the combination step runs against the
@@ -870,6 +895,11 @@ impl LlmClient {
             extraction.periods = select_periods_within_cap(extraction.periods);
         }
         extraction.dropped_period_count = original_count.saturating_sub(MAX_PERIODS);
+        // Before the adversarial passes, which echo each period's scope back
+        // and are checked against exactly what was sent.
+        for period in &mut extraction.periods {
+            bound_scope_description(&mut period.scope_description);
+        }
         Ok(extraction)
     }
 
@@ -1011,6 +1041,36 @@ pub(crate) fn live_client_from_env() -> LlmClient {
         std::time::Duration::from_secs(timeout_secs),
     )
     .with_provider_policy(policy)
+}
+
+#[cfg(test)]
+mod scope_bound_tests {
+    use super::*;
+
+    /// SVC-13: an over-long scope description is cut to the cap (with a
+    /// marker, on a character boundary); a normal one is untouched.
+    #[test]
+    fn scope_description_is_truncated_to_the_cap() {
+        let mut short = Some("platform 2 closed".to_string());
+        bound_scope_description(&mut short);
+        assert_eq!(short.as_deref(), Some("platform 2 closed"));
+
+        let mut none = None;
+        bound_scope_description(&mut none);
+        assert_eq!(none, None);
+
+        let exact = "a".repeat(MAX_SCOPE_DESCRIPTION_CHARS);
+        let mut at_cap = Some(exact.clone());
+        bound_scope_description(&mut at_cap);
+        assert_eq!(at_cap.as_deref(), Some(exact.as_str()));
+
+        // Multi-byte characters: the cut must land on a char boundary.
+        let mut huge = Some("\u{e9}".repeat(1_000_000));
+        bound_scope_description(&mut huge);
+        let huge = huge.unwrap();
+        assert_eq!(huge.chars().count(), MAX_SCOPE_DESCRIPTION_CHARS);
+        assert!(huge.ends_with('\u{2026}'));
+    }
 }
 
 #[cfg(test)]

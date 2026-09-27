@@ -1,13 +1,17 @@
 use clap::Parser;
+use common::secret::Secret;
 
 /// CLI/env configuration for the `enricher` service.
+/// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
+/// (SVC-12).
 #[derive(Debug, Parser)]
 pub struct Config {
-    #[arg(long, env)]
-    pub database_url: String,
+    #[arg(long, env, hide_env_values = true)]
+    pub database_url: Secret,
 
-    #[arg(long, env)]
-    pub redis_url: String,
+    /// May carry a password (`redis://:pw@host`).
+    #[arg(long, env, hide_env_values = true)]
+    pub redis_url: Secret,
 
     /// Base URL of an OpenAI-compatible Chat Completions endpoint, e.g.
     /// `http://localhost:8080/v1` for a local server. No vendor is assumed.
@@ -15,8 +19,8 @@ pub struct Config {
     pub llm_base_url: String,
 
     /// Optional -- many local OpenAI-compatible servers don't require one.
-    #[arg(long, env)]
-    pub llm_api_key: Option<String>,
+    #[arg(long, env, hide_env_values = true)]
+    pub llm_api_key: Option<Secret>,
 
     /// Model name/identifier as the endpoint expects it.
     #[arg(long, env)]

@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
         Some(&progress),
         || async {
             use sqlx::Connection;
-            sqlx::PgConnection::connect(&config.database_url)
+            sqlx::PgConnection::connect(config.database_url.expose())
                 .await?
                 .close()
                 .await
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     // acquire_timeout; see `common::pg`. The retention prunes and archive
     // batches raise the statement timeout for their own transactions.
     let pool = common::pg::PoolSettings::from_env("distant-signal-aggregator", 10)?
-        .connect(&config.database_url)
+        .connect(config.database_url.expose())
         .await?;
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -90,6 +90,23 @@ async fn main() -> anyhow::Result<()> {
     // docs for why a process-lifetime, non-persisted ledger is judged
     // sufficient.
     let mut dedup_ledger = SeenServiceLedger::new();
+
+    if archiver.is_some() {
+        // Registered at 0 so the chart's archive alert sees the first
+        // failure with a plain increase().
+        for name in [
+            "aggregator_archive_upload_failures_total",
+            "aggregator_archive_batches_changed_total",
+        ] {
+            metrics::counter!(common::metrics::metric_name(name)).increment(0);
+        }
+    }
+    let retention = tokio::spawn(retention_loop(
+        pool.clone(),
+        RetentionSettings::from_config(&config),
+        archiver,
+        Duration::from_secs(config.poll_interval_secs),
+    ));
 
     let mut interval = cycle_interval(Duration::from_secs(config.poll_interval_secs));
 
@@ -111,60 +128,134 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(error = ?err, "aggregation cycle failed; will retry next interval");
         }
 
-        // Retention runs UNCONDITIONALLY, after the aggregation pass and
-        // outside its `?`-chain -- deliberately not gated on `result` being
-        // `Ok`. Pruning has no data dependency on the status/stats writes
-        // above, and two of its tiers exist to enforce real RDM licensing
-        // obligations (`trust_event_backlog`'s 1-day window, the LDBWS-derived
-        // stats tables' 1-year ceiling), so a run of failing aggregation
-        // cycles must not quietly suspend them. See `run_retention`.
-        if let Err(err) = run_retention(
-            &pool,
-            config.history_retention_days,
-            config.daily_stats_retention_days,
-            config.half_hourly_stats_retention_hours,
-            config.trust_event_backlog_retention_days,
-            config.trains_retention_days,
-            config.untracked_trains_retention_days,
-            config.schedule_destination_departures_retention_days,
-            config.schedule_derived_products_retention_days,
-            config.full_coverage_line_stats_retention_days,
-            archiver.as_ref(),
-        )
-        .await
-        {
-            tracing::error!(error = ?err, "retention pruning failed; will retry next interval");
-        }
-        // In its own error scope, after every other prune: the tables come
-        // from an api migration, so an aggregator deployed before it must
-        // not lose its other prunes to "relation does not exist".
-        match full_coverage_window::prune_full_coverage_window_stats(
-            &pool,
-            config
-                .full_coverage_window
-                .full_coverage_window_stats_retention_days,
-        )
-        .await
-        {
-            Ok(pruned) => {
-                metrics::counter!(common::metrics::metric_name(
-                    "aggregator_full_coverage_window_stats_pruned_total"
-                ))
-                .increment(pruned);
-            }
-            Err(err) => {
-                tracing::warn!(error = ?err, "failed to prune full-coverage window stats; will retry next interval");
-            }
-        }
-
-        // Records the whole iteration -- aggregation AND retention -- which
-        // is what this histogram measured before retention was split out of
-        // `run_cycle`, so its existing dashboards/alerts keep their meaning.
+        // Aggregation only, since retention moved to its own task (SVC-06);
+        // retention has `aggregator_retention_duration_seconds`.
         metrics::histogram!(common::metrics::metric_name(
             "aggregator_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
         progress.beat();
+
+        // The retention task never returns on its own; if it has, it
+        // panicked. Exit so Kubernetes restarts the pod rather than running
+        // on with the licensing prunes silently stopped.
+        if retention.is_finished() {
+            let outcome = retention.await;
+            anyhow::bail!("the retention task stopped unexpectedly: {outcome:?}");
+        }
+    }
+}
+
+/// Every retention knob, copied out of `Config` for the retention task.
+#[derive(Debug, Clone, Copy)]
+struct RetentionSettings {
+    history_retention_days: i64,
+    daily_stats_retention_days: i64,
+    half_hourly_stats_retention_hours: i64,
+    trust_event_backlog_retention_days: i64,
+    trains_retention_days: i64,
+    untracked_trains_retention_days: i64,
+    schedule_destination_departures_retention_days: i64,
+    schedule_derived_products_retention_days: i64,
+    full_coverage_line_stats_retention_days: i64,
+    full_coverage_window_stats_retention_days: i64,
+}
+
+impl RetentionSettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            history_retention_days: config.history_retention_days,
+            daily_stats_retention_days: config.daily_stats_retention_days,
+            half_hourly_stats_retention_hours: config.half_hourly_stats_retention_hours,
+            trust_event_backlog_retention_days: config.trust_event_backlog_retention_days,
+            trains_retention_days: config.trains_retention_days,
+            untracked_trains_retention_days: config.untracked_trains_retention_days,
+            schedule_destination_departures_retention_days: config
+                .schedule_destination_departures_retention_days,
+            schedule_derived_products_retention_days: config
+                .schedule_derived_products_retention_days,
+            full_coverage_line_stats_retention_days: config.full_coverage_line_stats_retention_days,
+            full_coverage_window_stats_retention_days: config
+                .full_coverage_window
+                .full_coverage_window_stats_retention_days,
+        }
+    }
+}
+
+/// The retention prunes, on their own task and interval (SVC-06).
+///
+/// They used to run inline after each aggregation pass, so a slow prune --
+/// above all the cold archive's uploads, which under the `retain` policy
+/// pay object storage's whole retry window on every run while it is down --
+/// held up line-status aggregation for as long as it took. They share
+/// nothing with `run_cycle` but the pool, so each now keeps its own cadence.
+/// Same interval as aggregation (`poll_interval_secs`); a run that overruns
+/// just delays the next one (`MissedTickBehavior::Delay`).
+///
+/// Retention still runs UNCONDITIONALLY: it never depended on aggregation
+/// succeeding, and two of its tiers enforce RDM licensing obligations
+/// (`trust_event_backlog`'s 1-day window, the LDBWS-derived stats tables'
+/// ceiling), so a run of failing aggregation cycles must not suspend them.
+async fn retention_loop(
+    pool: sqlx::PgPool,
+    settings: RetentionSettings,
+    archiver: Option<archive::Archiver>,
+    interval: Duration,
+) {
+    let mut interval = cycle_interval(interval);
+    loop {
+        interval.tick().await;
+        let started = std::time::Instant::now();
+        run_retention_pass(&pool, &settings, archiver.as_ref()).await;
+        metrics::histogram!(common::metrics::metric_name(
+            "aggregator_retention_duration_seconds"
+        ))
+        .record(started.elapsed().as_secs_f64());
+    }
+}
+
+/// One retention run: every prune, each failure logged and left for the
+/// next run.
+async fn run_retention_pass(
+    pool: &sqlx::PgPool,
+    settings: &RetentionSettings,
+    archiver: Option<&archive::Archiver>,
+) {
+    if let Err(err) = run_retention(
+        pool,
+        settings.history_retention_days,
+        settings.daily_stats_retention_days,
+        settings.half_hourly_stats_retention_hours,
+        settings.trust_event_backlog_retention_days,
+        settings.trains_retention_days,
+        settings.untracked_trains_retention_days,
+        settings.schedule_destination_departures_retention_days,
+        settings.schedule_derived_products_retention_days,
+        settings.full_coverage_line_stats_retention_days,
+        archiver,
+    )
+    .await
+    {
+        tracing::error!(error = ?err, "retention pruning failed; will retry next interval");
+    }
+    // In its own error scope, after every other prune: the tables come
+    // from an api migration, so an aggregator deployed before it must
+    // not lose its other prunes to "relation does not exist".
+    match full_coverage_window::prune_full_coverage_window_stats(
+        pool,
+        settings.full_coverage_window_stats_retention_days,
+    )
+    .await
+    {
+        Ok(pruned) => {
+            metrics::counter!(common::metrics::metric_name(
+                "aggregator_full_coverage_window_stats_pruned_total"
+            ))
+            .increment(pruned);
+        }
+        Err(err) => {
+            tracing::warn!(error = ?err, "failed to prune full-coverage window stats; will retry next interval");
+        }
     }
 }
 
@@ -547,8 +638,9 @@ async fn run_cycle(
 /// and another is `line_status_daily_stats`/`line_status_half_hourly_stats`'
 /// LDBWS 1-year deletion ceiling. Retention is a compliance obligation with
 /// no data dependency on the aggregation it was sharing a `?`-chain with, so
-/// `main`'s loop now awaits this separately and logs its own failure --
-/// pruning happens on schedule even during a stretch of failing cycles.
+/// it runs on its own task (`retention_loop`, SVC-06) and logs its own
+/// failure -- pruning happens on schedule even during a stretch of failing
+/// cycles, and a slow prune no longer delays aggregation either.
 ///
 /// `prune_removed_lines` deliberately stays in `run_cycle`: it needs that
 /// cycle's freshly-merged line set, so it genuinely cannot run without a

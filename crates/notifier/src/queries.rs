@@ -18,6 +18,23 @@ use sqlx::{PgPool, Row};
 
 use crate::decision::train_severity_rank;
 
+/// Row caps for the three watermark polls (DB review part 2, DB2-24). A
+/// stalled or reset cursor used to fetch everything above it in one
+/// statement -- for `line_status_history` that is every `statuses` JSONB
+/// blob (about 5 KB each) decoded before anything was sent. With these, a
+/// cycle reads at most one batch; see [`advance_cursor_with_grace_bounded`]
+/// for how the cursor then walks a backlog. Sized well above normal
+/// per-cycle volume, so ordinary cycles still read everything at once.
+pub const LINE_POLL_BATCH_ROWS: i64 = 2_000;
+/// Only ids are read here (the `DISTINCT trains_id` of subscribed trains),
+/// so this can be much larger than [`LINE_POLL_BATCH_ROWS`].
+pub const TRAIN_POLL_BATCH_ROWS: i64 = 50_000;
+pub const FORWARD_QUEUE_POLL_BATCH_ROWS: i64 = 10_000;
+
+/// Large enough that no test fixture fills a batch.
+#[cfg(test)]
+pub(crate) const TEST_POLL_BATCH_ROWS: i64 = 1_000_000;
+
 /// One `notifier_cursor` row: the committed watermark plus the
 /// not-yet-promoted proposal behind the grace window
 /// (`20260925215000_notifier_cursor_pending_watermark.sql`). See
@@ -36,15 +53,27 @@ pub struct CursorState {
     pub pending_observed_at: Option<DateTime<Utc>>,
 }
 
-/// Upserts a zero row on first use -- the migration declares the table's
+/// Inserts a zero row on first use -- the migration declares the table's
 /// shape but deliberately does not seed rows (Task 1), so the first ever
 /// poll cycle for a given `name` creates its own starting-at-zero cursor
 /// here.
+///
+/// A read, not a write (DB review part 2, DB2-26): this used to be
+/// `ON CONFLICT DO UPDATE SET name = EXCLUDED.name`, which rewrote the row
+/// (a dead tuple and WAL) on every read, several times a minute.
+/// `DO NOTHING` writes nothing when the row exists, and the second arm
+/// reads it.
 pub async fn read_cursor(pool: &PgPool, name: &str) -> anyhow::Result<CursorState> {
     let row = sqlx::query_as::<_, CursorState>(
-        "INSERT INTO notifier_cursor (name, last_processed_id) VALUES ($1, 0) \
-         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name \
-         RETURNING last_processed_id, pending_id, pending_observed_at",
+        "WITH inserted AS ( \
+             INSERT INTO notifier_cursor (name, last_processed_id) VALUES ($1, 0) \
+             ON CONFLICT (name) DO NOTHING \
+             RETURNING last_processed_id, pending_id, pending_observed_at \
+         ) \
+         SELECT last_processed_id, pending_id, pending_observed_at FROM inserted \
+         UNION ALL \
+         SELECT last_processed_id, pending_id, pending_observed_at FROM notifier_cursor \
+         WHERE name = $1 AND NOT EXISTS (SELECT 1 FROM inserted)",
     )
     .bind(name)
     .fetch_one(pool)
@@ -88,6 +117,10 @@ pub async fn read_cursor(pool: &PgPool, name: &str) -> anyhow::Result<CursorStat
 /// ever grows a genuinely long-running transaction.
 ///
 /// Returns the `last_processed_id` now stored, for the caller's logging.
+///
+/// Equivalent to [`advance_cursor_with_grace_bounded`] for a poll that read
+/// everything above the cursor (`read_through: None`).
+#[cfg(test)]
 pub async fn advance_cursor_with_grace(
     pool: &PgPool,
     name: &str,
@@ -96,8 +129,60 @@ pub async fn advance_cursor_with_grace(
     now: DateTime<Utc>,
     grace: chrono::Duration,
 ) -> anyhow::Result<i64> {
+    advance_cursor_with_grace_bounded(
+        pool,
+        name,
+        state,
+        PollWindow {
+            observed_max_id,
+            read_through: None,
+        },
+        now,
+        grace,
+    )
+    .await
+}
+
+/// What one bounded poll (DB review part 2, DB2-24) saw, for
+/// [`advance_cursor_with_grace_bounded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollWindow {
+    /// The highest id visible above the cursor when the poll ran (the
+    /// table's head), whether or not this poll's batch reached it. This is
+    /// what gets PROPOSED: once it has aged past the grace window, every row
+    /// at or below it has committed, however many batches it takes to read
+    /// them.
+    pub observed_max_id: i64,
+    /// `Some(id)` when the batch was full, so rows above `id` were not read
+    /// this cycle and the cursor must not be promoted past `id`. `None` when
+    /// the poll read everything above the cursor.
+    pub read_through: Option<i64>,
+}
+
+/// [`advance_cursor_with_grace`] for a bounded poll (DB2-24): the polls read
+/// at most a fixed number of rows above the cursor per cycle (a stalled or
+/// reset cursor used to fetch the whole table in one statement), so a
+/// proposal is only promoted as far as this cycle actually read
+/// (`window.read_through`). An aged proposal that is only partly covered
+/// stays pending with its original observed-at, so the next cycle promotes
+/// the next batch straight away: after one grace window a backlog drains at
+/// one batch per poll interval, not one batch per grace window.
+pub async fn advance_cursor_with_grace_bounded(
+    pool: &PgPool,
+    name: &str,
+    state: &CursorState,
+    window: PollWindow,
+    now: DateTime<Utc>,
+    grace: chrono::Duration,
+) -> anyhow::Result<i64> {
+    let observed_max_id = window.observed_max_id;
     let promoted = match (state.pending_id, state.pending_observed_at) {
-        (Some(pending_id), Some(observed_at)) if now - observed_at >= grace => pending_id,
+        (Some(pending_id), Some(observed_at)) if now - observed_at >= grace => {
+            match window.read_through {
+                Some(read_through) => pending_id.min(read_through),
+                None => pending_id,
+            }
+        }
         _ => state.last_processed_id,
     };
     // `max` on both: a watermark must never move BACKWARDS, not even if a
@@ -144,10 +229,14 @@ pub async fn advance_cursor_with_grace(
         }
     };
 
+    // Only when something changed (DB2-26): most cycles store exactly the
+    // values already there, and an unguarded UPDATE rewrote the row anyway.
     sqlx::query(
         "UPDATE notifier_cursor \
          SET last_processed_id = $1, pending_id = $2, pending_observed_at = $3 \
-         WHERE name = $4",
+         WHERE name = $4 \
+           AND (last_processed_id, pending_id, pending_observed_at) \
+               IS DISTINCT FROM ($1, $2, $3)",
     )
     .bind(new_last)
     .bind(new_pending)
@@ -334,13 +423,28 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
 /// CANDIDATE ids alone, so a cycle that found no candidate at all left the
 /// cursor where it was and re-scanned the same rows on every subsequent
 /// cycle for as long as no transition ever occurred.
+///
+/// Bounded (DB2-24): reads at most `batch_rows` rows above `since_id`, in id
+/// order. The anchor/`LAG` reasoning above still holds for a batch: it is
+/// the lowest `batch_rows` ids above the cursor, so per line it is still a
+/// contiguous run from the anchor onward. The returned [`PollWindow`] says
+/// how far the batch reached; see [`advance_cursor_with_grace_bounded`].
 pub async fn poll_line_candidates(
     pool: &PgPool,
     since_id: i64,
-) -> anyhow::Result<(Vec<LineCandidate>, i64)> {
+    batch_rows: i64,
+) -> anyhow::Result<(Vec<LineCandidate>, PollWindow)> {
+    // The head first: a batch that then comes back short has read every row
+    // at or below it.
+    let head: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(id) FROM line_status_history WHERE id > $1")
+            .bind(since_id)
+            .fetch_one(pool)
+            .await?;
     let rows = sqlx::query_as::<_, LineHistoryRow>(
         "WITH candidates AS ( \
              SELECT id, line_id, statuses FROM line_status_history WHERE id > $1 \
+             ORDER BY id LIMIT $2 \
          ), \
          anchors AS ( \
              SELECT DISTINCT ON (line_id) id, line_id, statuses \
@@ -364,15 +468,20 @@ pub async fn poll_line_candidates(
          ORDER BY id",
     )
     .bind(since_id)
+    .bind(batch_rows)
     .fetch_all(pool)
     .await?;
 
-    let observed_max_id = rows.iter().map(|row| row.id).max().unwrap_or(since_id);
+    let batch_max_id = rows.iter().map(|row| row.id).max().unwrap_or(since_id);
+    let window = PollWindow {
+        observed_max_id: head.unwrap_or(since_id).max(batch_max_id),
+        read_through: (rows.len() as i64 >= batch_rows).then_some(batch_max_id),
+    };
     let candidates = rows
         .into_iter()
         .filter_map(line_candidate_from_row)
         .collect();
-    Ok((candidates, observed_max_id))
+    Ok((candidates, window))
 }
 
 pub struct TrainCandidate {
@@ -479,11 +588,15 @@ pub async fn candidates_for_trains_id(
 /// `candidates_for_trains_id` in the first place -- a pure query-efficiency
 /// change, the per-subscriber cooldown/escalation join in
 /// `candidates_for_trains_id` below is untouched.
+///
+/// Bounded (DB2-24): considers at most `batch_rows` event ids above
+/// `since_id`; see [`PollWindow`].
 pub async fn poll_train_candidates(
     pool: &PgPool,
     since_id: i64,
     delay_threshold_minutes: i32,
-) -> anyhow::Result<(Vec<TrainCandidate>, i64)> {
+    batch_rows: i64,
+) -> anyhow::Result<(Vec<TrainCandidate>, PollWindow)> {
     // The watermark must advance past EVERY event since $1 (subscribed or
     // not), or unsubscribed-train events would be re-scanned by the
     // `touched` query below forever -- so this is deliberately computed
@@ -496,15 +609,24 @@ pub async fn poll_train_candidates(
             .fetch_one(pool)
             .await?;
     let Some(max_id) = max_id else {
-        return Ok((Vec::new(), since_id));
+        return Ok((
+            Vec::new(),
+            PollWindow {
+                observed_max_id: since_id,
+                read_through: None,
+            },
+        ));
     };
+    let read_through = batch_end(pool, "train_movement_events", since_id, batch_rows).await?;
 
     let touched: Vec<i64> = sqlx::query_scalar(
         "SELECT DISTINCT tme.trains_id FROM train_movement_events tme \
          JOIN train_subscriptions ts ON ts.trains_id = tme.trains_id \
-         WHERE tme.id > $1 AND tme.trains_id IS NOT NULL",
+         WHERE tme.id > $1 AND ($2::bigint IS NULL OR tme.id <= $2) \
+           AND tme.trains_id IS NOT NULL",
     )
     .bind(since_id)
+    .bind(read_through)
     .fetch_all(pool)
     .await?;
 
@@ -513,7 +635,33 @@ pub async fn poll_train_candidates(
         candidates
             .extend(candidates_for_trains_id(pool, trains_id, delay_threshold_minutes).await?);
     }
-    Ok((candidates, max_id))
+    Ok((
+        candidates,
+        PollWindow {
+            observed_max_id: max_id,
+            read_through,
+        },
+    ))
+}
+
+/// The id of the `batch_rows`-th row above `since_id` in `table` (a
+/// constant, never user input), or `None` when there are fewer rows than
+/// that -- i.e. where a full batch ends. An index-only walk of `batch_rows`
+/// primary-key entries.
+async fn batch_end(
+    pool: &PgPool,
+    table: &'static str,
+    since_id: i64,
+    batch_rows: i64,
+) -> anyhow::Result<Option<i64>> {
+    let end = sqlx::query_scalar(&format!(
+        "SELECT id FROM {table} WHERE id > $1 ORDER BY id OFFSET $2 LIMIT 1"
+    ))
+    .bind(since_id)
+    .bind(batch_rows.max(1) - 1)
+    .fetch_optional(pool)
+    .await?;
+    Ok(end)
 }
 
 /// The forward queue's own watermark poll -- same shape as
@@ -521,21 +669,44 @@ pub async fn poll_train_candidates(
 /// `notifier_forward_queue` instead. Advanced via its own, separate
 /// `notifier_cursor` row (name `"notifier_forward_queue"`), independent of
 /// the `"train_movement_events"` cursor `poll_train_candidates` advances.
-pub async fn poll_forward_queue(pool: &PgPool, since_id: i64) -> anyhow::Result<(Vec<i64>, i64)> {
-    let touched: Vec<i64> =
-        sqlx::query_scalar("SELECT DISTINCT trains_id FROM notifier_forward_queue WHERE id > $1")
-            .bind(since_id)
-            .fetch_all(pool)
-            .await?;
-    if touched.is_empty() {
-        return Ok((Vec::new(), since_id));
-    }
-    let max_id: i64 =
+///
+/// Bounded (DB2-24): considers at most `batch_rows` queue ids above
+/// `since_id`; see [`PollWindow`].
+pub async fn poll_forward_queue(
+    pool: &PgPool,
+    since_id: i64,
+    batch_rows: i64,
+) -> anyhow::Result<(Vec<i64>, PollWindow)> {
+    let max_id: Option<i64> =
         sqlx::query_scalar("SELECT MAX(id) FROM notifier_forward_queue WHERE id > $1")
             .bind(since_id)
             .fetch_one(pool)
             .await?;
-    Ok((touched, max_id))
+    let Some(max_id) = max_id else {
+        return Ok((
+            Vec::new(),
+            PollWindow {
+                observed_max_id: since_id,
+                read_through: None,
+            },
+        ));
+    };
+    let read_through = batch_end(pool, "notifier_forward_queue", since_id, batch_rows).await?;
+    let touched: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT trains_id FROM notifier_forward_queue \
+         WHERE id > $1 AND ($2::bigint IS NULL OR id <= $2)",
+    )
+    .bind(since_id)
+    .bind(read_through)
+    .fetch_all(pool)
+    .await?;
+    Ok((
+        touched,
+        PollWindow {
+            observed_max_id: max_id,
+            read_through,
+        },
+    ))
 }
 
 pub async fn pinned_users_for_line(pool: &PgPool, line_id: &str) -> anyhow::Result<Vec<String>> {
@@ -1360,6 +1531,15 @@ async fn cif_train_schedule(
 ///   left to the api: a leg is auto-committed BEFORE its train has run, so
 ///   there is no retained history to replay yet, and once it does run
 ///   `trust-consumer` feeds this shared `trains_id` live anyway.
+/// * `schedule_matched_at` is deliberately NOT stamped (DB review part 2,
+///   DB2-9). The api reads it as "fully schedule-matched": its
+///   reconciliation sweep (`api::data::reconciliation`, `WHERE
+///   schedule_matched_at IS NULL`) and `enrich_shared_train`'s precheck both
+///   skip a stamped row. Stamping it here, without the `calling_points` and
+///   `matched_line_id` a real match writes, left the row permanently
+///   unenriched. Leaving it NULL lets the api's own match fill those in
+///   later; the `COALESCE`s below mean that match keeps the origin and
+///   terminus written here.
 ///
 /// Every column is `COALESCE`d against the existing value, exactly like
 /// `api::data::trains::find_or_create_train_with_schedule_match` -- so this
@@ -1379,18 +1559,37 @@ pub async fn find_or_create_train_with_cif_schedule(
     // instant to store; the rest of the enrichment is still worth writing.
     let scheduled_departure = crate::london_to_utc(service_date.and_time(schedule.scheduled));
 
+    // Read first, as in `find_or_create_train` above and `crates/api`'s
+    // copy (DB review part 2, DB2-7): the old unconditional `ON CONFLICT
+    // DO UPDATE` rewrote the row (a dead tuple and a row lock) on every
+    // call, even when nothing changed. Now an existing row is only
+    // UPDATEd when it is missing a column this call can fill, and the
+    // insert's `DO UPDATE` only covers a concurrent insert that committed
+    // after this statement's snapshot.
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO trains \
-            (train_uid, service_date, origin_crs, scheduled_departure, destination_crs, \
-             schedule_matched_at) \
-         VALUES ($1, $2, $3, $4, $5, NOW()) \
-         ON CONFLICT (train_uid, service_date) DO UPDATE SET \
-            train_uid           = EXCLUDED.train_uid, \
-            origin_crs          = COALESCE(trains.origin_crs, EXCLUDED.origin_crs), \
-            scheduled_departure = COALESCE(trains.scheduled_departure, EXCLUDED.scheduled_departure), \
-            destination_crs     = COALESCE(trains.destination_crs, EXCLUDED.destination_crs), \
-            schedule_matched_at = COALESCE(trains.schedule_matched_at, EXCLUDED.schedule_matched_at) \
-         RETURNING id",
+        "WITH existing AS ( \
+             SELECT id FROM trains WHERE train_uid = $1 AND service_date = $2 \
+         ), filled AS ( \
+             UPDATE trains t SET \
+                origin_crs          = COALESCE(t.origin_crs, $3), \
+                scheduled_departure = COALESCE(t.scheduled_departure, $4), \
+                destination_crs     = COALESCE(t.destination_crs, $5) \
+             WHERE t.id IN (SELECT id FROM existing) \
+               AND ((t.origin_crs IS NULL AND $3::text IS NOT NULL) \
+                 OR (t.scheduled_departure IS NULL AND $4::timestamptz IS NOT NULL) \
+                 OR (t.destination_crs IS NULL AND $5::text IS NOT NULL)) \
+             RETURNING t.id \
+         ), inserted AS ( \
+             INSERT INTO trains \
+                (train_uid, service_date, origin_crs, scheduled_departure, destination_crs) \
+             SELECT $1, $2, $3, $4, $5 WHERE NOT EXISTS (SELECT 1 FROM existing) \
+             ON CONFLICT (train_uid, service_date) DO UPDATE SET \
+                origin_crs          = COALESCE(trains.origin_crs, EXCLUDED.origin_crs), \
+                scheduled_departure = COALESCE(trains.scheduled_departure, EXCLUDED.scheduled_departure), \
+                destination_crs     = COALESCE(trains.destination_crs, EXCLUDED.destination_crs) \
+             RETURNING id \
+         ) \
+         SELECT id FROM existing UNION ALL SELECT id FROM inserted",
     )
     .bind(train_uid)
     .bind(service_date)
@@ -1727,7 +1926,12 @@ mod tests {
 
         let cursor_name = "line_status_history";
         let cursor = read_cursor(&pool, cursor_name).await.expect("read cursor");
-        let (first_pass, observed_max_id) = poll_line_candidates(&pool, cursor.last_processed_id)
+        let (
+            first_pass,
+            PollWindow {
+                observed_max_id, ..
+            },
+        ) = poll_line_candidates(&pool, cursor.last_processed_id, TEST_POLL_BATCH_ROWS)
             .await
             .expect("first poll");
         let candidate = first_pass
@@ -1753,9 +1957,10 @@ mod tests {
         .await
         .expect("advance");
 
-        let (second_pass, _) = poll_line_candidates(&pool, advanced.max(observed_max_id))
-            .await
-            .expect("second poll");
+        let (second_pass, _) =
+            poll_line_candidates(&pool, advanced.max(observed_max_id), TEST_POLL_BATCH_ROWS)
+                .await
+                .expect("second poll");
         assert!(
             second_pass.iter().all(|c| c.line_id != line_id),
             "an unchanged table must produce zero new candidates for this line on a repeat poll"
@@ -1819,7 +2024,12 @@ mod tests {
         .await
         .expect("seed the transitioned good row");
 
-        let (candidates, observed_max_id) = poll_line_candidates(&pool, start)
+        let (
+            candidates,
+            PollWindow {
+                observed_max_id, ..
+            },
+        ) = poll_line_candidates(&pool, start, TEST_POLL_BATCH_ROWS)
             .await
             .expect("the poll must SUCCEED despite an undecodable row -- this is the whole fix");
 
@@ -2021,7 +2231,7 @@ mod tests {
         // MinorDelays) and a3 (MinorDelays -> SevereDelays) are both
         // severity transitions and must surface with the matching
         // previous_rank; b1 (cold start) must never be a candidate.
-        let (found, _) = poll_line_candidates(&pool, since_id)
+        let (found, _) = poll_line_candidates(&pool, since_id, TEST_POLL_BATCH_ROWS)
             .await
             .expect("poll_line_candidates");
         let found_a2 = found
@@ -2245,6 +2455,192 @@ mod tests {
             .await
             .expect("re-read cursor");
         assert_eq!(after_seventh.pending_id, Some(140));
+
+        sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
+            .bind(cursor_name)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// DB2-24: a poll reads at most one batch above the cursor, and an aged
+    /// proposal is promoted only as far as the batch reached, then the rest
+    /// on the next cycle.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                bounded_polls_walk_a_backlog_one_batch_at_a_time -- --ignored --test-threads=1`"]
+    async fn bounded_polls_walk_a_backlog_one_batch_at_a_time() {
+        let pool = connect().await;
+        let line_id = "TEST-NOTIFIER-DB224-LINE";
+        let cursor_name = "TEST-NOTIFIER-DB224-CURSOR";
+        cleanup_line_history(&pool, line_id).await;
+
+        let mut ids = Vec::new();
+        for severity in [
+            common::Severity::GoodService,
+            common::Severity::SevereDelays,
+            common::Severity::GoodService,
+        ] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+                 VALUES ($1, $2, NOW()) RETURNING id",
+            )
+            .bind(line_id)
+            .bind(status_json(severity))
+            .fetch_one(&pool)
+            .await
+            .expect("seed history row");
+            ids.push(id);
+        }
+        let since = ids[0] - 1;
+
+        let (first, first_window) = poll_line_candidates(&pool, since, 2)
+            .await
+            .expect("first batch");
+        assert_eq!(
+            first_window,
+            PollWindow {
+                observed_max_id: ids[2],
+                read_through: Some(ids[1]),
+            },
+            "a full batch reports where it stopped, and the head it saw"
+        );
+        assert_eq!(
+            first.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![ids[1]],
+            "only the batch's own transition (good -> severe)"
+        );
+
+        // A cursor whose proposal (the head) has already aged.
+        sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
+            .bind(cursor_name)
+            .execute(&pool)
+            .await
+            .expect("clear fixture cursor");
+        let now = Utc::now();
+        let grace = chrono::Duration::seconds(120);
+        sqlx::query(
+            "INSERT INTO notifier_cursor (name, last_processed_id, pending_id, pending_observed_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(cursor_name)
+        .bind(since)
+        .bind(ids[2])
+        .bind(now - chrono::Duration::hours(1))
+        .execute(&pool)
+        .await
+        .expect("seed cursor");
+        let cursor = read_cursor(&pool, cursor_name).await.expect("read");
+        let promoted = advance_cursor_with_grace_bounded(
+            &pool,
+            cursor_name,
+            &cursor,
+            first_window,
+            now,
+            grace,
+        )
+        .await
+        .expect("first advance");
+        assert_eq!(
+            promoted, ids[1],
+            "never promoted past what this cycle actually read"
+        );
+        let cursor = read_cursor(&pool, cursor_name).await.expect("read");
+        assert_eq!(cursor.pending_id, Some(ids[2]), "the rest stays pending");
+
+        let (second, second_window) = poll_line_candidates(&pool, cursor.last_processed_id, 2)
+            .await
+            .expect("second batch");
+        assert_eq!(second_window.read_through, None, "the backlog is drained");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, ids[2]);
+        assert_eq!(
+            second[0].previous_rank,
+            severity_rank(common::Severity::SevereDelays),
+            "the batch boundary keeps the previous row via the anchor"
+        );
+        let promoted = advance_cursor_with_grace_bounded(
+            &pool,
+            cursor_name,
+            &cursor,
+            second_window,
+            now,
+            grace,
+        )
+        .await
+        .expect("second advance");
+        assert_eq!(
+            promoted, ids[2],
+            "the already-aged proposal completes on the very next cycle"
+        );
+
+        sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
+            .bind(cursor_name)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_line_history(&pool, line_id).await;
+    }
+
+    /// DB2-26: reading a cursor and "advancing" it to the values it already
+    /// holds must not rewrite the row (same `xmin`); a real change must.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                read_and_unchanged_advance_do_not_rewrite_the_cursor_row -- --ignored \
+                --test-threads=1`"]
+    async fn read_and_unchanged_advance_do_not_rewrite_the_cursor_row() {
+        let pool = connect().await;
+        let cursor_name = "TEST-NOTIFIER-DB226-CURSOR";
+        sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
+            .bind(cursor_name)
+            .execute(&pool)
+            .await
+            .expect("clear fixture cursor");
+        let xmin = || async {
+            sqlx::query_scalar::<_, String>(
+                "SELECT xmin::text FROM notifier_cursor WHERE name = $1",
+            )
+            .bind(cursor_name)
+            .fetch_one(&pool)
+            .await
+            .expect("xmin")
+        };
+        let grace = chrono::Duration::seconds(120);
+        let t0 = Utc::now();
+
+        let fresh = read_cursor(&pool, cursor_name)
+            .await
+            .expect("first read inserts");
+        assert_eq!(fresh.last_processed_id, 0);
+        let created = xmin().await;
+        let reread = read_cursor(&pool, cursor_name).await.expect("second read");
+        assert_eq!(reread.last_processed_id, 0);
+        assert_eq!(xmin().await, created, "a read must not rewrite the row");
+
+        advance_cursor_with_grace(&pool, cursor_name, &reread, 50, t0, grace)
+            .await
+            .expect("propose 50");
+        let proposed = read_cursor(&pool, cursor_name).await.expect("read");
+        assert_eq!(proposed.pending_id, Some(50));
+        let after_proposal = xmin().await;
+        assert_ne!(after_proposal, created, "a real change is written");
+
+        // Same observation, still inside the grace window: nothing changes.
+        advance_cursor_with_grace(
+            &pool,
+            cursor_name,
+            &proposed,
+            50,
+            t0 + chrono::Duration::seconds(60),
+            grace,
+        )
+        .await
+        .expect("unchanged advance");
+        assert_eq!(
+            xmin().await,
+            after_proposal,
+            "an advance that stores the same values must not rewrite the row"
+        );
 
         sqlx::query("DELETE FROM notifier_cursor WHERE name = $1")
             .bind(cursor_name)
@@ -2507,7 +2903,12 @@ mod tests {
             "the still-uncommitted row must hold the LOWER id for this test to mean anything"
         );
 
-        let (_, observed_max_id) = poll_line_candidates(&pool, cursor.last_processed_id)
+        let (
+            _,
+            PollWindow {
+                observed_max_id, ..
+            },
+        ) = poll_line_candidates(&pool, cursor.last_processed_id, TEST_POLL_BATCH_ROWS)
             .await
             .expect("first poll");
         assert!(
@@ -2539,19 +2940,27 @@ mod tests {
         let after = read_cursor(&pool, cursor_name)
             .await
             .expect("re-read cursor");
-        let (candidates, _) = poll_line_candidates(&pool, after.last_processed_id)
-            .await
-            .expect("second poll");
+        let (candidates, _) =
+            poll_line_candidates(&pool, after.last_processed_id, TEST_POLL_BATCH_ROWS)
+                .await
+                .expect("second poll");
         assert!(
             candidates.iter().any(|c| c.id == visible_id)
-                || poll_line_candidates(&pool, after.last_processed_id)
+                || poll_line_candidates(&pool, after.last_processed_id, TEST_POLL_BATCH_ROWS)
                     .await
                     .expect("re-poll")
                     .1
+                    .observed_max_id
                     >= late_id,
             "the late row is inside the still-unpassed range, so a later cycle sees it"
         );
-        let (_, observed_after) = poll_line_candidates(&pool, after.last_processed_id)
+        let (
+            _,
+            PollWindow {
+                observed_max_id: observed_after,
+                ..
+            },
+        ) = poll_line_candidates(&pool, after.last_processed_id, TEST_POLL_BATCH_ROWS)
             .await
             .expect("third poll");
         assert!(
@@ -2847,7 +3256,13 @@ mod tests {
         .await
         .expect("seed current state showing a real delay");
 
-        let (candidates, max_id) = poll_train_candidates(&pool, event_id - 1, 15)
+        let (
+            candidates,
+            PollWindow {
+                observed_max_id: max_id,
+                ..
+            },
+        ) = poll_train_candidates(&pool, event_id - 1, 15, TEST_POLL_BATCH_ROWS)
             .await
             .expect("poll_train_candidates");
         assert_eq!(max_id, event_id);
@@ -3011,13 +3426,25 @@ mod tests {
         .await
         .expect("seed a forward-queue row");
 
-        let (touched, max_id) = poll_forward_queue(&pool, queue_id - 1)
+        let (
+            touched,
+            PollWindow {
+                observed_max_id: max_id,
+                ..
+            },
+        ) = poll_forward_queue(&pool, queue_id - 1, TEST_POLL_BATCH_ROWS)
             .await
             .expect("poll_forward_queue");
         assert_eq!(touched, vec![trains_id]);
         assert_eq!(max_id, queue_id);
 
-        let (touched_again, max_id_again) = poll_forward_queue(&pool, max_id)
+        let (
+            touched_again,
+            PollWindow {
+                observed_max_id: max_id_again,
+                ..
+            },
+        ) = poll_forward_queue(&pool, max_id, TEST_POLL_BATCH_ROWS)
             .await
             .expect("poll_forward_queue again from the new watermark");
         assert!(touched_again.is_empty());
@@ -3163,7 +3590,13 @@ mod tests {
         let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subscriber = tracing_subscriber::registry().with(SqlxQueryCounter(query_count.clone()));
         let guard = tracing::subscriber::set_default(subscriber);
-        let (candidates, max_id) = poll_train_candidates(&pool, since_id, 15)
+        let (
+            candidates,
+            PollWindow {
+                observed_max_id: max_id,
+                ..
+            },
+        ) = poll_train_candidates(&pool, since_id, 15, TEST_POLL_BATCH_ROWS)
             .await
             .expect("poll_train_candidates");
         drop(guard);
@@ -3679,6 +4112,140 @@ mod sweep_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+
+    /// DB2-9: the CIF enrichment must leave `schedule_matched_at` NULL, or
+    /// the api's reconciliation sweep (`WHERE schedule_matched_at IS NULL`)
+    /// never gives the row its calling points.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                find_or_create_train_with_cif_schedule_leaves_schedule_matched_at_null \
+                -- --ignored --test-threads=1`"]
+    async fn find_or_create_train_with_cif_schedule_leaves_schedule_matched_at_null() {
+        let pool = connect().await;
+        let train_uid = "TEST-CIF-DB29-UID";
+        let service_date: chrono::NaiveDate = "2001-09-25".parse().unwrap();
+        let cleanup = || async {
+            sqlx::query("DELETE FROM trains WHERE train_uid = $1")
+                .bind(train_uid)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid = $1")
+                .bind(train_uid)
+                .execute(&pool)
+                .await
+                .ok();
+        };
+        cleanup().await;
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, day_offset, train_uid, origin_crs, \
+                 true_origin_crs, destination_arrival, destination_arrival_day_offset) \
+             VALUES ($1, 'WOK', '09:05:00', 0, $2, 'RDG', 'RDG', '09:25:00', 0)",
+        )
+        .bind(service_date)
+        .bind(train_uid)
+        .execute(&pool)
+        .await
+        .expect("seed CIF");
+
+        let trains_id = find_or_create_train_with_cif_schedule(&pool, train_uid, service_date)
+            .await
+            .expect("first call creates the row");
+        let again = find_or_create_train_with_cif_schedule(&pool, train_uid, service_date)
+            .await
+            .expect("second call finds it");
+        assert_eq!(trains_id, again);
+
+        let (origin_crs, matched_at): (Option<String>, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT origin_crs, schedule_matched_at FROM trains WHERE id = $1")
+                .bind(trains_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read back");
+        assert_eq!(origin_crs.as_deref(), Some("RDG"));
+        assert_eq!(
+            matched_at, None,
+            "schedule_matched_at is the api's 'fully matched' marker; the notifier must not set it"
+        );
+        cleanup().await;
+    }
+
+    /// DB2-7 (notifier copy): a repeat call on an already-complete row must
+    /// not rewrite it (same `xmin`), while a bare row still gets filled.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                find_or_create_train_with_cif_schedule_does_not_rewrite_a_complete_row \
+                -- --ignored --test-threads=1`"]
+    async fn find_or_create_train_with_cif_schedule_does_not_rewrite_a_complete_row() {
+        let pool = connect().await;
+        let train_uid = "TEST-CIF-DB27-UID";
+        let service_date: chrono::NaiveDate = "2001-09-26".parse().unwrap();
+        let cleanup = || async {
+            sqlx::query("DELETE FROM trains WHERE train_uid = $1")
+                .bind(train_uid)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid = $1")
+                .bind(train_uid)
+                .execute(&pool)
+                .await
+                .ok();
+        };
+        cleanup().await;
+        // A bare row, as the plain find_or_create_train leaves it.
+        let bare_id = find_or_create_train(&pool, train_uid, service_date)
+            .await
+            .expect("bare row");
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, day_offset, train_uid, origin_crs, \
+                 true_origin_crs, destination_arrival, destination_arrival_day_offset) \
+             VALUES ($1, 'WOK', '09:05:00', 0, $2, 'RDG', 'RDG', '09:25:00', 0)",
+        )
+        .bind(service_date)
+        .bind(train_uid)
+        .execute(&pool)
+        .await
+        .expect("seed CIF");
+
+        let xmin = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT xmin::text FROM trains WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("xmin")
+            }
+        };
+
+        let filled_id = find_or_create_train_with_cif_schedule(&pool, train_uid, service_date)
+            .await
+            .expect("fills the bare row");
+        assert_eq!(filled_id, bare_id);
+        let (origin_crs, destination_crs): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT origin_crs, destination_crs FROM trains WHERE id = $1")
+                .bind(bare_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read back");
+        assert_eq!(origin_crs.as_deref(), Some("RDG"));
+        assert_eq!(destination_crs.as_deref(), Some("WOK"));
+
+        let before = xmin(bare_id).await;
+        let again = find_or_create_train_with_cif_schedule(&pool, train_uid, service_date)
+            .await
+            .expect("repeat call");
+        assert_eq!(again, bare_id);
+        assert_eq!(
+            xmin(bare_id).await,
+            before,
+            "a complete row must be returned without being rewritten"
+        );
+        cleanup().await;
     }
 
     #[tokio::test]

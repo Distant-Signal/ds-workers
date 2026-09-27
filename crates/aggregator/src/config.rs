@@ -30,10 +30,12 @@ fn non_negative_retention(s: &str) -> anyhow::Result<i64> {
 }
 
 /// CLI/env configuration for the `aggregator` service.
+/// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
+/// (SVC-12).
 #[derive(Debug, Parser)]
 pub struct Config {
-    #[arg(long, env)]
-    pub database_url: String,
+    #[arg(long, env, hide_env_values = true)]
+    pub database_url: common::secret::Secret,
 
     /// Directory of line-catalogue TOML files, loaded once at startup.
     /// Same default as the `api` crate's `--lines-dir`, since both load
