@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
+use common::redis_conn::RedisConn;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 
 const STREAM: &str = "incident-text-changed";
 const GROUP: &str = "enricher";
@@ -25,7 +25,7 @@ const _: () =
 /// itself if this is the very first run (`MKSTREAM`). `BUSYGROUP` (group
 /// already exists) is the expected steady-state outcome and is swallowed,
 /// not treated as an error.
-pub async fn ensure_group(conn: &mut ConnectionManager) -> anyhow::Result<()> {
+pub async fn ensure_group(conn: &mut RedisConn) -> anyhow::Result<()> {
     ensure_group_on(conn, STREAM).await
 }
 
@@ -35,7 +35,7 @@ pub async fn ensure_group(conn: &mut ConnectionManager) -> anyhow::Result<()> {
 /// treatment: a consumer group is scoped to the stream it was created on,
 /// so `enricher`/`enricher-1` on a test's own stream can never collide with
 /// the same names on the real one).
-async fn ensure_group_on(conn: &mut ConnectionManager, stream: &str) -> anyhow::Result<()> {
+async fn ensure_group_on(conn: &mut RedisConn, stream: &str) -> anyhow::Result<()> {
     let result: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(stream)
@@ -55,13 +55,13 @@ async fn ensure_group_on(conn: &mut ConnectionManager, stream: &str) -> anyhow::
 /// Reads at most one new entry for this consumer, blocking up to 5s if
 /// none are immediately available. Returns the entry's own stream ID
 /// (needed to `ack`) paired with the `incident_id` field it carries.
-pub async fn read_one(conn: &mut ConnectionManager) -> anyhow::Result<Option<(String, String)>> {
+pub async fn read_one(conn: &mut RedisConn) -> anyhow::Result<Option<(String, String)>> {
     read_one_on(conn, STREAM).await
 }
 
 /// See `ensure_group_on` for why this takes `stream` explicitly.
 async fn read_one_on(
-    conn: &mut ConnectionManager,
+    conn: &mut RedisConn,
     stream: &str,
 ) -> anyhow::Result<Option<(String, String)>> {
     let reply: redis::streams::StreamReadReply = conn
@@ -123,12 +123,12 @@ async fn read_one_on(
     }
 }
 
-pub async fn ack(conn: &mut ConnectionManager, entry_id: &str) -> anyhow::Result<()> {
+pub async fn ack(conn: &mut RedisConn, entry_id: &str) -> anyhow::Result<()> {
     ack_on(conn, STREAM, entry_id).await
 }
 
 /// See `ensure_group_on` for why this takes `stream` explicitly.
-async fn ack_on(conn: &mut ConnectionManager, stream: &str, entry_id: &str) -> anyhow::Result<()> {
+async fn ack_on(conn: &mut RedisConn, stream: &str, entry_id: &str) -> anyhow::Result<()> {
     let _: i64 = conn.xack(stream, GROUP, &[entry_id]).await?;
     Ok(())
 }
@@ -147,7 +147,7 @@ async fn ack_on(conn: &mut ConnectionManager, stream: &str, entry_id: &str) -> a
 /// `"0-0"` (fully scanned) rather than stopping after one call's worth of
 /// entries.
 pub async fn claim_stale(
-    conn: &mut ConnectionManager,
+    conn: &mut RedisConn,
     min_idle: Duration,
 ) -> anyhow::Result<Vec<(String, String)>> {
     claim_stale_on(conn, STREAM, min_idle).await
@@ -155,7 +155,7 @@ pub async fn claim_stale(
 
 /// See `ensure_group_on` for why this takes `stream` explicitly.
 async fn claim_stale_on(
-    conn: &mut ConnectionManager,
+    conn: &mut RedisConn,
     stream: &str,
     min_idle: Duration,
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -221,7 +221,7 @@ async fn claim_stale_on(
 /// server predates the `lag` field (added in Redis 7.0; this app's own
 /// deployments always run Redis 7, but a self-managed external Redis might
 /// not be).
-pub async fn group_lag(conn: &mut ConnectionManager) -> anyhow::Result<Option<i64>> {
+pub async fn group_lag(conn: &mut RedisConn) -> anyhow::Result<Option<i64>> {
     let reply: Vec<redis::Value> = redis::cmd("XINFO")
         .arg("GROUPS")
         .arg(STREAM)
@@ -276,14 +276,14 @@ mod redis_tests {
 
     async fn cleanup(stream: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut conn).await;
     }
 
     /// Adds a raw entry with no `incident_id` field at all -- the exact
     /// shape that used to wedge forever (see `read_one_on`/`claim_stale_on`'s
     /// own doc comments).
-    async fn xadd_without_incident_id(conn: &mut ConnectionManager, stream: &str) -> String {
+    async fn xadd_without_incident_id(conn: &mut RedisConn, stream: &str) -> String {
         redis::cmd("XADD")
             .arg(stream)
             .arg("*")
@@ -299,7 +299,7 @@ mod redis_tests {
     async fn read_one_acks_and_skips_an_entry_missing_incident_id() {
         let stream = unique_stream("read-one-missing-id");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         xadd_without_incident_id(&mut conn, &stream).await;
 
@@ -336,7 +336,7 @@ mod redis_tests {
     async fn claim_stale_acks_and_skips_a_reclaimed_entry_missing_incident_id() {
         let stream = unique_stream("claim-stale-missing-id");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         xadd_without_incident_id(&mut conn, &stream).await;
 

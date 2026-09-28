@@ -877,7 +877,7 @@ where
 /// loop is still processing are skipped (see `InFlight`).
 async fn reclaim_loop(
     enricher: Arc<Enricher>,
-    mut redis: redis::aio::ConnectionManager,
+    mut redis: common::redis_conn::RedisConn,
     interval_secs: u64,
     min_idle_secs: u64,
 ) {
