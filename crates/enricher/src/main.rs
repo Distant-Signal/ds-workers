@@ -80,11 +80,16 @@ async fn main() -> anyhow::Result<()> {
         config.redis_password.as_ref(),
     )?;
     let redis_client = redis::Client::open(redis_url.expose())?;
-    let mut redis = common::startup::retry_until_ready(
+    // Bounded connections (`common::redis_conn`): no redis-rs-internal
+    // retries (minutes, unlogged, with the defaults), a connect timeout and a
+    // per-command response timeout. A Redis outage later on fails
+    // `read_one` within seconds, and the loop below logs, backs off and
+    // retries -- beating progress every iteration.
+    let mut redis = common::redis_conn::connect_until_ready(
         "Redis",
+        &redis_client,
         common::startup::CONNECT_BACKOFF,
         Some(&progress),
-        || redis_client.get_connection_manager(),
     )
     .await;
     common::startup::retry_until_ready(
@@ -138,11 +143,11 @@ async fn main() -> anyhow::Result<()> {
         config.sweep_interval_secs,
     ));
 
-    let reclaim_redis = common::startup::retry_until_ready(
+    let reclaim_redis = common::redis_conn::connect_until_ready(
         "Redis (reclaim connection)",
+        &redis_client,
         common::startup::CONNECT_BACKOFF,
         Some(&progress),
-        || redis_client.get_connection_manager(),
     )
     .await;
     tokio::spawn(reclaim_loop(

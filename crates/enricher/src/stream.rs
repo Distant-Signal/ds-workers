@@ -11,6 +11,16 @@ const STREAM: &str = "incident-text-changed";
 const GROUP: &str = "enricher";
 const CONSUMER: &str = "enricher-1";
 
+/// How long `read_one` waits server-side for a new entry
+/// (`XREADGROUP ... BLOCK`).
+const READ_BLOCK_MS: usize = 5000;
+
+// Every command is bounded by `common::redis_conn::RESPONSE_TIMEOUT`, so a
+// blocking read must return well within it or a quiet stream would look
+// like a dead connection.
+const _: () =
+    assert!((READ_BLOCK_MS as u128) * 2 < common::redis_conn::RESPONSE_TIMEOUT.as_millis());
+
 /// Creates the consumer group if it doesn't already exist, and the stream
 /// itself if this is the very first run (`MKSTREAM`). `BUSYGROUP` (group
 /// already exists) is the expected steady-state outcome and is swallowed,
@@ -61,7 +71,7 @@ async fn read_one_on(
             &redis::streams::StreamReadOptions::default()
                 .group(GROUP, CONSUMER)
                 .count(1)
-                .block(5000),
+                .block(READ_BLOCK_MS),
         )
         .await?;
 
