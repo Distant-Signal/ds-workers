@@ -40,11 +40,7 @@ async fn ensure_group_on(conn: &mut RedisConn, stream: &str) -> anyhow::Result<(
 }
 
 /// [`ensure_group_on`], the group (if created) starting after `start_id`.
-async fn ensure_group_at(
-    conn: &mut RedisConn,
-    stream: &str,
-    start_id: &str,
-) -> anyhow::Result<()> {
+async fn ensure_group_at(conn: &mut RedisConn, stream: &str, start_id: &str) -> anyhow::Result<()> {
     let result: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(stream)
@@ -544,11 +540,7 @@ mod redis_tests {
     }
 
     /// Reads (and acks) incident ids until a read comes back empty.
-    async fn drain(
-        conn: &mut RedisConn,
-        stream: &str,
-        last: &mut Option<String>,
-    ) -> Vec<String> {
+    async fn drain(conn: &mut RedisConn, stream: &str, last: &mut Option<String>) -> Vec<String> {
         let mut out = Vec::new();
         while let Some((entry_id, incident_id)) = read_one_on(conn, stream).await.unwrap() {
             ack_on(conn, stream, &entry_id).await.unwrap();
