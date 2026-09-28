@@ -302,6 +302,8 @@ mod tests {
             skipped_stations: vec![],
             platform: None,
             planned_platform: None,
+            rsid: None,
+            calling_points: Vec::new(),
         }
     }
 
