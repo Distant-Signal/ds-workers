@@ -102,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await;
+    // The group's position, kept for `stream::recreate_group`.
+    let mut last_delivered = stream::group_last_delivered_id(&mut redis).await;
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // `config.llm_model` is the ONLY thing ever sent to the endpoint as the
@@ -164,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         progress.beat();
         match stream::read_one(&mut redis).await {
             Ok(Some((entry_id, incident_id))) => {
+                last_delivered = Some(entry_id.clone());
                 if process_stream_entry(&enricher, &entry_id, &incident_id).await
                     && let Err(err) = stream::ack(&mut redis, &entry_id).await
                 {
@@ -176,14 +179,16 @@ async fn main() -> anyhow::Result<()> {
                 // disposable trigger queue, not a system of record -- so a pod
                 // restart takes the stream and the consumer group with it and
                 // every subsequent read fails NOGROUP. Recreating the group
-                // here (`ensure_group` is idempotent; BUSYGROUP is swallowed)
-                // makes that self-heal within seconds instead of needing a
-                // manual enricher restart. The sleep is what stops the same
+                // here (a no-op BUSYGROUP while it exists) makes that
+                // self-heal within seconds instead of needing a manual
+                // enricher restart. It is recreated after the last entry
+                // read, not at the tail, so entries `api` published in
+                // between are not skipped (see `stream::recreate_group`). The sleep is what stops the same
                 // error from becoming a tight CPU-burning retry loop in the
                 // meantime; `read_one` only blocks when it gets far enough to
                 // block at all, which a NOGROUP read never does.
                 tracing::error!(error = ?err, "error reading from incident-text-changed stream; recreating consumer group and backing off");
-                if let Err(err) = stream::ensure_group(&mut redis).await {
+                if let Err(err) = stream::recreate_group(&mut redis, &mut last_delivered).await {
                     tracing::error!(error = ?err, "failed to recreate the consumer group");
                 }
                 tokio::time::sleep(STREAM_ERROR_BACKOFF).await;

@@ -36,11 +36,20 @@ pub async fn ensure_group(conn: &mut RedisConn) -> anyhow::Result<()> {
 /// so `enricher`/`enricher-1` on a test's own stream can never collide with
 /// the same names on the real one).
 async fn ensure_group_on(conn: &mut RedisConn, stream: &str) -> anyhow::Result<()> {
+    ensure_group_at(conn, stream, "$").await
+}
+
+/// [`ensure_group_on`], the group (if created) starting after `start_id`.
+async fn ensure_group_at(
+    conn: &mut RedisConn,
+    stream: &str,
+    start_id: &str,
+) -> anyhow::Result<()> {
     let result: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(stream)
         .arg(GROUP)
-        .arg("$")
+        .arg(start_id)
         .arg("MKSTREAM")
         .query_async(conn)
         .await;
@@ -50,6 +59,125 @@ async fn ensure_group_on(conn: &mut RedisConn, stream: &str) -> anyhow::Result<(
         Err(err) if err.to_string().contains("BUSYGROUP") => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+/// The `enricher` group's `last-delivered-id` (`XINFO GROUPS`), or `None`
+/// (logged) when it cannot be read. `main` keeps it, advanced to every
+/// entry `read_one` hands back, for [`recreate_group`].
+pub async fn group_last_delivered_id(conn: &mut RedisConn) -> Option<String> {
+    group_last_delivered_id_on(conn, STREAM).await
+}
+
+/// See `ensure_group_on` for why this takes `stream` explicitly.
+async fn group_last_delivered_id_on(conn: &mut RedisConn, stream: &str) -> Option<String> {
+    let result: anyhow::Result<Option<String>> = async {
+        let reply: Vec<redis::Value> = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(stream)
+            .query_async(conn)
+            .await?;
+        for group in reply {
+            let redis::Value::Array(fields) = group else {
+                continue;
+            };
+            let mut name: Option<String> = None;
+            let mut last: Option<String> = None;
+            let mut iter = fields.into_iter();
+            while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+                let key: String = redis::from_redis_value(&key)?;
+                match key.as_str() {
+                    "name" => name = redis::from_redis_value(&value).ok(),
+                    "last-delivered-id" => last = redis::from_redis_value(&value).ok(),
+                    _ => {}
+                }
+            }
+            if name.as_deref() == Some(GROUP) {
+                return Ok(last);
+            }
+        }
+        Ok(None)
+    }
+    .await;
+    result.unwrap_or_else(|err| {
+        tracing::warn!(error = ?err, "could not read the consumer group's last-delivered-id");
+        None
+    })
+}
+
+/// Recreates the consumer group after a failed read (a no-op `BUSYGROUP`
+/// when it still exists) at [`recreate_start_id`], rather than at the
+/// stream's tail: entries `api` wrote between Redis coming back empty and
+/// this call are then read, not left for the hourly sweep, and a group
+/// deleted by hand does not replay the whole stream. `last_delivered` is
+/// `main`'s copy of the group's position, refreshed from Redis afterwards.
+/// Entries the lost group had delivered but not ACKed are not redelivered
+/// (the sweep still backstops them).
+pub async fn recreate_group(
+    conn: &mut RedisConn,
+    last_delivered: &mut Option<String>,
+) -> anyhow::Result<()> {
+    recreate_group_on(conn, STREAM, last_delivered).await
+}
+
+/// See `ensure_group_on` for why this takes `stream` explicitly.
+async fn recreate_group_on(
+    conn: &mut RedisConn,
+    stream: &str,
+    last_delivered: &mut Option<String>,
+) -> anyhow::Result<()> {
+    let exists: bool = conn.exists(stream).await?;
+    let last_generated = if exists {
+        let info: Vec<redis::Value> = redis::cmd("XINFO")
+            .arg("STREAM")
+            .arg(stream)
+            .query_async(conn)
+            .await?;
+        let mut last = None;
+        let mut iter = info.into_iter();
+        while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+            let key: String = redis::from_redis_value(&key)?;
+            if key == "last-generated-id" {
+                last = redis::from_redis_value::<Option<String>>(&value)?;
+            }
+        }
+        Some(last.unwrap_or_else(|| "0-0".to_string()))
+    } else {
+        None
+    };
+    let start_id = recreate_start_id(last_delivered.as_deref(), last_generated.as_deref());
+    ensure_group_at(conn, stream, &start_id).await?;
+    if let Some(id) = group_last_delivered_id_on(conn, stream).await {
+        *last_delivered = Some(id);
+    }
+    Ok(())
+}
+
+/// Where a lost consumer group is recreated -- the same rule as
+/// `movement_feed::redis_stream::recreate_start_id`, which documents it in
+/// full: after `last_delivered` if the stream still holds ids at or past
+/// it (intact stream, or one recreated since on a server whose clock moved
+/// on), `0` if the stream is missing or its `last-generated-id` is behind
+/// `last_delivered` (a new stream), `$` if the position is unknown.
+fn recreate_start_id(last_delivered: Option<&str>, stream_last_generated: Option<&str>) -> String {
+    let Some(last_generated) = stream_last_generated else {
+        return "0".to_string();
+    };
+    match last_delivered {
+        None => "$".to_string(),
+        Some(last) if stream_id_less_than(last_generated, last) => "0".to_string(),
+        Some(last) => last.to_string(),
+    }
+}
+
+/// Stream ids compared as `(ms, seq)` integer pairs, never as strings.
+fn stream_id_less_than(a: &str, b: &str) -> bool {
+    fn parts(id: &str) -> (u64, u64) {
+        let mut it = id.splitn(2, '-');
+        let ms = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let seq = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        (ms, seq)
+    }
+    parts(a) < parts(b)
 }
 
 /// Reads at most one new entry for this consumer, blocking up to 5s if
@@ -250,6 +378,30 @@ pub async fn group_lag(conn: &mut RedisConn) -> anyhow::Result<Option<i64>> {
     Ok(None)
 }
 
+#[cfg(test)]
+mod recreate_start_id_tests {
+    use super::*;
+
+    #[test]
+    fn an_intact_stream_resumes_after_the_last_delivered_entry() {
+        assert_eq!(recreate_start_id(Some("100-3"), Some("250-0")), "100-3");
+        assert_eq!(recreate_start_id(Some("9-0"), Some("10-0")), "9-0");
+    }
+
+    #[test]
+    fn a_missing_or_newer_stream_is_read_in_full() {
+        assert_eq!(recreate_start_id(Some("100-3"), None), "0");
+        assert_eq!(recreate_start_id(None, None), "0");
+        assert_eq!(recreate_start_id(Some("100-3"), Some("90-0")), "0");
+        assert_eq!(recreate_start_id(Some("10-0"), Some("9-0")), "0");
+    }
+
+    #[test]
+    fn an_unknown_position_falls_back_to_the_tail() {
+        assert_eq!(recreate_start_id(None, Some("250-0")), "$");
+    }
+}
+
 /// Live-Redis regression tests for the "entry missing `incident_id`" poison
 /// message fix. Ignored by default (needs a real Redis) -- run explicitly
 /// with `cargo test -p enricher stream:: -- --ignored`, mirroring
@@ -377,6 +529,106 @@ mod redis_tests {
             "a poison entry must not be reclaimed forever: {claimed_again:?}"
         );
 
+        cleanup(&stream).await;
+    }
+
+    async fn xadd_incident(conn: &mut RedisConn, stream: &str, incident_id: &str) {
+        let _: String = redis::cmd("XADD")
+            .arg(stream)
+            .arg("*")
+            .arg("incident_id")
+            .arg(incident_id)
+            .query_async(conn)
+            .await
+            .unwrap();
+    }
+
+    /// Reads (and acks) incident ids until a read comes back empty.
+    async fn drain(
+        conn: &mut RedisConn,
+        stream: &str,
+        last: &mut Option<String>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some((entry_id, incident_id)) = read_one_on(conn, stream).await.unwrap() {
+            ack_on(conn, stream, &entry_id).await.unwrap();
+            *last = Some(entry_id);
+            out.push(incident_id);
+        }
+        out
+    }
+
+    fn is_nogroup(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<redis::RedisError>()
+            .and_then(redis::RedisError::code)
+            == Some("NOGROUP")
+    }
+
+    /// Redis back empty and `api` already publishing before the next read:
+    /// the stream is recreated by `XADD`, without the group. Those entries
+    /// used to be skipped (recreated at `$`); now they are all read.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn entries_written_before_a_lost_group_is_recreated_are_not_lost() {
+        let stream = unique_stream("nogroup-recreated-stream");
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        ensure_group_on(&mut conn, &stream).await.unwrap();
+        let mut last = group_last_delivered_id_on(&mut conn, &stream).await;
+        xadd_incident(&mut conn, &stream, "before").await;
+        assert_eq!(drain(&mut conn, &stream, &mut last).await, vec!["before"]);
+
+        cleanup(&stream).await;
+        xadd_incident(&mut conn, &stream, "after-1").await;
+        xadd_incident(&mut conn, &stream, "after-2").await;
+
+        let err = read_one_on(&mut conn, &stream)
+            .await
+            .expect_err("the group is gone");
+        assert!(is_nogroup(&err), "{err:?}");
+        recreate_group_on(&mut conn, &stream, &mut last)
+            .await
+            .unwrap();
+        assert_eq!(
+            drain(&mut conn, &stream, &mut last).await,
+            vec!["after-1", "after-2"]
+        );
+        cleanup(&stream).await;
+    }
+
+    /// The group deleted by hand, stream intact: only what it had not yet
+    /// delivered is read, not the whole stream again.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_group_deleted_by_hand_resumes_without_replaying_the_stream() {
+        let stream = unique_stream("nogroup-destroyed");
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        ensure_group_on(&mut conn, &stream).await.unwrap();
+        let mut last = group_last_delivered_id_on(&mut conn, &stream).await;
+        for i in 0..3 {
+            xadd_incident(&mut conn, &stream, &format!("read-{i}")).await;
+        }
+        assert_eq!(drain(&mut conn, &stream, &mut last).await.len(), 3);
+
+        let destroyed: i64 = redis::cmd("XGROUP")
+            .arg("DESTROY")
+            .arg(&stream)
+            .arg(GROUP)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(destroyed, 1);
+        xadd_incident(&mut conn, &stream, "unread").await;
+
+        let err = read_one_on(&mut conn, &stream)
+            .await
+            .expect_err("the group is gone");
+        assert!(is_nogroup(&err), "{err:?}");
+        recreate_group_on(&mut conn, &stream, &mut last)
+            .await
+            .unwrap();
+        assert_eq!(drain(&mut conn, &stream, &mut last).await, vec!["unread"]);
         cleanup(&stream).await;
     }
 }
