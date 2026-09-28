@@ -141,7 +141,7 @@ talked to. Each batch goes through three steps:
    and commits. If anything changed in between (for example, someone
    subscribed to one of the trains), nothing is deleted and the run stops.
    The next run exports that batch again and overwrites the same keys.
-   `aggregator_archive_batches_changed_total` counts these.
+   `distant_signal_aggregator_archive_batches_changed_total` counts these.
 
 Object keys:
 
@@ -186,18 +186,18 @@ deduplicate on it (see below).
 
 **Metrics:**
 
-- `aggregator_archive_rows_total{table}`
-- `aggregator_archive_objects_total`
-- `aggregator_archive_upload_failures_total`
-- `aggregator_archive_batches_changed_total`
-- `aggregator_retention_duration_seconds` (the whole retention pass)
+- `distant_signal_aggregator_archive_rows_total{table}`
+- `distant_signal_aggregator_archive_objects_total`
+- `distant_signal_aggregator_archive_upload_failures_total`
+- `distant_signal_aggregator_archive_batches_changed_total`
+- `distant_signal_aggregator_retention_duration_seconds` (the whole retention pass)
 
 **Alert:** with `metrics.prometheusRule.enabled` and `archive.enabled`, the
 chart renders `DistantSignalArchiveUploadFailures`, which fires when at
 least `metrics.prometheusRule.archiveUploadFailures.minFailures` (3) batch
 uploads fail within its `window` (1h).
 
-`aggregator_trains_rows_pruned_total` keeps its existing meaning.
+`distant_signal_aggregator_trains_rows_pruned_total` keeps its existing meaning.
 
 ## Reading an archive offline
 

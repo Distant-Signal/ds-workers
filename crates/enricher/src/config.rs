@@ -83,10 +83,9 @@ pub struct Config {
     #[arg(long, env, default_value_t = 1000)]
     pub reclaim_min_idle_secs: u64,
 
-    /// Port for this service's Prometheus `/metrics` endpoint. See
-    /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
-    /// for why this differs from api.service.port -- api reuses its
-    /// existing HTTP listener, this service has none, so it needs a new one.
+    /// Port for this service's Prometheus `/metrics` endpoint. The enricher
+    /// has no HTTP server of its own, so `common::metrics::install_with_buckets`
+    /// starts a dedicated listener on this port.
     #[arg(long, env, default_value_t = 9091)]
     pub metrics_port: u16,
 

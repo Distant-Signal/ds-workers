@@ -250,11 +250,9 @@ pub struct Config {
     #[arg(long, env, default_value_t = 14, value_parser = non_negative_retention)]
     pub untracked_trains_retention_days: i64,
 
-    /// Port for the aggregator's Prometheus `/metrics` endpoint. See
-    /// docs/superpowers/plans/2026-08-29-metrics.md's Global Constraints
-    /// for why this differs from api.service.port -- api reuses its
-    /// existing HTTP listener, the aggregator has none, so it needs a new
-    /// one.
+    /// Port for the aggregator's Prometheus `/metrics` endpoint. The
+    /// aggregator has no HTTP server of its own, so `common::metrics::install`
+    /// starts a dedicated listener on this port.
     #[arg(long, env, default_value_t = 9091)]
     pub metrics_port: u16,
 
