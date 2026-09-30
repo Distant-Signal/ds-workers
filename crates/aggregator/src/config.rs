@@ -383,6 +383,18 @@ mod tests {
             !config.archive.archive_enabled,
             "archiving must be off unless explicitly enabled"
         );
+        let expiry = &config.archive.expiry;
+        assert!(
+            !expiry.archive_expiry_enabled,
+            "archive expiry is off by default"
+        );
+        assert!(
+            expiry.archive_expiry_dry_run,
+            "archive expiry is dry-run by default"
+        );
+        assert_eq!(expiry.archive_expiry_retention_days, 730);
+        assert_eq!(expiry.archive_expiry_max_deletes_per_run, 20_000);
+        assert!(expiry.archive_protected_prefixes.is_empty());
         let window = &config.full_coverage_window;
         assert_eq!(
             window.mode,
@@ -392,6 +404,26 @@ mod tests {
         assert_eq!(window.full_coverage_window_enforce_lines, "");
         assert_eq!(window.full_coverage_window_min_escalation_rank, 4);
         assert_eq!(window.full_coverage_window_stats_retention_days, 14);
+    }
+
+    #[test]
+    fn archive_expiry_flags_parse() {
+        let config = Config::try_parse_from(minimal_args(&[
+            "--archive-expiry-enabled",
+            "true",
+            "--archive-expiry-dry-run",
+            "false",
+            "--archive-protected-prefixes",
+            "mine-bringer/backups/,mine-bringer/pgbackrest/",
+        ]))
+        .unwrap();
+        let expiry = &config.archive.expiry;
+        assert!(expiry.archive_expiry_enabled);
+        assert!(!expiry.archive_expiry_dry_run);
+        assert_eq!(
+            expiry.archive_protected_prefixes,
+            ["mine-bringer/backups/", "mine-bringer/pgbackrest/"]
+        );
     }
 
     #[test]

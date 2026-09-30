@@ -45,21 +45,110 @@ live (hot) tables in Postgres.
 
 ## Object expiry
 
-The app never deletes an archived object, and it cannot see the bucket's
-lifecycle rules. Expiry is therefore the bucket's job, and enabling the
-archive requires you to confirm it:
+The archiver never deletes an archived object. Something else must, so
+enabling the archive requires one of two things:
 
-- The chart refuses to render with `archive.enabled: true` unless
-  `archive.s3.lifecycleConfirmed: true` is also set.
-- The aggregator refuses to start with `ARCHIVE_ENABLED=true` unless
-  `ARCHIVE_S3_LIFECYCLE_CONFIRMED=true` is also set. The chart sets it for
-  you once `lifecycleConfirmed` is true.
+- **A bucket lifecycle rule** that you confirm with
+  `archive.s3.lifecycleConfirmed: true` (`ARCHIVE_S3_LIFECYCLE_CONFIRMED`).
+  The app cannot see the bucket's rules, so this is your word for it.
+- **Client-side expiry** by the aggregator, with `archive.expiry.enabled:
+  true` (`ARCHIVE_EXPIRY_ENABLED`). Use this when the store has no
+  lifecycle API, as on Thoth (`GET ?lifecycle` returns 501). See
+  "Client-side expiry" below.
 
-Before you set it, add an expiration rule covering the archive prefix. The
-expiry age is a licensing decision, not a technical one: the archived rows
-are derived from TRUST (Network Rail's movement feed, via the Rail Data
-Marketplace), so pick an age your review of that licence allows. With the
-AWS CLI (most S3-compatible servers accept the same call):
+The chart refuses to render, and the aggregator refuses to start, with the
+archive enabled and neither set. The expiry age is a licensing decision,
+not a technical one: the archived rows are derived from TRUST (Network
+Rail's movement feed, via the Rail Data Marketplace), so pick an age your
+review of that licence allows. On mine-bringer it is 730 days (decided
+2026-09-30).
+
+### Client-side expiry
+
+Code: `crates/aggregator/src/archive_expiry.rs`. Off by default, and
+**dry-run by default** once enabled.
+
+```yaml
+archive:
+  expiry:
+    enabled: true
+    dryRun: true              # log and count only; set false once the metrics look right
+    retentionDays: 730        # the floor of 90 is fixed in code
+    intervalSecs: 86400
+    maxDeletesPerRun: 20000
+    protectedPrefixes: [mine-bringer/backups/, mine-bringer/pgbackrest/]
+```
+
+A task in the aggregator, separate from the retention prunes, runs at
+startup and then every `intervalSecs`. For each of `trains`,
+`train_movement_events` and `train_current_state` it lists
+`<prefix>/<table>/` (ListObjectsV2). It deletes an object only if all of
+these hold:
+
+- its key matches exactly
+  `<prefix>/<table>/service_date=YYYY-MM-DD/part-<19 digits>.jsonl.zst`,
+  with a real calendar date;
+- the `service_date` **in the key** is older than the current rail day
+  (02:00 Europe/London) minus `retentionDays`. The object's
+  `LastModified` is never used. With 730 days, the date exactly 730 days
+  back is kept and the one before it goes;
+- `retentionDays` is at least 90. That floor has no setting: a lower value
+  fails the render and the aggregator's startup;
+- the key is not under a `protectedPrefixes` entry.
+
+Keys that don't match are counted and logged (the first 20 per table per
+run), never deleted. Each run handles at most `maxDeletesPerRun` objects,
+oldest date first, and sends one single-object `DELETE` per object (bulk
+`DeleteObjects` is disabled on the archive client). After 10 consecutive
+failed DELETEs a run stops, and the next run retries.
+
+The archive's S3 key may be able to delete other things in the same bucket
+(on mine-bringer, the backups). So, at startup, the aggregator refuses to
+run expiry if `archive.s3.prefix` is empty, has fewer than two path
+segments, or equals, contains or sits inside any `protectedPrefixes` entry.
+
+Metrics, all registered at 0 at startup (names carry the
+`distant_signal_` prefix):
+
+| Metric | Meaning |
+| --- | --- |
+| `aggregator_archive_expiry_candidates{table}` | Gauge: matching keys past retention in the last run, before the cap. |
+| `aggregator_archive_expiry_would_delete{table}` | Gauge: what the last dry run would have deleted, after the cap. 0 when live. |
+| `aggregator_archive_expiry_objects_deleted_total{table}` | Objects deleted. |
+| `aggregator_archive_expiry_errors_total{stage}` | `list`: a listing failed (that table is skipped for the run). `delete`: a DELETE failed or the pre-delete check refused a key. |
+| `aggregator_archive_expiry_skipped_unmatched_total{table}` | Keys under a table prefix that don't match the layout. Counted every run they are seen. |
+| `aggregator_archive_expiry_cap_reached_total` | Runs that hit `maxDeletesPerRun`. |
+| `aggregator_archive_oldest_service_date_seconds{table}` | Gauge: the oldest archived `service_date` (midnight UTC, Unix seconds). Unset until a run sees an object. |
+| `aggregator_archive_expiry_dry_run` | Gauge: 1 in dry-run, 0 live. |
+| `aggregator_archive_expiry_retention_days` | Gauge: the configured retention. |
+| `aggregator_archive_expiry_last_success_timestamp_seconds` | Gauge: when the last run with no errors finished. |
+
+The chart's PrometheusRule adds `DistantSignalArchiveExpiryErrors`,
+`DistantSignalArchiveExpiryUnmatchedKeys`,
+`DistantSignalArchiveExpiryCapReached` and
+`DistantSignalArchiveExpiryOverdue` (the oldest date is more than
+`retentionDays` + 7 days old: expiry isn't running, or is still in
+dry-run).
+
+**Going live.** Leave `dryRun: true` until the metrics show that listing
+and matching are right:
+
+- `aggregator_archive_expiry_last_success_timestamp_seconds` is recent;
+- `aggregator_archive_expiry_errors_total` and
+  `aggregator_archive_expiry_skipped_unmatched_total` stay at 0;
+- `aggregator_archive_oldest_service_date_seconds` matches the oldest
+  `service_date=` directory you can see in the bucket;
+- `aggregator_archive_expiry_candidates` and `…_would_delete` are what you
+  expect. With 730 days they stay at 0 until about two years after the
+  first upload.
+
+Then set `dryRun: false`, well before the first object comes due.
+
+### Bucket lifecycle rule
+
+If the store supports lifecycle rules, add an expiration rule covering
+the archive prefix before you set `lifecycleConfirmed`. With the AWS CLI
+(most S3-compatible servers accept the same call):
 
 ```sh
 aws --endpoint-url https://thoth.<tailnet>.ts.net s3api put-bucket-lifecycle-configuration \
@@ -97,6 +186,10 @@ archive:
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
     lifecycleConfirmed: true   # only after adding an expiry rule; see "Object expiry"
+  # or, instead of lifecycleConfirmed (see "Client-side expiry"):
+  # expiry:
+  #   enabled: true
+  #   dryRun: true
 ```
 
 The chart never creates the credentials Secret. Create it yourself:
@@ -113,7 +206,41 @@ example in docker-compose: `ARCHIVE_ENABLED`, `ARCHIVE_TABLES`
 `ARCHIVE_S3_BUCKET`, `ARCHIVE_S3_PREFIX`, `ARCHIVE_S3_REGION`,
 `ARCHIVE_S3_PATH_STYLE`, `ARCHIVE_S3_ALLOW_HTTP`,
 `ARCHIVE_S3_LIFECYCLE_CONFIRMED`, `ARCHIVE_S3_ACCESS_KEY_ID` and
-`ARCHIVE_S3_SECRET_ACCESS_KEY`.
+`ARCHIVE_S3_SECRET_ACCESS_KEY`. Client-side expiry adds
+`ARCHIVE_EXPIRY_ENABLED`, `ARCHIVE_EXPIRY_DRY_RUN` (default `true`),
+`ARCHIVE_EXPIRY_RETENTION_DAYS` (default `730`),
+`ARCHIVE_EXPIRY_INTERVAL_SECS` (default `86400`),
+`ARCHIVE_EXPIRY_MAX_DELETES_PER_RUN` (default `20000`) and
+`ARCHIVE_PROTECTED_PREFIXES` (comma-separated).
+
+### Network access
+
+The aggregator needs egress to the S3 endpoint. The chart renders no
+egress policy for the aggregator, so on a cluster with default-deny egress
+add one yourself. The endpoint is often at a private or tailnet address
+that a generic "public internet" allow excludes (on mine-bringer,
+`allow-egress-internet` excludes `100.64.0.0/10`, where Thoth lives). A
+narrow rule, for example:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-aggregator-thoth
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: distant-signal
+      app.kubernetes.io/component: aggregator
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: <S3 endpoint address>/32
+      ports:
+        - protocol: TCP
+          port: <S3 endpoint port>
+```
 
 ## How it works
 

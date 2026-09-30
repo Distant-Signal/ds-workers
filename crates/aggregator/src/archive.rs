@@ -185,11 +185,18 @@ pub struct ArchiveArgs {
     pub archive_failure_policy: FailurePolicy,
 
     /// The operator's confirmation that the bucket (or the archive prefix)
-    /// has an S3 lifecycle expiration rule. Nothing in the app deletes an
-    /// archived object and it cannot inspect the bucket's rules, so
-    /// archiving refuses to start without this (triage DQ14 / LEG-27).
+    /// has an S3 lifecycle expiration rule. The archiver itself never
+    /// deletes an object and cannot inspect the bucket's rules, so archiving
+    /// refuses to start without either this or client-side expiry
+    /// (`ARCHIVE_EXPIRY_ENABLED`, see `crate::archive_expiry`) (triage DQ14 /
+    /// LEG-27).
     #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
     pub archive_s3_lifecycle_confirmed: bool,
+
+    /// Client-side expiry of archived objects (`ARCHIVE_EXPIRY_*`,
+    /// `ARCHIVE_PROTECTED_PREFIXES`). Off by default, dry-run by default.
+    #[command(flatten)]
+    pub expiry: crate::archive_expiry::ExpiryArgs,
 }
 
 /// Validates `tables` against [`ARCHIVABLE_TABLES`], with a specific
@@ -245,11 +252,16 @@ impl Archiver {
             return Ok(None);
         }
         let tables = validate_tables(&args.archive_tables)?;
+        // Either the bucket expires objects (a lifecycle rule the operator
+        // confirms) or the aggregator does (client-side expiry, even while
+        // still in dry-run: the retention is then decided, and the chart's
+        // overdue alert fires if dry-run outlives it).
         anyhow::ensure!(
-            args.archive_s3_lifecycle_confirmed,
-            "ARCHIVE_ENABLED is true but ARCHIVE_S3_LIFECYCLE_CONFIRMED is not: archived objects \
-             are never deleted by the app, so configure an S3 lifecycle expiration rule on the \
-             archive bucket/prefix first, then set ARCHIVE_S3_LIFECYCLE_CONFIRMED=true \
+            args.archive_s3_lifecycle_confirmed || args.expiry.archive_expiry_enabled,
+            "ARCHIVE_ENABLED is true but neither ARCHIVE_S3_LIFECYCLE_CONFIRMED nor \
+             ARCHIVE_EXPIRY_ENABLED is: something must expire archived objects, so either \
+             configure an S3 lifecycle expiration rule on the archive bucket/prefix and set \
+             ARCHIVE_S3_LIFECYCLE_CONFIRMED=true, or enable client-side expiry \
              (docs/cold-archive.md, \"Object expiry\")"
         );
         let bucket = args
@@ -274,6 +286,10 @@ impl Archiver {
             .with_access_key_id(key_id.expose())
             .with_secret_access_key(secret.expose())
             .with_virtual_hosted_style_request(!args.archive_s3_path_style)
+            // Archive expiry deletes with single-object DELETEs: bulk
+            // DeleteObjects (`POST /?delete`) is untested on Thoth. The
+            // archiver itself never deletes.
+            .with_disable_bulk_delete(true)
             .with_allow_http(args.archive_s3_allow_http)
             // Bounded, so an unreachable endpoint fails a batch in about a
             // minute (and, under `retain`, ends this cycle's trains prune)
@@ -328,6 +344,14 @@ impl Archiver {
             tables,
             policy,
         }
+    }
+
+    /// An expiry runner over this archive's store and prefix.
+    pub fn expirer(
+        &self,
+        settings: crate::archive_expiry::ExpirySettings,
+    ) -> crate::archive_expiry::Expirer {
+        crate::archive_expiry::Expirer::new(self.store.clone(), self.prefix.clone(), settings)
     }
 
     pub fn archives(&self, table: &str) -> bool {
@@ -854,6 +878,14 @@ mod tests {
             archive_s3_allow_http: false,
             archive_failure_policy: FailurePolicy::Retain,
             archive_s3_lifecycle_confirmed: true,
+            expiry: crate::archive_expiry::ExpiryArgs {
+                archive_expiry_enabled: false,
+                archive_expiry_dry_run: true,
+                archive_expiry_retention_days: 730,
+                archive_expiry_interval_secs: 86_400,
+                archive_expiry_max_deletes_per_run: 20_000,
+                archive_protected_prefixes: vec![],
+            },
         }
     }
 
@@ -930,9 +962,14 @@ mod tests {
         assert!(err.contains("ARCHIVE_S3_LIFECYCLE_CONFIRMED"), "{err}");
         let disabled = ArchiveArgs {
             archive_enabled: false,
-            ..unconfirmed
+            ..unconfirmed.clone()
         };
         assert!(Archiver::from_args(&disabled).unwrap().is_none());
+        // Client-side expiry stands in for the lifecycle rule, even in its
+        // default dry-run mode.
+        let mut with_expiry = unconfirmed;
+        with_expiry.expiry.archive_expiry_enabled = true;
+        assert!(Archiver::from_args(&with_expiry).unwrap().is_some());
     }
 
     #[test]

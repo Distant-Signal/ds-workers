@@ -8,6 +8,7 @@
 
 mod aggregation;
 mod archive;
+mod archive_expiry;
 mod config;
 mod dedup;
 mod full_coverage_window;
@@ -36,6 +37,19 @@ async fn main() -> anyhow::Result<()> {
     let archiver = archive::Archiver::from_args(&config.archive)?;
     if let Some(archiver) = &archiver {
         tracing::info!(?archiver, "cold archive enabled for retention prunes");
+    }
+    // Client-side archive expiry: `None` unless ARCHIVE_EXPIRY_ENABLED.
+    // Fails startup on an unsafe setting (retention under the 90-day
+    // floor, a short or protected prefix).
+    let expirer = archive_expiry::ExpirySettings::from_args(
+        &config.archive.expiry,
+        config.archive.archive_enabled,
+        &config.archive.archive_s3_prefix,
+    )?
+    .zip(archiver.as_ref())
+    .map(|(settings, archiver)| archiver.expirer(settings));
+    if let Some(expirer) = &expirer {
+        tracing::info!(?expirer, "cold archive expiry enabled");
     }
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
@@ -101,6 +115,12 @@ async fn main() -> anyhow::Result<()> {
             metrics::counter!(common::metrics::metric_name(name)).increment(0);
         }
     }
+    // Its own task: a slow LIST or a store outage touches neither
+    // aggregation nor the retention prunes.
+    let mut expiry = expirer.map(|expirer| {
+        archive_expiry::init_metrics(expirer.settings());
+        tokio::spawn(archive_expiry::expiry_loop(expirer))
+    });
     let retention = tokio::spawn(retention_loop(
         pool.clone(),
         RetentionSettings::from_config(&config),
@@ -142,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
         if retention.is_finished() {
             let outcome = retention.await;
             anyhow::bail!("the retention task stopped unexpectedly: {outcome:?}");
+        }
+        if let Some(expiry) = expiry.take_if(|t| t.is_finished()) {
+            let outcome = expiry.await;
+            anyhow::bail!("the archive expiry task stopped unexpectedly: {outcome:?}");
         }
     }
 }
