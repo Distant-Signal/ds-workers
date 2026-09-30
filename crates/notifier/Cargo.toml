@@ -37,3 +37,7 @@ http = "0.2"
 # a local wiremock server whose delayed response outlasts a short injected
 # per-attempt timeout. Same version `common` already uses.
 wiremock = "0.6"
+# Paused (virtual) time for push-queue tests with time bounds
+# (`#[tokio::test(start_paused = true)]`), so no test asserts on wall-clock
+# time a loaded CI runner can blow. Same tokio, one more feature.
+tokio = { version = "1.52.3", features = ["test-util"] }

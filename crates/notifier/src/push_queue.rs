@@ -362,6 +362,10 @@ struct State {
     runnable: VecDeque<String>,
     queued: usize,
     in_flight: usize,
+    /// The most jobs any one user has had in flight at once, per user: lets
+    /// tests prove the per-user cap held over a whole run without sampling.
+    #[cfg(test)]
+    peak_user_in_flight: HashMap<String, usize>,
 }
 
 struct Shared<B> {
@@ -540,6 +544,16 @@ impl<B: PushBackend> PushQueue<B> {
         lock(&self.shared.state).in_flight
     }
 
+    /// The most jobs `user_id` has ever had in flight at once.
+    #[cfg(test)]
+    pub fn peak_in_flight(&self, user_id: &str) -> usize {
+        lock(&self.shared.state)
+            .peak_user_in_flight
+            .get(user_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Resolves once nothing is queued or in flight.
     #[cfg(test)]
     pub async fn wait_idle(&self) {
@@ -617,6 +631,12 @@ fn take_next(st: &mut State, per_user_in_flight: usize) -> Option<(JobKey, PushJ
         };
         user.queued -= 1;
         user.in_flight += 1;
+        #[cfg(test)]
+        {
+            let now = user.in_flight;
+            let peak = st.peak_user_in_flight.entry(user_id.clone()).or_default();
+            *peak = (*peak).max(now);
+        }
         st.queued -= 1;
         st.in_flight += 1;
         let job = match st.slots.remove(&key) {
@@ -900,6 +920,8 @@ async fn prune<B: PushBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::send::tests::{TEST_AUTH, TEST_P256DH};
 
     /// In-memory subscriptions and bookkeeping; sends go either through the
@@ -911,6 +933,8 @@ mod tests {
         deleted: Mutex<Vec<i64>>,
         recorded: Mutex<Vec<(String, Delivered)>>,
         gate: Arc<tokio::sync::Semaphore>,
+        /// Sends that have reached a `gate://` endpoint (hung or released).
+        gated: AtomicUsize,
         scripted: Mutex<HashMap<i64, VecDeque<SendOutcome>>>,
     }
 
@@ -922,6 +946,7 @@ mod tests {
                 deleted: Mutex::new(Vec::new()),
                 recorded: Mutex::new(Vec::new()),
                 gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                gated: AtomicUsize::new(0),
                 scripted: Mutex::new(HashMap::new()),
             }
         }
@@ -969,6 +994,7 @@ mod tests {
                 return outcome;
             }
             if subscription.endpoint.starts_with("gate://") {
+                self.gated.fetch_add(1, Ordering::SeqCst);
                 self.gate
                     .acquire()
                     .await
@@ -1058,51 +1084,53 @@ mod tests {
     /// SVC-02: a user whose every endpoint is a tarpit, with many
     /// notifications queued, neither slows the caller (the main loop only
     /// ever calls `enqueue`) nor delays another user's delivery -- that one
-    /// lands in well under one tarpit timeout.
+    /// is delivered and recorded while the tarpit user's sends are still
+    /// hanging.
+    ///
+    /// Deterministic: the tarpit is a `gate://` endpoint that hangs until
+    /// the test opens the gate, so every assertion is about ordering and
+    /// counts, none about wall-clock time (a timing bound here flaked on a
+    /// loaded CI runner).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_tarpit_user_delays_neither_the_enqueuer_nor_other_users() {
-        const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
-        let tarpit = tarpit().await;
-        let fine = healthy(201).await;
-        let mut backend = FakeBackend::new(PER_ATTEMPT_TIMEOUT);
-        for id in 1..=20 {
-            backend =
-                backend.with_subscription("tarpit-user", id, &format!("{}/p{id}", tarpit.uri()));
+        const TARPIT_JOBS: usize = 10;
+        const TARPIT_SUBSCRIPTIONS: usize = 20;
+        let mut backend = FakeBackend::new(Duration::from_secs(5));
+        for id in 1..=TARPIT_SUBSCRIPTIONS as i64 {
+            backend = backend.with_subscription("tarpit-user", id, &format!("gate://p{id}"));
         }
-        let backend = backend.with_subscription("other-user", 100, &format!("{}/p", fine.uri()));
+        let backend = backend.with_subscription("other-user", 100, "script://");
+        lock(&backend.scripted).insert(100, VecDeque::from([SendOutcome::Sent]));
+        let gate = Arc::clone(&backend.gate);
         let queue = PushQueue::start(backend, config());
 
-        let started = Instant::now();
-        for line in 0..10 {
+        // `enqueue` is synchronous: each call returning while the gate is
+        // shut (so no tarpit send can have completed) is the proof that the
+        // enqueuer never waits on a send.
+        for line in 0..TARPIT_JOBS {
             assert_eq!(
                 queue.enqueue(line_job("tarpit-user", &format!("L{line}"), 3)),
                 EnqueueOutcome::Queued
             );
         }
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "enqueue must never wait on a send (took {:?})",
-            started.elapsed()
-        );
-        // The tarpit user's jobs reach their endpoints and hang; for well
-        // under one timeout, at most 2 of them (the per-user cap) are ever
-        // in flight, with 8 workers available.
-        let mut max_in_flight = 0;
-        while started.elapsed() < Duration::from_millis(500) {
-            max_in_flight = max_in_flight.max(queue.in_flight());
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            max_in_flight, 2,
-            "per-user cap: only 2 of the tarpit user's jobs at once"
-        );
+        assert_eq!(queue.depth() + queue.in_flight(), TARPIT_JOBS);
+
+        // The per-user cap: with 8 workers free, exactly 2 of the tarpit
+        // user's jobs start, and all 2 x 20 of their sends reach the
+        // endpoint and hang there; the rest wait in the user's own queue.
+        eventually("both capped tarpit jobs hanging at their endpoints", || {
+            queue.shared.backend.gated.load(Ordering::SeqCst) >= 2 * TARPIT_SUBSCRIPTIONS
+        })
+        .await;
+        assert_eq!(queue.in_flight(), 2, "per-user cap: only 2 at once");
         assert_eq!(
             queue.depth(),
-            8,
+            TARPIT_JOBS - 2,
             "the rest wait in the tarpit user's own queue"
         );
 
-        let other_started = Instant::now();
+        // Another user's push is delivered and recorded while the tarpit
+        // user's sends are provably still hanging (the gate is shut).
         assert_eq!(
             queue.enqueue(line_job("other-user", "L0", 3)),
             EnqueueOutcome::Queued
@@ -1113,10 +1141,15 @@ mod tests {
                 .any(|(user, _)| user == "other-user")
         })
         .await;
-        assert!(
-            other_started.elapsed() < PER_ATTEMPT_TIMEOUT / 2,
-            "another user's push must not wait behind the tarpit (took {:?})",
-            other_started.elapsed()
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the gate is still shut: the tarpit sends are still hanging"
+        );
+        assert_eq!(
+            queue.shared.backend.gated.load(Ordering::SeqCst),
+            2 * TARPIT_SUBSCRIPTIONS,
+            "no further tarpit job started while the first two hang"
         );
         assert!(
             !recorded(&queue)
@@ -1124,7 +1157,18 @@ mod tests {
                 .any(|(user, _)| user == "tarpit-user"),
             "nothing is recorded for the tarpit user while its sends hang"
         );
-        queue.shutdown(Duration::from_millis(10)).await;
+
+        // Release the tarpit: everything drains, and the cap held for the
+        // whole run, not just at the moments the test looked.
+        gate.add_permits(TARPIT_JOBS * TARPIT_SUBSCRIPTIONS);
+        queue.wait_idle().await;
+        assert_eq!(recorded(&queue).len(), TARPIT_JOBS + 1);
+        assert_eq!(
+            queue.peak_in_flight("tarpit-user"),
+            2,
+            "per-user cap: never more than 2 of the tarpit user's jobs at once"
+        );
+        queue.shutdown(Duration::from_secs(1)).await;
     }
 
     /// One user can occupy at most `per_user_in_flight` workers however
@@ -1140,13 +1184,11 @@ mod tests {
         for line in 0..6 {
             queue.enqueue(line_job("greedy", &format!("L{line}"), 1));
         }
-        eventually("greedy at its cap", || queue.in_flight() == 2).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            queue.in_flight(),
-            2,
-            "never more than the cap, with 8 workers free"
-        );
+        eventually("greedy at its cap", || {
+            queue.shared.backend.gated.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        assert_eq!(queue.in_flight(), 2, "the cap, with 8 workers free");
         assert_eq!(queue.depth(), 4);
 
         queue.enqueue(line_job("modest", "L0", 1));
@@ -1158,6 +1200,11 @@ mod tests {
         gate.add_permits(100);
         queue.wait_idle().await;
         assert_eq!(recorded(&queue).len(), 7);
+        assert_eq!(
+            queue.peak_in_flight("greedy"),
+            2,
+            "never more than the cap over the whole run"
+        );
         queue.shutdown(Duration::from_secs(1)).await;
     }
 
@@ -1461,8 +1508,9 @@ mod tests {
     }
 
     /// ...and abandons the rest once it runs out, without hanging, and
-    /// refuses new work meanwhile.
-    #[tokio::test]
+    /// refuses new work meanwhile. Runs on paused (virtual) time, so the
+    /// bound below is exact rather than a wall-clock guess.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_abandons_stuck_jobs_after_the_grace_period() {
         let backend =
             FakeBackend::new(Duration::from_secs(5)).with_subscription("u", 1, "gate://u");
@@ -1478,9 +1526,12 @@ mod tests {
         }
         eventually("in flight", || queue.in_flight() == 1).await;
         let shared = Arc::clone(&queue.shared);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let report = queue.shutdown(Duration::from_millis(200)).await;
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            started.elapsed() < SUBSCRIPTION_BUDGET,
+            "shutdown returns at the grace period, not when the stuck send's budget runs out"
+        );
         assert_eq!(
             report,
             ShutdownReport {

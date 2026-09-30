@@ -1240,11 +1240,18 @@ mod db_tests {
     /// endpoint. The cycle itself returns without waiting on either send,
     /// and the healthy user's push is delivered and recorded while the
     /// tarpit user's is still hanging.
+    ///
+    /// The bounds are causal, not performance ones: the tarpit never
+    /// answers and the per-attempt timeout is a minute, so a cycle that
+    /// waited on it, or a healthy push queued behind it, would take at
+    /// least that long, and "still hanging" is checked directly (the
+    /// tarpit job is still in flight). Tight wall-clock bounds here could
+    /// fail on a loaded CI runner.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
                 a_tarpit_user -- --ignored --test-threads=1`"]
     async fn a_tarpit_user_delays_neither_the_cycle_nor_another_users_push() {
-        const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+        const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
         let pool = connect().await;
         let (tarpit_user, fine_user) = ("TEST-NOTIFIER-TARPIT-USER", "TEST-NOTIFIER-FINE-USER");
         let line_id = "TEST-NOTIFIER-TARPIT-LINE";
@@ -1254,7 +1261,7 @@ mod db_tests {
 
         let tarpit = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(201).set_delay(Duration::from_secs(60)))
+            .respond_with(wiremock::ResponseTemplate::new(201).set_delay(10 * PER_ATTEMPT_TIMEOUT))
             .mount(&tarpit)
             .await;
         let fine = wiremock::MockServer::start().await;
@@ -1291,11 +1298,12 @@ mod db_tests {
         .expect("run_cycle");
         let cycle_took = started.elapsed();
         assert!(
-            cycle_took < Duration::from_secs(2),
+            cycle_took < PER_ATTEMPT_TIMEOUT,
             "the cycle must not wait on any push send (took {cycle_took:?})"
         );
 
-        let deadline = std::time::Instant::now() + PER_ATTEMPT_TIMEOUT / 2;
+        // Well inside the tarpit's timeout, however slow the runner.
+        let deadline = started + PER_ATTEMPT_TIMEOUT / 2;
         loop {
             if queries::line_notification_state(&pool, fine_user, line_id)
                 .await
@@ -1310,6 +1318,22 @@ mod db_tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Causality, not timing: the healthy push was recorded while the
+        // tarpit user's job is still in flight (its sends still hanging).
+        // The healthy job may still be finishing its bookkeeping, so wait
+        // for it to leave; the tarpit job can't, for a minute.
+        while queue.in_flight() > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the healthy user's job must finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            queue.in_flight(),
+            1,
+            "the tarpit user's job is still hanging after the healthy push landed"
+        );
         assert!(
             queries::line_notification_state(&pool, tarpit_user, line_id)
                 .await
