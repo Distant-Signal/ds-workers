@@ -1067,10 +1067,28 @@ mod tests {
         lock(&queue.shared.backend.recorded).clone()
     }
 
+    /// Waits until `cond` holds, on a `#[tokio::test(start_paused = true)]`
+    /// (current-thread, virtual-time) runtime only.
+    ///
+    /// There the queue's workers run on the test's own thread, so they make
+    /// progress whenever this yields, and the clock only moves when every
+    /// task is blocked -- the deadline is virtual, counted in idle rounds
+    /// of the runtime, not wall-clock time, so CPU load can't make it
+    /// expire. (The old wall-clock version flaked under load: both its own
+    /// 10 s deadline and `SUBSCRIPTION_BUDGET`'s 30 s on the hung sends were
+    /// real time.) A condition that never holds still fails, instantly.
     async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+            "eventually() needs #[tokio::test(start_paused = true)]"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !cond() {
-            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never happened: {what}"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -1101,9 +1119,10 @@ mod tests {
     ///
     /// Deterministic: the tarpit is a `gate://` endpoint that hangs until
     /// the test opens the gate, so every assertion is about ordering and
-    /// counts, none about wall-clock time (a timing bound here flaked on a
-    /// loaded CI runner).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// counts, and the runtime's clock is paused, so no wait here -- the
+    /// test's own or the queue's `SUBSCRIPTION_BUDGET` on the hung sends --
+    /// is wall-clock time (both flaked on a loaded machine).
+    #[tokio::test(start_paused = true)]
     async fn a_tarpit_user_delays_neither_the_enqueuer_nor_other_users() {
         const TARPIT_JOBS: usize = 10;
         const TARPIT_SUBSCRIPTIONS: usize = 20;
@@ -1185,7 +1204,7 @@ mod tests {
 
     /// One user can occupy at most `per_user_in_flight` workers however
     /// many jobs they queue; other users get the remaining workers.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_per_user_in_flight_cap_holds() {
         let backend = FakeBackend::new(Duration::from_secs(5))
             .with_subscription("greedy", 1, "gate://g")
@@ -1223,7 +1242,7 @@ mod tests {
     /// A full queue (or a user's full share of it) drops the new job: it
     /// is never sent or recorded, and the refusal doesn't wedge its key --
     /// the same notification is accepted once there is room again.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_full_queue_drops_the_new_job_and_records_nothing_for_it() {
         let backend = FakeBackend::new(Duration::from_secs(5))
             .with_subscription("a", 1, "gate://a")
@@ -1270,7 +1289,7 @@ mod tests {
         queue.shutdown(Duration::from_secs(1)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn one_user_cannot_take_more_than_their_share_of_the_queue() {
         let backend = FakeBackend::new(Duration::from_secs(5))
             .with_subscription("greedy", 1, "gate://g")
@@ -1309,7 +1328,7 @@ mod tests {
     /// notification while its job is still queued or in flight: that must
     /// not send it twice. A changed state is sent after the in-flight one,
     /// never alongside it, and only the newest parked state survives.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn re_decided_notifications_are_coalesced_and_newer_states_follow_in_order() {
         let backend =
             FakeBackend::new(Duration::from_secs(5)).with_subscription("u", 1, "gate://u");
