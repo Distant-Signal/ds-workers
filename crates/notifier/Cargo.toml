@@ -18,7 +18,6 @@ sqlx = { version = "0.8.6", features = ["chrono", "json", "macros", "postgres", 
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 metrics = "0.24"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # No client feature at all: `default-features = false` drops the default
 # `isahc-client` (a libcurl wrapper), and `hyper-client` is no longer used
 # either -- sends go through `reqwest` below via web-push's own
@@ -41,3 +40,6 @@ wiremock = "0.6"
 # (`#[tokio::test(start_paused = true)]`), so no test asserts on wall-clock
 # time a loaded CI runner can blow. Same tokio, one more feature.
 tokio = { version = "1.52.3", features = ["test-util"] }
+# Only the query-count tests' `SqlxQueryCounter` layer; the binary's own
+# subscriber is `common::logging`.
+tracing-subscriber = "0.3.23"

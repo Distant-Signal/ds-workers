@@ -50,7 +50,11 @@ fn poll_interval(interval_secs: u64) -> tokio::time::Interval {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    common::logging::exit_code(run().await)
+}
+
+async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let config = Config::parse();
 
@@ -75,9 +79,10 @@ async fn main() -> anyhow::Result<()> {
         "vapid_subject (--vapid-subject / VAPID_SUBJECT) must not be empty"
     );
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(&config.log_level))
-        .init();
+    common::logging::init_with_filter(
+        "notifier",
+        common::logging::EnvFilter::new(&config.log_level),
+    );
 
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;

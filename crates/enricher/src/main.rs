@@ -35,12 +35,14 @@ use sqlx::PgPool;
 const LLM_DURATION_METRIC: &str = "enricher_llm_call_duration_seconds";
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    common::logging::exit_code(run().await)
+}
+
+async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    common::logging::init("enricher");
 
     let config = Config::parse();
     if config.metrics_enabled {
