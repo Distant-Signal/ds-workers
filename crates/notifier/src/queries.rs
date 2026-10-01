@@ -498,6 +498,61 @@ pub(crate) struct TrainCandidate {
     pub user_id: String,
     pub new_rank: u8,
     pub previous_rank: u8,
+    /// The delay at this subscriber's own stop, against the public
+    /// timetable ([`subscriber_stop_delays`]) -- what `new_rank` was judged
+    /// on and what the push says.
+    pub delay_minutes: Option<i32>,
+}
+
+/// One subscriber of a train and the stop they get off at: their journey
+/// leg's destination (the same first leg by id
+/// [`journey_leg_for_train_subscription`] reads for the push copy), else the
+/// subscription's pin destination.
+#[derive(sqlx::FromRow)]
+struct Subscriber {
+    id: i64,
+    user_id: String,
+    stop_crs: Option<String>,
+}
+
+/// The delay at each subscriber's own stop, measured against the PUBLIC
+/// timetable (design doc §9 decision 2): measured once the train has
+/// reported there, forecast from TRUST's running delay before then. See
+/// `common::public_delay`. The 15-minute threshold therefore means "15
+/// minutes late against the public timetable where you get off", not "15
+/// minutes late against the working timetable wherever the train last
+/// reported". The CORPUS crosswalk fallback is not used here (it is an
+/// api-only setting); every bookable station resolves without it.
+async fn subscriber_stop_delays(
+    pool: &PgPool,
+    trains_id: i64,
+    train: Option<&(String, chrono::NaiveDate)>,
+    working_delay_minutes: Option<i32>,
+    subscribers: &[Subscriber],
+) -> anyhow::Result<Vec<Option<i32>>> {
+    let Some((train_uid, service_date)) = train else {
+        return Ok(vec![working_delay_minutes; subscribers.len()]);
+    };
+    let targets: Vec<common::public_delay::db::StopDelayTarget> = subscribers
+        .iter()
+        .map(|subscriber| common::public_delay::db::StopDelayTarget {
+            trains_id,
+            train_uid: train_uid.clone(),
+            service_date: *service_date,
+            stop_crs: subscriber
+                .stop_crs
+                .as_deref()
+                .map(str::trim)
+                .filter(|crs| !crs.is_empty())
+                .map(str::to_uppercase),
+            working_delay_minutes,
+        })
+        .collect();
+    Ok(common::public_delay::db::stop_delays(pool, &targets, false)
+        .await?
+        .into_iter()
+        .map(|delay| delay.map(|delay| delay.minutes))
+        .collect())
 }
 
 /// The per-`trains_id` candidate-building body Task 12's `poll_train_candidates`
@@ -524,29 +579,51 @@ pub(crate) async fn candidates_for_trains_id(
     trains_id: i64,
     delay_threshold_minutes: i32,
 ) -> anyhow::Result<Vec<TrainCandidate>> {
-    let current =
-        sqlx::query("SELECT status, delay_minutes FROM train_current_state WHERE trains_id = $1")
-            .bind(trains_id)
-            .fetch_optional(pool)
-            .await?;
+    let current = sqlx::query(
+        "SELECT cs.status, cs.delay_minutes, tr.train_uid, tr.service_date \
+         FROM train_current_state cs LEFT JOIN trains tr ON tr.id = cs.trains_id \
+         WHERE cs.trains_id = $1",
+    )
+    .bind(trains_id)
+    .fetch_optional(pool)
+    .await?;
     let Some(current) = current else {
         return Ok(Vec::new());
     }; // no current-state row yet -- nothing to compare
 
     let status: String = current.try_get("status")?;
-    let delay_minutes: Option<i32> = current.try_get("delay_minutes")?;
-    let new_rank = train_severity_rank(&status, delay_minutes, delay_threshold_minutes);
+    // TRUST's running delay, against the working timetable: only the input
+    // to each subscriber's public-time delay below.
+    let working_delay_minutes: Option<i32> = current.try_get("delay_minutes")?;
+    let train_uid: Option<String> = current.try_get("train_uid")?;
+    let service_date: Option<chrono::NaiveDate> = current.try_get("service_date")?;
+    let train = train_uid.zip(service_date);
 
-    let subscribers = sqlx::query(
-        "SELECT id, user_id FROM train_subscriptions WHERE trains_id = $1 AND notifications_enabled",
+    let subscribers: Vec<Subscriber> = sqlx::query_as(
+        "SELECT ts.id, ts.user_id, \
+                COALESCE((SELECT jl.destination_crs FROM journey_legs jl \
+                          WHERE jl.train_subscription_id = ts.id \
+                          ORDER BY jl.id LIMIT 1), \
+                         ts.pin_destination_crs) AS stop_crs \
+         FROM train_subscriptions ts \
+         WHERE ts.trains_id = $1 AND ts.notifications_enabled",
     )
     .bind(trains_id)
     .fetch_all(pool)
     .await?;
+    let delays = subscriber_stop_delays(
+        pool,
+        trains_id,
+        train.as_ref(),
+        working_delay_minutes,
+        &subscribers,
+    )
+    .await?;
     let mut candidates = Vec::new();
-    for subscriber in subscribers {
-        let tracked_train_id: i64 = subscriber.try_get("id")?;
-        let user_id: String = subscriber.try_get("user_id")?;
+    for (subscriber, delay_minutes) in subscribers.into_iter().zip(delays) {
+        let tracked_train_id = subscriber.id;
+        let user_id = subscriber.user_id;
+        let new_rank = train_severity_rank(&status, delay_minutes, delay_threshold_minutes);
 
         let previous = sqlx::query(
             "SELECT last_notified_status, last_notified_delay_minutes \
@@ -575,6 +652,7 @@ pub(crate) async fn candidates_for_trains_id(
                 user_id,
                 new_rank,
                 previous_rank,
+                delay_minutes,
             });
         }
     }
@@ -1359,6 +1437,7 @@ pub(crate) async fn schedule_candidates_for_leg(
          FROM schedule_destination_departures main \
          WHERE main.service_date = $1 \
            AND main.origin_crs = $2 \
+           AND main.can_board IS NOT FALSE \
            AND ($3::time IS NULL OR main.scheduled >= $3) \
            AND ($4::time IS NULL OR main.scheduled <= $4) \
            AND ( \
@@ -1367,6 +1446,7 @@ pub(crate) async fn schedule_candidates_for_leg(
                      SELECT 1 FROM schedule_destination_departures stop \
                      WHERE stop.service_date = $1 AND stop.train_uid = main.train_uid \
                        AND stop.origin_crs = $5 \
+                       AND stop.can_alight IS NOT FALSE \
                        AND (stop.day_offset, stop.scheduled) > (main.day_offset, main.scheduled) \
                  ) \
            ) \
@@ -1381,6 +1461,7 @@ pub(crate) async fn schedule_candidates_for_leg(
                      SELECT 1 FROM schedule_destination_departures stop \
                      WHERE stop.service_date = $1 AND stop.train_uid = main.train_uid \
                        AND stop.origin_crs = $5 \
+                       AND stop.can_alight IS NOT FALSE \
                        AND (stop.day_offset, stop.scheduled) > (main.day_offset, main.scheduled) \
                        AND ($6::time IS NULL OR stop.calling_point_arrival >= $6) \
                        AND ($7::time IS NULL OR stop.calling_point_arrival <= $7) \

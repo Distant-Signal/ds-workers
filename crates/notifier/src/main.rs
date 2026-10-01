@@ -398,7 +398,11 @@ async fn notify_train_candidates(
         // aggregator's trains prune cascades to it). That is a data
         // condition, not a failed cycle: skip this candidate instead of
         // aborting the cycle before its cursor advance (DB2-27).
-        let Some((status, delay_minutes)) = current_train_state(pool, candidate.trains_id).await?
+        // The status is re-read (the row can vanish, see below); the delay is
+        // the candidate's own, at the subscriber's stop on public times.
+        let delay_minutes = candidate.delay_minutes;
+        let Some((status, _working_delay_minutes)) =
+            current_train_state(pool, candidate.trains_id).await?
         else {
             tracing::warn!(
                 trains_id = candidate.trains_id,
@@ -1073,6 +1077,7 @@ mod db_tests {
             user_id: "TEST-DB227-USER".to_string(),
             new_rank: 2,
             previous_rank: 0,
+            delay_minutes: None,
         }];
         notify_train_candidates(&pool, &queue, &candidates, Utc::now())
             .await
