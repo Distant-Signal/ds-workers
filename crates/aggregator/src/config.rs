@@ -190,7 +190,9 @@ pub struct Config {
 
     /// Retention window, in days of `service_date`, for the OTHER three
     /// CIF-derived published products: `schedule_calling_points_full`,
-    /// `schedule_network_departures` and `schedule_line_population`.
+    /// `schedule_network_departures` and `schedule_line_population` (which
+    /// has its own shorter `schedule_line_population_retention_days` below
+    /// since 2026-10-01).
     ///
     /// **None of the three had a pruning job anywhere in this repo until
     /// 2026-09-25, and all three genuinely accrue.** The reasoning that
@@ -230,6 +232,42 @@ pub struct Config {
     /// raising this -- only disk -- so no warning is emitted.
     #[arg(long, env, default_value_t = 8, value_parser = non_negative_retention)]
     pub schedule_derived_products_retention_days: i64,
+
+    /// Retention window, in days of `service_date`, for
+    /// `schedule_line_population` alone; it overrides
+    /// `schedule_derived_products_retention_days` for that table. `3` keeps
+    /// today and the three days before (`service_date < CURRENT_DATE - 3`
+    /// is pruned).
+    ///
+    /// **Why shorter (Train Register N3, 2026-10-01).** Each row is one
+    /// line's whole day of schedules with every calling point, ~8.8 MB of
+    /// JSON on average and up to ~31 MB. Measured in production that day:
+    /// 9 dates x 243 rows, 1.5 GB of TOAST, and ~2.1 GB of JSON text per
+    /// date. The nightly `pg_dump` writes that text out (~17 GB through one
+    /// `gzip -9`) and spent 481 s on this one table, ~8x any other. The
+    /// table was already at its steady state (8 days of retention, one date
+    /// published per day), so it would not shrink by itself, and recompressing
+    /// it with lz4 would not shorten the dump, which costs per byte of text.
+    ///
+    /// Nothing needs the older dates:
+    /// - `full-coverage-consumer` reads today and tomorrow only;
+    /// - the pending-pin and NR-primary schedule-match sweeps reach back 2
+    ///   days (`list_pending_pins_for_schedule_match`,
+    ///   `reconciliation`'s candidate query);
+    /// - `schedule-reference` publishes only the current date.
+    ///
+    /// The one reader that can ask for an older date is the public
+    /// `/Train/{uid}/{date}` enrichment of a train that was never
+    /// schedule-matched while its date was recent. Beyond this window it
+    /// finds no population and serves the train without the schedule
+    /// overlay, as it already does past the 8-day window. Every tracked or
+    /// already-matched train keeps its schedule on `trains`.
+    ///
+    /// 3 cuts the table, and the dump time spent on it, by more than half
+    /// (9 dates to 4). One day of slack over the sweeps' 2 covers the
+    /// UTC/London date boundary.
+    #[arg(long, env, default_value_t = 3, value_parser = non_negative_retention)]
+    pub schedule_line_population_retention_days: i64,
 
     /// How long to keep a `trains` row (and its cascaded
     /// `train_movement_events`/`train_current_state` rows) when NO
@@ -378,6 +416,7 @@ mod tests {
         assert_eq!(config.trains_retention_days, 30);
         assert_eq!(config.schedule_destination_departures_retention_days, 8);
         assert_eq!(config.schedule_derived_products_retention_days, 8);
+        assert_eq!(config.schedule_line_population_retention_days, 3);
         assert_eq!(config.untracked_trains_retention_days, 14);
         assert!(
             !config.archive.archive_enabled,
