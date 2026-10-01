@@ -1,7 +1,9 @@
 [package]
 name = "enricher"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 health-http = { path = "../health-http" }
@@ -21,3 +23,6 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 wiremock = "0.6"
+
+[lints]
+workspace = true

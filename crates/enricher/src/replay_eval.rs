@@ -31,6 +31,11 @@
 //! `LLM_MODEL`/`LLM_API_KEY`/`LIVE_EVAL_TIMEOUT_SECS` and provider-policy
 //! env vars (see `llm::live_client_from_env`).
 
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "test code: casts of small known test values"
+)]
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -75,6 +80,10 @@ fn load() -> Vec<Incident> {
 
 /// Groups JSONL history rows into per-incident version lists -- split out
 /// of `load` so it's testable without a file.
+#[allow(
+    clippy::similar_names,
+    reason = "only rustc 1.88's clippy flags these names, so #[expect] can't be used"
+)]
 fn parse(raw: &str) -> Vec<Incident> {
     let mut by_id: BTreeMap<String, Vec<HistoryRow>> = BTreeMap::new();
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {

@@ -54,7 +54,7 @@ const PUSH_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 /// Any change to this shape must be reflected in Task 9's push-handler
 /// code -- they are two hand-written halves of the same wire contract.
 #[derive(Debug, Serialize)]
-pub struct NotificationPayload {
+pub(crate) struct NotificationPayload {
     pub title: String,
     pub body: String,
     pub url: String,
@@ -62,7 +62,7 @@ pub struct NotificationPayload {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum SendOutcome {
+pub(crate) enum SendOutcome {
     Sent,
     /// 404/410 from the push service -- caller must delete the subscription.
     Expired,
@@ -84,7 +84,7 @@ pub enum SendOutcome {
 /// credentials plus the per-attempt timeout. `Clone` is cheap (two `Arc`s),
 /// so each `push_queue` worker can hold one.
 #[derive(Clone)]
-pub struct Pusher {
+pub(crate) struct Pusher {
     vapid_private_key: std::sync::Arc<str>,
     vapid_subject: std::sync::Arc<str>,
     per_attempt_timeout: Duration,
@@ -107,7 +107,7 @@ impl std::fmt::Debug for Pusher {
 impl Pusher {
     /// The production sender: L9 send-time re-validation on, and
     /// `PUSH_SEND_TIMEOUT` per attempt.
-    pub fn new(vapid_private_key: &str, vapid_subject: &str) -> Self {
+    pub(crate) fn new(vapid_private_key: &str, vapid_subject: &str) -> Self {
         Self {
             vapid_private_key: vapid_private_key.into(),
             vapid_subject: vapid_subject.into(),
@@ -120,7 +120,7 @@ impl Pusher {
     /// re-validation (a `127.0.0.1` endpoint would fail it) and a short,
     /// injected per-attempt timeout. Everything else is the production path.
     #[cfg(test)]
-    pub fn for_local_tests(per_attempt_timeout: Duration) -> Self {
+    pub(crate) fn for_local_tests(per_attempt_timeout: Duration) -> Self {
         Self {
             vapid_private_key: tests::TEST_VAPID_PRIVATE_KEY_PEM.into(),
             vapid_subject: "mailto:test@example.com".into(),
@@ -129,7 +129,7 @@ impl Pusher {
         }
     }
 
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         subscription: &PushSubscriptionRow,
         payload: &NotificationPayload,
@@ -156,7 +156,7 @@ impl Pusher {
     }
 }
 
-pub async fn send_to_subscription(
+pub(crate) async fn send_to_subscription(
     vapid_private_key: &str,
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
@@ -214,6 +214,10 @@ pub async fn send_to_subscription(
 /// real network IO against a local mock server, and paused time
 /// auto-advances while the runtime waits on that real TCP connect, so the
 /// timeout could fire before any request ever reached the mock.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+)]
 async fn send_to_subscription_with_timeout(
     vapid_private_key: &str,
     vapid_subject: &str,
@@ -284,10 +288,12 @@ async fn send_to_subscription_with_timeout(
         // etc.").
         match tokio::time::timeout(per_attempt_timeout, send_message(client, message)).await {
             Ok(Ok(())) => return SendOutcome::Sent,
-            Ok(Err(PushSendError::Push(err))) => match classify_web_push_error(&err) {
-                SendOutcome::Expired => return SendOutcome::Expired,
-                _ => tracing::warn!(error = ?err, attempt, "web push send failed, retrying"),
-            },
+            Ok(Err(PushSendError::Push(err))) => {
+                if classify_web_push_error(&err) == SendOutcome::Expired {
+                    return SendOutcome::Expired;
+                }
+                tracing::warn!(error = ?err, attempt, "web push send failed, retrying");
+            }
             Ok(Err(PushSendError::Transport(err))) => {
                 tracing::warn!(error = ?err, attempt, "web push send failed, retrying");
             }
@@ -319,6 +325,10 @@ async fn send_to_subscription_with_timeout(
 /// `validate_outbound_url` check -- and a 0-TTL rebinding name can answer
 /// differently the second time, so that check alone never constrained
 /// where the POST actually went. Built once and reused (connection pool).
+#[expect(
+    clippy::expect_used,
+    reason = "a client builder with static settings fails only if TLS init does, which is fatal"
+)]
 fn push_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {

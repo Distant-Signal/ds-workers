@@ -1,5 +1,5 @@
-//! Watermark polling and candidate joins over line_status_history /
-//! train_movement_events. See
+//! Watermark polling and candidate joins over `line_status_history` /
+//! `train_movement_events`. See
 //! docs/superpowers/specs/2026-09-02-line-status-notifications-design.md's
 //! Architecture section for the full per-cycle shape this implements.
 //!
@@ -25,11 +25,11 @@ use crate::decision::train_severity_rank;
 /// cycle reads at most one batch; see [`advance_cursor_with_grace_bounded`]
 /// for how the cursor then walks a backlog. Sized well above normal
 /// per-cycle volume, so ordinary cycles still read everything at once.
-pub const LINE_POLL_BATCH_ROWS: i64 = 2_000;
+pub(crate) const LINE_POLL_BATCH_ROWS: i64 = 2_000;
 /// Only ids are read here (the `DISTINCT trains_id` of subscribed trains),
 /// so this can be much larger than [`LINE_POLL_BATCH_ROWS`].
-pub const TRAIN_POLL_BATCH_ROWS: i64 = 50_000;
-pub const FORWARD_QUEUE_POLL_BATCH_ROWS: i64 = 10_000;
+pub(crate) const TRAIN_POLL_BATCH_ROWS: i64 = 50_000;
+pub(crate) const FORWARD_QUEUE_POLL_BATCH_ROWS: i64 = 10_000;
 
 /// Large enough that no test fixture fills a batch.
 #[cfg(test)]
@@ -41,7 +41,7 @@ pub(crate) const TEST_POLL_BATCH_ROWS: i64 = 1_000_000;
 /// [`advance_cursor_with_grace`] for the full two-phase mechanic and the
 /// out-of-order-commit bug it closes.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct CursorState {
+pub(crate) struct CursorState {
     /// Every row at or below this id is genuinely processed-and-past --
     /// only this value bounds the next poll's `WHERE id > $1`.
     pub last_processed_id: i64,
@@ -63,7 +63,7 @@ pub struct CursorState {
 /// (a dead tuple and WAL) on every read, several times a minute.
 /// `DO NOTHING` writes nothing when the row exists, and the second arm
 /// reads it.
-pub async fn read_cursor(pool: &PgPool, name: &str) -> anyhow::Result<CursorState> {
+pub(crate) async fn read_cursor(pool: &PgPool, name: &str) -> anyhow::Result<CursorState> {
     let row = sqlx::query_as::<_, CursorState>(
         "WITH inserted AS ( \
              INSERT INTO notifier_cursor (name, last_processed_id) VALUES ($1, 0) \
@@ -121,7 +121,7 @@ pub async fn read_cursor(pool: &PgPool, name: &str) -> anyhow::Result<CursorStat
 /// Equivalent to [`advance_cursor_with_grace_bounded`] for a poll that read
 /// everything above the cursor (`read_through: None`).
 #[cfg(test)]
-pub async fn advance_cursor_with_grace(
+pub(crate) async fn advance_cursor_with_grace(
     pool: &PgPool,
     name: &str,
     state: &CursorState,
@@ -146,7 +146,7 @@ pub async fn advance_cursor_with_grace(
 /// What one bounded poll (DB review part 2, DB2-24) saw, for
 /// [`advance_cursor_with_grace_bounded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PollWindow {
+pub(crate) struct PollWindow {
     /// The highest id visible above the cursor when the poll ran (the
     /// table's head), whether or not this poll's batch reached it. This is
     /// what gets PROPOSED: once it has aged past the grace window, every row
@@ -167,7 +167,7 @@ pub struct PollWindow {
 /// stays pending with its original observed-at, so the next cycle promotes
 /// the next batch straight away: after one grace window a backlog drains at
 /// one batch per poll interval, not one batch per grace window.
-pub async fn advance_cursor_with_grace_bounded(
+pub(crate) async fn advance_cursor_with_grace_bounded(
     pool: &PgPool,
     name: &str,
     state: &CursorState,
@@ -247,7 +247,7 @@ pub async fn advance_cursor_with_grace_bounded(
     Ok(new_last)
 }
 
-pub struct LineCandidate {
+pub(crate) struct LineCandidate {
     pub id: i64,
     pub line_id: String,
     pub new_rank: u8,
@@ -301,6 +301,10 @@ fn worst_rank(statuses: &[LineStatus]) -> u8 {
 /// skipped, not propagated"), and is what the aggregator's equivalent
 /// row-decode path does too. A genuine DB/connectivity failure still
 /// propagates -- that is `fetch_all`'s own `?`, above, untouched.
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant is established just above; the expect message names it"
+)]
 fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
     let statuses: Vec<LineStatus> = match serde_json::from_value(row.statuses) {
         Ok(statuses) => statuses,
@@ -348,8 +352,8 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
     })
 }
 
-/// Finds "the immediately preceding line_status_history row for this same
-/// line_id" (Decision 3's guard -- NULL previous_statuses means none
+/// Finds "the immediately preceding `line_status_history` row for this same
+/// `line_id`" (Decision 3's guard -- NULL `previous_statuses` means none
 /// exists) via a window function, bounded to the rows this poll actually
 /// needs rather than a per-row correlated subquery over the whole table.
 ///
@@ -380,12 +384,12 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
 /// row at or before the cursor (`id <= $1`, `DISTINCT ON (line_id) ...
 /// ORDER BY line_id, id DESC`) -- onto the polled rows (`id > $1`) before
 /// windowing, then filter the windowed result back down to `id > $1` for
-/// the actual output. Per line_id, `anchor ∪ candidates` is exactly the
+/// the actual output. Per `line_id`, `anchor ∪ candidates` is exactly the
 /// contiguous run of every row from the anchor onward (nothing else can
 /// exist between them: the anchor is by construction the highest id not
 /// greater than `$1`, and `candidates` already contains every row with a
 /// higher id), so `LAG` over that combined, ordered set produces exactly
-/// the same "max id less than mine, same line_id" row the old correlated
+/// the same "max id less than mine, same `line_id`" row the old correlated
 /// subquery computed for every candidate row -- including a bare `NULL`
 /// when a line has no anchor at all (a brand-new line, or a poll starting
 /// at `since_id = 0`), matching the subquery's own "no earlier row exists"
@@ -429,7 +433,11 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
 /// the lowest `batch_rows` ids above the cursor, so per line it is still a
 /// contiguous run from the anchor onward. The returned [`PollWindow`] says
 /// how far the batch reached; see [`advance_cursor_with_grace_bounded`].
-pub async fn poll_line_candidates(
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "collection lengths stay far below i64::MAX"
+)]
+pub(crate) async fn poll_line_candidates(
     pool: &PgPool,
     since_id: i64,
     batch_rows: i64,
@@ -484,7 +492,7 @@ pub async fn poll_line_candidates(
     Ok((candidates, window))
 }
 
-pub struct TrainCandidate {
+pub(crate) struct TrainCandidate {
     pub tracked_train_id: i64,
     pub trains_id: i64,
     pub user_id: String,
@@ -511,7 +519,7 @@ pub struct TrainCandidate {
 /// generating notifications -- this filter is the other, equally
 /// necessary half of that fix: without it, a deactivated subscription
 /// would still show up here and get notified exactly as before.
-pub async fn candidates_for_trains_id(
+pub(crate) async fn candidates_for_trains_id(
     pool: &PgPool,
     trains_id: i64,
     delay_threshold_minutes: i32,
@@ -584,14 +592,14 @@ pub async fn candidates_for_trains_id(
 /// each then costing >= 2 more sequential round trips in
 /// `candidates_for_trains_id` for nothing. The `JOIN` below pushes the
 /// "does this train have a subscriber at all" filter into this one query,
-/// so a trains_id with zero rows in `train_subscriptions` never reaches
+/// so a `trains_id` with zero rows in `train_subscriptions` never reaches
 /// `candidates_for_trains_id` in the first place -- a pure query-efficiency
 /// change, the per-subscriber cooldown/escalation join in
 /// `candidates_for_trains_id` below is untouched.
 ///
 /// Bounded (DB2-24): considers at most `batch_rows` event ids above
 /// `since_id`; see [`PollWindow`].
-pub async fn poll_train_candidates(
+pub(crate) async fn poll_train_candidates(
     pool: &PgPool,
     since_id: i64,
     delay_threshold_minutes: i32,
@@ -672,7 +680,7 @@ async fn batch_end(
 ///
 /// Bounded (DB2-24): considers at most `batch_rows` queue ids above
 /// `since_id`; see [`PollWindow`].
-pub async fn poll_forward_queue(
+pub(crate) async fn poll_forward_queue(
     pool: &PgPool,
     since_id: i64,
     batch_rows: i64,
@@ -709,7 +717,10 @@ pub async fn poll_forward_queue(
     ))
 }
 
-pub async fn pinned_users_for_line(pool: &PgPool, line_id: &str) -> anyhow::Result<Vec<String>> {
+pub(crate) async fn pinned_users_for_line(
+    pool: &PgPool,
+    line_id: &str,
+) -> anyhow::Result<Vec<String>> {
     let rows =
         sqlx::query_scalar::<_, String>("SELECT user_id FROM pinned_lines WHERE line_id = $1")
             .bind(line_id)
@@ -724,7 +735,12 @@ struct LineNotificationStateRow {
     last_notified_at: DateTime<Utc>,
 }
 
-pub async fn line_notification_state(
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "severity ranks are 0..=3"
+)]
+pub(crate) async fn line_notification_state(
     pool: &PgPool,
     user_id: &str,
     line_id: &str,
@@ -740,7 +756,7 @@ pub async fn line_notification_state(
     Ok(row.map(|row| (row.last_notified_severity_rank as u8, row.last_notified_at)))
 }
 
-pub async fn upsert_line_notification_state(
+pub(crate) async fn upsert_line_notification_state(
     pool: &PgPool,
     user_id: &str,
     line_id: &str,
@@ -755,14 +771,14 @@ pub async fn upsert_line_notification_state(
     )
     .bind(user_id)
     .bind(line_id)
-    .bind(rank as i16)
+    .bind(i16::from(rank))
     .bind(at)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn upsert_train_notification_state(
+pub(crate) async fn upsert_train_notification_state(
     pool: &PgPool,
     user_id: &str,
     tracked_train_id: i64,
@@ -790,7 +806,7 @@ pub async fn upsert_train_notification_state(
 }
 
 #[derive(Debug, sqlx::FromRow)]
-pub struct JourneyLegContext {
+pub(crate) struct JourneyLegContext {
     pub journey_id: i64,
     pub journey_name: Option<String>,
     pub leg_order: i32,
@@ -812,14 +828,14 @@ pub struct JourneyLegContext {
 /// `ORDER BY jl.id LIMIT 1`: a known, accepted edge case -- if the SAME
 /// physical train (`trains_id`) is tracked via two different legs (legal:
 /// `create_subscription_for_train` is idempotent by `(user_id, trains_id)`,
-/// so a second leg pointing at the same trains_id reuses the same
+/// so a second leg pointing at the same `trains_id` reuses the same
 /// `train_subscriptions` row -- design spec §0.1), this query returns only
 /// the first-created leg's context, so the payload describes only one of
 /// the two legs even though both legs' owners (if different users) are
 /// notified via the existing per-trains_id fan-out. Rare, and no worse
 /// than the ambiguity already inherent in "one physical train, several
 /// subscribers" today.
-pub async fn journey_leg_for_train_subscription(
+pub(crate) async fn journey_leg_for_train_subscription(
     pool: &PgPool,
     tracked_train_id: i64,
 ) -> anyhow::Result<Option<JourneyLegContext>> {
@@ -839,14 +855,14 @@ pub async fn journey_leg_for_train_subscription(
 }
 
 #[derive(Debug, sqlx::FromRow)]
-pub struct PushSubscriptionRow {
+pub(crate) struct PushSubscriptionRow {
     pub id: i64,
     pub endpoint: String,
     pub p256dh: String,
     pub auth: String,
 }
 
-pub async fn push_subscriptions_for_user(
+pub(crate) async fn push_subscriptions_for_user(
     pool: &PgPool,
     user_id: &str,
 ) -> anyhow::Result<Vec<PushSubscriptionRow>> {
@@ -862,7 +878,7 @@ pub async fn push_subscriptions_for_user(
 /// Error handling: called on a 404/410 from the push service (Task 6) --
 /// self-healing cleanup, mirroring users.rs's own "every write takes out
 /// its own trash" posture cited by the spec.
-pub async fn delete_push_subscription(pool: &PgPool, id: i64) -> anyhow::Result<()> {
+pub(crate) async fn delete_push_subscription(pool: &PgPool, id: i64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM push_subscriptions WHERE id = $1")
         .bind(id)
         .execute(pool)
@@ -876,7 +892,7 @@ pub async fn delete_push_subscription(pool: &PgPool, id: i64) -> anyhow::Result<
 /// must not) depend on `crates/api`. Same table (`station_samples`,
 /// wholesale-replaced per poll, one row per station, no history), same
 /// "None means no sample for this CRS yet" contract.
-pub async fn station_sample_for_crs(
+pub(crate) async fn station_sample_for_crs(
     pool: &PgPool,
     crs: &str,
 ) -> anyhow::Result<Option<common::StationSample>> {
@@ -900,7 +916,7 @@ pub async fn station_sample_for_crs(
     }))
 }
 
-pub struct CommittedLeg {
+pub(crate) struct CommittedLeg {
     pub journey_leg_id: i64,
     pub journey_id: i64,
     pub user_id: String,
@@ -921,7 +937,7 @@ pub struct CommittedLeg {
 /// is a current-snapshot table with no watermark to diff against). One row
 /// per leg, already carrying everything `skip_check::leg_is_skipped`
 /// (Task 9) needs -- no further per-leg query required.
-pub async fn list_committed_legs_for_today(
+pub(crate) async fn list_committed_legs_for_today(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<CommittedLeg>> {
@@ -962,7 +978,7 @@ pub async fn list_committed_legs_for_today(
         .collect()
 }
 
-pub async fn skip_notification_state(
+pub(crate) async fn skip_notification_state(
     pool: &PgPool,
     user_id: &str,
     journey_leg_id: i64,
@@ -978,12 +994,12 @@ pub async fn skip_notification_state(
     Ok(row.map(|(skipped,)| skipped))
 }
 
-pub async fn upsert_skip_notification_state(
+pub(crate) async fn upsert_skip_notification_state(
     pool: &PgPool,
     user_id: &str,
     journey_leg_id: i64,
     skipped: bool,
-    at: chrono::DateTime<Utc>,
+    at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO journey_leg_notification_state \
@@ -1072,7 +1088,7 @@ pub async fn upsert_skip_notification_state(
 /// from the earlier `due_templates_for` listing, so a concurrent edit could
 /// mint a journey mixing the old name with new legs, and a template paused
 /// or deleted after the listing was still minted.
-pub async fn materialize_due_template_occurrence(
+pub(crate) async fn materialize_due_template_occurrence(
     pool: &PgPool,
     template_id: i64,
     user_id: &str,
@@ -1093,7 +1109,10 @@ pub async fn materialize_due_template_occurrence(
         return Ok(None);
     };
 
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple mirrors the columns of the SQL row it decodes"
+    )]
     let legs: Vec<(
         i32,
         Option<String>,
@@ -1188,7 +1207,7 @@ pub async fn materialize_due_template_occurrence(
 }
 
 /// Every active template due to materialize `today` -- active, today's
-/// weekday bit set, today within [starts_on, ends_on]. Does NOT itself
+/// weekday bit set, today within [`starts_on`, `ends_on`]. Does NOT itself
 /// check the idempotency guard (that's `materialize_due_template_occurrence`'s
 /// own job, per-template) -- this just narrows the sweep's per-tick
 /// candidate set. `days_of_week IS NULL` (a one-shot, non-recurring
@@ -1199,12 +1218,12 @@ pub async fn materialize_due_template_occurrence(
 /// `run_template_sweep_cycle` (Task 5, stage 1) -- also exercised directly
 /// by this module's own `sweep_tests`.
 #[derive(Debug, sqlx::FromRow)]
-pub struct DueTemplate {
+pub(crate) struct DueTemplate {
     pub id: i64,
     pub user_id: String,
 }
 
-pub async fn due_templates_for(
+pub(crate) async fn due_templates_for(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<DueTemplate>> {
@@ -1254,7 +1273,7 @@ pub async fn due_templates_for(
 /// from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) -- also
 /// exercised directly by this module's own `sweep_tests`.
 #[derive(Debug, sqlx::FromRow)]
-pub struct CommitCheckLeg {
+pub(crate) struct CommitCheckLeg {
     pub journey_leg_id: i64,
     pub journey_id: i64,
     pub user_id: String,
@@ -1267,7 +1286,7 @@ pub struct CommitCheckLeg {
     pub arrive_before: Option<chrono::NaiveTime>,
 }
 
-pub async fn unmatched_auto_legs_for_commit_check(
+pub(crate) async fn unmatched_auto_legs_for_commit_check(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<CommitCheckLeg>> {
@@ -1321,8 +1340,11 @@ pub async fn unmatched_auto_legs_for_commit_check(
 /// its wider return type, which this slimmed version doesn't need).
 /// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
 /// also exercised directly by this module's own `sweep_tests`.
-#[allow(clippy::too_many_arguments)]
-pub async fn schedule_candidates_for_leg(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them"
+)]
+pub(crate) async fn schedule_candidates_for_leg(
     pool: &PgPool,
     origin_crs: &str,
     destination_crs: &str,
@@ -1400,7 +1422,7 @@ pub async fn schedule_candidates_for_leg(
 /// because the enriching one falls back to it whenever CIF has nothing to
 /// enrich WITH, and because it is the exact shape being duplicated from
 /// `crates/api`.
-pub async fn find_or_create_train<'e, E>(
+pub(crate) async fn find_or_create_train<'e, E>(
     executor: E,
     train_uid: &str,
     service_date: chrono::NaiveDate,
@@ -1547,7 +1569,7 @@ async fn cif_train_schedule(
 /// to call repeatedly. Falls back to a bare `find_or_create_train` when CIF
 /// has nothing published for this train at all (best-effort, never fatal:
 /// the auto-commit itself must still happen).
-pub async fn find_or_create_train_with_cif_schedule(
+pub(crate) async fn find_or_create_train_with_cif_schedule(
     pool: &PgPool,
     train_uid: &str,
     service_date: chrono::NaiveDate,
@@ -1619,7 +1641,7 @@ pub async fn find_or_create_train_with_cif_schedule(
 /// Takes the same `(user_id, trains_id)` advisory lock as the original
 /// (DB2-21, `common::pg::lock_user_train_subscription`), so this copy and
 /// the api's serialise against each other too.
-pub async fn create_subscription_for_train<'e, A>(
+pub(crate) async fn create_subscription_for_train<'e, A>(
     conn: A,
     trains_id: i64,
     user_id: &str,
@@ -1684,7 +1706,7 @@ where
 /// for `&mut Transaction<'_, Postgres>` as well as for `&Pool<Postgres>`).
 /// Still called directly (with a plain `&PgPool`) by this module's own
 /// `sweep_tests`.
-pub async fn commit_leg_to_train<'e, A>(
+pub(crate) async fn commit_leg_to_train<'e, A>(
     executor: A,
     journey_leg_id: i64,
     train_subscription_id: i64,
@@ -1751,7 +1773,7 @@ where
 /// SELECTs it (no write to undo), so the rollback cannot destroy a
 /// subscription this sweep did not create -- it only ever discards its own
 /// brand-new INSERT.
-pub async fn auto_commit_leg_to_train(
+pub(crate) async fn auto_commit_leg_to_train(
     pool: &PgPool,
     journey_leg_id: i64,
     trains_id: i64,
@@ -1781,7 +1803,7 @@ pub async fn auto_commit_leg_to_train(
 /// distinction the api draws on the read side, applied here to a
 /// notification that fires at most once per leg and can therefore not be
 /// taken back.
-pub async fn schedule_published_for(
+pub(crate) async fn schedule_published_for(
     pool: &PgPool,
     service_date: chrono::NaiveDate,
 ) -> anyhow::Result<bool> {
@@ -1796,7 +1818,7 @@ pub async fn schedule_published_for(
 
 /// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
 /// also exercised directly by this module's own `sweep_tests`.
-pub async fn unmatched_notification_state(
+pub(crate) async fn unmatched_notification_state(
     pool: &PgPool,
     user_id: &str,
     journey_leg_id: i64,
@@ -1821,11 +1843,11 @@ pub async fn unmatched_notification_state(
 ///
 /// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
 /// also exercised directly by this module's own `sweep_tests`.
-pub async fn upsert_unmatched_notification_state(
+pub(crate) async fn upsert_unmatched_notification_state(
     pool: &PgPool,
     user_id: &str,
     journey_leg_id: i64,
-    at: chrono::DateTime<Utc>,
+    at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO journey_leg_notification_state \
@@ -1845,6 +1867,12 @@ pub async fn upsert_unmatched_notification_state(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::items_after_statements,
+    clippy::too_many_lines,
+    reason = "test code: casts of small known test values; fixtures sit next to their use; scenario tests read top to bottom"
+)]
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
@@ -1889,11 +1917,11 @@ mod tests {
     /// `Serialize_repr`/`DataQuality`'s kebab-case tagging and mask a real
     /// round-trip bug.
     fn status_json(severity: common::Severity) -> serde_json::Value {
-        let status = common::LineStatus {
+        let status = LineStatus {
             severity,
             reason: String::new(),
             validity: common::ValidityPeriod {
-                from_date: chrono::Utc::now(),
+                from_date: Utc::now(),
                 to_date: None,
                 is_now: true,
             },
@@ -2780,7 +2808,7 @@ mod tests {
 
         let mut cursor = read_cursor(&pool, cursor_name).await.expect("read cursor");
         // Every value observed so far, with the time it was first observed.
-        let mut observed: Vec<(i64, chrono::DateTime<Utc>)> = Vec::new();
+        let mut observed: Vec<(i64, DateTime<Utc>)> = Vec::new();
         let mut promotions = Vec::new();
         let mut previous_last = 0;
 
@@ -2807,8 +2835,10 @@ mod tests {
                 let first_seen = observed
                     .iter()
                     .find(|(id, _)| *id == last_processed_id)
-                    .map(|(_, at)| *at)
-                    .unwrap_or_else(|| panic!("tick {tick}: promoted an id never observed"));
+                    .map_or_else(
+                        || panic!("tick {tick}: promoted an id never observed"),
+                        |(_, at)| *at,
+                    );
                 assert!(
                     now - first_seen >= grace,
                     "tick {tick}: promoted {last_processed_id} only {}s after it was first \
@@ -3619,11 +3649,9 @@ mod tests {
         let observed = query_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             observed < 10,
-            "poll_train_candidates must not do a per-train round trip for each of the {} \
+            "poll_train_candidates must not do a per-train round trip for each of the {UNSUBSCRIBED_COUNT} \
              unsubscribed trains -- observed {observed} sqlx queries for one subscribed train \
-             plus {} unsubscribed ones",
-            UNSUBSCRIBED_COUNT,
-            UNSUBSCRIBED_COUNT
+             plus {UNSUBSCRIBED_COUNT} unsubscribed ones"
         );
 
         sqlx::query("DELETE FROM train_movement_events WHERE dedup_key LIKE 'test-nosub-%'")
@@ -3666,6 +3694,10 @@ mod tests {
 /// machinery, but to keep this plan's own addition reviewable as one
 /// self-contained unit.
 #[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test code: scenario tests read top to bottom"
+)]
 mod sweep_tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;

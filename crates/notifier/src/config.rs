@@ -5,11 +5,11 @@ use common::secret::Secret;
 /// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Secret,
 
-    /// How often the notifier polls line_status_history/train_movement_events.
+    /// How often the notifier polls `line_status_history/train_movement_events`.
     /// DESIGN.md-style "reasonable round number, revisit with real usage"
     /// posture -- not independently load-tested, matching the spec's own
     /// framing of the cooldown/threshold constants below.
@@ -48,7 +48,7 @@ pub struct Config {
     /// Cadence for the forwarding-queue poll (Task 17/18) -- deliberately
     /// faster than `poll_interval_secs`, since the whole point of
     /// trust-consumer's forwarding signal is a quicker path to a push than
-    /// waiting for train_movement_events' own slower-polled cycle. The exact
+    /// waiting for `train_movement_events`' own slower-polled cycle. The exact
     /// value is a judgment call, not a researched figure -- see the design
     /// spec's own Open Question 3 on this cadence needing "concrete design
     /// during implementation planning."
@@ -91,10 +91,10 @@ pub struct Config {
 
     /// VAPID keys, PEM-encoded EC private key (`openssl ecparam -genkey
     /// -name prime256v1`) and the matching uncompressed public key --
-    /// wired into web-push's VapidSignatureBuilder in Task 6. Fails fast
+    /// wired into web-push's `VapidSignatureBuilder` in Task 6. Fails fast
     /// at startup if either is empty (Task 6), matching this repo's
     /// existing "refuse to start on a missing required secret" posture
-    /// (crates/api/src/app.rs's internal_token `ensure!`).
+    /// (crates/api/src/app.rs's `internal_token` `ensure!`).
     #[arg(long, env)]
     pub vapid_private_key: Secret,
     #[arg(long, env)]
@@ -192,7 +192,7 @@ impl Config {
     /// constructed, turns that into the same "refuse to start on a bad
     /// config, with a message that says why" posture this crate's own VAPID
     /// `ensure!`s already establish in `main`.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.poll_interval_secs > 0,
             "poll_interval_secs (--poll-interval-secs / POLL_INTERVAL_SECS) must be greater \
@@ -240,7 +240,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn push_queue_config(&self) -> crate::push_queue::PushQueueConfig {
+    pub(crate) fn push_queue_config(&self) -> crate::push_queue::PushQueueConfig {
         crate::push_queue::PushQueueConfig {
             workers: self.push_workers,
             capacity: self.push_queue_capacity,

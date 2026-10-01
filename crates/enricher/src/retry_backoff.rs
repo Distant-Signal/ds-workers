@@ -94,7 +94,7 @@ struct BackoffEntry {
 /// `MismatchTracker`) across the stream consumer loop, the hourly sweep, and
 /// the reclaim loop -- see this module's doc comment.
 #[derive(Default)]
-pub struct RetryBackoff {
+pub(crate) struct RetryBackoff {
     entries: Mutex<HashMap<String, BackoffEntry>>,
 }
 
@@ -105,10 +105,14 @@ impl RetryBackoff {
     /// failure's backoff yet. Never skips a text this incident hasn't
     /// failed against before (a fresh incident, or one whose text just
     /// changed since its last failure).
-    pub fn should_skip(&self, incident_id: &str, current_text_hash: &str) -> bool {
+    pub(crate) fn should_skip(&self, incident_id: &str, current_text_hash: &str) -> bool {
         self.should_skip_at(incident_id, current_text_hash, Instant::now())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
     fn should_skip_at(&self, incident_id: &str, current_text_hash: &str, now: Instant) -> bool {
         let entries = self.entries.lock().expect("retry backoff mutex poisoned");
         entries.get(incident_id).is_some_and(|entry| {
@@ -119,10 +123,14 @@ impl RetryBackoff {
     /// Records a failed attempt against `text_hash`, returning the new
     /// consecutive-failure count for that exact text (1 on the first
     /// failure, or the first failure since the text last changed).
-    pub fn record_failure(&self, incident_id: &str, text_hash: &str) -> u32 {
+    pub(crate) fn record_failure(&self, incident_id: &str, text_hash: &str) -> u32 {
         self.record_failure_at(incident_id, text_hash, Instant::now())
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
     fn record_failure_at(&self, incident_id: &str, text_hash: &str, now: Instant) -> u32 {
         let mut entries = self.entries.lock().expect("retry backoff mutex poisoned");
         let entry = entries
@@ -150,7 +158,11 @@ impl RetryBackoff {
     /// has actually produced a usable result for it (see `process_incident`
     /// for exactly which outcomes count), since there is nothing left to
     /// back off from.
-    pub fn record_success(&self, incident_id: &str) {
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
+    pub(crate) fn record_success(&self, incident_id: &str) {
         self.entries
             .lock()
             .expect("retry backoff mutex poisoned")

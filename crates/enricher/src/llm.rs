@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 /// `None` (a real, valid state per this struct's own doc above) and logs a
 /// warning, so one malformed date poisons only itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DateRange {
+pub(crate) struct DateRange {
     #[serde(default, deserialize_with = "deserialize_lenient_date")]
     pub from_date: Option<DateTime<Utc>>,
     #[serde(default, deserialize_with = "deserialize_lenient_date")]
@@ -96,7 +96,7 @@ where
 /// if any -- unchanged in shape from the original design, just scoped to
 /// one period instead of the whole incident.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ScheduleWindow {
+pub(crate) struct ScheduleWindow {
     /// ISO 8601 weekday numbers, 1 (Monday) through 7 (Sunday).
     pub days_of_week: Vec<u8>,
     /// "HH:MM", 24-hour, Europe/London local time.
@@ -108,7 +108,7 @@ pub struct ScheduleWindow {
 /// overwhelming common case) always collapses to exactly one
 /// `ExtractionPeriod` with `date_range: None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ExtractionPeriod {
+pub(crate) struct ExtractionPeriod {
     /// Short, display/annotation-only text distinguishing this period's
     /// scope from the incident's other periods (e.g. "platform 2 closed,
     /// calls at platform 1"). Never matched against.
@@ -151,7 +151,7 @@ pub struct ExtractionPeriod {
 /// Rust after parsing, treating an empty array as a hard parse failure (see
 /// its body below).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct PrimaryExtraction {
+pub(crate) struct PrimaryExtraction {
     pub category: String,
     pub periods: Vec<ExtractionPeriod>,
     /// How many periods `extract_primary` dropped to bring the response
@@ -175,20 +175,20 @@ pub struct PrimaryExtraction {
 /// §2/§7 item 4); this is the ordinal-alignment mitigation, not the "single
 /// enum" shape the original design's adversarial pass used.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct AdversarialPeriodVerdict {
+pub(crate) struct AdversarialPeriodVerdict {
     pub period_index: usize,
     pub scope_description: Option<String>,
     pub resolution_status: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct SeverityAdversarialPeriodVerdict {
+pub(crate) struct SeverityAdversarialPeriodVerdict {
     pub period_index: usize,
     pub scope_description: Option<String>,
     pub apparent_severity: String,
 }
 
-pub struct LlmClient {
+pub(crate) struct LlmClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
@@ -212,11 +212,11 @@ pub struct LlmClient {
 /// server-requested wait fails the call instead (as a provider-transient
 /// error), so one incident never pins a stream/sweep/reclaim loop -- and its
 /// in-flight claim -- for hours; the reclaim loop retries it later.
-pub const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Per-provider request/retry policy.
 #[derive(Debug, Clone)]
-pub struct ProviderPolicy {
+pub(crate) struct ProviderPolicy {
     /// Sent as `max_tokens` when `Some`. Reasoning models need an explicit
     /// ceiling (Skye's GLM test: 8192) so a runaway reasoning trace is
     /// bounded rather than consuming the whole gateway window.
@@ -258,7 +258,7 @@ impl Default for ProviderPolicy {
 /// extracted". `main.rs` still sees an `anyhow::Error`; use
 /// [`LlmClient::is_provider_transient`] to downcast.
 #[derive(Debug)]
-pub enum LlmCallError {
+pub(crate) enum LlmCallError {
     RateLimited {
         retry_after: Option<std::time::Duration>,
     },
@@ -305,7 +305,7 @@ impl std::error::Error for LlmCallError {}
 
 impl LlmCallError {
     /// Metric label for `enricher_llm_call_total{outcome=...}`.
-    pub fn outcome_label(&self) -> &'static str {
+    pub(crate) fn outcome_label(&self) -> &'static str {
         match self {
             Self::RateLimited { .. } => "rate_limited",
             Self::GatewayUnavailable { .. } => "gateway_error",
@@ -671,7 +671,11 @@ struct SeverityAdversarialExtraction {
 // `main.rs`'s reclaim loop retries it once it's been idle long enough.
 
 impl LlmClient {
-    pub fn new(
+    #[expect(
+        clippy::expect_used,
+        reason = "a client builder with static settings fails only if TLS init does, which is fatal"
+    )]
+    pub(crate) fn new(
         base_url: String,
         api_key: Option<String>,
         model: String,
@@ -694,7 +698,7 @@ impl LlmClient {
     }
 
     /// Opts into a non-default [`ProviderPolicy`].
-    pub fn with_provider_policy(mut self, policy: ProviderPolicy) -> Self {
+    pub(crate) fn with_provider_policy(mut self, policy: ProviderPolicy) -> Self {
         self.in_flight = policy
             .max_in_flight
             .map(|n| std::sync::Arc::new(tokio::sync::Semaphore::new(n.max(1))));
@@ -712,11 +716,16 @@ impl LlmClient {
     ///   keeps backing off exactly as before; once the operator opts into
     ///   gateway retries (`max_gateway_retries > 0`, i.e. a provider whose
     ///   gateway is known to cut slow calls) it counts as transient.
-    pub fn is_provider_transient(&self, err: &anyhow::Error) -> bool {
+    #[expect(
+        clippy::match_same_arms,
+        reason = "separate arms document distinct cases"
+    )]
+    pub(crate) fn is_provider_transient(&self, err: &anyhow::Error) -> bool {
         match err.downcast_ref::<LlmCallError>() {
             Some(LlmCallError::RateLimited { .. }) => true,
-            Some(LlmCallError::GatewayUnavailable { status: 504 })
-            | Some(LlmCallError::ClientTimeout) => self.policy.max_gateway_retries > 0,
+            Some(
+                LlmCallError::GatewayUnavailable { status: 504 } | LlmCallError::ClientTimeout,
+            ) => self.policy.max_gateway_retries > 0,
             Some(LlmCallError::GatewayUnavailable { .. }) => true,
             _ => false,
         }
@@ -850,7 +859,7 @@ impl LlmClient {
     /// caller has nothing better, the current time) -- threaded into the
     /// user content so the model can resolve year-less dates in the text
     /// against a concrete anchor (design §1's "year inference" convention).
-    pub async fn extract_primary(
+    pub(crate) async fn extract_primary(
         &self,
         summary: &str,
         description: &str,
@@ -907,7 +916,7 @@ impl LlmClient {
     /// (design §2) -- the adversarial pass does not re-derive periods, it
     /// only returns a per-period resolution-status verdict, index-aligned
     /// and echoing back each period's `period_index`/`scope_description`.
-    pub async fn extract_adversarial(
+    pub(crate) async fn extract_adversarial(
         &self,
         summary: &str,
         description: &str,
@@ -928,7 +937,7 @@ impl LlmClient {
         Ok(extraction.periods)
     }
 
-    pub async fn extract_severity_adversarial(
+    pub(crate) async fn extract_severity_adversarial(
         &self,
         summary: &str,
         description: &str,

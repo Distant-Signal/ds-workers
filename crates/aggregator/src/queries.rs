@@ -15,7 +15,7 @@ use sqlx::{PgConnection, PgExecutor, PgPool, Row};
 /// of `common::IncidentMessage` -- the wire type pollers/the API share --
 /// since `first_seen_at` is a fact only this crate's staleness check cares
 /// about. See docs/superpowers/specs/2026-07-16-stale-incident-handling-design.md.
-pub struct LoadedIncident {
+pub(crate) struct LoadedIncident {
     pub message: IncidentMessage,
     pub first_seen_at: DateTime<Utc>,
     /// `Vec<ExtractionPeriod>` JSON (see
@@ -63,7 +63,7 @@ impl LoadedIncident {
     /// rather than inside each consumer, so every reader of
     /// `extracted_periods` (`apply_extraction`, `governing_impact_type`,
     /// `has_recurring_schedule`) is covered by construction.
-    pub fn new(
+    pub(crate) fn new(
         message: IncidentMessage,
         first_seen_at: DateTime<Utc>,
         source_text_hash: Option<&str>,
@@ -98,6 +98,10 @@ impl LoadedIncident {
 /// and per-row in the logs -- instead of the entire cycle.
 ///
 /// Returns `None` after logging, so callers can `filter_map` over it.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "callers hand over values they no longer need"
+)]
 fn skip_bad_row<T>(table: &'static str, key: Option<String>, result: Result<T>) -> Option<T> {
     match result {
         Ok(value) => Some(value),
@@ -142,7 +146,7 @@ fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
     ))
 }
 
-pub async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
+pub(crate) async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
                 priority, validity_periods, is_planned, is_cleared, first_seen_at, \
@@ -177,7 +181,7 @@ fn station_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<(String, Stati
     Ok((crs, sample))
 }
 
-pub async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, StationSample>> {
+pub(crate) async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, StationSample>> {
     let rows = sqlx::query("SELECT crs, polled_at, departures FROM station_samples")
         .fetch_all(pool)
         .await?;
@@ -211,7 +215,7 @@ pub async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, Stati
 /// has just started sampling (a catalogue change rolling out, or a custom
 /// line created since this cycle loaded the lines) is not deleted while
 /// still live. An empty `sampled` deletes nothing rather than everything.
-pub async fn prune_orphaned_station_samples(
+pub(crate) async fn prune_orphaned_station_samples(
     pool: &PgPool,
     sampled: &[String],
     min_age_minutes: i64,
@@ -245,7 +249,7 @@ fn custom_line_from_row(row: &sqlx::postgres::PgRow) -> Result<common::CustomLin
     })
 }
 
-pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>> {
+pub(crate) async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>> {
     let rows = sqlx::query(
         "SELECT id, name, operators, stations, headcode_prefixes, destination_crs_filter \
          FROM custom_lines",
@@ -290,7 +294,7 @@ pub async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::CustomLine>>
 /// the two conventions disagree. `london_calendar_day` stays the right
 /// choice for this file's OTHER queries (daily-stats bucketing, an
 /// aggregator-internal concern with no cross-service writer to match).
-pub async fn load_full_coverage_line_stats(
+pub(crate) async fn load_full_coverage_line_stats(
     pool: &PgPool,
     today: NaiveDate,
 ) -> Result<HashMap<String, common::SampleStats>> {
@@ -320,6 +324,10 @@ pub async fn load_full_coverage_line_stats(
 /// open discards EVERY line's full-coverage signal for the cycle, where a
 /// single unreadable row (a NULL `avg_delay_minutes` a future writer
 /// permits, say) should only cost that one line's.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "database counts are non-negative and far below u32::MAX"
+)]
 fn full_coverage_stats_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<(String, common::SampleStats)> {
@@ -342,7 +350,7 @@ fn full_coverage_stats_from_row(
 /// process's lifetime).
 ///
 /// Scoped to `source = 'aggregator'`: this crate is no longer the only
-/// writer of `line_status`. TfL lines are written by the api crate's
+/// writer of `line_status`. `TfL` lines are written by the api crate's
 /// `/private/tfl-line-status` ingest and are pruned by that endpoint
 /// against its own batch — they are invisible to this crate's line set, so
 /// an unscoped DELETE here would wipe them on the very next cycle.
@@ -362,7 +370,7 @@ fn full_coverage_stats_from_row(
 /// into a delete that can wipe the whole table, this no-ops and logs a
 /// warning: the next cycle retries with (hopefully) a populated catalogue,
 /// and existing rows survive the gap either way.
-pub async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> Result<u64> {
+pub(crate) async fn prune_removed_lines(pool: &PgPool, current_line_ids: &[String]) -> Result<u64> {
     if current_line_ids.is_empty() {
         tracing::warn!(
             "prune_removed_lines called with an empty line-id list; skipping the prune rather \
@@ -695,7 +703,10 @@ fn normalize_sample_counts(reason: &str) -> String {
 /// so this function still works standalone for callers/tests that don't
 /// need batching -- just `pool.acquire().await?` first and pass
 /// `&mut *conn`.
-pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusReport) -> Result<()> {
+pub(crate) async fn write_line_status(
+    conn: &mut PgConnection,
+    report: &LineStatusReport,
+) -> Result<()> {
     let fresh_statuses_json = serde_json::to_value(&report.statuses)?;
     let existing = existing_statuses(&mut *conn, &report.id).await?;
 
@@ -715,7 +726,7 @@ pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusRepor
     };
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO line_status (line_id, name, mode_name, operators, statuses, computed_at, source)
         VALUES ($1, $2, $3, $4, $5, NOW(), 'aggregator')
         ON CONFLICT (line_id) DO UPDATE SET
@@ -725,7 +736,7 @@ pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusRepor
             statuses    = EXCLUDED.statuses,
             computed_at = NOW(),
             source      = 'aggregator'
-        "#,
+        ",
     )
     .bind(&report.id)
     .bind(&report.name)
@@ -753,14 +764,15 @@ pub async fn write_line_status(conn: &mut PgConnection, report: &LineStatusRepor
 /// `schedule_*` prunes delete a whole service date at a time
 /// (`schedule_calling_points_full`: ~1M rows), which can legitimately take
 /// minutes; 10 minutes still bounds a runaway well inside the cycle.
-pub const RETENTION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const RETENTION_STATEMENT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 /// Runs one retention `DELETE` in its own transaction under
 /// [`RETENTION_STATEMENT_TIMEOUT`]. Same autocommit-per-statement semantics
 /// the prunes always had, just with the longer budget.
-pub(crate) async fn execute_retention_delete<'q>(
+pub(crate) async fn execute_retention_delete(
     pool: &PgPool,
-    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
 ) -> Result<sqlx::postgres::PgQueryResult> {
     let mut tx = pool.begin().await?;
     common::pg::set_local_statement_timeout(&mut tx, RETENTION_STATEMENT_TIMEOUT).await?;
@@ -774,7 +786,7 @@ pub(crate) async fn execute_retention_delete<'q>(
 /// Probes `MIN(computed_at)` first (one descent of
 /// `line_status_history_computed_at`) and skips the `DELETE` when nothing is
 /// old enough, which is every cycle but the few after a row ages out.
-pub async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub(crate) async fn prune_history(pool: &PgPool, retention_days: i64) -> Result<u64> {
     let due: Option<bool> = sqlx::query_scalar(
         "SELECT (SELECT MIN(computed_at) FROM line_status_history) \
                 < NOW() - ($1 || ' days')::interval",
@@ -815,7 +827,7 @@ const PRUNE_TRUST_EVENT_BACKLOG_BATCH: i64 = 5000;
 /// `prune_trains`, and stops as soon as a batch comes back short. The
 /// cutoff is fixed once per call so a long prune never chases rows that
 /// only aged out while it ran.
-pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub(crate) async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Result<u64> {
     let (oldest, cutoff): (Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
         "SELECT (SELECT MIN(received_at) FROM trust_event_backlog), \
                 NOW() - ($1 || ' days')::interval",
@@ -823,7 +835,7 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
     .bind(retention_days.to_string())
     .fetch_one(pool)
     .await?;
-    if !oldest.is_some_and(|oldest| oldest < cutoff) {
+    if oldest.is_none_or(|oldest| oldest >= cutoff) {
         return Ok(0);
     }
     let mut pruned = 0u64;
@@ -884,7 +896,7 @@ pub async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64) -> Re
 /// place to spend the time. If lock duration or WAL volume ever does bite,
 /// `service_date` partitioning with a partition swap is the standard
 /// mitigation -- reach for that rather than for a batching loop.
-pub async fn prune_schedule_destination_departures(
+pub(crate) async fn prune_schedule_destination_departures(
     pool: &PgPool,
     retention_days: i64,
 ) -> Result<u64> {
@@ -917,7 +929,10 @@ pub async fn prune_schedule_destination_departures(
 /// `CURRENT_DATE` so today's rows survive any retention value including 0.
 /// See `Config::schedule_derived_products_retention_days` for the window and
 /// for the one reader whose reach this deliberately bounds.
-pub async fn prune_schedule_calling_points_full(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub(crate) async fn prune_schedule_calling_points_full(
+    pool: &PgPool,
+    retention_days: i64,
+) -> Result<u64> {
     let result = execute_retention_delete(
         pool,
         sqlx::query(
@@ -941,7 +956,10 @@ pub async fn prune_schedule_calling_points_full(pool: &PgPool, retention_days: i
 /// forever. Cheap to keep bounded, and nothing reads a `service_date` past
 /// the window (`queries::get_schedule_network_departures` is a single-date
 /// lookup for a board being rendered now).
-pub async fn prune_schedule_network_departures(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub(crate) async fn prune_schedule_network_departures(
+    pool: &PgPool,
+    retention_days: i64,
+) -> Result<u64> {
     let result = execute_retention_delete(
         pool,
         sqlx::query(
@@ -964,7 +982,10 @@ pub async fn prune_schedule_network_departures(pool: &PgPool, retention_days: i6
 /// the same single-date reader
 /// (`full-coverage-consumer`'s reload via `GET /private/schedule-line-population`,
 /// which asks for one `(line_id, service_date)` it is gating right now).
-pub async fn prune_schedule_line_population(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub(crate) async fn prune_schedule_line_population(
+    pool: &PgPool,
+    retention_days: i64,
+) -> Result<u64> {
     let result = execute_retention_delete(
         pool,
         sqlx::query(
@@ -1016,7 +1037,7 @@ const PRUNE_TRAINS_BATCH: i64 = 1000;
 /// of `trains_service_date`: without it, a stale row estimate plus `LIMIT`
 /// made the planner pick a whole-table seq scan it expected to stop early
 /// (DB review part 2, DB2-6).
-pub async fn prune_trains(
+pub(crate) async fn prune_trains(
     pool: &PgPool,
     retention_days: i64,
     untracked_retention_days: i64,
@@ -1102,7 +1123,7 @@ pub(crate) async fn trains_prune_due(
 /// used elsewhere in this crate for incident staleness -- see
 /// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md, Open
 /// question 5, for why these two conventions coexist.
-pub fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
+pub(crate) fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
     instant
         .with_timezone(&chrono_tz::Europe::London)
         .date_naive()
@@ -1129,7 +1150,11 @@ pub fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
 /// Cargo feature was not confirmed enabled for this crate's `chrono`
 /// dependency -- this avoids depending on an unverified feature flag for
 /// what is otherwise a few-line truncation.
-pub fn utc_half_hour_start(instant: DateTime<Utc>) -> DateTime<Utc> {
+#[expect(
+    clippy::expect_used,
+    reason = "a constant or range-checked time is always valid"
+)]
+pub(crate) fn utc_half_hour_start(instant: DateTime<Utc>) -> DateTime<Utc> {
     use chrono::Timelike;
     let bucket_minute = if instant.minute() < 30 { 0 } else { 30 };
     instant
@@ -1169,7 +1194,12 @@ pub fn utc_half_hour_start(instant: DateTime<Utc>) -> DateTime<Utc> {
 /// full rationale. A single query, so (unlike `write_line_status`) no
 /// `&mut PgConnection` is needed here: any executor works, including a
 /// bare `&PgPool` for standalone callers/tests.
-pub async fn record_daily_stats<'c, E>(
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "per-day train counts stay far below 2^52 and i64::MAX"
+)]
+pub(crate) async fn record_daily_stats<'c, E>(
     executor: E,
     line_id: &str,
     day: NaiveDate,
@@ -1223,7 +1253,11 @@ where
 /// cycle from `run_cycle`, same as `prune_history`, now that
 /// `daily_stats_retention_days` always carries a real value (see
 /// `config.rs` and docs/superpowers/plans/2026-09-01-ldbws-data-retention.md).
-pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a retention period in days never approaches i32::MAX"
+)]
+pub(crate) async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
     let result = execute_retention_delete(
         pool,
         sqlx::query("DELETE FROM line_status_daily_stats WHERE day < (CURRENT_DATE - $1::int)")
@@ -1235,7 +1269,7 @@ pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64
 
 /// Half-hourly-granularity sibling of `record_daily_stats` -- same
 /// accumulate-upsert shape, same "fed the DEDUPED per-cycle contribution,
-/// not raw SampleStats" contract (see that function's own doc comment,
+/// not raw `SampleStats`" contract (see that function's own doc comment,
 /// which applies here unchanged), keyed on `half_hour_start` (a plain UTC
 /// 30-minute boundary from `utc_half_hour_start`, Decision 4 of the
 /// original hourly design, still applicable at the new granularity)
@@ -1255,7 +1289,12 @@ pub async fn prune_daily_stats(pool: &PgPool, retention_days: i64) -> Result<u64
 ///
 /// Generic over `E: PgExecutor` for the same reason as `record_daily_stats`
 /// -- see that function's doc comment.
-pub async fn record_half_hourly_stats<'c, E>(
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "per-slot train counts stay far below 2^52 and i64::MAX"
+)]
+pub(crate) async fn record_half_hourly_stats<'c, E>(
     executor: E,
     line_id: &str,
     half_hour_start: DateTime<Utc>,
@@ -1317,7 +1356,7 @@ where
 /// same window -- a trivial row-count increase for Postgres, not a reason
 /// to touch this default or its unit. See `config.rs`'s doc comment on
 /// this field for the full reasoning.
-pub async fn prune_half_hourly_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
+pub(crate) async fn prune_half_hourly_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
     let result = execute_retention_delete(pool, sqlx::query(
         "DELETE FROM line_status_half_hourly_stats WHERE half_hour_start < NOW() - ($1 || ' hours')::interval",
     )
@@ -1355,7 +1394,12 @@ pub async fn prune_half_hourly_stats(pool: &PgPool, retention_hours: i64) -> Res
 /// call exactly like `sample_cycles` does. See this section's own module
 /// doc comment for the "what counts as a cycle's contribution" judgment
 /// call.
-pub async fn record_daily_coverage_stats<'c, E>(
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "per-day train counts stay far below 2^52 and i64::MAX"
+)]
+pub(crate) async fn record_daily_coverage_stats<'c, E>(
     executor: E,
     line_id: &str,
     day: NaiveDate,
@@ -1410,7 +1454,11 @@ where
 /// new one -- a reasonable default for a sibling table with the same shape
 /// and no real data yet to suggest it needs a different window; revisit
 /// once a real producer exists.
-pub async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a retention period in days never approaches i32::MAX"
+)]
+pub(crate) async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
     let result = execute_retention_delete(
         pool,
         sqlx::query(
@@ -1428,7 +1476,14 @@ pub async fn prune_daily_coverage_stats(pool: &PgPool, retention_days: i64) -> R
 /// Same shape as `prune_daily_coverage_stats`. A `service_date`-only
 /// predicate on a `(line_id, service_date)` key is a sequential scan, which
 /// is fine at ~250 rows per day.
-pub async fn prune_full_coverage_line_stats(pool: &PgPool, retention_days: i64) -> Result<u64> {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a retention period in days never approaches i32::MAX"
+)]
+pub(crate) async fn prune_full_coverage_line_stats(
+    pool: &PgPool,
+    retention_days: i64,
+) -> Result<u64> {
     let result = execute_retention_delete(
         pool,
         sqlx::query(
@@ -1444,7 +1499,12 @@ pub async fn prune_full_coverage_line_stats(pool: &PgPool, retention_days: i64) 
 /// same relationship `record_half_hourly_stats` already has to
 /// `record_daily_stats`. See this section's own module doc comment for
 /// the "what counts as a cycle's contribution" judgment call.
-pub async fn record_half_hourly_coverage_stats<'c, E>(
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "per-slot train counts stay far below 2^52 and i64::MAX"
+)]
+pub(crate) async fn record_half_hourly_coverage_stats<'c, E>(
     executor: E,
     line_id: &str,
     half_hour_start: DateTime<Utc>,
@@ -1497,7 +1557,10 @@ where
 /// Mirrors `prune_half_hourly_stats`'s shape exactly. **Judgment call**:
 /// reuses the same `half_hourly_stats_retention_hours` config knob -- same
 /// reasoning as `prune_daily_coverage_stats`'s own note.
-pub async fn prune_half_hourly_coverage_stats(pool: &PgPool, retention_hours: i64) -> Result<u64> {
+pub(crate) async fn prune_half_hourly_coverage_stats(
+    pool: &PgPool,
+    retention_hours: i64,
+) -> Result<u64> {
     let result = execute_retention_delete(pool, sqlx::query(
         "DELETE FROM line_status_half_hourly_coverage_stats WHERE half_hour_start < NOW() - ($1 || ' hours')::interval",
     )
@@ -1506,6 +1569,16 @@ pub async fn prune_half_hourly_coverage_stats(pool: &PgPool, retention_hours: i6
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::items_after_statements,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "test code: casts of small known test values; fixtures sit next to their use; paired test values share names; scenario tests read top to bottom"
+)]
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
@@ -3243,6 +3316,7 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 record_daily_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
+    #[expect(clippy::float_cmp, reason = "a sum of no samples is exactly 0.0")]
     async fn record_daily_stats_none_still_counts_the_cycle_but_adds_nothing() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
@@ -3623,7 +3697,7 @@ mod tests {
     /// `record_half_hourly_stats` -- exactly as `main.rs`'s `run_cycle` now
     /// does at its one call site -- must produce a daily row and a
     /// half-hourly row whose sums agree. This doesn't call `run_cycle`
-    /// itself (that would need a full aggregate() pipeline); it directly
+    /// itself (that would need a full `aggregate()` pipeline); it directly
     /// exercises the two write functions with an identical input, which is
     /// the actual invariant that matters and is what would regress if a
     /// future edit ever computed two separate `deduped` values instead of
@@ -3783,6 +3857,7 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
+    #[expect(clippy::float_cmp, reason = "a sum of no samples is exactly 0.0")]
     async fn record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
@@ -3911,7 +3986,7 @@ mod tests {
             .await
             .expect("prune_full_coverage_line_stats");
 
-        let survivors: Vec<chrono::NaiveDate> = sqlx::query_scalar(
+        let survivors: Vec<NaiveDate> = sqlx::query_scalar(
             "SELECT service_date FROM full_coverage_line_stats WHERE line_id = $1 ORDER BY service_date",
         )
         .bind(LINE_ID)
@@ -3920,7 +3995,7 @@ mod tests {
         .expect("survivors");
         cleanup().await;
 
-        let today: chrono::NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+        let today: NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
             .fetch_one(&pool)
             .await
             .expect("the database's own date, which the prune compares against");
@@ -4127,7 +4202,7 @@ mod tests {
         const AVAILABLE_TODAY: &str = "TEST-FC-AVAILABLE-TODAY";
         const PENDING_TODAY: &str = "TEST-FC-PENDING-TODAY";
         const AVAILABLE_YESTERDAY: &str = "TEST-FC-AVAILABLE-YESTERDAY";
-        let today = chrono::Utc::now().date_naive();
+        let today = Utc::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
 
         for id in [AVAILABLE_TODAY, PENDING_TODAY, AVAILABLE_YESTERDAY] {
@@ -4231,7 +4306,7 @@ mod tests {
         // Relative to CURRENT_DATE, not hardcoded: the predicate is
         // `service_date < CURRENT_DATE - $1`, so a fixed date would flip
         // this test's meaning as the calendar moved.
-        let today = chrono::Utc::now().date_naive();
+        let today = Utc::now().date_naive();
         let stale = today - chrono::Duration::days(5);
         let fresh = today - chrono::Duration::days(1);
 
@@ -4300,7 +4375,7 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
 
-        let today = chrono::Utc::now().date_naive();
+        let today = Utc::now().date_naive();
         let stale = today - chrono::Duration::days(5);
         let fresh = today - chrono::Duration::days(1);
 
@@ -4358,7 +4433,7 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
 
-        let today = chrono::Utc::now().date_naive();
+        let today = Utc::now().date_naive();
         let stale = today - chrono::Duration::days(5);
         let fresh = today - chrono::Duration::days(1);
 
@@ -4406,7 +4481,7 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
 
-        let today = chrono::Utc::now().date_naive();
+        let today = Utc::now().date_naive();
         let stale = today - chrono::Duration::days(5);
         let fresh = today - chrono::Duration::days(1);
 
@@ -4464,7 +4539,7 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
 
-        let today = chrono::Utc::now().date_naive();
+        let today = Utc::now().date_naive();
         sqlx::query(
             "INSERT INTO schedule_destination_departures \
                 (service_date, destination_crs, scheduled, train_uid, origin_crs) \
@@ -4508,10 +4583,8 @@ mod tests {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let old_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(40);
-        let recent_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(5);
+        let old_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(40);
+        let recent_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(5);
 
         let (old_id,): (i64,) = sqlx::query_as(
             "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TRAINS-OLD', $1) RETURNING id",
@@ -4567,8 +4640,7 @@ mod tests {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let old_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let old_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(40);
 
         let (old_train_id,): (i64,) = sqlx::query_as(
             "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-CASCADE-DELETE-OLD', $1) RETURNING id",
@@ -4683,8 +4755,7 @@ mod tests {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let old_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let old_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(40);
         const SEEDED_ROWS: i64 = 1500; // > the batch size any sane batched impl would use
 
         sqlx::query("DELETE FROM trains WHERE train_uid LIKE 'TEST-PRUNE-BATCH-%'")
@@ -4794,8 +4865,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         // 20 days: older than the 14-day untracked tier, younger than the
         // 30-day tracked tier.
-        let mid_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(20);
+        let mid_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(20);
 
         let (untracked_id,): (i64,) = sqlx::query_as(
             "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TIER-UNTRACKED', $1) \
@@ -4839,8 +4909,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         // 20 days: older than the 14-day untracked tier, younger than the
         // 30-day tracked tier.
-        let mid_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(20);
+        let mid_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(20);
         let user_id = "TEST-PRUNE-TIER-TRACKED-USER";
 
         sqlx::query(
@@ -4917,8 +4986,7 @@ mod tests {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let old_date: chrono::NaiveDate =
-            chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let old_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(40);
         let user_id = "TEST-PRUNE-TIER-TRACKED-OLD-USER";
 
         sqlx::query(
@@ -4993,7 +5061,7 @@ mod tests {
 
     async fn count_queries<F, T>(fut: F) -> (T, usize)
     where
-        F: std::future::Future<Output = T>,
+        F: Future<Output = T>,
     {
         use tracing_subscriber::layer::SubscriberExt;
         let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5054,7 +5122,7 @@ mod tests {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let old_date = chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let old_date = Utc::now().date_naive() - chrono::Duration::days(40);
         sqlx::query("DELETE FROM trains WHERE train_uid LIKE 'TEST-PRUNE-SHORT-%'")
             .execute(&pool)
             .await

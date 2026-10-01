@@ -138,7 +138,7 @@ const BOOKKEEPING_ATTEMPTS: u32 = 3;
 /// What a delivered job records -- and so also what identifies it: the
 /// variant plus its id is the target, the whole value is the state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Delivered {
+pub(crate) enum Delivered {
     /// `line_notification_state` at this rank.
     Line { line_id: String, rank: u8 },
     /// `train_notification_state` at this status and delay.
@@ -176,7 +176,7 @@ impl Delivered {
 
 /// One notification for one user.
 #[derive(Debug)]
-pub struct PushJob {
+pub(crate) struct PushJob {
     pub user_id: String,
     pub payload: NotificationPayload,
     pub delivered: Delivered,
@@ -196,7 +196,7 @@ impl PushJob {
 
 /// What [`PushQueue::enqueue`] did with a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EnqueueOutcome {
+pub(crate) enum EnqueueOutcome {
     /// Accepted; a worker will send it.
     Queued,
     /// The same notification is already queued or in flight; nothing done.
@@ -208,7 +208,7 @@ pub enum EnqueueOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DropReason {
+pub(crate) enum DropReason {
     QueueFull,
     UserQueueFull,
     ShuttingDown,
@@ -225,7 +225,7 @@ impl DropReason {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PushQueueConfig {
+pub(crate) struct PushQueueConfig {
     pub workers: usize,
     pub capacity: usize,
     pub per_user_in_flight: usize,
@@ -235,7 +235,7 @@ pub struct PushQueueConfig {
 
 /// The side effects a worker needs, abstracted so the scheduling, caps and
 /// pruning can be tested without a database. [`PgBackend`] is production.
-pub trait PushBackend: Send + Sync + 'static {
+pub(crate) trait PushBackend: Send + Sync + 'static {
     fn subscriptions(
         &self,
         user_id: &str,
@@ -256,13 +256,13 @@ pub trait PushBackend: Send + Sync + 'static {
 
 /// Production backend: Postgres for subscriptions and bookkeeping, and
 /// [`Pusher`] (the L9 public-only reqwest client) for the sends.
-pub struct PgBackend {
+pub(crate) struct PgBackend {
     pool: sqlx::PgPool,
     pusher: Pusher,
 }
 
 impl PgBackend {
-    pub fn new(pool: sqlx::PgPool, pusher: Pusher) -> Self {
+    pub(crate) fn new(pool: sqlx::PgPool, pusher: Pusher) -> Self {
         Self { pool, pusher }
     }
 }
@@ -380,14 +380,14 @@ struct Shared<B> {
     timeouts: Mutex<HashMap<i64, u32>>,
 }
 
-pub struct PushQueue<B: PushBackend> {
+pub(crate) struct PushQueue<B: PushBackend> {
     shared: Arc<Shared<B>>,
     workers: Vec<JoinHandle<()>>,
 }
 
 /// What [`PushQueue::shutdown`] left behind.
 #[derive(Debug, PartialEq, Eq)]
-pub struct ShutdownReport {
+pub(crate) struct ShutdownReport {
     pub drained: bool,
     pub abandoned: usize,
 }
@@ -398,7 +398,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // there is, so keep going rather than poisoning every later send.
     mutex
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn metric(suffix: &str) -> String {
@@ -407,7 +407,7 @@ fn metric(suffix: &str) -> String {
 
 impl<B: PushBackend> PushQueue<B> {
     /// Starts `config.workers` worker tasks on the current runtime.
-    pub fn start(backend: B, config: PushQueueConfig) -> Self {
+    pub(crate) fn start(backend: B, config: PushQueueConfig) -> Self {
         let shared = Arc::new(Shared {
             backend,
             config,
@@ -430,7 +430,7 @@ impl<B: PushBackend> PushQueue<B> {
     /// Hands a notification to the workers. Never blocks and never awaits:
     /// safe to call from the main loop whatever the push endpoints are
     /// doing. See the module doc for what each outcome means.
-    pub fn enqueue(&self, job: PushJob) -> EnqueueOutcome {
+    pub(crate) fn enqueue(&self, job: PushJob) -> EnqueueOutcome {
         let outcome = self.enqueue_inner(job);
         match outcome {
             EnqueueOutcome::Dropped(reason) => {
@@ -458,6 +458,10 @@ impl<B: PushBackend> PushQueue<B> {
         outcome
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the invariant is established just above; the expect message names it"
+    )]
     fn enqueue_inner(&self, job: PushJob) -> EnqueueOutcome {
         let config = self.shared.config;
         let key = job.key();
@@ -511,22 +515,19 @@ impl<B: PushBackend> PushQueue<B> {
         st.queued += 1;
         let user_id = job.user_id.clone();
         st.users.entry(user_id.clone()).or_default().queued += 1;
-        match st.slots.get_mut(&key) {
-            Some(Slot::InFlight { next, .. }) => {
-                // Parked: `finish` moves it to the front of the user's
-                // queue when the in-flight job for this key completes.
-                *next = Some(job);
-            }
-            _ => {
-                st.slots.insert(key.clone(), Slot::Queued(job));
-                st.users
-                    .get_mut(&user_id)
-                    .expect("inserted above")
-                    .ready
-                    .push_back(key);
-                make_runnable(&mut st, &user_id, config.per_user_in_flight);
-                self.shared.work.notify_one();
-            }
+        if let Some(Slot::InFlight { next, .. }) = st.slots.get_mut(&key) {
+            // Parked: `finish` moves it to the front of the user's
+            // queue when the in-flight job for this key completes.
+            *next = Some(job);
+        } else {
+            st.slots.insert(key.clone(), Slot::Queued(job));
+            st.users
+                .get_mut(&user_id)
+                .expect("inserted above")
+                .ready
+                .push_back(key);
+            make_runnable(&mut st, &user_id, config.per_user_in_flight);
+            self.shared.work.notify_one();
         }
         publish_gauges(&st);
         EnqueueOutcome::Queued
@@ -534,19 +535,19 @@ impl<B: PushBackend> PushQueue<B> {
 
     /// Jobs waiting (including ones parked behind an in-flight job).
     #[cfg(test)]
-    pub fn depth(&self) -> usize {
+    pub(crate) fn depth(&self) -> usize {
         lock(&self.shared.state).queued
     }
 
     /// Jobs being sent right now.
     #[cfg(test)]
-    pub fn in_flight(&self) -> usize {
+    pub(crate) fn in_flight(&self) -> usize {
         lock(&self.shared.state).in_flight
     }
 
     /// The most jobs `user_id` has ever had in flight at once.
     #[cfg(test)]
-    pub fn peak_in_flight(&self, user_id: &str) -> usize {
+    pub(crate) fn peak_in_flight(&self, user_id: &str) -> usize {
         lock(&self.shared.state)
             .peak_user_in_flight
             .get(user_id)
@@ -556,7 +557,7 @@ impl<B: PushBackend> PushQueue<B> {
 
     /// Resolves once nothing is queued or in flight.
     #[cfg(test)]
-    pub async fn wait_idle(&self) {
+    pub(crate) async fn wait_idle(&self) {
         loop {
             let notified = self.shared.idle.notified();
             tokio::pin!(notified);
@@ -573,7 +574,7 @@ impl<B: PushBackend> PushQueue<B> {
 
     /// Stops accepting jobs, lets the workers drain the queue for up to
     /// `grace`, then aborts them. See the module doc.
-    pub async fn shutdown(self, grace: Duration) -> ShutdownReport {
+    pub(crate) async fn shutdown(self, grace: Duration) -> ShutdownReport {
         lock(&self.shared.state).closed = true;
         self.shared.work.notify_waiters();
         let abort_handles: Vec<_> = self.workers.iter().map(JoinHandle::abort_handle).collect();
@@ -610,6 +611,10 @@ fn make_runnable(st: &mut State, user_id: &str, per_user_in_flight: usize) {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
 fn publish_gauges(st: &State) {
     metrics::gauge!(metric("notifier_push_queue_depth")).set(st.queued as f64);
     metrics::gauge!(metric("notifier_push_in_flight")).set(st.in_flight as f64);
@@ -918,6 +923,10 @@ async fn prune<B: PushBackend>(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "test code: casts of small known test values"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -966,8 +975,11 @@ mod tests {
     }
 
     impl PushBackend for FakeBackend {
-        async fn subscriptions(&self, user_id: &str) -> anyhow::Result<Vec<PushSubscriptionRow>> {
-            Ok(lock(&self.subscriptions)
+        fn subscriptions(
+            &self,
+            user_id: &str,
+        ) -> impl Future<Output = anyhow::Result<Vec<PushSubscriptionRow>>> {
+            std::future::ready(Ok(lock(&self.subscriptions)
                 .get(user_id)
                 .map(|subs| {
                     subs.iter()
@@ -979,7 +991,7 @@ mod tests {
                         })
                         .collect()
                 })
-                .unwrap_or_default())
+                .unwrap_or_default()))
         }
 
         async fn send(
@@ -1005,22 +1017,22 @@ mod tests {
             self.pusher.send(subscription, payload).await
         }
 
-        async fn delete_subscription(&self, id: i64) -> anyhow::Result<()> {
+        fn delete_subscription(&self, id: i64) -> impl Future<Output = anyhow::Result<()>> {
             lock(&self.deleted).push(id);
             for subs in lock(&self.subscriptions).values_mut() {
                 subs.retain(|s| s.id != id);
             }
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
-        async fn record_delivered(
+        fn record_delivered(
             &self,
             user_id: &str,
             delivered: &Delivered,
             _at: DateTime<Utc>,
-        ) -> anyhow::Result<()> {
+        ) -> impl Future<Output = anyhow::Result<()>> {
             lock(&self.recorded).push((user_id.to_string(), delivered.clone()));
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 

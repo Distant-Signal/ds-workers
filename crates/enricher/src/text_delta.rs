@@ -31,14 +31,14 @@
 /// and entity decoding: `key` is what's compared, `display` the original
 /// word (kept for debugging/log output).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Word {
+pub(crate) struct Word {
     pub key: String,
     pub display: String,
 }
 
 /// Strips tags, decodes/blanks entities, splits on whitespace -- steps 1-4
 /// of the module doc.
-pub fn words(text: &str) -> Vec<Word> {
+pub(crate) fn words(text: &str) -> Vec<Word> {
     let mut plain = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -111,7 +111,7 @@ fn keys(text: &str) -> Vec<String> {
 /// was computed from and now. `label` values are a fixed, low-cardinality
 /// set suitable for a metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditClass {
+pub(crate) enum EditClass {
     /// Identical under the module doc's normalisation.
     SemanticNoop,
     /// Every changed word is a number/time on both sides, one-for-one
@@ -128,7 +128,7 @@ pub enum EditClass {
 }
 
 impl EditClass {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             EditClass::SemanticNoop => "semantic_noop",
             EditClass::NumericOnly => "numeric_only",
@@ -143,19 +143,19 @@ impl EditClass {
 /// One non-equal hunk of a word diff: `old[old_range]` became
 /// `new[new_range]` (either side may be empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hunk {
+pub(crate) struct Hunk {
     pub old_range: std::ops::Range<usize>,
     pub new_range: std::ops::Range<usize>,
 }
 
-/// Upper bound on the LCS table (old_len * new_len cells). Incident text is
+/// Upper bound on the LCS table (`old_len` * `new_len` cells). Incident text is
 /// p99 ~5k chars (~900 words); 4M cells is ~2k x 2k words, 16 MB of u32.
 /// Past this, `diff` returns one whole-text hunk (i.e. "treat as rewrite").
 const MAX_LCS_CELLS: usize = 4_000_000;
 
 /// Word-level diff by longest common subsequence over `key`s. Returns the
 /// non-equal hunks and the number of matched words.
-pub fn diff(old: &[String], new: &[String]) -> (Vec<Hunk>, usize) {
+pub(crate) fn diff(old: &[String], new: &[String]) -> (Vec<Hunk>, usize) {
     let (n, m) = (old.len(), new.len());
     if n.saturating_mul(m) > MAX_LCS_CELLS {
         return (
@@ -216,7 +216,11 @@ fn is_numeric_key(key: &str) -> bool {
 
 /// Classifies the change from (`old_summary`, `old_description`) to
 /// (`new_summary`, `new_description`) -- see [`EditClass`].
-pub fn classify(
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "counts stay far below 2^52, so the f64 ratio is exact"
+)]
+pub(crate) fn classify(
     old_summary: &str,
     old_description: &str,
     new_summary: &str,

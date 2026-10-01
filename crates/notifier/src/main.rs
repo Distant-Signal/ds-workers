@@ -1,4 +1,4 @@
-//! `notifier`: polls line_status_history/train_movement_events by
+//! `notifier`: polls `line_status_history/train_movement_events` by
 //! watermark and sends Web Push notifications for real severity/status
 //! transitions on a user's pinned lines/tracked trains. See
 //! docs/superpowers/specs/2026-09-02-line-status-notifications-design.md.
@@ -61,6 +61,10 @@ async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     let config = Config::parse();
@@ -380,7 +384,7 @@ async fn notify_train_candidates(
     pool: &PgPool,
     queue: &Queue,
     candidates: &[queries::TrainCandidate],
-    now: chrono::DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     for candidate in candidates {
         tracing::info!(
@@ -626,6 +630,10 @@ async fn run_skip_check_cycle(
 /// `decision::commit_check_window`), so that time of day has to be
 /// controllable from a test rather than being whatever the clock happened to
 /// read while the suite ran.
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run_template_sweep_cycle(
     pool: &PgPool,
     queue: &Queue,
@@ -815,27 +823,29 @@ async fn run_template_sweep_cycle(
         // this would otherwise have left behind is rolled back with it,
         // instead of lingering and pushing notifications for a train they
         // never chose. See `queries::auto_commit_leg_to_train`.
-        match queries::auto_commit_leg_to_train(pool, leg.journey_leg_id, trains_id, &leg.user_id)
-            .await?
+        if let Some(tracking_id) =
+            queries::auto_commit_leg_to_train(pool, leg.journey_leg_id, trains_id, &leg.user_id)
+                .await?
         {
-            Some(tracking_id) => tracing::info!(
+            tracing::info!(
                 journey_leg_id = leg.journey_leg_id,
                 tracking_id,
                 train_uid,
                 "auto-committed leg to its chosen candidate"
-            ),
-            None => tracing::warn!(
+            );
+        } else {
+            tracing::warn!(
                 journey_leg_id = leg.journey_leg_id,
                 "leg was committed by a concurrent actor before this tick finished; rolled back \
-                 the subscription created for it rather than orphaning it"
-            ),
+             the subscription created for it rather than orphaning it"
+            );
         }
     }
 
     Ok(())
 }
 
-/// Resolves a service_date + local wall-clock TIME to the UTC instant it
+/// Resolves a `service_date` + local wall-clock TIME to the UTC instant it
 /// names -- same `LocalResult` handling as
 /// `crates/api::data::eta_blend::london_to_utc` (duplicated, per this
 /// crate's crate-boundary constraint; that one is `pub(crate)` and
@@ -941,7 +951,7 @@ mod drain_support {
 mod poll_interval_tests {
     use super::poll_interval;
 
-    /// Regression for the "L1 -- MissedTickBehavior::Burst still default"
+    /// Regression for the "L1 -- `MissedTickBehavior::Burst` still default"
     /// finding: `poll_interval` backs all four of `main`'s independent
     /// `select!` intervals (`interval`/`forward_interval`/
     /// `skip_check_interval`/`template_sweep_interval`), so asserting it
@@ -1048,7 +1058,7 @@ mod db_tests {
 
     /// DB2-27: a candidate whose `train_current_state` row has vanished is
     /// skipped; it used to abort the whole cycle (and its cursor advance)
-    /// with RowNotFound.
+    /// with `RowNotFound`.
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
                 a_vanished_train_state_skips_the_candidate_instead_of_failing -- --ignored \
@@ -1121,7 +1131,7 @@ mod db_tests {
             severity,
             reason: String::new(),
             validity: common::ValidityPeriod {
-                from_date: chrono::Utc::now(),
+                from_date: Utc::now(),
                 to_date: None,
                 is_now: true,
             },
@@ -1430,6 +1440,11 @@ mod db_tests {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_statements,
+    clippy::too_many_lines,
+    reason = "test code: fixtures sit next to their use; scenario tests read top to bottom"
+)]
 mod sweep_cycle_tests {
     use super::drain_support::*;
     use super::*;
@@ -2421,7 +2436,7 @@ mod sweep_cycle_tests {
         let train_uid = "TEST-SKIP-CYCLE-BST-UID";
         let utc_date: chrono::NaiveDate = "2026-07-15".parse().unwrap();
         let london_service_date: chrono::NaiveDate = "2026-07-16".parse().unwrap();
-        let now = chrono::DateTime::parse_from_rfc3339("2026-07-15T23:30:00+00:00")
+        let now = DateTime::parse_from_rfc3339("2026-07-15T23:30:00+00:00")
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(

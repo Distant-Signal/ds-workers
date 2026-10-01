@@ -50,11 +50,12 @@ use object_store::{ObjectStore, ObjectStoreExt};
 /// The hard retention floor, in days. Not configurable: a typo'd or hostile
 /// `ARCHIVE_EXPIRY_RETENTION_DAYS` below this refuses to start rather than
 /// deleting recent history.
-pub const MIN_RETENTION_DAYS: i64 = 90;
+pub(crate) const MIN_RETENTION_DAYS: i64 = 90;
 
 /// The table directories the archive writes (`archive.tables: [trains]`
 /// writes all three) and therefore the only ones expiry lists.
-pub const EXPIRY_TABLES: &[&str] = &["trains", "train_movement_events", "train_current_state"];
+pub(crate) const EXPIRY_TABLES: &[&str] =
+    &["trains", "train_movement_events", "train_current_state"];
 
 /// Stop a run after this many consecutive failed DELETEs: the store is
 /// probably down, and the next run retries.
@@ -68,7 +69,11 @@ const UNMATCHED_LOG_LIMIT: u64 = 20;
 /// [`crate::archive::ArchiveArgs`]. Read only when
 /// `ARCHIVE_EXPIRY_ENABLED` is true.
 #[derive(Debug, Clone, clap::Args)]
-pub struct ExpiryArgs {
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives each env var from the field name, so the prefix is part of the interface"
+)]
+pub(crate) struct ExpiryArgs {
     /// Master switch for client-side expiry. Needs `ARCHIVE_ENABLED`.
     #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
     pub archive_expiry_enabled: bool,
@@ -100,7 +105,7 @@ pub struct ExpiryArgs {
 
 /// Validated expiry settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpirySettings {
+pub(crate) struct ExpirySettings {
     pub dry_run: bool,
     pub retention_days: i64,
     pub interval: Duration,
@@ -111,7 +116,7 @@ pub struct ExpirySettings {
 
 /// `"/a//b/"` -> `["a", "b"]`, the same normalisation `Archiver::new`
 /// applies to the archive prefix.
-pub fn segments(prefix: &str) -> Vec<String> {
+pub(crate) fn segments(prefix: &str) -> Vec<String> {
     prefix
         .split('/')
         .filter(|p| !p.is_empty())
@@ -132,7 +137,7 @@ impl ExpirySettings {
     /// retention under the floor, a zero cap, a too-short interval, an
     /// archive prefix with fewer than two segments, or one that overlaps a
     /// protected prefix. `archive_prefix` is `ARCHIVE_S3_PREFIX`.
-    pub fn from_args(
+    pub(crate) fn from_args(
         args: &ExpiryArgs,
         archive_enabled: bool,
         archive_prefix: &str,
@@ -196,7 +201,7 @@ impl ExpirySettings {
 
 /// A key the archive wrote: its table and the `service_date` in the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ArchiveKey {
+pub(crate) struct ArchiveKey {
     pub table: &'static str,
     pub service_date: NaiveDate,
 }
@@ -206,7 +211,7 @@ pub struct ArchiveKey {
 /// exactly: `None` for anything else, including a key under a different
 /// prefix, an unknown table, extra or missing path segments, a malformed
 /// or impossible date, or a part id that is not exactly 19 ASCII digits.
-pub fn parse_key(prefix: &[String], key: &str) -> Option<ArchiveKey> {
+pub(crate) fn parse_key(prefix: &[String], key: &str) -> Option<ArchiveKey> {
     let mut rest = key;
     for segment in prefix {
         rest = rest.strip_prefix(segment.as_str())?.strip_prefix('/')?;
@@ -240,14 +245,14 @@ pub fn parse_key(prefix: &[String], key: &str) -> Option<ArchiveKey> {
 /// Whether `service_date` is past retention on rail day `today`: strictly
 /// older than `today - retention_days`, so with 730 days the date exactly
 /// 730 days back is kept.
-pub fn is_expired(service_date: NaiveDate, today: NaiveDate, retention_days: i64) -> bool {
+pub(crate) fn is_expired(service_date: NaiveDate, today: NaiveDate, retention_days: i64) -> bool {
     service_date < today - chrono::Duration::days(retention_days)
 }
 
 /// What one [`Expirer::run_once`] found and did. Per-table vectors follow
 /// [`EXPIRY_TABLES`] order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ExpiryOutcome {
+pub(crate) struct ExpiryOutcome {
     /// Matching keys past retention (all of them, before the cap).
     pub candidates: Vec<(&'static str, u64)>,
     /// Dry-run only: what this run would have deleted (after the cap).
@@ -276,7 +281,11 @@ fn get(v: &[(&'static str, u64)], table: &str) -> u64 {
 /// increment with a plain `increase()` and dashboards show 0, not "no data".
 /// `aggregator_archive_oldest_service_date_seconds` is deliberately left
 /// unset until a run sees an archived object: 0 would read as 1970.
-pub fn init_metrics(settings: &ExpirySettings) {
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
+pub(crate) fn init_metrics(settings: &ExpirySettings) {
     use common::metrics::metric_name;
     for table in EXPIRY_TABLES {
         let table = *table;
@@ -304,7 +313,7 @@ pub fn init_metrics(settings: &ExpirySettings) {
 }
 
 /// Runs expiry over one archive: the archive's own store and prefix.
-pub struct Expirer {
+pub(crate) struct Expirer {
     store: Arc<dyn ObjectStore>,
     prefix: Vec<String>,
     settings: ExpirySettings,
@@ -321,7 +330,11 @@ impl std::fmt::Debug for Expirer {
 }
 
 impl Expirer {
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: Vec<String>, settings: ExpirySettings) -> Self {
+    pub(crate) fn new(
+        store: Arc<dyn ObjectStore>,
+        prefix: Vec<String>,
+        settings: ExpirySettings,
+    ) -> Self {
         Self {
             store,
             prefix,
@@ -329,7 +342,7 @@ impl Expirer {
         }
     }
 
-    pub fn settings(&self) -> &ExpirySettings {
+    pub(crate) fn settings(&self) -> &ExpirySettings {
         &self.settings
     }
 
@@ -344,7 +357,12 @@ impl Expirer {
     /// One expiry pass against rail day `today`. Never returns an error:
     /// list and delete failures are counted (and logged) in the outcome and
     /// in `aggregator_archive_expiry_errors_total`, and retried next run.
-    pub async fn run_once(&self, today: NaiveDate) -> ExpiryOutcome {
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::too_many_lines,
+        reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52; long but linear; splitting it would scatter its shared state across helpers"
+    )]
+    pub(crate) async fn run_once(&self, today: NaiveDate) -> ExpiryOutcome {
         use common::metrics::metric_name;
         let retention = self.settings.retention_days;
         let mut out = ExpiryOutcome::default();
@@ -352,7 +370,12 @@ impl Expirer {
         let mut expired: Vec<(NaiveDate, Path, &'static str)> = Vec::new();
 
         for &table in EXPIRY_TABLES {
-            let dir = Path::from_iter(self.prefix.iter().map(String::as_str).chain([table]));
+            let dir: Path = self
+                .prefix
+                .iter()
+                .map(String::as_str)
+                .chain([table])
+                .collect();
             let mut stream = self.store.list(Some(&dir));
             let mut table_expired = Vec::new();
             let mut oldest: Option<NaiveDate> = None;
@@ -368,24 +391,20 @@ impl Expirer {
                     }
                 };
                 let key = meta.location.as_ref();
-                match parse_key(&self.prefix, key).filter(|k| k.table == table) {
-                    Some(parsed) => {
-                        oldest = Some(
-                            oldest.map_or(parsed.service_date, |o| o.min(parsed.service_date)),
-                        );
-                        if is_expired(parsed.service_date, today, retention) {
-                            table_expired.push((parsed.service_date, meta.location, table));
-                        }
+                if let Some(parsed) = parse_key(&self.prefix, key).filter(|k| k.table == table) {
+                    oldest =
+                        Some(oldest.map_or(parsed.service_date, |o| o.min(parsed.service_date)));
+                    if is_expired(parsed.service_date, today, retention) {
+                        table_expired.push((parsed.service_date, meta.location, table));
                     }
-                    None => {
-                        unmatched += 1;
-                        if unmatched <= UNMATCHED_LOG_LIMIT {
-                            tracing::warn!(
-                                key,
-                                table,
-                                "archive expiry: key does not match the archive layout; never deleted"
-                            );
-                        }
+                } else {
+                    unmatched += 1;
+                    if unmatched <= UNMATCHED_LOG_LIMIT {
+                        tracing::warn!(
+                            key,
+                            table,
+                            "archive expiry: key does not match the archive layout; never deleted"
+                        );
                     }
                 }
             }
@@ -512,7 +531,7 @@ impl Expirer {
 /// The expiry task: one run at startup, then every `interval`. Runs on its
 /// own task so neither a slow LIST nor a store outage touches aggregation
 /// or the retention prunes.
-pub async fn expiry_loop(expirer: Expirer) {
+pub(crate) async fn expiry_loop(expirer: Expirer) {
     let mut interval = tokio::time::interval(expirer.settings.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

@@ -7,7 +7,7 @@
 //! When enabled, each opted-in table's prune streams the rows it is about
 //! to delete into zstd-compressed JSON Lines objects in S3-compatible
 //! storage, confirms each object landed (PUT, then a HEAD whose size and
-//! ETag must match, the ETag being the body's MD5), and only then deletes
+//! `ETag` must match, the `ETag` being the body's MD5), and only then deletes
 //! exactly those rows. No database transaction or row lock is held while
 //! object storage is being talked to (SVC-06): the export reads one
 //! snapshot, the upload runs with no transaction open, and a short final
@@ -65,7 +65,7 @@ use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, PutPayload, Retry
 use sqlx::{PgConnection, PgPool};
 
 /// Tables an operator may list in `ARCHIVE_TABLES`.
-pub const ARCHIVABLE_TABLES: &[&str] = &["trains"];
+pub(crate) const ARCHIVABLE_TABLES: &[&str] = &["trains"];
 
 /// Tables that must never be archived because a licensing safeguard
 /// depends on the data actually disappearing. Rejected at startup with an
@@ -106,7 +106,7 @@ const LICENSING_EXCLUDED_TABLES: &[(&str, &str)] = &[
 /// Same size as `queries::PRUNE_TRAINS_BATCH`. At ~25 movement events per
 /// train this is ~25k event rows per batch -- a few MB once compressed,
 /// which is what is held in memory before the upload.
-pub const ARCHIVE_TRAINS_BATCH: i64 = 1000;
+pub(crate) const ARCHIVE_TRAINS_BATCH: i64 = 1000;
 
 /// `statement_timeout` for each archive batch's export and delete
 /// transactions; see `archive_and_prune_trains`. Matches the retention
@@ -121,7 +121,7 @@ const ZSTD_LEVEL: i32 = 3;
 
 /// What to do when an upload fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum FailurePolicy {
+pub(crate) enum FailurePolicy {
     /// Keep the rows (roll back the batch) and retry next retention cycle.
     /// The table grows past its window while storage is unreachable.
     Retain,
@@ -131,7 +131,7 @@ pub enum FailurePolicy {
     Delete,
 }
 
-pub use common::secret::Secret;
+pub(crate) use common::secret::Secret;
 
 /// CLI/env settings for the cold archive, flattened into `Config`.
 ///
@@ -139,7 +139,11 @@ pub use common::secret::Secret;
 /// `ARCHIVE_ENABLED` unset needs none of them; [`Archiver::from_args`]
 /// validates the combination only when archiving is enabled.
 #[derive(Debug, Clone, clap::Args)]
-pub struct ArchiveArgs {
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent on/off CLI flags"
+)]
+pub(crate) struct ArchiveArgs {
     /// Master switch. False (the default) keeps pruning delete-only.
     #[arg(long, env, default_value_t = false)]
     pub archive_enabled: bool,
@@ -225,7 +229,7 @@ fn validate_tables(tables: &[String]) -> Result<Vec<String>> {
 
 /// A configured archive target: where objects go and what to do when an
 /// upload fails.
-pub struct Archiver {
+pub(crate) struct Archiver {
     store: Arc<dyn ObjectStore>,
     prefix: Vec<String>,
     tables: Vec<String>,
@@ -247,7 +251,7 @@ impl Archiver {
     /// `Ok(None)` when archiving is disabled (nothing else is inspected).
     /// Fails loudly on an enabled-but-incomplete or unsafe configuration,
     /// the same "fail loud on bad config" posture as the retention knobs.
-    pub fn from_args(args: &ArchiveArgs) -> Result<Option<Self>> {
+    pub(crate) fn from_args(args: &ArchiveArgs) -> Result<Option<Self>> {
         if !args.archive_enabled {
             return Ok(None);
         }
@@ -328,7 +332,7 @@ impl Archiver {
     }
 
     /// Builds an archiver over any `ObjectStore` (tests use `InMemory`).
-    pub fn new(
+    pub(crate) fn new(
         store: Arc<dyn ObjectStore>,
         prefix: &str,
         tables: Vec<String>,
@@ -347,39 +351,39 @@ impl Archiver {
     }
 
     /// An expiry runner over this archive's store and prefix.
-    pub fn expirer(
+    pub(crate) fn expirer(
         &self,
         settings: crate::archive_expiry::ExpirySettings,
     ) -> crate::archive_expiry::Expirer {
         crate::archive_expiry::Expirer::new(self.store.clone(), self.prefix.clone(), settings)
     }
 
-    pub fn archives(&self, table: &str) -> bool {
+    pub(crate) fn archives(&self, table: &str) -> bool {
         self.tables.iter().any(|t| t == table)
     }
 
     /// `<prefix>/<table>/service_date=YYYY-MM-DD/part-<first_id>.jsonl.zst`.
     /// `first_id` is zero-padded to 19 digits (i64's width) so a listing
     /// sorts parts in id order.
-    pub fn object_path(&self, table: &str, service_date: NaiveDate, first_id: i64) -> Path {
+    pub(crate) fn object_path(&self, table: &str, service_date: NaiveDate, first_id: i64) -> Path {
         let date = format!("service_date={}", service_date.format("%Y-%m-%d"));
         let part = format!("part-{first_id:019}.jsonl.zst");
-        Path::from_iter(self.prefix.iter().map(String::as_str).chain([
-            table,
-            date.as_str(),
-            part.as_str(),
-        ]))
+        self.prefix
+            .iter()
+            .map(String::as_str)
+            .chain([table, date.as_str(), part.as_str()])
+            .collect()
     }
 
-    /// PUTs `bytes` to `path`, then HEADs it and checks its size and ETag,
+    /// PUTs `bytes` to `path`, then HEADs it and checks its size and `ETag`,
     /// so the caller only deletes rows once the object is confirmed present
     /// in full. A PUT overwrites any stale object at the same key.
     ///
-    /// The ETag check (SVC-07): for a single-part PUT, S3 and most
+    /// The `ETag` check (SVC-07): for a single-part PUT, S3 and most
     /// S3-compatible servers return the hex MD5 of the stored body as the
-    /// ETag, so both the PUT's and the
-    /// HEAD's ETag must equal the MD5 of the bytes sent. A size check alone
-    /// would pass a same-length corrupted body. A store whose ETag is not
+    /// `ETag`, so both the PUT's and the
+    /// HEAD's `ETag` must equal the MD5 of the bytes sent. A size check alone
+    /// would pass a same-length corrupted body. A store whose `ETag` is not
     /// the body's MD5 (AWS SSE-KMS or SSE-C encryption, for one) fails this
     /// check on every upload; `docs/cold-archive.md` says so.
     async fn put_verified(&self, path: &Path, bytes: Vec<u8>) -> Result<()> {
@@ -416,7 +420,11 @@ impl Archiver {
     }
 }
 
-/// Lower-case hex MD5 of `bytes`, the form S3 uses in a single-part ETag.
+/// Lower-case hex MD5 of `bytes`, the form S3 uses in a single-part `ETag`.
+#[expect(
+    clippy::format_collect,
+    reason = "short strings off the hot path; format! reads clearer"
+)]
 fn md5_hex(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     Md5::digest(bytes)
@@ -425,7 +433,7 @@ fn md5_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// An ETag as a bare lower-case value: no weak `W/` prefix, no quotes.
+/// An `ETag` as a bare lower-case value: no weak `W/` prefix, no quotes.
 fn normalize_etag(etag: &str) -> String {
     etag.trim()
         .trim_start_matches("W/")
@@ -435,20 +443,20 @@ fn normalize_etag(etag: &str) -> String {
 
 /// Accumulates JSON Lines into a zstd-compressed in-memory buffer, so only
 /// the compressed form of a batch is ever held.
-pub struct JsonlZstWriter {
+pub(crate) struct JsonlZstWriter {
     encoder: zstd::stream::write::Encoder<'static, Vec<u8>>,
     rows: u64,
 }
 
 impl JsonlZstWriter {
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             encoder: zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)?,
             rows: 0,
         })
     }
 
-    pub fn push(&mut self, json_line: &str) -> Result<()> {
+    pub(crate) fn push(&mut self, json_line: &str) -> Result<()> {
         debug_assert!(
             !json_line.contains('\n'),
             "JSON Lines rows must be single-line"
@@ -460,7 +468,7 @@ impl JsonlZstWriter {
     }
 
     /// `(compressed bytes, row count)`.
-    pub fn finish(self) -> Result<(Vec<u8>, u64)> {
+    pub(crate) fn finish(self) -> Result<(Vec<u8>, u64)> {
         Ok((self.encoder.finish()?, self.rows))
     }
 }
@@ -519,7 +527,7 @@ const TRAINS_GROUP_EXPORTS: &[TableExport] = &[
 
 /// Outcome of one [`archive_and_prune_trains`] run.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct TrainsArchiveOutcome {
+pub(crate) struct TrainsArchiveOutcome {
     /// `trains` rows deleted (same meaning as `queries::prune_trains`'s
     /// return value).
     pub pruned: u64,
@@ -571,7 +579,12 @@ impl TrainsArchiveOutcome {
 /// outage from aborting the LDBWS-ceiling prunes that `run_retention` runs
 /// after this one. Database errors still propagate as `Err`, exactly as
 /// `prune_trains`'s do.
-pub async fn archive_and_prune_trains(
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines,
+    reason = "collection lengths stay far below i64::MAX; long but linear; splitting it would scatter its shared state across helpers"
+)]
+pub(crate) async fn archive_and_prune_trains(
     pool: &PgPool,
     archiver: &Archiver,
     retention_days: i64,
@@ -670,7 +683,7 @@ pub async fn archive_and_prune_trains(
             }
         }
 
-        let deleted = match delete_batch(
+        let Some(deleted) = delete_batch(
             pool,
             &ids,
             exported_fingerprints.as_deref(),
@@ -678,21 +691,18 @@ pub async fn archive_and_prune_trains(
             untracked_retention_days,
         )
         .await?
-        {
-            Some(deleted) => deleted,
-            None => {
-                metrics::counter!(common::metrics::metric_name(
-                    "aggregator_archive_batches_changed_total"
-                ))
-                .increment(1);
-                tracing::warn!(
-                    %service_date,
-                    first_id,
-                    "a trains batch changed between its archive export and its delete; left in \
-                     place and re-exported next retention run"
-                );
-                break;
-            }
+        else {
+            metrics::counter!(common::metrics::metric_name(
+                "aggregator_archive_batches_changed_total"
+            ))
+            .increment(1);
+            tracing::warn!(
+                %service_date,
+                first_id,
+                "a trains batch changed between its archive export and its delete; left in \
+                 place and re-exported next retention run"
+            );
+            break;
         };
         outcome.pruned += deleted;
 
@@ -1037,9 +1047,9 @@ mod tests {
         lock_free_during_put: std::sync::Mutex<Vec<bool>>,
         /// During the next PUT, change this `trains` row (once).
         mutate_on_put: std::sync::Mutex<Option<(PgPool, i64)>>,
-        /// ETag per object, as S3 reports it: the body's quoted hex MD5.
+        /// `ETag` per object, as S3 reports it: the body's quoted hex MD5.
         etags: std::sync::Mutex<std::collections::HashMap<String, String>>,
-        /// Report an ETag that does not match the stored body on HEAD, as
+        /// Report an `ETag` that does not match the stored body on HEAD, as
         /// if the stored object were corrupt.
         corrupt_etag: std::sync::atomic::AtomicBool,
     }
@@ -1523,9 +1533,9 @@ mod tests {
         );
     }
 
-    /// SVC-07: a stored object whose ETag is not the MD5 of what was sent
+    /// SVC-07: a stored object whose `ETag` is not the MD5 of what was sent
     /// fails verification (a size-only check passed it), and a plain
-    /// in-memory store (counter ETags, not MD5s) fails too.
+    /// in-memory store (counter `ETags`, not MD5s) fails too.
     #[tokio::test]
     async fn put_verified_checks_the_etag_is_the_body_md5() {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");

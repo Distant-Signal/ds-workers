@@ -15,7 +15,7 @@ use crate::llm::{AdversarialPeriodVerdict, ExtractionPeriod, SeverityAdversarial
 /// missed one. Unchanged in substance from the original design's flat,
 /// incident-level version -- it now just runs once per period index
 /// instead of once per incident (see `combine_periods` below).
-pub fn combine(primary_status: &str, adversarial_status: &str) -> (String, String) {
+pub(crate) fn combine(primary_status: &str, adversarial_status: &str) -> (String, String) {
     if primary_status == "ongoing" {
         // No demotion is possible from "ongoing" either way, so the
         // adversarial pass's answer can't change the outcome.
@@ -54,7 +54,10 @@ pub(crate) fn severity_hint_rank(hint: &str) -> u8 {
 /// escalation (needless alarm, unnecessary rerouting) is the failure this
 /// guards against, so disagreement -- the adversarial pass finding a
 /// materially milder honest reading -- is low confidence.
-pub fn combine_severity(primary_severity: &str, adversarial_severity: &str) -> (String, String) {
+pub(crate) fn combine_severity(
+    primary_severity: &str,
+    adversarial_severity: &str,
+) -> (String, String) {
     if primary_severity == "normal" {
         // No escalation is possible from "normal" either way.
         return (primary_severity.to_string(), "high".to_string());
@@ -75,7 +78,7 @@ pub fn combine_severity(primary_severity: &str, adversarial_severity: &str) -> (
 /// retries, since `temperature: 0.0` makes it deterministic against
 /// unchanged text -- every retry reproduces the identical mismatch).
 #[derive(Debug)]
-pub enum CombineError {
+pub(crate) enum CombineError {
     /// An adversarial array's length didn't match the primary pass's
     /// `periods` length.
     LengthMismatch {
@@ -126,7 +129,7 @@ impl std::error::Error for CombineError {}
 /// "no partial-credit storage" philosophy the original design already
 /// applies to any schema-validation failure, extended to this new failure
 /// mode (design §2).
-pub fn combine_periods(
+pub(crate) fn combine_periods(
     primary_periods: &[ExtractionPeriod],
     resolution_adversarial: &[AdversarialPeriodVerdict],
     severity_adversarial: &[SeverityAdversarialPeriodVerdict],

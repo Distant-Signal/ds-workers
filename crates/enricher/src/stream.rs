@@ -25,7 +25,7 @@ const _: () =
 /// itself if this is the very first run (`MKSTREAM`). `BUSYGROUP` (group
 /// already exists) is the expected steady-state outcome and is swallowed,
 /// not treated as an error.
-pub async fn ensure_group(conn: &mut RedisConn) -> anyhow::Result<()> {
+pub(crate) async fn ensure_group(conn: &mut RedisConn) -> anyhow::Result<()> {
     ensure_group_on(conn, STREAM).await
 }
 
@@ -60,7 +60,7 @@ async fn ensure_group_at(conn: &mut RedisConn, stream: &str, start_id: &str) -> 
 /// The `enricher` group's `last-delivered-id` (`XINFO GROUPS`), or `None`
 /// (logged) when it cannot be read. `main` keeps it, advanced to every
 /// entry `read_one` hands back, for [`recreate_group`].
-pub async fn group_last_delivered_id(conn: &mut RedisConn) -> Option<String> {
+pub(crate) async fn group_last_delivered_id(conn: &mut RedisConn) -> Option<String> {
     group_last_delivered_id_on(conn, STREAM).await
 }
 
@@ -106,9 +106,9 @@ async fn group_last_delivered_id_on(conn: &mut RedisConn, stream: &str) -> Optio
 /// this call are then read, not left for the hourly sweep, and a group
 /// deleted by hand does not replay the whole stream. `last_delivered` is
 /// `main`'s copy of the group's position, refreshed from Redis afterwards.
-/// Entries the lost group had delivered but not ACKed are not redelivered
+/// Entries the lost group had delivered but not `ACKed` are not redelivered
 /// (the sweep still backstops them).
-pub async fn recreate_group(
+pub(crate) async fn recreate_group(
     conn: &mut RedisConn,
     last_delivered: &mut Option<String>,
 ) -> anyhow::Result<()> {
@@ -179,7 +179,7 @@ fn stream_id_less_than(a: &str, b: &str) -> bool {
 /// Reads at most one new entry for this consumer, blocking up to 5s if
 /// none are immediately available. Returns the entry's own stream ID
 /// (needed to `ack`) paired with the `incident_id` field it carries.
-pub async fn read_one(conn: &mut RedisConn) -> anyhow::Result<Option<(String, String)>> {
+pub(crate) async fn read_one(conn: &mut RedisConn) -> anyhow::Result<Option<(String, String)>> {
     read_one_on(conn, STREAM).await
 }
 
@@ -211,43 +211,42 @@ async fn read_one_on(
         return Ok(None);
     };
 
-    match entry
+    if let Some(incident_id) = entry
         .map
         .get("incident_id")
         .and_then(|v| redis::from_redis_value::<String>(v).ok())
     {
-        Some(incident_id) => Ok(Some((entry.id, incident_id))),
-        None => {
-            // A stream entry with no `incident_id` field can never be acted
-            // on -- there is nothing for `process_incident` to look up, no
-            // matter how many times this exact entry is redelivered.
-            // Returning an `Err` here (as this used to) left the caller's
-            // error branch in `main`'s consumer loop with no `entry_id` to
-            // ack (only the `Ok` arm above ever produces one), so the entry
-            // stayed in the pending-entries list forever: `claim_stale`
-            // would reclaim it once it went idle, log its own warning (see
-            // that function), and reclaim it again next cycle, forever --
-            // the same poison-message-wedges-the-queue failure mode
-            // `movement-feed` already closed elsewhere in this campaign.
-            // Acknowledge it here instead: a missing required field is not
-            // a transient condition this entry could ever recover from.
-            tracing::warn!(
+        Ok(Some((entry.id, incident_id)))
+    } else {
+        // A stream entry with no `incident_id` field can never be acted
+        // on -- there is nothing for `process_incident` to look up, no
+        // matter how many times this exact entry is redelivered.
+        // Returning an `Err` here (as this used to) left the caller's
+        // error branch in `main`'s consumer loop with no `entry_id` to
+        // ack (only the `Ok` arm above ever produces one), so the entry
+        // stayed in the pending-entries list forever: `claim_stale`
+        // would reclaim it once it went idle, log its own warning (see
+        // that function), and reclaim it again next cycle, forever --
+        // the same poison-message-wedges-the-queue failure mode
+        // `movement-feed` already closed elsewhere in this campaign.
+        // Acknowledge it here instead: a missing required field is not
+        // a transient condition this entry could ever recover from.
+        tracing::warn!(
+            entry_id = entry.id,
+            "stream entry missing incident_id field; acking and skipping"
+        );
+        if let Err(err) = ack_on(conn, stream, &entry.id).await {
+            tracing::error!(
+                error = ?err,
                 entry_id = entry.id,
-                "stream entry missing incident_id field; acking and skipping"
+                "failed to ack stream entry missing incident_id field"
             );
-            if let Err(err) = ack_on(conn, stream, &entry.id).await {
-                tracing::error!(
-                    error = ?err,
-                    entry_id = entry.id,
-                    "failed to ack stream entry missing incident_id field"
-                );
-            }
-            Ok(None)
         }
+        Ok(None)
     }
 }
 
-pub async fn ack(conn: &mut RedisConn, entry_id: &str) -> anyhow::Result<()> {
+pub(crate) async fn ack(conn: &mut RedisConn, entry_id: &str) -> anyhow::Result<()> {
     ack_on(conn, STREAM, entry_id).await
 }
 
@@ -270,7 +269,7 @@ async fn ack_on(conn: &mut RedisConn, stream: &str, entry_id: &str) -> anyhow::R
 /// cursor for continuing the scan, which is followed until it reports
 /// `"0-0"` (fully scanned) rather than stopping after one call's worth of
 /// entries.
-pub async fn claim_stale(
+pub(crate) async fn claim_stale(
     conn: &mut RedisConn,
     min_idle: Duration,
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -278,6 +277,10 @@ pub async fn claim_stale(
 }
 
 /// See `ensure_group_on` for why this takes `stream` explicitly.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+)]
 async fn claim_stale_on(
     conn: &mut RedisConn,
     stream: &str,
@@ -298,31 +301,30 @@ async fn claim_stale_on(
             .await?;
 
         for entry in reply.claimed {
-            match entry
+            if let Some(incident_id) = entry
                 .map
                 .get("incident_id")
                 .and_then(|v| redis::from_redis_value::<String>(v).ok())
             {
-                Some(incident_id) => claimed.push((entry.id, incident_id)),
-                None => {
-                    // Same poison-message reasoning as `read_one`'s own fix
-                    // above: merely logging and skipping (the old
-                    // behaviour) left this entry unacked, so the NEXT sweep
-                    // of this same function would reclaim it again once
-                    // idle, forever -- an entry missing this required field
-                    // never becomes processable no matter how many times
-                    // it's reclaimed, so ack it now instead.
-                    tracing::warn!(
+                claimed.push((entry.id, incident_id));
+            } else {
+                // Same poison-message reasoning as `read_one`'s own fix
+                // above: merely logging and skipping (the old
+                // behaviour) left this entry unacked, so the NEXT sweep
+                // of this same function would reclaim it again once
+                // idle, forever -- an entry missing this required field
+                // never becomes processable no matter how many times
+                // it's reclaimed, so ack it now instead.
+                tracing::warn!(
+                    entry_id = entry.id,
+                    "reclaimed stream entry missing incident_id field; acking and skipping"
+                );
+                if let Err(err) = ack_on(conn, stream, &entry.id).await {
+                    tracing::error!(
+                        error = ?err,
                         entry_id = entry.id,
-                        "reclaimed stream entry missing incident_id field; acking and skipping"
+                        "failed to ack reclaimed stream entry missing incident_id field"
                     );
-                    if let Err(err) = ack_on(conn, stream, &entry.id).await {
-                        tracing::error!(
-                            error = ?err,
-                            entry_id = entry.id,
-                            "failed to ack reclaimed stream entry missing incident_id field"
-                        );
-                    }
                 }
             }
         }
@@ -345,7 +347,7 @@ async fn claim_stale_on(
 /// server predates the `lag` field (added in Redis 7.0; this app's own
 /// deployments always run Redis 7, but a self-managed external Redis might
 /// not be).
-pub async fn group_lag(conn: &mut RedisConn) -> anyhow::Result<Option<i64>> {
+pub(crate) async fn group_lag(conn: &mut RedisConn) -> anyhow::Result<Option<i64>> {
     let reply: Vec<redis::Value> = redis::cmd("XINFO")
         .arg("GROUPS")
         .arg(STREAM)

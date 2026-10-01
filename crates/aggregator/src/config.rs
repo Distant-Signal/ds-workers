@@ -15,7 +15,7 @@ use common::config::{LineCatalogue, parse_lines};
 /// env var -- there is no legitimate reason to configure one -- so this
 /// fails startup outright rather than silently accepting it, the same
 /// "fail loud on bad config" convention `parse_lines`/`parse_stanox_crs`
-/// already use for THEIR own value_parsers (see `common::config::parse_lines`'s
+/// already use for THEIR own `value_parsers` (see `common::config::parse_lines`'s
 /// doc comment).
 fn non_negative_retention(s: &str) -> anyhow::Result<i64> {
     let value: i64 = s
@@ -33,7 +33,7 @@ fn non_negative_retention(s: &str) -> anyhow::Result<i64> {
 /// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: common::secret::Secret,
 
@@ -357,7 +357,7 @@ mod tests {
             "--lines-dir".to_string(),
             lines_dir(),
         ];
-        args.extend(extra.iter().map(|s| s.to_string()));
+        args.extend(extra.iter().map(ToString::to_string));
         args
     }
 

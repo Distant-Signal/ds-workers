@@ -39,6 +39,10 @@ async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
@@ -204,6 +208,10 @@ async fn run() -> anyhow::Result<()> {
 /// retries included) can legitimately run to a few multiples of it, and a
 /// timeout above the old 300 s top bucket (e.g. 320 s behind a 302 s
 /// gateway) would otherwise land every slow call in `+Inf`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a timeout in seconds is far below 2^52"
+)]
 fn llm_duration_buckets(request_timeout_secs: u64) -> Vec<f64> {
     let timeout = request_timeout_secs as f64;
     let mut buckets = vec![1.0, 5.0, 15.0, 30.0, 60.0, 90.0, 120.0, 180.0, 300.0];
@@ -265,6 +273,10 @@ struct InFlight {
 }
 
 impl InFlight {
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
     fn try_claim(&self, incident_id: &str) -> Option<InFlightClaim<'_>> {
         let mut ids = self.ids.lock().expect("in-flight set mutex poisoned");
         ids.insert(incident_id.to_string()).then(|| InFlightClaim {
@@ -378,6 +390,10 @@ struct MismatchTracker {
 impl MismatchTracker {
     /// Records a combine failure for `incident_id` and returns the new
     /// consecutive-failure count (1 on the first occurrence).
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
     fn record_failure(&self, incident_id: &str) -> u32 {
         let mut counts = self.counts.lock().expect("mismatch tracker mutex poisoned");
         let count = counts.entry(incident_id.to_string()).or_insert(0);
@@ -389,6 +405,10 @@ impl MismatchTracker {
     /// successful combination, since a text change (which resets
     /// `source_text_hash`) or a prompt fix could make a previously-mismatching
     /// incident succeed again.
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
     fn record_success(&self, incident_id: &str) {
         let mut counts = self.counts.lock().expect("mismatch tracker mutex poisoned");
         counts.remove(incident_id);
@@ -397,6 +417,10 @@ impl MismatchTracker {
     /// Current count of incidents with at least one recorded consecutive
     /// combine-mismatch failure -- exposed as
     /// `distant_signal_enricher_mismatch_incidents` (Task 9).
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
     fn len(&self) -> usize {
         self.counts
             .lock()
@@ -452,11 +476,7 @@ async fn sweep_ids(enricher: &Enricher, ids: &[String]) -> usize {
 /// not user data, so no cardinality risk. `outcome` is `llm_outcome`'s
 /// fixed label set. The duration covers the whole call, in-call retries and
 /// 429 waits included.
-fn record_llm_call_metrics(
-    call: &'static str,
-    elapsed: std::time::Duration,
-    outcome: &'static str,
-) {
+fn record_llm_call_metrics(call: &'static str, elapsed: Duration, outcome: &'static str) {
     metrics::histogram!(
         common::metrics::metric_name(LLM_DURATION_METRIC),
         "call" => call
@@ -524,6 +544,10 @@ fn record_extraction_failure(
 ///
 /// Callers go through `Enricher::process_exclusive`, never straight here,
 /// so two loops never run this for the same incident at once.
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
     let Enricher {
         pool,
@@ -857,7 +881,7 @@ const WRITE_EXTRACTION_BACKOFF: Duration = Duration::from_millis(500);
 async fn retry_locally<T, F, Fut>(attempts: u32, backoff: Duration, mut op: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
+    Fut: Future<Output = anyhow::Result<T>>,
 {
     let mut delay = backoff;
     let mut attempt = 1;
@@ -882,6 +906,10 @@ where
 /// hourly sweep -- this is the debounced retry path for a transient
 /// per-incident failure, distinct from both. Entries whose incident another
 /// loop is still processing are skipped (see `InFlight`).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
+)]
 async fn reclaim_loop(
     enricher: Arc<Enricher>,
     mut redis: common::redis_conn::RedisConn,
@@ -944,6 +972,10 @@ async fn process_reclaimed(enricher: &Enricher, entries: Vec<(String, String)>) 
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test code: scenario tests read top to bottom"
+)]
 mod tests {
     use sqlx::postgres::PgPoolOptions;
     use wiremock::matchers::{body_string_contains, method, path};
@@ -1025,7 +1057,7 @@ mod tests {
     }
 
     /// The full crux of this plan: a primary extraction that exceeds
-    /// MAX_PERIODS must now (a) still write successfully, and (b) leave
+    /// `MAX_PERIODS` must now (a) still write successfully, and (b) leave
     /// `source_text_hash`/`extraction_model_version` matching the current
     /// text/version -- proving `sweep::incidents_needing_extraction` will
     /// NOT re-select this incident on its next tick (it re-selects only on
@@ -1035,12 +1067,12 @@ mod tests {
     /// exists to close. Mocks all three LLM calls against one wiremock
     /// server, distinguished by each request's `response_format.json_schema.name`
     /// (`"incident_extraction"` / `"adversarial_resolution_check"` /
-    /// `"adversarial_severity_check"`, matching PRIMARY_SCHEMA_NAME/
-    /// ADVERSARIAL_SCHEMA_NAME/SEVERITY_ADVERSARIAL_SCHEMA_NAME in llm.rs)
-    /// so the primary call can return more than MAX_PERIODS periods while
-    /// the two adversarial calls return exactly MAX_PERIODS verdicts each
-    /// -- matching what extract_primary's own truncation guarantees
-    /// process_incident will actually send them.
+    /// `"adversarial_severity_check"`, matching `PRIMARY_SCHEMA_NAME`/
+    /// `ADVERSARIAL_SCHEMA_NAME/SEVERITY_ADVERSARIAL_SCHEMA_NAME` in llm.rs)
+    /// so the primary call can return more than `MAX_PERIODS` periods while
+    /// the two adversarial calls return exactly `MAX_PERIODS` verdicts each
+    /// -- matching what `extract_primary`'s own truncation guarantees
+    /// `process_incident` will actually send them.
     #[tokio::test]
     #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored --test-threads=1`"]
     async fn process_incident_writes_successfully_and_advances_hash_and_version_when_primary_extraction_is_truncated()
@@ -1303,7 +1335,7 @@ mod tests {
     }
 
     /// Overlap fix: reclaim hands back an entry the stream loop is still
-    /// processing once the attempt outlasts RECLAIM_MIN_IDLE_SECS. It must
+    /// processing once the attempt outlasts `RECLAIM_MIN_IDLE_SECS`. It must
     /// neither re-run it nor ack it (the holder acks on success; otherwise a
     /// later reclaim pass retries it).
     #[tokio::test]

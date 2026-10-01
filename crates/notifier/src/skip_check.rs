@@ -24,7 +24,7 @@ use crate::queries::{self, CommittedLeg};
 /// caller (`run_skip_check_cycle`) lets that fail the whole cycle, retried
 /// next interval, same as `run_cycle`/`run_forward_queue_cycle` already do
 /// for their own DB errors.
-pub async fn leg_is_skipped(pool: &PgPool, leg: &CommittedLeg) -> anyhow::Result<bool> {
+pub(crate) async fn leg_is_skipped(pool: &PgPool, leg: &CommittedLeg) -> anyhow::Result<bool> {
     let match_target = leg
         .pin_destination_crs
         .as_deref()
@@ -76,7 +76,7 @@ mod tests {
     /// `ZQ*`-prefixed convention `crates/api/src/routes/train.rs`'s own
     /// `seed_station_sample` and its siblings in `departures.rs`/
     /// `station_stats.rs` already use for a fake-but-valid CRS) with one
-    /// non-cancelled departure. The JSON keys below are plain snake_case,
+    /// non-cancelled departure. The JSON keys below are plain `snake_case`,
     /// NOT camelCase: `common::StationDeparture` has no
     /// `#[serde(rename_all = ...)]` at all, so its `Deserialize` impl reads
     /// these keys verbatim as its own field names -- confirmed against

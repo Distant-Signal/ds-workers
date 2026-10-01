@@ -127,12 +127,12 @@ use crate::aggregation::{relevant_departures, stats_from_departures};
 /// (not persisted) is judged sufficient, and how it could be swapped for a
 /// persisted backing later without touching `dedup_new_sample_stats`.
 #[derive(Default)]
-pub struct SeenServiceLedger {
+pub(crate) struct SeenServiceLedger {
     seen: HashMap<(String, NaiveDate), HashSet<String>>,
 }
 
 impl SeenServiceLedger {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -190,7 +190,7 @@ impl SeenServiceLedger {
     /// worth of `service_id`s for every line would accumulate forever).
     /// Intended to be called once per cycle with the current period -- a
     /// cheap no-op once no stale periods remain.
-    pub fn prune_before(&mut self, retain_from: NaiveDate) {
+    pub(crate) fn prune_before(&mut self, retain_from: NaiveDate) {
         self.seen.retain(|(_, period), _| *period >= retain_from);
     }
 
@@ -227,7 +227,7 @@ impl SeenServiceLedger {
 /// period" -- where a single newly-seen train is still one real,
 /// worth-counting observation, even on a cycle where the whole window
 /// happened to be sparse.
-pub fn dedup_new_sample_stats(
+pub(crate) fn dedup_new_sample_stats(
     ledger: &mut SeenServiceLedger,
     line_id: &str,
     period: NaiveDate,
@@ -277,7 +277,7 @@ mod tests {
                     segment: None,
                 },
             ],
-            sample_stations: sample_stations.iter().map(|s| s.to_string()).collect(),
+            sample_stations: sample_stations.iter().map(ToString::to_string).collect(),
             match_keywords: vec![],
             excluded_keywords: vec![],
             severity_overrides: HashMap::new(),

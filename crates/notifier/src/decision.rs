@@ -17,7 +17,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotifyDecision {
+pub(crate) enum NotifyDecision {
     Skip,
     NotifyNow,
 }
@@ -26,7 +26,7 @@ pub enum NotifyDecision {
 /// any per-user join. `previous_rank = None` means no preceding history
 /// row exists for this `line_id` at all (Decision 3's cold-start guard --
 /// must not be treated as "changed from nothing").
-pub fn is_severity_transition(previous_rank: Option<u8>, new_rank: u8) -> bool {
+pub(crate) fn is_severity_transition(previous_rank: Option<u8>, new_rank: u8) -> bool {
     match previous_rank {
         None => false,
         Some(previous) => previous != new_rank,
@@ -38,7 +38,7 @@ pub fn is_severity_transition(previous_rank: Option<u8>, new_rank: u8) -> bool {
 /// objective transition (shared across every user pinning this line);
 /// `last_notified_rank`/`last_notified_at` are this specific user's own
 /// notification history for this line.
-pub fn decide_user_notification(
+pub(crate) fn decide_user_notification(
     previous_rank: u8,
     new_rank: u8,
     last_notified_rank: Option<u8>,
@@ -64,23 +64,21 @@ pub fn decide_user_notification(
 
 /// Maps a tracked train's derived state onto the same rank shape lines
 /// use. Cancellation always outranks any delay reading.
-pub fn train_severity_rank(
+pub(crate) fn train_severity_rank(
     status: &str,
     delay_minutes: Option<i32>,
     delay_threshold_minutes: i32,
 ) -> u8 {
     if status == "cancelled" {
         2
-    } else if delay_minutes.unwrap_or(0) >= delay_threshold_minutes {
-        1
     } else {
-        0
+        u8::from(delay_minutes.unwrap_or(0) >= delay_threshold_minutes)
     }
 }
 
 /// Escalation-only (see this plan's Task 3 design notes for why trains
 /// don't get a de-escalation/cooldown branch).
-pub fn decide_train_notification(previous_rank: u8, new_rank: u8) -> NotifyDecision {
+pub(crate) fn decide_train_notification(previous_rank: u8, new_rank: u8) -> NotifyDecision {
     if new_rank > previous_rank {
         NotifyDecision::NotifyNow
     } else {
@@ -99,7 +97,7 @@ pub fn decide_train_notification(previous_rank: u8, new_rank: u8) -> NotifyDecis
 /// convention -- see `crates/notifier/src/queries.rs`'s
 /// `skip_notification_state`) still notifies once immediately, the same
 /// way "a newly tracked already-delayed train does notify once."
-pub fn decide_skip_notification(was_skipped: bool, is_skipped: bool) -> NotifyDecision {
+pub(crate) fn decide_skip_notification(was_skipped: bool, is_skipped: bool) -> NotifyDecision {
     if is_skipped && !was_skipped {
         NotifyDecision::NotifyNow
     } else {
@@ -112,8 +110,14 @@ pub fn decide_skip_notification(was_skipped: bool, is_skipped: bool) -> NotifyDe
 /// this plan's Task 4 writes as `1 << (EXTRACT(ISODOW FROM $1)::int - 1)`
 /// -- ISODOW is 1=Monday..7=Sunday, matching `num_days_from_monday()`'s
 /// 0=Monday..6=Sunday after the +1/-1 shift.
-#[allow(dead_code)]
-pub fn weekday_bit(date: chrono::NaiveDate) -> i16 {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the tests call it until the SQL twin is retired; see above"
+    )
+)]
+pub(crate) fn weekday_bit(date: chrono::NaiveDate) -> i16 {
     use chrono::Datelike;
     1i16 << date.weekday().num_days_from_monday()
 }
@@ -124,7 +128,7 @@ pub fn weekday_bit(date: chrono::NaiveDate) -> i16 {
 /// of that leg's `service_date` (Judgment Call 3 -- the caller's own
 /// `service_date = today` query scoping is what eventually stops this
 /// from being consulted forever, not this function).
-pub fn is_due_for_commit_check(
+pub(crate) fn is_due_for_commit_check(
     now: DateTime<Utc>,
     earliest_bound_utc: DateTime<Utc>,
     lead_minutes: i64,
@@ -143,7 +147,7 @@ pub fn is_due_for_commit_check(
 /// the fallback -- which is what this code did before -- is what caused the
 /// bug described on [`commit_check_window`] below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitCheckWindow {
+pub(crate) enum CommitCheckWindow {
     /// The leg names its own EARLIEST acceptable time (`depart_after`, else
     /// `arrive_after`). The user has told us when they want to travel, so
     /// "nearest to now" is measured against that intent and a candidate
@@ -161,14 +165,14 @@ impl CommitCheckWindow {
     /// Whether the user named an earliest time of their own. `false` means
     /// this leg has NO lower bound, and so must be anchored on the sweep's
     /// own `now` instead -- see [`commit_check_window`].
-    pub fn names_an_earliest_time(self) -> bool {
+    pub(crate) fn names_an_earliest_time(self) -> bool {
         matches!(self, Self::EarliestKnown(_))
     }
 
     /// The local time this leg's due-check should be measured against, or
     /// `None` for [`CommitCheckWindow::Open`] (the caller substitutes `now`
     /// -- there is no wall-clock time on the leg to convert).
-    pub fn due_check_bound(self) -> Option<chrono::NaiveTime> {
+    pub(crate) fn due_check_bound(self) -> Option<chrono::NaiveTime> {
         match self {
             Self::EarliestKnown(t) | Self::LatestOnly(t) => Some(t),
             Self::Open => None,
@@ -214,7 +218,7 @@ impl CommitCheckWindow {
 ///   UPCOMING candidate relative to that moment -- "the user wants any
 ///   train from here on," evaluated against when we are actually looking
 ///   rather than against midnight.
-pub fn commit_check_window(
+pub(crate) fn commit_check_window(
     depart_after: Option<chrono::NaiveTime>,
     depart_before: Option<chrono::NaiveTime>,
     arrive_after: Option<chrono::NaiveTime>,
@@ -274,7 +278,7 @@ pub fn commit_check_window(
 /// candidate when literally every candidate has already gone -- preserving
 /// "an already-departed candidate is still acceptable" as a last resort,
 /// never as a preference over a comparably-close upcoming one.
-pub fn pick_nearest_to_now_candidate(
+pub(crate) fn pick_nearest_to_now_candidate(
     candidates: &[(u8, chrono::NaiveTime)],
     now_local: chrono::NaiveTime,
 ) -> Option<usize> {
@@ -333,7 +337,7 @@ fn candidate_secs(day_offset: u8, at: chrono::NaiveTime) -> i64 {
 /// Day-offset-aware, same `(day_offset, time)` arithmetic and same
 /// "`now_local` is always day 0" contract as
 /// [`pick_nearest_to_now_candidate`].
-pub fn pick_next_upcoming_candidate(
+pub(crate) fn pick_next_upcoming_candidate(
     candidates: &[(u8, chrono::NaiveTime)],
     now_local: chrono::NaiveTime,
 ) -> Option<usize> {
@@ -351,7 +355,7 @@ pub fn pick_next_upcoming_candidate(
 /// Fires once, the first time an `'auto'`-mode leg's commit-check finds
 /// zero candidates for today; never re-fires for the same leg (§4.2,
 /// narrowly scoped per this plan's own Judgment Call 4).
-pub fn decide_unmatched_notification(already_notified: bool) -> NotifyDecision {
+pub(crate) fn decide_unmatched_notification(already_notified: bool) -> NotifyDecision {
     if already_notified {
         NotifyDecision::Skip
     } else {

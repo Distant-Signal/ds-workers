@@ -59,7 +59,7 @@ use crate::queries::IncidentState;
 /// The previous (about-to-be-overwritten) extraction for an incident, parsed
 /// out of `incidents.extracted_category`/`extracted_periods`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Baseline {
+pub(crate) struct Baseline {
     pub category: Option<String>,
     pub periods: Vec<ExtractionPeriod>,
 }
@@ -70,7 +70,7 @@ pub struct Baseline {
 /// same-text retry, or a stored `extracted_periods` value that doesn't parse
 /// (logged at warn and otherwise ignored: measurement must never affect the
 /// write path).
-pub fn baseline_for_text_change_rerun(
+pub(crate) fn baseline_for_text_change_rerun(
     incident_id: &str,
     state: &IncidentState,
     new_text_hash: &str,
@@ -103,7 +103,7 @@ pub fn baseline_for_text_change_rerun(
 /// One thing that can change between two extractions. `label` values are
 /// the `field` label of `enricher_extraction_churn_total` -- a fixed set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ChurnField {
+pub(crate) enum ChurnField {
     Category,
     PeriodCount,
     /// At least one period on either side had no counterpart.
@@ -117,7 +117,7 @@ pub enum ChurnField {
 }
 
 impl ChurnField {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             ChurnField::Category => "category",
             ChurnField::PeriodCount => "period_count",
@@ -134,7 +134,7 @@ impl ChurnField {
 
 /// Result of comparing one previous extraction with its replacement.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct ChurnReport {
+pub(crate) struct ChurnReport {
     pub old_period_count: usize,
     pub new_period_count: usize,
     pub key_pairs: usize,
@@ -148,7 +148,7 @@ pub struct ChurnReport {
 /// Output of [`pair_periods`]: `(old_index, new_index)` pairs from each pass
 /// plus the leftover indices on each side.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Pairing {
+pub(crate) struct Pairing {
     pub by_key: Vec<(usize, usize)>,
     pub by_position: Vec<(usize, usize)>,
     pub unpaired_old: Vec<usize>,
@@ -167,7 +167,7 @@ fn same_key(a: &ExtractionPeriod, b: &ExtractionPeriod) -> bool {
 }
 
 /// Pairs old and new periods -- see the module doc's "Pairing rule".
-pub fn pair_periods(old: &[ExtractionPeriod], new: &[ExtractionPeriod]) -> Pairing {
+pub(crate) fn pair_periods(old: &[ExtractionPeriod], new: &[ExtractionPeriod]) -> Pairing {
     let mut old_taken = vec![false; old.len()];
     let mut new_taken = vec![false; new.len()];
     let mut pairing = Pairing::default();
@@ -200,7 +200,7 @@ pub fn pair_periods(old: &[ExtractionPeriod], new: &[ExtractionPeriod]) -> Pairi
 /// Compares a previous extraction with its replacement. Pure and
 /// panic-free (indices come only from `pair_periods`, which draws them from
 /// the same slices).
-pub fn compare(
+pub(crate) fn compare(
     old_category: Option<&str>,
     old_periods: &[ExtractionPeriod],
     new_category: &str,
@@ -262,7 +262,7 @@ pub fn compare(
 /// `incident_history`) -- a fixed set of 7 values, so the label adds at most
 /// 7x series. It is what lets churn be read per edit
 /// class ("do small edits re-roll untouched fields?").
-pub fn record(incident_id: &str, report: &ChurnReport, edit_class: &'static str) {
+pub(crate) fn record(incident_id: &str, report: &ChurnReport, edit_class: &'static str) {
     metrics::counter!(
         common::metrics::metric_name("enricher_extraction_rerun_total"),
         "changed" => if report.changed.is_empty() { "false" } else { "true" },

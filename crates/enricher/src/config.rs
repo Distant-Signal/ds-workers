@@ -5,7 +5,7 @@ use common::secret::Secret;
 /// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
-pub struct Config {
+pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Secret,
 
@@ -123,7 +123,11 @@ pub struct Config {
 /// defaults to "off": an unset deployment sends byte-for-byte the same
 /// request as before and never retries in-call. See `llm::ProviderPolicy`.
 #[derive(Debug, Clone, Parser)]
-pub struct ProviderPolicyConfig {
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives each env var from the field name, so the prefix is part of the interface"
+)]
+pub(crate) struct ProviderPolicyConfig {
     /// Sent as `max_tokens` when set (e.g. 8192 for a reasoning model).
     #[arg(long, env)]
     pub llm_max_tokens: Option<u32>,
@@ -147,7 +151,7 @@ pub struct ProviderPolicyConfig {
 }
 
 impl ProviderPolicyConfig {
-    pub fn policy(&self) -> crate::llm::ProviderPolicy {
+    pub(crate) fn policy(&self) -> crate::llm::ProviderPolicy {
         crate::llm::ProviderPolicy {
             max_tokens: self.llm_max_tokens,
             reasoning_effort: self.llm_reasoning_effort.clone(),

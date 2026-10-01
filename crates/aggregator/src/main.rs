@@ -28,6 +28,10 @@ async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
@@ -363,9 +367,9 @@ async fn run_retention_pass(
 /// back, every line already processed earlier in that same chunk has its
 /// dedup "seen" marks stay consumed in memory even though their DB writes
 /// for this cycle just got undone -- a pre-existing risk (it already
-/// existed per-line, pre-batching, whenever a single write_line_status/
+/// existed per-line, pre-batching, whenever a single `write_line_status`/
 /// record_*_stats call failed) that chunking widens from "1 line" to "up
-/// to WRITE_CHUNK_SIZE lines" in the rare case a chunk transaction has to
+/// to `WRITE_CHUNK_SIZE` lines" in the rare case a chunk transaction has to
 /// roll back. `record_daily_stats`/`record_half_hourly_stats` do simple
 /// parameterized `INSERT ... ON CONFLICT` against tables with real PKs on
 /// entirely local, already-valid data, so this is expected to be
@@ -408,6 +412,11 @@ fn cycle_interval(poll_interval: Duration) -> tokio::time::Interval {
 // knob it used to thread through now belongs to `run_retention` instead --
 // see that function's doc comment for why pruning is no longer part of this
 // one's `?`-chain.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52; long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run_cycle(
     pool: &sqlx::PgPool,
     static_lines: &HashMap<String, LineDefinition>,
@@ -709,7 +718,11 @@ async fn run_cycle(
 /// `full-coverage-consumer/src/main.rs` and `schedule-ingest/src/main.rs`'s
 /// analogous top-level loop functions, which `run_cycle` itself used to
 /// carry before this split.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them; long but linear; splitting it would scatter its shared state across helpers"
+)]
 async fn run_retention(
     pool: &sqlx::PgPool,
     retention_days: i64,
@@ -972,6 +985,7 @@ mod tests {
     use common::{
         DataQuality, LineStatus, SampleAvailability, SampleStats, Severity, ValidityPeriod,
     };
+    use std::collections::HashSet;
 
     use super::*;
 
@@ -996,7 +1010,7 @@ mod tests {
             sample_stations: vec![],
             match_keywords: vec![],
             excluded_keywords: vec![],
-            severity_overrides: Default::default(),
+            severity_overrides: HashMap::default(),
             destination_crs_filter: vec![],
             headcode_prefixes: vec![],
             full_coverage_enabled: false,
@@ -1217,10 +1231,10 @@ mod tests {
             .iter()
             .map(|id| {
                 (
-                    id.to_string(),
+                    (*id).to_string(),
                     LineStatusReport {
-                        id: id.to_string(),
-                        name: id.to_string(),
+                        id: (*id).to_string(),
+                        name: (*id).to_string(),
                         mode_name: "tube".to_string(),
                         operators: vec![],
                         statuses: vec![status_with_full_coverage_stats(Some(sample_stats()))],
@@ -1229,7 +1243,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            coverage_rollup_lines(&reports, &Default::default()).len(),
+            coverage_rollup_lines(&reports, &HashSet::default()).len(),
             2
         );
         let enforced = ["central".to_string()].into_iter().collect();

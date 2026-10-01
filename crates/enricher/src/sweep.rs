@@ -10,7 +10,7 @@ use sqlx::PgPool;
 
 use common::text_hash::text_hash;
 
-pub struct SweepRow {
+pub(crate) struct SweepRow {
     pub incident_id: String,
     pub summary: String,
     pub description: String,
@@ -25,7 +25,10 @@ pub struct SweepRow {
 /// the thin, untested DB-fetching wrapper, following this codebase's
 /// existing pattern of keeping query functions thin and testing the pure
 /// logic they feed.
-pub fn incidents_needing_extraction(rows: &[SweepRow], current_model_version: &str) -> Vec<String> {
+pub(crate) fn incidents_needing_extraction(
+    rows: &[SweepRow],
+    current_model_version: &str,
+) -> Vec<String> {
     rows.iter()
         .filter(|row| {
             let current_hash = text_hash(&row.summary, &row.description);
@@ -36,7 +39,7 @@ pub fn incidents_needing_extraction(rows: &[SweepRow], current_model_version: &s
         .collect()
 }
 
-pub async fn fetch_sweep_rows(pool: &PgPool) -> anyhow::Result<Vec<SweepRow>> {
+pub(crate) async fn fetch_sweep_rows(pool: &PgPool) -> anyhow::Result<Vec<SweepRow>> {
     let rows = sqlx::query_as::<_, SweepRowRecord>(
         "SELECT incident_id, summary, description, source_text_hash, extraction_model_version \
          FROM incidents WHERE NOT is_cleared",

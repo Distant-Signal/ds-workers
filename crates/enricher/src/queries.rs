@@ -9,7 +9,7 @@ use sqlx::PgPool;
 
 use crate::llm::ExtractionPeriod;
 
-pub struct IncidentState {
+pub(crate) struct IncidentState {
     pub summary: String,
     pub description: String,
     pub source_text_hash: Option<String>,
@@ -42,7 +42,7 @@ type IncidentStateRow = (
     Option<serde_json::Value>,
 );
 
-pub async fn fetch_incident_state(
+pub(crate) async fn fetch_incident_state(
     pool: &PgPool,
     incident_id: &str,
 ) -> anyhow::Result<Option<IncidentState>> {
@@ -116,8 +116,11 @@ pub async fn fetch_incident_state(
 /// lint would separate the guard's two halves from the five extraction
 /// fields they're guarding, for no readability win at this call's one
 /// call site (`main.rs`'s `process_incident`).
-#[allow(clippy::too_many_arguments)]
-pub async fn write_extraction(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input from the single caller; a struct would only wrap them; see the doc comment"
+)]
+pub(crate) async fn write_extraction(
     pool: &PgPool,
     incident_id: &str,
     category: &str,
@@ -160,7 +163,7 @@ pub async fn write_extraction(
 /// match a history row. `Ok(None)` if nothing matches (history purged, or a
 /// hash written by some other path) -- the caller then does a full
 /// extraction, exactly as today.
-pub async fn fetch_extracted_source_text(
+pub(crate) async fn fetch_extracted_source_text(
     pool: &PgPool,
     incident_id: &str,
     source_text_hash: &str,
@@ -195,7 +198,7 @@ pub async fn fetch_extracted_source_text(
 ///
 /// `Ok(false)` = a guard rejected it; the caller falls back to a full
 /// extraction (or acks, if the text moved -- same as a stale write).
-pub async fn carry_forward_extraction(
+pub(crate) async fn carry_forward_extraction(
     pool: &PgPool,
     incident_id: &str,
     new_text_hash: &str,
@@ -221,6 +224,10 @@ pub async fn carry_forward_extraction(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test code: scenario tests read top to bottom"
+)]
 mod tests {
     use sqlx::postgres::PgPoolOptions;
 

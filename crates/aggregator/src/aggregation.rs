@@ -34,7 +34,7 @@ use crate::queries::LoadedIncident;
 /// treats them identically to catalogue lines. Re-run every poll cycle
 /// (`main.rs`) since custom lines can be created or deleted at any time,
 /// unlike the static catalogue which is fixed at process startup.
-pub fn merge_custom_lines(
+pub(crate) fn merge_custom_lines(
     static_lines: &HashMap<String, LineDefinition>,
     custom_lines: Vec<CustomLine>,
 ) -> HashMap<String, LineDefinition> {
@@ -45,7 +45,12 @@ pub fn merge_custom_lines(
     merged
 }
 
-pub fn aggregate(
+#[expect(
+    clippy::format_push_string,
+    clippy::unwrap_used,
+    reason = "short strings off the hot path; format! reads clearer; reports holds an entry for every configured line, inserted above"
+)]
+pub(crate) fn aggregate(
     lines: &HashMap<String, LineDefinition>,
     incidents: &[LoadedIncident],
     samples: &HashMap<String, StationSample>,
@@ -121,7 +126,11 @@ pub fn aggregate(
 /// `now` is threaded in from `aggregate()`'s single `Utc::now()` rather than
 /// re-read here, so every incident in one aggregation pass is judged against
 /// the same instant that `is_active` already filtered them by.
-fn status_from_incident(m: &Match, loaded: &LoadedIncident, now: DateTime<Utc>) -> LineStatus {
+#[expect(
+    clippy::format_push_string,
+    reason = "short strings off the hot path; format! reads clearer"
+)]
+fn status_from_incident(m: &Match<'_>, loaded: &LoadedIncident, now: DateTime<Utc>) -> LineStatus {
     let incident = &loaded.message;
     let base_severity = severity_from_incident(incident);
     let (extracted_severity, extraction_annotation) = apply_extraction(base_severity, loaded, now);
@@ -203,7 +212,7 @@ fn validity_for_output(periods: &[ValidityPeriod]) -> ValidityPeriod {
 /// incident is included at all) so the "is this period active" condition
 /// has one definition, not two.
 fn period_covers_now(period: &ValidityPeriod, now: DateTime<Utc>) -> bool {
-    period.from_date <= now && period.to_date.map(|to| to > now).unwrap_or(true)
+    period.from_date <= now && period.to_date.is_none_or(|to| to > now)
 }
 
 /// Whether an incident should still contribute a `LineStatus` to any line
@@ -392,7 +401,7 @@ fn severity_from_incident(incident: &IncidentMessage) -> Severity {
 /// Measured with `common::severity_rank`, NOT `Severity`'s discriminant.
 /// This used to read `severity.max(Severity::SevereDelays)`, which is the
 /// same non-monotonic-ordering bug `apply_extraction` below was already
-/// fixed for (see `severity_rank`'s own docs): TfL's `statusSeverity` codes
+/// fixed for (see `severity_rank`'s own docs): `TfL`'s `statusSeverity` codes
 /// aren't monotonic with real severity, so `Diverted = 21` and
 /// `PartClosed = 11` compare as "mild" against `SevereDelays = 16` /
 /// `MinorDelays = 19` and escaped demotion entirely -- an operator-wide
@@ -583,13 +592,15 @@ fn elapsed_annotation(period: &ExtractionPeriod) -> String {
         .as_ref()
         .and_then(|range| range.to_date.as_deref())
         .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|dt| {
-            format!(
-                "expected to end by {}",
-                dt.with_timezone(&chrono_tz::Europe::London).format("%H:%M")
-            )
-        })
-        .unwrap_or_else(|| "reported period has ended".to_string());
+        .map_or_else(
+            || "reported period has ended".to_string(),
+            |dt| {
+                format!(
+                    "expected to end by {}",
+                    dt.with_timezone(&chrono_tz::Europe::London).format("%H:%M")
+                )
+            },
+        );
     scope_qualify(period, text)
 }
 
@@ -601,6 +612,10 @@ fn elapsed_annotation(period: &ExtractionPeriod) -> String {
 /// `days_of_week` is matched against the day the *active window instance
 /// started on*, which for an overnight window in its early-morning tail is
 /// yesterday, not today. See the `window_start_date` comment below.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "number_from_monday is 1..=7"
+)]
 fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
     // An empty `days_of_week` is degenerate/malformed extraction data (the
     // enricher's JSON schema permits it -- no `minItems` constraint), not a
@@ -922,7 +937,7 @@ pub(crate) fn sampled_stations(lines: &HashMap<String, LineDefinition>) -> Vec<S
 ///
 /// # Why this exists
 ///
-/// `station_samples` is keyed by CRS and UPSERTed in place, so a stalled
+/// `station_samples` is keyed by CRS and `UPSERTed` in place, so a stalled
 /// `poller-ldbws` leaves its last snapshot sitting in the table forever with
 /// no outward sign of being dead. `polled_at` was loaded but never checked
 /// against the clock, and both consumers treated that frozen snapshot as
@@ -1032,31 +1047,41 @@ pub(crate) fn stats_from_departures(
 /// reason" pass at line 777, and `dedup::dedup_new_sample_stats`) is "give
 /// me the relevant departures," and a second return channel would change
 /// its signature for two callers that don't need the distinction.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "collection lengths stay far below i64::MAX"
+)]
 fn compute_sample_availability(
     line: &LineDefinition,
     samples: &HashMap<String, StationSample>,
     defaults: &Defaults,
-) -> common::SampleAvailability {
+) -> SampleAvailability {
     let thresholds = thresholds_for(defaults, &line.severity_overrides);
     let has_any_row = line
         .sample_stations
         .iter()
         .any(|crs| samples.contains_key(crs));
     if !has_any_row {
-        return common::SampleAvailability::NoCoverage;
+        return SampleAvailability::NoCoverage;
     }
 
     let relevant = relevant_departures(line, samples);
     if (relevant.len() as i64) < thresholds.min_sample_size {
-        return common::SampleAvailability::BelowThreshold {
+        return SampleAvailability::BelowThreshold {
             observed: relevant.len(),
             required: thresholds.min_sample_size,
         };
     }
 
-    common::SampleAvailability::Available(stats_from_departures(&relevant, line, &thresholds))
+    SampleAvailability::Available(stats_from_departures(&relevant, line, &thresholds))
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::format_push_string,
+    clippy::similar_names,
+    reason = "counts stay far below 2^52, so the f64 ratio is exact; short strings off the hot path; format! reads clearer; the similar names are distinct domain terms"
+)]
 fn infer_from_samples(
     line: &LineDefinition,
     samples: &HashMap<String, StationSample>,
@@ -1198,6 +1223,11 @@ struct ClassifyCounts {
     skipped: usize,
 }
 
+#[expect(
+    clippy::match_same_arms,
+    clippy::needless_pass_by_value,
+    reason = "separate arms document distinct cases; callers hand over values they no longer need"
+)]
 fn classify(counts: ClassifyCounts, thresholds: &Defaults) -> (Severity, String) {
     let ClassifyCounts {
         cancel_rate,
@@ -1299,6 +1329,10 @@ fn escalate_from_sample_stats(
 /// reuse the identical rate computation and `classify()` call regardless
 /// of which producer's `SampleStats` is being judged. Pure refactor --
 /// `escalate_from_sample_stats`'s own behavior is unchanged by this split.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "counts stay far below 2^52, so the f64 ratio is exact"
+)]
 fn classify_stats(stats: &SampleStats, thresholds: &Defaults) -> (Severity, String) {
     let cancel_rate = stats.cancelled as f64 / stats.total as f64;
     let delay_rate = stats.delayed as f64 / stats.total as f64;
@@ -1323,7 +1357,7 @@ fn classify_stats(stats: &SampleStats, thresholds: &Defaults) -> (Severity, Stri
 /// Differs only in the reason-annotation prefix, so a reader can tell
 /// which producer supplied the escalating number. See
 /// docs/superpowers/specs/2026-09-03-full-coverage-metrics-transition-design.md
-/// Decision 3's "escalate_from_coverage_stats... never demoting below
+/// Decision 3's "`escalate_from_coverage_stats`... never demoting below
 /// whatever Knowledgebase/Planned already established -- identical
 /// escalate-only posture to today's rule, one level stronger."
 fn escalate_from_coverage_stats(
@@ -1400,6 +1434,10 @@ fn escalate_from_coverage_stats(
 /// `coverage_severity != GoodService` guard is subsumed by the rank check --
 /// `GoodService` has rank 0, so it can never be strictly higher than
 /// anything.
+#[expect(
+    clippy::format_push_string,
+    reason = "short strings off the hot path; format! reads clearer"
+)]
 fn merge_full_coverage_stats(
     report: &mut LineStatusReport,
     stats: &SampleStats,
@@ -1414,7 +1452,7 @@ fn merge_full_coverage_stats(
         if no_incident_present && severity_rank(coverage_severity) > severity_rank(status.severity)
         {
             status.severity = coverage_severity;
-            status.reason = coverage_reason.clone();
+            status.reason.clone_from(&coverage_reason);
             status.data_quality = DataQuality::TrustInferred;
         } else {
             let (escalated, annotation) =
@@ -1514,6 +1552,12 @@ fn most_common<'a>(items: &[&'a str]) -> Option<&'a str> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    reason = "test code: casts of small known test values; helpers take owned fixtures; paired test values share names"
+)]
 mod tests {
     use super::*;
 
@@ -1537,8 +1581,8 @@ mod tests {
             incident_id: id.to_string(),
             summary: summary.to_string(),
             description: description.to_string(),
-            operators: operators.iter().map(|s| s.to_string()).collect(),
-            affected_stations: affected_stations.iter().map(|s| s.to_string()).collect(),
+            operators: operators.iter().map(ToString::to_string).collect(),
+            affected_stations: affected_stations.iter().map(ToString::to_string).collect(),
             priority: 0,
             validity: vec![],
             is_planned: false,
@@ -1810,12 +1854,12 @@ mod tests {
     fn validity_for_output_picks_the_currently_active_period() {
         let now = Utc::now();
         let expired = ValidityPeriod {
-            from_date: now - chrono::Duration::days(2),
-            to_date: Some(now - chrono::Duration::days(1)),
+            from_date: now - Duration::days(2),
+            to_date: Some(now - Duration::days(1)),
             is_now: false,
         };
         let active = ValidityPeriod {
-            from_date: now - chrono::Duration::hours(1),
+            from_date: now - Duration::hours(1),
             to_date: None,
             is_now: true,
         };
@@ -1827,7 +1871,7 @@ mod tests {
     fn validity_for_output_falls_back_to_first_when_none_are_active() {
         let now = Utc::now();
         let future = ValidityPeriod {
-            from_date: now + chrono::Duration::days(1),
+            from_date: now + Duration::days(1),
             to_date: None,
             is_now: false,
         };
@@ -3993,7 +4037,7 @@ mod tests {
             first_seen_at: Utc::now(),
             extracted_periods: Some(periods),
         };
-        let m = common::matcher::Match {
+        let m = Match {
             line: alton,
             scope: MatchScope::ExclusiveSegment,
             evidence: common::matcher::Evidence {

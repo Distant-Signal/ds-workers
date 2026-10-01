@@ -37,7 +37,7 @@ use common::{
 use sqlx::{PgPool, Row};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum WindowMode {
+pub(crate) enum WindowMode {
     /// Today's behaviour, exactly.
     #[default]
     Off,
@@ -48,7 +48,7 @@ pub enum WindowMode {
 }
 
 impl WindowMode {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             WindowMode::Off => "off",
             WindowMode::Shadow => "shadow",
@@ -72,7 +72,7 @@ fn non_negative_days(s: &str) -> anyhow::Result<i64> {
 /// The aggregator's windowed full-coverage settings. **All off by
 /// default.**
 #[derive(Debug, Clone, clap::Args)]
-pub struct WindowArgs {
+pub(crate) struct WindowArgs {
     /// `off` (default), `shadow` or `enforce` -- see this module's doc.
     #[arg(
         long = "full-coverage-window-mode",
@@ -99,13 +99,13 @@ pub struct WindowArgs {
 
 /// `FULL_COVERAGE_WINDOW_ENFORCE_LINES`, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Allowlist {
+pub(crate) enum Allowlist {
     All,
     Lines(HashSet<String>),
 }
 
 impl Allowlist {
-    pub fn parse(value: &str) -> Self {
+    pub(crate) fn parse(value: &str) -> Self {
         if value.trim() == "*" {
             return Allowlist::All;
         }
@@ -119,7 +119,7 @@ impl Allowlist {
         )
     }
 
-    pub fn contains(&self, line_id: &str) -> bool {
+    pub(crate) fn contains(&self, line_id: &str) -> bool {
         match self {
             Allowlist::All => true,
             Allowlist::Lines(lines) => lines.contains(line_id),
@@ -128,14 +128,14 @@ impl Allowlist {
 }
 
 #[derive(Debug, Clone)]
-pub struct WindowSettings {
+pub(crate) struct WindowSettings {
     pub mode: WindowMode,
     pub allowlist: Allowlist,
     pub min_rank: u8,
 }
 
 impl WindowSettings {
-    pub fn from_args(args: &WindowArgs) -> Self {
+    pub(crate) fn from_args(args: &WindowArgs) -> Self {
         Self {
             mode: args.mode,
             allowlist: Allowlist::parse(&args.full_coverage_window_enforce_lines),
@@ -144,7 +144,11 @@ impl WindowSettings {
     }
 
     /// Whether `enforce` may change `line`.
-    pub fn enforces(&self, line: &LineDefinition, full_coverage_enabled_default: bool) -> bool {
+    pub(crate) fn enforces(
+        &self,
+        line: &LineDefinition,
+        full_coverage_enabled_default: bool,
+    ) -> bool {
         self.mode == WindowMode::Enforce
             && (line.full_coverage_enabled || full_coverage_enabled_default)
             && self.allowlist.contains(&line.id)
@@ -153,14 +157,14 @@ impl WindowSettings {
 
 /// One stored window bucket.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StoredWindow {
+pub(crate) struct StoredWindow {
     pub bucket_start: DateTime<Utc>,
     pub row: FullCoverageWindowStatsRow,
 }
 
 /// A line's newest windows.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct LineWindows {
+pub(crate) struct LineWindows {
     pub recent: Option<StoredWindow>,
     pub day_to_date: Option<StoredWindow>,
 }
@@ -168,7 +172,7 @@ pub struct LineWindows {
 /// What was decided about one line's `recent` window this cycle -- one
 /// `full_coverage_window_verdicts` row.
 #[derive(Debug, Clone, PartialEq)]
-pub struct VerdictRecord {
+pub(crate) struct VerdictRecord {
     pub line_id: String,
     pub bucket_start: DateTime<Utc>,
     pub evaluated_at: DateTime<Utc>,
@@ -201,7 +205,7 @@ fn worst_severity(report: &LineStatusReport) -> Severity {
 /// or above the rank gate that is strictly worse than the status raises it
 /// -- replacing an LDBWS-inferred status (as `TrustInferred`), or annotating
 /// an incident's reason. Never lowers anything.
-pub fn apply_windows(
+pub(crate) fn apply_windows(
     reports: &mut HashMap<String, LineStatusReport>,
     lines: &HashMap<String, LineDefinition>,
     windows: &HashMap<String, LineWindows>,
@@ -280,6 +284,10 @@ pub fn apply_windows(
 
 /// Applies one eligible-or-not verdict to every status of an allow-listed
 /// line. Returns whether any status's severity was raised.
+#[expect(
+    clippy::format_push_string,
+    reason = "short strings off the hot path; format! reads clearer"
+)]
 fn enforce_on(
     report: &mut LineStatusReport,
     counts: &FullCoverageWindowCounts,
@@ -305,7 +313,7 @@ fn enforce_on(
         }
         status.severity = *severity;
         if status.data_quality == DataQuality::LdbwsInferred {
-            status.reason = reason.clone();
+            status.reason.clone_from(reason);
             status.data_quality = DataQuality::TrustInferred;
         } else {
             status
@@ -321,7 +329,7 @@ fn enforce_on(
 /// minutes (the staleness check proper is `computed_at` vs now, in
 /// `classify_full_coverage_window`). A row that fails to decode is skipped
 /// and logged, not fatal.
-pub async fn load_full_coverage_windows(
+pub(crate) async fn load_full_coverage_windows(
     pool: &PgPool,
     now: DateTime<Utc>,
 ) -> anyhow::Result<HashMap<String, LineWindows>> {
@@ -356,6 +364,10 @@ pub async fn load_full_coverage_windows(
     Ok(windows)
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "clamped to >= 0 first; the columns hold small counts and versions"
+)]
 fn stored_window(row: &sqlx::postgres::PgRow) -> anyhow::Result<StoredWindow> {
     let uint =
         |name: &str| -> anyhow::Result<u32> { Ok(row.try_get::<i32, _>(name)?.max(0) as u32) };
@@ -396,7 +408,10 @@ fn severity_db(severity: Severity) -> i16 {
 
 /// Upserts this cycle's verdicts, one row per `(line_id, bucket_start)`;
 /// the latest evaluation of a bucket wins.
-pub async fn write_verdicts(pool: &PgPool, records: &[VerdictRecord]) -> anyhow::Result<u64> {
+pub(crate) async fn write_verdicts(
+    pool: &PgPool,
+    records: &[VerdictRecord],
+) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
     let mut written = 0u64;
     for record in records {
@@ -459,7 +474,7 @@ pub async fn write_verdicts(pool: &PgPool, records: &[VerdictRecord]) -> anyhow:
 /// its `*_bucket` index) and its `DELETE` skipped when nothing is due, and
 /// each `DELETE` runs in its own transaction under
 /// `queries::RETENTION_STATEMENT_TIMEOUT`.
-pub async fn prune_full_coverage_window_stats(
+pub(crate) async fn prune_full_coverage_window_stats(
     pool: &PgPool,
     retention_days: i64,
 ) -> anyhow::Result<u64> {
@@ -491,7 +506,7 @@ pub async fn prune_full_coverage_window_stats(
 }
 
 /// Every counter an alert or dashboard would key on, at 0.
-pub fn init_metrics() {
+pub(crate) fn init_metrics() {
     for verdict in [
         "missing",
         "good",
@@ -654,7 +669,7 @@ mod tests {
         );
         let lines = ["severe", "minor", "incident"]
             .iter()
-            .map(|id| (id.to_string(), line(id, false)))
+            .map(|id| ((*id).to_string(), line(id, false)))
             .collect();
         let mut windows = HashMap::new();
         windows.insert("severe".to_string(), window("severe", 12, 7, 0));
@@ -691,7 +706,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&f.reports).unwrap(), before);
     }
 
-    /// Shadow: no LineStatus field changes, but every line's verdict --
+    /// Shadow: no `LineStatus` field changes, but every line's verdict --
     /// including the lower-tier would-escalate, flagged below the gate --
     /// is recorded.
     #[test]

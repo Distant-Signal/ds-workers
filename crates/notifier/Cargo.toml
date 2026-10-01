@@ -1,7 +1,9 @@
 [package]
 name = "notifier"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 health-http = { path = "../health-http" }
@@ -43,3 +45,6 @@ tokio = { version = "1.52.3", features = ["test-util"] }
 # Only the query-count tests' `SqlxQueryCounter` layer; the binary's own
 # subscriber is `common::logging`.
 tracing-subscriber = "0.3.23"
+
+[lints]
+workspace = true
