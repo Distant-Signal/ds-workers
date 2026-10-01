@@ -342,7 +342,7 @@ mod tests {
     use super::*;
 
     fn lines_dir() -> String {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        common::manifest_dir!()
             .join("../../lines")
             .to_str()
             .expect("utf8 lines dir path")

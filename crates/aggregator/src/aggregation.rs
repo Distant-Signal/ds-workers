@@ -1500,10 +1500,9 @@ fn most_common<'a>(items: &[&'a str]) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn load_all_lines() -> HashMap<String, LineDefinition> {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lines");
+        let dir = common::manifest_dir!().join("../../lines");
         LineDefinition::from_dir(&dir)
             .expect("lines/ directory should parse")
             .into_iter()
