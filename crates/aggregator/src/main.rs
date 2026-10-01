@@ -429,6 +429,27 @@ async fn run_cycle(
     let registry = SegmentRegistry::new(&lines);
 
     let incidents = queries::load_incidents(pool).await?;
+    // Rows for stations no line samples any more (the catalogue dropped
+    // them) are never refreshed, so they would otherwise sit in the table
+    // and be reported as stale every cycle. Fail-open: a failed prune only
+    // means they are dropped as stale below, as before.
+    match queries::prune_orphaned_station_samples(
+        pool,
+        &aggregation::sampled_stations(&lines),
+        aggregation::MAX_SAMPLE_AGE_MINUTES,
+    )
+    .await
+    {
+        Ok(pruned) if !pruned.is_empty() => tracing::info!(
+            stations = ?pruned,
+            "deleted station_samples rows for stations no line samples any more"
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            error = ?err,
+            "failed to prune orphaned station_samples rows; will retry next cycle"
+        ),
+    }
     let mut samples = queries::load_station_samples(pool).await?;
     // Freshness gate on the LDBWS snapshot BEFORE anything reads it, so both
     // consumers below -- `aggregation::aggregate`'s severity inference and

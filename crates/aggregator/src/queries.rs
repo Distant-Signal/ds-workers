@@ -194,6 +194,45 @@ pub async fn load_station_samples(pool: &PgPool) -> Result<HashMap<String, Stati
         .collect())
 }
 
+/// Deletes `station_samples` rows for stations no line samples any more
+/// (`sampled` is every line's `sample_stations`, static and custom),
+/// returning their CRS codes, sorted.
+///
+/// `station_samples` is keyed by CRS and only ever upserted, so when a
+/// station leaves the catalogue its last row stays forever. In production
+/// DDG and WNE, dropped from `lines/*.toml` on 2026-09-21 (DDG replaced by
+/// LMS on the WMR Snow Hill line; WNE a mistagged Windermere, now WDM),
+/// sat there from 2026-09-22 on, and every aggregator cycle logged them as
+/// stale samples. Nothing reads them for inference (lines only look up
+/// their own `sample_stations`), but `api`'s departure board and the
+/// notifier's skip check read rows by CRS and would serve the frozen board.
+///
+/// Only rows older than `min_age_minutes` go, so a station a newer `api`
+/// has just started sampling (a catalogue change rolling out, or a custom
+/// line created since this cycle loaded the lines) is not deleted while
+/// still live. An empty `sampled` deletes nothing rather than everything.
+pub async fn prune_orphaned_station_samples(
+    pool: &PgPool,
+    sampled: &[String],
+    min_age_minutes: i64,
+) -> Result<Vec<String>> {
+    if sampled.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pruned: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM station_samples \
+         WHERE crs::text <> ALL($1::text[]) \
+           AND polled_at < NOW() - make_interval(mins => $2::int) \
+         RETURNING crs::text",
+    )
+    .bind(sampled)
+    .bind(i32::try_from(min_age_minutes)?)
+    .fetch_all(pool)
+    .await?;
+    pruned.sort();
+    Ok(pruned)
+}
+
 /// Deserializes one `custom_lines` row -- see `incident_from_row`.
 fn custom_line_from_row(row: &sqlx::postgres::PgRow) -> Result<common::CustomLine> {
     Ok(common::CustomLine {
@@ -1666,6 +1705,75 @@ mod tests {
             after_re_extraction,
             Some(periods_b),
             "re-extraction for the new text must apply as soon as it is written"
+        );
+    }
+
+    /// The production case (2026-10-01): DDG and WNE left the catalogue on
+    /// 2026-09-21 but their rows stayed, reported stale every cycle. Rows
+    /// for unsampled stations older than the limit go; sampled stations
+    /// (however old) and recent unsampled ones (a station another `api`
+    /// version has just started sampling) stay; an empty set prunes nothing.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_orphaned_station_samples_deletes_only_old_unsampled_rows \
+                -- --ignored --test-threads=1`"]
+    async fn prune_orphaned_station_samples_deletes_only_old_unsampled_rows() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        let fixtures = ["ZQA", "ZQB", "ZQC", "ZQD"];
+        let cleanup = || async {
+            sqlx::query("DELETE FROM station_samples WHERE crs::text = ANY($1::text[])")
+                .bind(&fixtures[..])
+                .execute(&pool)
+                .await
+                .expect("cleanup fixture rows");
+        };
+        cleanup().await;
+        sqlx::query(
+            "INSERT INTO station_samples (crs, polled_at, departures) VALUES \
+                ('ZQA', NOW() - interval '9 days', '[]'), \
+                ('ZQB', NOW() - interval '9 days', '[]'), \
+                ('ZQC', NOW() - interval '1 minute', '[]'), \
+                ('ZQD', NOW() - interval '9 days', '[]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+        let remaining = || async {
+            let mut crs: Vec<String> = sqlx::query_scalar(
+                "SELECT crs::text FROM station_samples WHERE crs::text = ANY($1::text[])",
+            )
+            .bind(&fixtures[..])
+            .fetch_all(&pool)
+            .await
+            .expect("read fixture rows");
+            crs.sort();
+            crs
+        };
+
+        let nothing = prune_orphaned_station_samples(&pool, &[], 15).await;
+        let after_nothing = remaining().await;
+        // ZQD stands in for every real sampled station in a shared test DB.
+        let sampled = ["ZQD".to_string()];
+        let pruned = prune_orphaned_station_samples(&pool, &sampled, 15).await;
+        let after = remaining().await;
+        cleanup().await;
+
+        assert_eq!(nothing.expect("prune"), Vec::<String>::new());
+        assert_eq!(after_nothing, vec!["ZQA", "ZQB", "ZQC", "ZQD"]);
+        let pruned = pruned.expect("prune");
+        assert!(
+            pruned.contains(&"ZQA".to_string()) && pruned.contains(&"ZQB".to_string()),
+            "{pruned:?}"
+        );
+        assert_eq!(
+            after,
+            vec!["ZQC", "ZQD"],
+            "a recent unsampled row and an old sampled one both stay"
         );
     }
 
