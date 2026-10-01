@@ -130,6 +130,10 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_secs(config.poll_interval_secs),
     ));
 
+    // aggregator_cycles_total{cycle="aggregate",result} and
+    // aggregator_last_success_timestamp_seconds, read by the chart's
+    // DistantSignalAggregatorCycleFailing (see common::metrics::register_cycle).
+    common::metrics::register_cycle("aggregator", AGGREGATE_CYCLE);
     let mut interval = cycle_interval(Duration::from_secs(config.poll_interval_secs));
 
     loop {
@@ -146,9 +150,10 @@ async fn run() -> anyhow::Result<()> {
         )
         .await;
 
-        if let Err(err) = result {
+        if let Err(err) = &result {
             tracing::error!(error = ?err, "aggregation cycle failed; will retry next interval");
         }
+        common::metrics::record_cycle("aggregator", AGGREGATE_CYCLE, result.is_ok());
 
         // Aggregation only, since retention moved to its own task (SVC-06);
         // retention has `aggregator_retention_duration_seconds`.
@@ -171,6 +176,9 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 }
+
+/// The `cycle` label of the aggregation pass's cycle metrics.
+const AGGREGATE_CYCLE: &str = "aggregate";
 
 /// Every retention knob, copied out of `Config` for the retention task.
 #[derive(Debug, Clone, Copy)]

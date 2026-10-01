@@ -49,6 +49,13 @@ fn poll_interval(interval_secs: u64) -> tokio::time::Interval {
     interval
 }
 
+/// The `cycle` labels of the notifier's cycle metrics, one per loop below.
+const LINE_STATUS_CYCLE: &str = "line_status";
+const FORWARD_QUEUE_CYCLE: &str = "forward_queue";
+const SKIP_CHECK_CYCLE: &str = "skip_check";
+/// Hourly by default, so the chart's 15-minute alert leaves it out.
+const TEMPLATE_SWEEP_CYCLE: &str = "template_sweep";
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     common::logging::exit_code(run().await)
@@ -125,6 +132,17 @@ async fn run() -> anyhow::Result<()> {
 
     let cooldown = chrono::Duration::minutes(config.cooldown_minutes);
     let cursor_grace = chrono::Duration::seconds(config.cursor_grace_seconds);
+    // notifier_cycles_total{cycle,result} and
+    // notifier_last_success_timestamp_seconds{cycle}, read by the chart's
+    // DistantSignalNotifierCycleFailing (see common::metrics::register_cycle).
+    for cycle in [
+        LINE_STATUS_CYCLE,
+        FORWARD_QUEUE_CYCLE,
+        SKIP_CHECK_CYCLE,
+        TEMPLATE_SWEEP_CYCLE,
+    ] {
+        common::metrics::register_cycle("notifier", cycle);
+    }
     let mut interval = poll_interval(config.poll_interval_secs);
     let mut forward_interval = poll_interval(config.forward_queue_poll_interval_secs);
     let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
@@ -153,9 +171,10 @@ async fn run() -> anyhow::Result<()> {
                     cursor_grace,
                 )
                 .await;
-                if let Err(err) = result {
+                if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier cycle failed; will retry next interval");
                 }
+                common::metrics::record_cycle("notifier", LINE_STATUS_CYCLE, result.is_ok());
             }
             _ = progress.idle(forward_interval.tick()) => {
                 let result = run_forward_queue_cycle(
@@ -166,15 +185,17 @@ async fn run() -> anyhow::Result<()> {
                     cursor_grace,
                 )
                 .await;
-                if let Err(err) = result {
+                if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier forward-queue cycle failed; will retry next interval");
                 }
+                common::metrics::record_cycle("notifier", FORWARD_QUEUE_CYCLE, result.is_ok());
             }
             _ = progress.idle(skip_check_interval.tick()) => {
                 let result = run_skip_check_cycle(&pool, &queue, Utc::now()).await;
-                if let Err(err) = result {
+                if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
                 }
+                common::metrics::record_cycle("notifier", SKIP_CHECK_CYCLE, result.is_ok());
             }
             _ = progress.idle(template_sweep_interval.tick()) => {
                 let result = run_template_sweep_cycle(
@@ -184,9 +205,10 @@ async fn run() -> anyhow::Result<()> {
                     config.auto_commit_lead_minutes,
                 )
                 .await;
-                if let Err(err) = result {
+                if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier template-sweep cycle failed; will retry next interval");
                 }
+                common::metrics::record_cycle("notifier", TEMPLATE_SWEEP_CYCLE, result.is_ok());
             }
         }
     }
