@@ -269,6 +269,16 @@ pub(crate) async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::Custo
         .collect())
 }
 
+/// Every station's name (`stations`, the station reference feed), for
+/// resolving "No trains between X and Y" against a line
+/// (`no_trains::closed_section`). About 2,600 short rows.
+pub(crate) async fn load_station_names(pool: &PgPool) -> Result<crate::no_trains::StationNames> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT crs::text, name FROM stations")
+        .fetch_all(pool)
+        .await?;
+    Ok(crate::no_trains::StationNames::new(rows))
+}
+
 /// Every `full_coverage_line_stats` row with `availability = 'available'`
 /// AND `service_date = today`. A stale (yesterday's) or still-`pending`
 /// row is simply absent from the returned map --
@@ -2098,7 +2108,14 @@ mod tests {
             .expect("pre-test cleanup of line_status");
 
         // Cycle 1.
-        let reports1 = aggregate(&lines, &no_incidents, &samples, &registry, &defaults);
+        let reports1 = aggregate(
+            &lines,
+            &no_incidents,
+            &samples,
+            &registry,
+            &defaults,
+            &crate::no_trains::StationNames::default(),
+        );
         let report1 = reports1.get(LINE_ID).expect("line should have a report");
         assert_eq!(
             report1.statuses[0].data_quality,
@@ -2123,7 +2140,14 @@ mod tests {
 
         // Cycle 2: identical samples (a real re-poll of the same ongoing,
         // unchanged disruption), but a later, distinct Utc::now() internally.
-        let reports2 = aggregate(&lines, &no_incidents, &samples, &registry, &defaults);
+        let reports2 = aggregate(
+            &lines,
+            &no_incidents,
+            &samples,
+            &registry,
+            &defaults,
+            &crate::no_trains::StationNames::default(),
+        );
         let report2 = reports2.get(LINE_ID).expect("line should have a report");
         let fresh_from_date_cycle_2 = serde_json::to_value(report2.statuses[0].validity.from_date)
             .expect("serialize fresh from_date");

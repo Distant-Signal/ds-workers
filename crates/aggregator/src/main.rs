@@ -12,6 +12,7 @@ mod archive_expiry;
 mod config;
 mod dedup;
 mod full_coverage_window;
+mod no_trains;
 mod queries;
 
 use std::collections::HashMap;
@@ -101,7 +102,14 @@ async fn run() -> anyhow::Result<()> {
         .collect();
     tracing::info!(count = static_lines.len(), "loaded static line catalogue");
 
-    let defaults = Defaults::default();
+    let defaults = Defaults {
+        // FULL_COVERAGE_SPARSE_MIN_CANCELLED: the chart's knob for rule A;
+        // a line's severity_overrides still win over it.
+        full_coverage_sparse_min_cancelled: config
+            .full_coverage_window
+            .full_coverage_sparse_min_cancelled,
+        ..Defaults::default()
+    };
 
     // Lives for the whole process, threaded into every cycle -- this is
     // exactly what makes the dedup ledger "in-memory, restart-scoped"
@@ -468,7 +476,23 @@ async fn run_cycle(
     // the same live-only view. See `aggregation::drop_stale_samples`.
     let stale_samples_dropped = aggregation::drop_stale_samples(&mut samples, chrono::Utc::now());
 
-    let mut reports = aggregation::aggregate(&lines, &incidents, &samples, &registry, defaults);
+    // Station names resolve "No trains between X and Y" against each
+    // matched line (`no_trains`). Fail-open: without them such incidents
+    // are classified exactly as before.
+    let station_names = queries::load_station_names(pool)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = ?err, "failed to load station names; \"no trains between\" incidents are not resolved this cycle");
+            no_trains::StationNames::default()
+        });
+    let mut reports = aggregation::aggregate(
+        &lines,
+        &incidents,
+        &samples,
+        &registry,
+        defaults,
+        &station_names,
+    );
     // Layer 3 (Decision 3): merges a per-line materialized full-coverage
     // signal onto the reports Layer 1/2 already built. `full-coverage-consumer`
     // (docs/superpowers/plans/2026-09-04-option-b-live-consumer-plan.md,

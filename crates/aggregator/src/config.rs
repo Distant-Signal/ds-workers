@@ -443,6 +443,11 @@ mod tests {
         assert_eq!(window.full_coverage_window_enforce_lines, "");
         assert_eq!(window.full_coverage_window_min_escalation_rank, 4);
         assert_eq!(window.full_coverage_window_stats_retention_days, 14);
+        assert_eq!(
+            window.full_coverage_window_sparse_enforce_lines, "",
+            "sparse all-cancelled verdicts are shadow-only by default"
+        );
+        assert_eq!(window.full_coverage_sparse_min_cancelled, 2);
     }
 
     #[test]

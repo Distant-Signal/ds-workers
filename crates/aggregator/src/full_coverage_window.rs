@@ -27,11 +27,19 @@
 //!   notice that is not in effect stays as published; when nothing on the
 //!   line is in effect, an enforced verdict is shown as its own
 //!   `TrustInferred` status instead.
+//! - **Sparse all-cancelled verdicts** (rule A, user decision 2026-10-02:
+//!   `EscalationBasis::SparseAllCancelled`, a window below the sample size
+//!   in which every train was cancelled) have their OWN allowlist,
+//!   `FULL_COVERAGE_WINDOW_SPARSE_ENFORCE_LINES` (empty by default), in
+//!   place of `FULL_COVERAGE_WINDOW_ENFORCE_LINES`: they are always
+//!   recorded, but enforced only on the lines named there, so the rule can
+//!   stay shadow-only while the pilot enforces the rate tiers.
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use common::full_coverage_window::{
+    EscalationBasis, FULL_COVERAGE_SPARSE_MIN_CANCELLED,
     FULL_COVERAGE_WINDOW_DEFAULT_MIN_ESCALATION_RANK, WindowVerdict, classify_full_coverage_window,
     escalation_decision,
 };
@@ -99,6 +107,20 @@ pub(crate) struct WindowArgs {
     /// Delays and Reduced Service.
     #[arg(long, env, default_value_t = FULL_COVERAGE_WINDOW_DEFAULT_MIN_ESCALATION_RANK)]
     pub full_coverage_window_min_escalation_rank: u8,
+    /// Lines `enforce` may change with a SPARSE all-cancelled verdict (a
+    /// window below the sample size in which every train was cancelled):
+    /// a comma list, or `*` for every full-coverage-enabled line. Separate
+    /// from `FULL_COVERAGE_WINDOW_ENFORCE_LINES`, which no longer covers
+    /// those verdicts. EMPTY by default: sparse verdicts are recorded
+    /// (shadow) but never shown.
+    #[arg(long, env, default_value = "")]
+    pub full_coverage_window_sparse_enforce_lines: String,
+    /// The default of `Defaults::full_coverage_sparse_min_cancelled`: a
+    /// sparse window needs at least this many cancelled trains, all of
+    /// them (a line's `severity_overrides` may still set its own). 0 turns
+    /// the sparse rule off.
+    #[arg(long, env, default_value_t = FULL_COVERAGE_SPARSE_MIN_CANCELLED)]
+    pub full_coverage_sparse_min_cancelled: i64,
     /// Retention of `full_coverage_line_window_stats` and
     /// `full_coverage_window_verdicts`. Pruned in every mode.
     #[arg(long, env, default_value_t = 14, value_parser = non_negative_days)]
@@ -139,6 +161,9 @@ impl Allowlist {
 pub(crate) struct WindowSettings {
     pub mode: WindowMode,
     pub allowlist: Allowlist,
+    /// `FULL_COVERAGE_WINDOW_SPARSE_ENFORCE_LINES`: where a sparse
+    /// all-cancelled verdict may change a line.
+    pub sparse_allowlist: Allowlist,
     pub min_rank: u8,
 }
 
@@ -147,11 +172,13 @@ impl WindowSettings {
         Self {
             mode: args.mode,
             allowlist: Allowlist::parse(&args.full_coverage_window_enforce_lines),
+            sparse_allowlist: Allowlist::parse(&args.full_coverage_window_sparse_enforce_lines),
             min_rank: args.full_coverage_window_min_escalation_rank,
         }
     }
 
-    /// Whether `enforce` may change `line`.
+    /// Whether `enforce` may change `line` (rate-based verdicts, and the
+    /// counts shown on every status).
     pub(crate) fn enforces(
         &self,
         line: &LineDefinition,
@@ -161,6 +188,24 @@ impl WindowSettings {
             && (line.full_coverage_enabled || full_coverage_enabled_default)
             && self.allowlist.contains(&line.id)
     }
+
+    /// Whether `enforce` may raise `line` with a sparse all-cancelled
+    /// verdict: the same conditions, under the sparse allowlist.
+    pub(crate) fn enforces_sparse(
+        &self,
+        line: &LineDefinition,
+        full_coverage_enabled_default: bool,
+    ) -> bool {
+        self.mode == WindowMode::Enforce
+            && (line.full_coverage_enabled || full_coverage_enabled_default)
+            && self.sparse_allowlist.contains(&line.id)
+    }
+}
+
+/// A metric label for an optional basis: `none` for a verdict that is not
+/// an escalation.
+fn basis_label(basis: Option<EscalationBasis>) -> &'static str {
+    basis.map_or("none", EscalationBasis::as_str)
 }
 
 /// The lines full coverage covers: every line except users' custom lines.
@@ -205,9 +250,14 @@ pub(crate) struct VerdictRecord {
     pub window_computed_at: DateTime<Utc>,
     pub mode: WindowMode,
     pub verdict: WindowVerdict,
+    /// The rule behind an `Escalate` verdict (`verdict.basis()`); stored in
+    /// the `basis` column.
+    pub basis: Option<EscalationBasis>,
     pub current_severity: Severity,
     pub would_escalate_to: Option<Severity>,
     pub below_min_rank: bool,
+    /// The line is in the allowlist that governs this verdict: the sparse
+    /// one for a sparse all-cancelled verdict, the main one otherwise.
     pub in_allowlist: bool,
     pub enforced: bool,
 }
@@ -234,6 +284,10 @@ fn worst_severity(report: &LineStatusReport, now: DateTime<Utc>) -> Severity {
 /// or above the rank gate that is strictly worse than the status raises it
 /// -- replacing an LDBWS-inferred status (as `TrustInferred`), or annotating
 /// an incident's reason. Never lowers anything.
+///
+/// A sparse all-cancelled verdict raises a line only when the line is in
+/// the SPARSE allowlist; on a line only in the main allowlist it is
+/// recorded and its counts are shown, but nothing is raised.
 pub(crate) fn apply_windows(
     reports: &mut HashMap<String, LineStatusReport>,
     lines: &HashMap<String, LineDefinition>,
@@ -255,10 +309,12 @@ pub(crate) fn apply_windows(
             continue;
         };
         let enforce = settings.enforces(line, full_coverage_enabled_default);
+        let enforce_sparse = settings.enforces_sparse(line, full_coverage_enabled_default);
         let Some(recent) = windows.get(line_id).and_then(|w| w.recent.as_ref()) else {
             metrics::counter!(
                 common::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
-                "verdict" => "missing"
+                "verdict" => "missing",
+                "basis" => basis_label(None)
             )
             .increment(1);
             if enforce {
@@ -272,9 +328,26 @@ pub(crate) fn apply_windows(
         let verdict = classify_full_coverage_window(&recent.row, &thresholds, now);
         let current = worst_severity(report, now);
         let decision = escalation_decision(&verdict, current, settings.min_rank);
+        let basis = verdict.basis();
+        // Which allowlist may raise the line with this verdict.
+        let may_raise = if basis == Some(EscalationBasis::SparseAllCancelled) {
+            enforce_sparse
+        } else {
+            enforce
+        };
         let mut enforced = false;
-        if enforce {
-            enforced = enforce_on(report, &recent.row.counts, &verdict, settings.min_rank, now);
+        if enforce || may_raise {
+            enforced = enforce_on(
+                report,
+                &recent.row.counts,
+                &verdict,
+                Enforcement {
+                    show_counts: enforce,
+                    may_raise,
+                },
+                settings.min_rank,
+                now,
+            );
         }
         let label = match &verdict {
             WindowVerdict::Ineligible(reason) => reason.as_str(),
@@ -282,7 +355,8 @@ pub(crate) fn apply_windows(
         };
         metrics::counter!(
             common::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
-            "verdict" => label
+            "verdict" => label,
+            "basis" => basis_label(basis)
         )
         .increment(1);
         if let Some(severity) = decision.would_escalate_to {
@@ -290,7 +364,8 @@ pub(crate) fn apply_windows(
                 common::metrics::metric_name("aggregator_full_coverage_window_escalations_total"),
                 "severity" => severity.description(),
                 "mode" => if enforced { "enforce" } else { "shadow" },
-                "below_min_rank" => if decision.below_min_rank { "true" } else { "false" }
+                "below_min_rank" => if decision.below_min_rank { "true" } else { "false" },
+                "basis" => basis_label(basis)
             )
             .increment(1);
         }
@@ -301,20 +376,36 @@ pub(crate) fn apply_windows(
             window_computed_at: recent.row.computed_at,
             mode: settings.mode,
             verdict,
+            basis,
             current_severity: current,
             would_escalate_to: decision.would_escalate_to,
             below_min_rank: decision.below_min_rank,
-            in_allowlist: enforce,
+            in_allowlist: may_raise,
             enforced,
         });
     }
     records
 }
 
+/// What `enforce` may do to one line with one verdict.
+#[derive(Debug, Clone, Copy)]
+struct Enforcement {
+    /// The line is in the main allowlist: its statuses show the window's
+    /// counts and availability (in place of the legacy whole-day merge).
+    show_counts: bool,
+    /// The allowlist governing this verdict's basis names the line: the
+    /// verdict may raise a status.
+    may_raise: bool,
+}
+
 /// Applies one eligible-or-not verdict to every status of an allow-listed
 /// line, raising only the statuses in effect at `now`. When none is, an
 /// enforced verdict is added as its own `TrustInferred` status. Returns
 /// whether any severity was raised (or added).
+///
+/// A line only in the sparse allowlist keeps its legacy counts
+/// (`show_counts` false) and is only raised; a line only in the main
+/// allowlist with a sparse verdict shows the counts and is not raised.
 #[expect(
     clippy::format_push_string,
     reason = "short strings off the hot path; format! reads clearer"
@@ -323,9 +414,14 @@ fn enforce_on(
     report: &mut LineStatusReport,
     counts: &FullCoverageWindowCounts,
     verdict: &WindowVerdict,
+    enforcement: Enforcement,
     min_rank: u8,
     now: DateTime<Utc>,
 ) -> bool {
+    let Enforcement {
+        show_counts,
+        may_raise,
+    } = enforcement;
     let stats = counts.to_sample_stats();
     let eligible = !matches!(verdict, WindowVerdict::Ineligible(_));
     let availability = if eligible {
@@ -336,12 +432,17 @@ fn enforce_on(
     let any_in_effect = report.statuses.iter().any(|s| in_effect_now(s, now));
     let mut raised = false;
     for status in &mut report.statuses {
-        status.full_coverage_stats = Some(stats.clone());
-        status.full_coverage_availability = availability.clone();
-        if !in_effect_now(status, now) {
+        if show_counts {
+            status.full_coverage_stats = Some(stats.clone());
+            status.full_coverage_availability = availability.clone();
+        }
+        if !may_raise || !in_effect_now(status, now) {
             continue;
         }
-        let WindowVerdict::Escalate { severity, reason } = verdict else {
+        let WindowVerdict::Escalate {
+            severity, reason, ..
+        } = verdict
+        else {
             continue;
         };
         let rank = severity_rank(*severity);
@@ -359,7 +460,10 @@ fn enforce_on(
         }
         raised = true;
     }
-    if let WindowVerdict::Escalate { severity, reason } = verdict
+    if let WindowVerdict::Escalate {
+        severity, reason, ..
+    } = verdict
+        && may_raise
         && !any_in_effect
         && severity_rank(*severity) >= min_rank
         && severity_rank(*severity) > severity_rank(Severity::GoodService)
@@ -407,7 +511,7 @@ pub(crate) async fn load_full_coverage_windows(
                 line_id, window_kind, bucket_start, service_date, window_start, window_end,
                 computed_at, total, on_time, delayed, cancelled_explicit, cancelled_presumed,
                 skipped, pending, unobserved, avg_delay_minutes, relevance, presumed_enabled,
-                partial, feed_stale, stats_version
+                partial, feed_stale, stats_version, cancelled_in_advance
            FROM full_coverage_line_window_stats
           WHERE bucket_start >= $1 - interval '30 minutes'
           ORDER BY line_id, window_kind, bucket_start DESC",
@@ -461,6 +565,7 @@ fn stored_window(row: &sqlx::postgres::PgRow) -> anyhow::Result<StoredWindow> {
                 pending: uint("pending")?,
                 unobserved: uint("unobserved")?,
                 avg_delay_minutes: row.try_get("avg_delay_minutes")?,
+                cancelled_in_advance: uint("cancelled_in_advance")?,
             },
             relevance: row.try_get("relevance")?,
             presumed_enabled: row.try_get("presumed_enabled")?,
@@ -487,7 +592,9 @@ pub(crate) async fn write_verdicts(
         let (verdict, ineligible_reason, verdict_severity, reason) = match &record.verdict {
             WindowVerdict::Ineligible(r) => ("ineligible", Some(r.as_str()), None, None),
             WindowVerdict::Good => ("good", None, None, None),
-            WindowVerdict::Escalate { severity, reason } => (
+            WindowVerdict::Escalate {
+                severity, reason, ..
+            } => (
                 "escalate",
                 None,
                 Some(severity_db(*severity)),
@@ -498,8 +605,8 @@ pub(crate) async fn write_verdicts(
             "INSERT INTO full_coverage_window_verdicts
                 (line_id, bucket_start, evaluated_at, window_computed_at, mode, verdict,
                  ineligible_reason, verdict_severity, current_severity, would_escalate_to,
-                 below_min_rank, in_allowlist, enforced, reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                 below_min_rank, in_allowlist, enforced, reason, basis)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
              ON CONFLICT (line_id, bucket_start) DO UPDATE SET
                 evaluated_at       = EXCLUDED.evaluated_at,
                 window_computed_at = EXCLUDED.window_computed_at,
@@ -512,7 +619,8 @@ pub(crate) async fn write_verdicts(
                 below_min_rank     = EXCLUDED.below_min_rank,
                 in_allowlist       = EXCLUDED.in_allowlist,
                 enforced           = EXCLUDED.enforced,
-                reason             = EXCLUDED.reason",
+                reason             = EXCLUDED.reason,
+                basis              = EXCLUDED.basis",
         )
         .bind(&record.line_id)
         .bind(record.bucket_start)
@@ -528,6 +636,7 @@ pub(crate) async fn write_verdicts(
         .bind(record.in_allowlist)
         .bind(record.enforced)
         .bind(reason)
+        .bind(record.basis.map(EscalationBasis::as_str))
         .execute(&mut *tx)
         .await?;
         written += result.rows_affected();
@@ -576,18 +685,20 @@ pub(crate) async fn prune_full_coverage_window_stats(
 
 /// Every counter an alert or dashboard would key on, at 0.
 pub(crate) fn init_metrics() {
-    for verdict in [
-        "missing",
-        "good",
-        "escalate",
-        "below_threshold",
-        "partial",
-        "feed_stale",
-        "stale_row",
+    for (verdict, basis) in [
+        ("missing", None),
+        ("good", None),
+        ("escalate", Some(EscalationBasis::Rate)),
+        ("escalate", Some(EscalationBasis::SparseAllCancelled)),
+        ("below_threshold", None),
+        ("partial", None),
+        ("feed_stale", None),
+        ("stale_row", None),
     ] {
         metrics::counter!(
             common::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
-            "verdict" => verdict
+            "verdict" => verdict,
+            "basis" => basis_label(basis)
         )
         .increment(0);
     }
@@ -688,8 +799,104 @@ mod tests {
         WindowSettings {
             mode,
             allowlist: Allowlist::parse(allow),
+            sparse_allowlist: Allowlist::parse(""),
             min_rank: FULL_COVERAGE_WINDOW_DEFAULT_MIN_ESCALATION_RANK,
         }
+    }
+
+    /// A fixture plus a "branch" line whose window is 3 of 3 cancelled
+    /// (a sparse all-cancelled verdict), showing Good Service.
+    fn sparse_fixture() -> Fixture {
+        let mut f = fixture();
+        f.reports.insert(
+            "branch".to_string(),
+            report(
+                "branch",
+                vec![status(
+                    Severity::GoodService,
+                    DataQuality::LdbwsInferred,
+                    "Good Service",
+                )],
+            ),
+        );
+        f.lines.insert("branch".to_string(), line("branch", false));
+        f.windows
+            .insert("branch".to_string(), window("branch", 3, 0, 3));
+        f
+    }
+
+    /// The default: the sparse verdict is recorded, flagged as the sparse
+    /// basis, and changes nothing -- even with the line in the main
+    /// allowlist, where the rate tiers ARE enforced.
+    #[test]
+    fn a_sparse_verdict_is_shadow_only_without_the_sparse_allowlist() {
+        let mut f = sparse_fixture();
+        let records = run(&mut f, &settings(WindowMode::Enforce, "*"), true);
+        let b = record(&records, "branch");
+        assert_eq!(b.basis, Some(EscalationBasis::SparseAllCancelled));
+        assert_eq!(b.would_escalate_to, Some(Severity::PartSuspended));
+        assert!(!b.below_min_rank);
+        assert!(!b.enforced && !b.in_allowlist);
+        let s = &f.reports["branch"].statuses;
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].severity, Severity::GoodService);
+        assert!(
+            s[0].full_coverage_stats.is_some(),
+            "the counts are still shown"
+        );
+        // The rate tiers on the same run are enforced as before.
+        assert_eq!(
+            record(&records, "severe").basis,
+            Some(EscalationBasis::Rate)
+        );
+        assert!(record(&records, "severe").enforced);
+        assert_eq!(
+            f.reports["severe"].statuses[0].severity,
+            Severity::SevereDelays
+        );
+    }
+
+    #[test]
+    fn the_sparse_allowlist_enforces_sparse_verdicts_only() {
+        let mut f = sparse_fixture();
+        let mut s = settings(WindowMode::Enforce, "");
+        s.sparse_allowlist = Allowlist::parse("branch,severe");
+        let records = run(&mut f, &s, true);
+        let b = record(&records, "branch");
+        assert!(b.enforced && b.in_allowlist);
+        let st = &f.reports["branch"].statuses[0];
+        assert_eq!(st.severity, Severity::PartSuspended);
+        assert_eq!(st.data_quality, DataQuality::TrustInferred);
+        assert_eq!(
+            st.reason,
+            "All 3 trains due in the last hour were cancelled."
+        );
+        assert!(
+            st.full_coverage_stats.is_none(),
+            "outside the main allowlist the legacy counts stay"
+        );
+        // "severe" is in the sparse list but its verdict is rate-based: the
+        // sparse allowlist does not enforce it.
+        let r = record(&records, "severe");
+        assert!(!r.enforced && !r.in_allowlist);
+        assert_eq!(
+            f.reports["severe"].statuses[0].severity,
+            Severity::GoodService
+        );
+    }
+
+    #[test]
+    fn shadow_records_the_sparse_basis_and_changes_nothing() {
+        let mut f = sparse_fixture();
+        let before = serde_json::to_value(&f.reports).unwrap();
+        let mut s = settings(WindowMode::Shadow, "*");
+        s.sparse_allowlist = Allowlist::All;
+        let records = run(&mut f, &s, true);
+        assert_eq!(serde_json::to_value(&f.reports).unwrap(), before);
+        let b = record(&records, "branch");
+        assert_eq!(b.basis, Some(EscalationBasis::SparseAllCancelled));
+        assert!(!b.enforced);
+        assert_eq!(record(&records, "minor").basis, Some(EscalationBasis::Rate));
     }
 
     struct Fixture {
@@ -1169,7 +1376,9 @@ mod tests {
             verdict: WindowVerdict::Escalate {
                 severity: Severity::MinorDelays,
                 reason: "3 of 12 trains due in the last hour were late.".to_string(),
+                basis: EscalationBasis::Rate,
             },
+            basis: Some(EscalationBasis::Rate),
             current_severity: Severity::GoodService,
             would_escalate_to: Some(Severity::MinorDelays),
             below_min_rank: true,
@@ -1182,20 +1391,43 @@ mod tests {
                 .unwrap(),
             1
         );
+        let basis: Option<String> = sqlx::query_scalar(
+            "SELECT basis FROM full_coverage_window_verdicts WHERE line_id = 'ztest-fcw-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(basis.as_deref(), Some("rate"));
+        let mut sparse = record.clone();
+        sparse.verdict = WindowVerdict::Escalate {
+            severity: Severity::PartSuspended,
+            reason: "All 2 trains due in the last hour were cancelled.".to_string(),
+            basis: EscalationBasis::SparseAllCancelled,
+        };
+        sparse.basis = Some(EscalationBasis::SparseAllCancelled);
+        write_verdicts(&pool, &[sparse]).await.unwrap();
+        let basis: Option<String> = sqlx::query_scalar(
+            "SELECT basis FROM full_coverage_window_verdicts WHERE line_id = 'ztest-fcw-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(basis.as_deref(), Some("sparse_all_cancelled"));
         let mut again = record.clone();
         again.verdict = WindowVerdict::Good;
+        again.basis = None;
         again.would_escalate_to = None;
         again.below_min_rank = false;
         write_verdicts(&pool, &[again]).await.unwrap();
-        let (verdict, would): (String, Option<i16>) = sqlx::query_as(
-            "SELECT verdict, would_escalate_to FROM full_coverage_window_verdicts WHERE line_id = 'ztest-fcw-a'",
+        let (verdict, would, basis): (String, Option<i16>, Option<String>) = sqlx::query_as(
+            "SELECT verdict, would_escalate_to, basis FROM full_coverage_window_verdicts WHERE line_id = 'ztest-fcw-a'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
-            (verdict.as_str(), would),
-            ("good", None),
+            (verdict.as_str(), would, basis),
+            ("good", None, None),
             "latest evaluation wins"
         );
 
