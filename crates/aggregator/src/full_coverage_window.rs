@@ -21,6 +21,12 @@
 //!   Severe Delays and Part Suspended). Lower tiers (Minor Delays, Reduced
 //!   Service) are still recorded, with `below_min_rank`, so widening the
 //!   enforced tiers later is an evidence-based config change.
+//! - **Only statuses in effect now** (`aggregation::in_effect_now`, user
+//!   decision 2026-10-02) are raised, and the line's "current severity"
+//!   (what a verdict must beat) is the worst of those alone. A planned-works
+//!   notice that is not in effect stays as published; when nothing on the
+//!   line is in effect, an enforced verdict is shown as its own
+//!   `TrustInferred` status instead.
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,11 +36,13 @@ use common::full_coverage_window::{
     escalation_decision,
 };
 use common::{
-    DataQuality, Defaults, FullCoverageAvailability, FullCoverageWindowCounts,
-    FullCoverageWindowKind, FullCoverageWindowStatsRow, LineDefinition, LineStatusReport, Severity,
-    severity_rank, thresholds_for,
+    DataQuality, Defaults, Disruption, FullCoverageAvailability, FullCoverageWindowCounts,
+    FullCoverageWindowKind, FullCoverageWindowStatsRow, LineDefinition, LineStatus,
+    LineStatusReport, Severity, ValidityPeriod, severity_rank, thresholds_for,
 };
 use sqlx::{PgPool, Row};
+
+use crate::aggregation::in_effect_now;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum WindowMode {
@@ -155,6 +163,24 @@ impl WindowSettings {
     }
 }
 
+/// The lines full coverage covers: every line except users' custom lines.
+/// `full-coverage-consumer` builds populations and windows for the
+/// `lines/*.toml` catalogue only, and `CustomLine`'s `From` impl already
+/// marks a custom line as never a full-coverage candidate -- but
+/// `FULL_COVERAGE_ENABLED_DEFAULT=true` would otherwise enable it, so each
+/// one read as a "missing" window every cycle (and as Pending under
+/// `enforce` with `*`). They keep `NotEnabled`.
+pub(crate) fn full_coverage_lines(
+    lines: &HashMap<String, LineDefinition>,
+    custom_ids: &HashSet<String>,
+) -> HashMap<String, LineDefinition> {
+    lines
+        .iter()
+        .filter(|(id, _)| !custom_ids.contains(*id))
+        .map(|(id, line)| (id.clone(), line.clone()))
+        .collect()
+}
+
 /// One stored window bucket.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StoredWindow {
@@ -186,10 +212,13 @@ pub(crate) struct VerdictRecord {
     pub enforced: bool,
 }
 
-fn worst_severity(report: &LineStatusReport) -> Severity {
+/// The worst severity among the statuses in effect at `now`; Good Service
+/// when none is.
+fn worst_severity(report: &LineStatusReport, now: DateTime<Utc>) -> Severity {
     report
         .statuses
         .iter()
+        .filter(|s| in_effect_now(s, now))
         .map(|s| s.severity)
         .max_by_key(|s| severity_rank(*s))
         .unwrap_or(Severity::GoodService)
@@ -241,11 +270,11 @@ pub(crate) fn apply_windows(
         };
         let thresholds = thresholds_for(defaults, &line.severity_overrides);
         let verdict = classify_full_coverage_window(&recent.row, &thresholds, now);
-        let current = worst_severity(report);
+        let current = worst_severity(report, now);
         let decision = escalation_decision(&verdict, current, settings.min_rank);
         let mut enforced = false;
         if enforce {
-            enforced = enforce_on(report, &recent.row.counts, &verdict, settings.min_rank);
+            enforced = enforce_on(report, &recent.row.counts, &verdict, settings.min_rank, now);
         }
         let label = match &verdict {
             WindowVerdict::Ineligible(reason) => reason.as_str(),
@@ -283,7 +312,9 @@ pub(crate) fn apply_windows(
 }
 
 /// Applies one eligible-or-not verdict to every status of an allow-listed
-/// line. Returns whether any status's severity was raised.
+/// line, raising only the statuses in effect at `now`. When none is, an
+/// enforced verdict is added as its own `TrustInferred` status. Returns
+/// whether any severity was raised (or added).
 #[expect(
     clippy::format_push_string,
     reason = "short strings off the hot path; format! reads clearer"
@@ -293,17 +324,23 @@ fn enforce_on(
     counts: &FullCoverageWindowCounts,
     verdict: &WindowVerdict,
     min_rank: u8,
+    now: DateTime<Utc>,
 ) -> bool {
     let stats = counts.to_sample_stats();
     let eligible = !matches!(verdict, WindowVerdict::Ineligible(_));
+    let availability = if eligible {
+        FullCoverageAvailability::Available(stats.clone())
+    } else {
+        FullCoverageAvailability::Pending
+    };
+    let any_in_effect = report.statuses.iter().any(|s| in_effect_now(s, now));
     let mut raised = false;
     for status in &mut report.statuses {
         status.full_coverage_stats = Some(stats.clone());
-        status.full_coverage_availability = if eligible {
-            FullCoverageAvailability::Available(stats.clone())
-        } else {
-            FullCoverageAvailability::Pending
-        };
+        status.full_coverage_availability = availability.clone();
+        if !in_effect_now(status, now) {
+            continue;
+        }
         let WindowVerdict::Escalate { severity, reason } = verdict else {
             continue;
         };
@@ -320,6 +357,38 @@ fn enforce_on(
                 .reason
                 .push_str(&format!(" (train-running data shows: {reason})"));
         }
+        raised = true;
+    }
+    if let WindowVerdict::Escalate { severity, reason } = verdict
+        && !any_in_effect
+        && severity_rank(*severity) >= min_rank
+        && severity_rank(*severity) > severity_rank(Severity::GoodService)
+    {
+        let template = report.statuses.first();
+        report.statuses.push(LineStatus {
+            severity: *severity,
+            reason: reason.clone(),
+            validity: ValidityPeriod {
+                from_date: now,
+                to_date: None,
+                is_now: true,
+            },
+            disruption: Some(Disruption {
+                category: "RealTime".to_string(),
+                description: reason.clone(),
+                affected_stops: vec![],
+                affected_routes: vec![],
+                source: Some("full-coverage-window".to_string()),
+                impact_type: None,
+            }),
+            data_quality: DataQuality::TrustInferred,
+            sample_stats: template.and_then(|s| s.sample_stats.clone()),
+            sample_availability: template.map_or(common::SampleAvailability::NoCoverage, |s| {
+                s.sample_availability.clone()
+            }),
+            full_coverage_stats: Some(stats),
+            full_coverage_availability: availability,
+        });
         raised = true;
     }
     raised
@@ -865,6 +934,138 @@ mod tests {
         assert!(records.iter().all(|r| r.line_id != "severe"));
         assert_eq!(
             f.reports["severe"].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::Pending
+        );
+    }
+
+    /// A planned-works notice whose validity covers now but which is
+    /// bounded (`is_now = false`): not in effect.
+    fn planned_notice(severity: Severity) -> LineStatus {
+        let mut s = status(
+            severity,
+            DataQuality::Planned,
+            "Buses replace late night trains.",
+        );
+        s.validity = ValidityPeriod {
+            from_date: now() - chrono::Duration::hours(10),
+            to_date: Some(now() + chrono::Duration::days(3)),
+            is_now: false,
+        };
+        s
+    }
+
+    /// 2026-10-02: a planned notice that is not in effect is neither the
+    /// line's current severity nor raised. Alone on the line, the enforced
+    /// verdict becomes its own `TrustInferred` status; the notice stays as
+    /// published.
+    #[test]
+    fn enforce_never_raises_a_planned_notice_that_is_not_in_effect() {
+        let mut f = fixture();
+        // A Bus Service notice (rank 4) would otherwise hide the Severe
+        // verdict entirely.
+        f.reports.get_mut("severe").unwrap().statuses = vec![planned_notice(Severity::BusService)];
+        let records = run(&mut f, &settings(WindowMode::Enforce, "*"), true);
+        let r = record(&records, "severe");
+        assert_eq!(r.current_severity, Severity::GoodService);
+        assert_eq!(r.would_escalate_to, Some(Severity::SevereDelays));
+        assert!(r.enforced);
+        let statuses = &f.reports["severe"].statuses;
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        assert_eq!(statuses[0].severity, Severity::BusService);
+        assert_eq!(statuses[0].reason, "Buses replace late night trains.");
+        assert_eq!(statuses[0].data_quality, DataQuality::Planned);
+        assert!(statuses[0].full_coverage_stats.is_some(), "counts shown");
+        assert_eq!(statuses[1].severity, Severity::SevereDelays);
+        assert_eq!(statuses[1].data_quality, DataQuality::TrustInferred);
+        assert_eq!(
+            statuses[1].reason,
+            "7 of 12 trains due in the last hour were late."
+        );
+        assert!(statuses[1].validity.is_now);
+
+        // Below the rank gate, nothing is added.
+        let mut f = fixture();
+        f.reports.get_mut("minor").unwrap().statuses = vec![planned_notice(Severity::MinorDelays)];
+        let records = run(&mut f, &settings(WindowMode::Enforce, "*"), true);
+        assert_eq!(f.reports["minor"].statuses.len(), 1);
+        assert!(!record(&records, "minor").enforced);
+    }
+
+    /// Beside an in-effect status, the in-effect one is raised and the
+    /// not-in-effect notice left alone; shadow records the same current
+    /// severity and changes nothing.
+    #[test]
+    fn only_in_effect_statuses_are_raised_and_counted_as_current() {
+        let mut f = fixture();
+        f.reports
+            .get_mut("severe")
+            .unwrap()
+            .statuses
+            .push(planned_notice(Severity::PartSuspended));
+        let before = serde_json::to_value(&f.reports).unwrap();
+        let records = run(&mut f, &settings(WindowMode::Shadow, "*"), true);
+        assert_eq!(serde_json::to_value(&f.reports).unwrap(), before);
+        let r = record(&records, "severe");
+        assert_eq!(r.current_severity, Severity::GoodService);
+        assert_eq!(r.would_escalate_to, Some(Severity::SevereDelays));
+
+        run(&mut f, &settings(WindowMode::Enforce, "*"), true);
+        let statuses = &f.reports["severe"].statuses;
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].severity, Severity::SevereDelays);
+        assert_eq!(statuses[0].data_quality, DataQuality::TrustInferred);
+        assert_eq!(statuses[1].severity, Severity::PartSuspended);
+        assert_eq!(statuses[1].reason, "Buses replace late night trains.");
+    }
+
+    /// A custom line is not in the full-coverage set, so `enforce` with `*`
+    /// neither marks it Pending nor counts it as a missing window.
+    #[test]
+    fn custom_lines_are_left_out_of_full_coverage() {
+        let mut f = fixture();
+        let custom = "custom-milton-keynes-drain";
+        f.lines.insert(custom.to_string(), line(custom, false));
+        f.reports.insert(
+            custom.to_string(),
+            report(
+                custom,
+                vec![status(
+                    Severity::GoodService,
+                    DataQuality::LdbwsInferred,
+                    "Good Service",
+                )],
+            ),
+        );
+        let custom_ids: HashSet<String> = [custom.to_string()].into_iter().collect();
+        let catalogue = full_coverage_lines(&f.lines, &custom_ids);
+        assert!(!catalogue.contains_key(custom));
+        assert_eq!(catalogue.len(), 3);
+        let records = apply_windows(
+            &mut f.reports,
+            &catalogue,
+            &f.windows,
+            &Defaults::default(),
+            &settings(WindowMode::Enforce, "*"),
+            true,
+            now(),
+        );
+        assert!(records.iter().all(|r| r.line_id != custom));
+        assert_eq!(
+            f.reports[custom].statuses[0].full_coverage_availability,
+            FullCoverageAvailability::NotEnabled
+        );
+        // Without the filter, the same custom line is Pending ("missing").
+        apply_windows(
+            &mut f.reports,
+            &f.lines,
+            &f.windows,
+            &Defaults::default(),
+            &settings(WindowMode::Enforce, "*"),
+            true,
+            now(),
+        );
+        assert_eq!(
+            f.reports[custom].statuses[0].full_coverage_availability,
             FullCoverageAvailability::Pending
         );
     }

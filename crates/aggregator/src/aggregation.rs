@@ -92,6 +92,12 @@ pub(crate) fn aggregate(
     // to escalate their severity -- never demote it -- when live delay/
     // cancellation data implies something worse than the incident text
     // alone accounted for. See `escalate_from_sample_stats`.
+    //
+    // Only a status in effect now is escalated (`in_effect_now`, user
+    // decision 2026-10-02): a planned-works notice that is not in effect
+    // stays exactly as published. When a line has no status in effect at
+    // all, live samples that show disruption get their own LDBWS-inferred
+    // status beside the notice, as they would on a line with no incident.
     for line in lines.values() {
         let report = reports.get_mut(&line.id).unwrap();
         if report.statuses.is_empty() {
@@ -104,16 +110,25 @@ pub(crate) fn aggregate(
         for status in &mut report.statuses {
             status.sample_availability = availability.clone();
         }
+        let any_in_effect = report.statuses.iter().any(|s| in_effect_now(s, now));
         if let Some(stats) = availability.sample_stats() {
             let thresholds = thresholds_for(defaults, &line.severity_overrides);
             for status in &mut report.statuses {
-                let (escalated, annotation) =
-                    escalate_from_sample_stats(status.severity, &stats, &thresholds);
-                status.severity = escalated;
-                if let Some(annotation) = annotation {
-                    status.reason.push_str(&format!(" ({annotation})"));
+                if in_effect_now(status, now) {
+                    let (escalated, annotation) =
+                        escalate_from_sample_stats(status.severity, &stats, &thresholds);
+                    status.severity = escalated;
+                    if let Some(annotation) = annotation {
+                        status.reason.push_str(&format!(" ({annotation})"));
+                    }
                 }
                 status.sample_stats = Some(stats.clone());
+            }
+        }
+        if !any_in_effect {
+            let inferred = infer_from_samples(line, samples, defaults);
+            if severity_rank(inferred.severity) > severity_rank(Severity::GoodService) {
+                report.statuses.push(inferred);
             }
         }
     }
@@ -213,6 +228,23 @@ fn validity_for_output(periods: &[ValidityPeriod]) -> ValidityPeriod {
 /// has one definition, not two.
 fn period_covers_now(period: &ValidityPeriod, now: DateTime<Utc>) -> bool {
     period.from_date <= now && period.to_date.is_none_or(|to| to > now)
+}
+
+/// Whether `status` is in effect at `now`, so live data (LDBWS samples, a
+/// full-coverage window) may raise it, and so it counts toward the
+/// severity a line is showing right now (user decision, 2026-10-02).
+///
+/// `validity.is_now` says so directly. A status without it is in effect
+/// when its validity period covers `now` -- except a planned-works notice:
+/// `poller-incidents` publishes `is_now = false` for every notice with an
+/// end date, and a notice's validity spans whole days while the works are
+/// often only overnight ("Buses replace late night trains ... from Monday
+/// to Thursday"), so a bounded planned notice is never treated as in
+/// effect. Raising it would pin live delays on works that are not
+/// happening.
+pub(crate) fn in_effect_now(status: &LineStatus, now: DateTime<Utc>) -> bool {
+    status.validity.is_now
+        || (status.data_quality != DataQuality::Planned && period_covers_now(&status.validity, now))
 }
 
 /// Whether an incident should still contribute a `LineStatus` to any line
@@ -2657,6 +2689,126 @@ mod tests {
         assert_eq!(stats.delayed, 3);
         assert_eq!(stats.cancelled, 0);
         assert!(alton.statuses[0].reason.contains("live samples show"));
+    }
+
+    /// Three of four Alton departures 8+ minutes late (Severe Delays by
+    /// samples alone), and a planned-works notice on the Alton line whose
+    /// validity covers now but which is bounded (`is_now = false`, as
+    /// `poller-incidents` publishes every notice with an end date).
+    fn alton_planned_notice_and_severe_samples() -> (
+        HashMap<String, LineDefinition>,
+        LoadedIncident,
+        HashMap<String, StationSample>,
+    ) {
+        let lines = load_all_lines();
+        let mut inc = incident(
+            "SWR-PLANNED",
+            "Buses replace late night trains between Alton and Farnham",
+            "Buses replace late night trains between Alton and Farnham from Monday to Thursday.",
+            &["SW"],
+            &["AON"],
+        );
+        inc.is_planned = true;
+        inc.validity = vec![ValidityPeriod {
+            from_date: Utc::now() - Duration::hours(10),
+            to_date: Some(Utc::now() + Duration::days(3)),
+            is_now: false,
+        }];
+        let mut samples = HashMap::new();
+        samples.insert(
+            "AHT".to_string(),
+            StationSample {
+                crs: "AHT".to_string(),
+                polled_at: Utc::now(),
+                departures: vec![
+                    departure("AON", 10, false),
+                    departure("AON", 12, false),
+                    departure("AON", 8, false),
+                    departure("AON", 0, false),
+                ],
+            },
+        );
+        let loaded = LoadedIncident {
+            message: inc,
+            first_seen_at: Utc::now(),
+            extracted_periods: None,
+        };
+        (lines, loaded, samples)
+    }
+
+    /// 2026-10-02: live samples never raise a planned notice that is not in
+    /// effect -- it stays exactly as published -- and, with nothing else in
+    /// effect on the line, the samples show as their own LDBWS-inferred
+    /// status instead.
+    #[test]
+    fn sample_stats_never_raise_a_planned_notice_that_is_not_in_effect() {
+        let (lines, loaded, samples) = alton_planned_notice_and_severe_samples();
+        let registry = SegmentRegistry::new(&lines);
+        let defaults = Defaults::default();
+        let reports = aggregate(&lines, &[loaded], &samples, &registry, &defaults);
+        let alton = &reports["swr-alton"];
+        let planned = alton
+            .statuses
+            .iter()
+            .find(|s| s.data_quality == DataQuality::Planned)
+            .expect("the notice is still shown");
+        assert!(
+            !planned.reason.contains("live samples show"),
+            "{}",
+            planned.reason
+        );
+        assert_ne!(planned.severity, Severity::SevereDelays);
+        assert!(planned.sample_stats.is_some(), "stats are still attached");
+        let inferred: Vec<&LineStatus> = alton
+            .statuses
+            .iter()
+            .filter(|s| s.data_quality == DataQuality::LdbwsInferred)
+            .collect();
+        assert_eq!(inferred.len(), 1, "{:?}", alton.statuses);
+        assert_eq!(inferred[0].severity, Severity::SevereDelays);
+        assert_eq!(alton.worst_severity(), Severity::SevereDelays);
+    }
+
+    /// The same notice with `is_now = true` (no end date) is in effect and
+    /// is raised as before; no extra status is added.
+    #[test]
+    fn sample_stats_still_raise_a_planned_notice_that_is_in_effect() {
+        let (lines, mut loaded, samples) = alton_planned_notice_and_severe_samples();
+        loaded.message.validity[0].is_now = true;
+        loaded.message.validity[0].to_date = None;
+        let registry = SegmentRegistry::new(&lines);
+        let reports = aggregate(&lines, &[loaded], &samples, &registry, &Defaults::default());
+        let alton = &reports["swr-alton"];
+        assert_eq!(alton.statuses.len(), 1, "{:?}", alton.statuses);
+        assert_eq!(alton.statuses[0].data_quality, DataQuality::Planned);
+        assert_eq!(alton.statuses[0].severity, Severity::SevereDelays);
+        assert!(alton.statuses[0].reason.contains("live samples show"));
+    }
+
+    /// A real-time incident with an end date (`is_now = false`) whose
+    /// validity covers now is in effect; a planned one is not.
+    #[test]
+    fn in_effect_now_reads_is_now_or_a_covering_period_for_real_time_statuses() {
+        let now = Utc::now();
+        let mut status = good_service();
+        status.validity = ValidityPeriod {
+            from_date: now - Duration::hours(1),
+            to_date: Some(now + Duration::hours(1)),
+            is_now: false,
+        };
+        status.data_quality = DataQuality::Knowledgebase;
+        assert!(in_effect_now(&status, now));
+        status.data_quality = DataQuality::Planned;
+        assert!(!in_effect_now(&status, now));
+        status.validity.is_now = true;
+        assert!(in_effect_now(&status, now));
+        status.data_quality = DataQuality::Knowledgebase;
+        status.validity = ValidityPeriod {
+            from_date: now + Duration::hours(1),
+            to_date: None,
+            is_now: false,
+        };
+        assert!(!in_effect_now(&status, now), "not started");
     }
 
     #[test]

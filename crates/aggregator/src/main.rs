@@ -434,6 +434,8 @@ async fn run_cycle(
     // silently dropping catalogued lines mid-cycle would be worse than the
     // work of evaluating them.
     let custom_lines = queries::load_custom_lines(pool).await?;
+    let custom_ids: std::collections::HashSet<String> =
+        custom_lines.iter().map(|c| c.id.clone()).collect();
     let lines = aggregation::merge_custom_lines(static_lines, custom_lines);
     let registry = SegmentRegistry::new(&lines);
 
@@ -494,20 +496,21 @@ async fn run_cycle(
     // matched: design section 1) and take the window verdict instead; every
     // other line -- and every line in `off`/`shadow` -- merges exactly as
     // before.
-    let enforced_lines: std::collections::HashSet<String> = lines
+    //
+    // Only catalogue lines take part in full coverage at all: a custom line
+    // is never covered by full-coverage-consumer, so it would read as a
+    // "missing" window (and, under `enforce` with `*`, Pending) forever.
+    let catalogue_lines = full_coverage_window::full_coverage_lines(&lines, &custom_ids);
+    let enforced_lines: std::collections::HashSet<String> = catalogue_lines
         .values()
         .filter(|line| window_settings.enforces(line, full_coverage_enabled_default))
         .map(|line| line.id.clone())
         .collect();
-    let legacy_lines: HashMap<String, LineDefinition> = if enforced_lines.is_empty() {
-        lines.clone()
-    } else {
-        lines
-            .iter()
-            .filter(|(id, _)| !enforced_lines.contains(*id))
-            .map(|(id, line)| (id.clone(), line.clone()))
-            .collect()
-    };
+    let legacy_lines: HashMap<String, LineDefinition> = catalogue_lines
+        .iter()
+        .filter(|(id, _)| !enforced_lines.contains(*id))
+        .map(|(id, line)| (id.clone(), line.clone()))
+        .collect();
     aggregation::merge_full_coverage(
         &mut reports,
         &legacy_lines,
@@ -527,7 +530,7 @@ async fn run_cycle(
             });
         let records = full_coverage_window::apply_windows(
             &mut reports,
-            &lines,
+            &catalogue_lines,
             &windows,
             defaults,
             window_settings,
