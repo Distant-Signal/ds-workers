@@ -7,6 +7,8 @@
 mod churn;
 mod combine;
 mod config;
+#[cfg(test)]
+mod eval;
 mod llm;
 mod queries;
 #[cfg(test)]

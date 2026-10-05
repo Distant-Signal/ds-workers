@@ -22,6 +22,8 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "
 tracing = "0.1.44"
 
 [dev-dependencies]
+# Parses the model-eval harness's targets file (`src/eval/target.rs`).
+toml = { version = "1.1.2", features = ["serde"] }
 wiremock = "0.6"
 
 [lints]

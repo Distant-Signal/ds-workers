@@ -1,0 +1,51 @@
+# Example targets for the enricher model-eval harness (src/eval/). Copy to
+# targets.toml (git-ignored), edit, and point EVAL_TARGETS at it; see
+# docs/enricher-model-eval.md. A target is one model served from one endpoint
+# in one environment: the same model on two hosts is two targets.
+#
+# Every key except name/base_url/model is optional and defaults to what the
+# enricher service itself defaults to, so an unset key benchmarks the
+# deployment as it would really run. Keys mirror the service's env vars:
+#
+#   base_url              LLM_BASE_URL (OpenAI-compatible, ends in /v1)
+#   model                 LLM_MODEL
+#   api_key_env           NAME of the env var holding the key (never the key)
+#   request_timeout_secs  LLM_REQUEST_TIMEOUT_SECS (perf benchmark only)
+#   quality_timeout_secs  request timeout for the quality eval (default 1800)
+#   reclaim_min_idle_secs RECLAIM_MIN_IDLE_SECS (perf report comparison only)
+#   max_tokens            LLM_MAX_TOKENS
+#   reasoning_effort      LLM_REASONING_EFFORT
+#   max_in_flight         LLM_MAX_IN_FLIGHT
+#   rate_limit_retries    LLM_RATE_LIMIT_RETRIES
+#   rate_limit_retry_secs LLM_RATE_LIMIT_RETRY_SECS
+#   gateway_retries       LLM_GATEWAY_RETRIES
+#
+# environment is free text, but fill it in: perf numbers are meaningless
+# without knowing the hardware/host they came from.
+
+[[targets]]
+name = "ollama-gpu-gemma3-12b"
+environment = "Self-hosted Ollama, single consumer GPU, reached over Tailscale"
+base_url = "http://ollama.example.internal:11434/v1"
+model = "gemma3:12b"
+
+[[targets]]
+name = "ollama-cpu-gemma3-4b"
+environment = "Developer laptop, CPU only (Ollama)"
+base_url = "http://localhost:11434/v1"
+model = "gemma3:4b"
+# A CPU box is slow; match the timeout you would deploy with.
+request_timeout_secs = 600
+
+[[targets]]
+name = "hosted-glm-low-effort"
+environment = "Hosted OpenAI-compatible API (gateway cuts requests at ~302 s)"
+base_url = "https://integrate.api.nvidia.com/v1"
+model = "z-ai/glm-5.3"
+api_key_env = "NVIDIA_API_KEY"
+request_timeout_secs = 320
+max_tokens = 8192
+reasoning_effort = "low"
+max_in_flight = 2
+rate_limit_retries = 3
+gateway_retries = 1

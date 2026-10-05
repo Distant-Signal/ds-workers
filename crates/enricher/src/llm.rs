@@ -200,6 +200,44 @@ pub(crate) struct LlmClient {
     in_flight: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
+/// One pass's raw chat-completion result: the unparsed `content` (or the
+/// typed [`LlmCallError`] / other error that ended the call) plus how many
+/// in-call retries ([`ProviderPolicy`]'s 429/gateway budgets) were spent
+/// before it, and what each HTTP attempt did. The service only reads
+/// `content` (through `extract_*`); the model-eval harness (`eval`) also
+/// records `retries` and `attempts`.
+pub(crate) struct RawCall {
+    pub content: anyhow::Result<String>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read only by the test-only model-eval harness")
+    )]
+    pub retries: u32,
+    /// Every HTTP attempt `chat_completion` made, in order (empty when the
+    /// call failed before sending anything). Only observes the retry loop:
+    /// collecting it changes no request, retry decision or metric.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read only by the test-only model-eval harness")
+    )]
+    pub attempts: Vec<Attempt>,
+}
+
+/// One HTTP attempt of a [`RawCall`], for the model-eval harness's perf
+/// benchmark: a timeout that a gateway retry recovered is still a timeout
+/// against the per-attempt request timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attempt {
+    /// `success`, or the attempt's [`LlmCallError::outcome_label`].
+    pub outcome: &'static str,
+    /// Waiting for an `in_flight` permit before sending.
+    pub queued: std::time::Duration,
+    /// The attempt itself (`send_once`): what `request_timeout` bounds.
+    pub send: std::time::Duration,
+    /// 429 back-off slept after this attempt, before the next one.
+    pub backoff: std::time::Duration,
+}
+
 // ---------------------------------------------------------------------------
 // Provider policy (2026-09-27): the per-provider knobs a slow, rate-limited
 // hosted endpoint needs (reasoning models, 429s, a gateway that cuts calls
@@ -525,11 +563,13 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     at Clapham Junction is closed, trains call at platform 4. Saturday 16 May to Sunday 14 June: Platform 5 \
     is closed, trains call at platform 6.\" segments into exactly two periods -- period 1: \
     `scope_description` \"platform 3 closed, calls at platform 4\", `date_range` `{\"from_date\": \
-    \"2026-04-06T00:00:00Z\", \"to_date\": \"2026-05-16T00:00:00Z\"}` (2026 because that's the closest \
-    occurrence to the March 2026 reference date; `to_date` is the day AFTER the stated 15 May end), \
+    \"2026-04-05T23:00:00Z\", \"to_date\": \"2026-05-15T23:00:00Z\"}` (2026 because that's the closest \
+    occurrence to the March 2026 reference date; `to_date` is the day AFTER the stated 15 May end; both \
+    dates fall in BST, UTC+1, so each Europe/London midnight is 23:00Z on the previous UTC day -- in GMT \
+    it would be 00:00Z), \
     `schedule_window: null`, `resolution_status: \"ongoing\"` (no statement that it has ended); period 2: \
     `scope_description` \"platform 5 closed, calls at platform 6\", `date_range` `{\"from_date\": \
-    \"2026-05-16T00:00:00Z\", \"to_date\": \"2026-06-15T00:00:00Z\"}`, `resolution_status: \"ongoing\"`. Note \
+    \"2026-05-15T23:00:00Z\", \"to_date\": \"2026-06-14T23:00:00Z\"}`, `resolution_status: \"ongoing\"`. Note \
     both periods got real `date_range` values -- never null when dates are stated -- and neither was marked \
     `resolved` just because the text is matter-of-fact. \
     Second worked example, reference date 2026-08-01T00:00:00Z: input \"From Saturday 29 August to Friday \
@@ -539,8 +579,8 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     Sundays.\" segments into exactly three periods, all sharing the same overall date range but none \
     merged into one, because each names a different leg and/or a different treatment: period 1 -- \
     `scope_description` \"buses replace trains, Barrhead to Kilmarnock / Dumfries\", `date_range` \
-    `{\"from_date\": \"2026-08-29T00:00:00Z\", \"to_date\": \"2026-09-12T00:00:00Z\"}`, `schedule_window: \
-    null` (applies every day of the range), `apparent_severity: \"severe_disruption\"`; period 2 -- \
+    `{\"from_date\": \"2026-08-28T23:00:00Z\", \"to_date\": \"2026-09-11T23:00:00Z\"}` (BST again), \
+    `schedule_window: null` (applies every day of the range), `apparent_severity: \"severe_disruption\"`; period 2 -- \
     `scope_description` \"buses operate Kilmarnock to Troon, connecting to Ayr trains\", same `date_range`, \
     `schedule_window` `{\"days_of_week\": [1,2,3,4,5,6], \"start_time\": \"00:00\", \"end_time\": \"23:59\"}` \
     (Monday-Saturday only), `apparent_severity: \"severe_disruption\"`; period 3 -- `scope_description` \"no \
@@ -652,6 +692,36 @@ const SEVERITY_ADVERSARIAL_PROMPT: &str = "You are reviewing a UK National Rail 
     given, in the same order, and each element must echo back the exact `period_index` and \
     `scope_description` you were given for that period -- do not renumber, reorder, or reword them.";
 
+/// A short hash over every pass's system prompt, schema name and schema,
+/// for the model-eval harness: each record stores it, so a replay can warn
+/// when saved outputs came from different prompts than the current code.
+/// (The user-content wrappers in the `*_raw` methods aren't covered.)
+#[cfg(test)]
+pub(crate) fn prompt_fingerprint() -> String {
+    let mut text = String::new();
+    for (prompt, schema_name, schema) in [
+        (PRIMARY_PROMPT, PRIMARY_SCHEMA_NAME, primary_schema()),
+        (
+            ADVERSARIAL_PROMPT,
+            ADVERSARIAL_SCHEMA_NAME,
+            adversarial_schema(),
+        ),
+        (
+            SEVERITY_ADVERSARIAL_PROMPT,
+            SEVERITY_ADVERSARIAL_SCHEMA_NAME,
+            severity_adversarial_schema(),
+        ),
+    ] {
+        for part in [prompt, schema_name, &schema.to_string()] {
+            text.push_str(part);
+            text.push('\0');
+        }
+    }
+    let mut hash = common::text_hash::text_hash("enricher-prompts", &text);
+    hash.truncate(16);
+    hash
+}
+
 #[derive(Deserialize)]
 struct SeverityAdversarialExtraction {
     periods: Vec<SeverityAdversarialPeriodVerdict>,
@@ -731,13 +801,16 @@ impl LlmClient {
         }
     }
 
+    /// One pass's chat completion, in-call retries included. Returns the raw
+    /// `content` string (not yet parsed) and how many in-call retries the
+    /// provider policy spent on it -- see [`RawCall`].
     async fn chat_completion(
         &self,
         system_prompt: &str,
         user_content: String,
         schema_name: &'static str,
         schema: serde_json::Value,
-    ) -> anyhow::Result<String> {
+    ) -> RawCall {
         let request = ChatCompletionRequest {
             model: &self.model,
             messages: vec![
@@ -768,20 +841,30 @@ impl LlmClient {
         // returned exactly as before.
         let mut rate_limit_retries = 0;
         let mut gateway_retries = 0;
+        // Observation only (see `RawCall::attempts`): timings around the
+        // unchanged retry loop.
+        let mut attempts: Vec<Attempt> = Vec::with_capacity(1);
         loop {
-            let attempt = {
-                let _permit = match &self.in_flight {
-                    Some(sem) => Some(
-                        sem.acquire()
-                            .await
-                            .map_err(|err| anyhow::anyhow!("in-flight limiter closed: {err}"))?,
-                    ),
-                    None => None,
-                };
-                self.send_once(&request).await
+            let retries = rate_limit_retries + gateway_retries;
+            let (attempt, timing) = match self.limited_send(&request).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    return RawCall {
+                        content: Err(err),
+                        retries,
+                        attempts,
+                    };
+                }
             };
+            attempts.push(timing);
             match attempt {
-                Ok(content) => return Ok(content),
+                Ok(content) => {
+                    return RawCall {
+                        content: Ok(content),
+                        retries,
+                        attempts,
+                    };
+                }
                 Err(LlmCallError::RateLimited { retry_after })
                     if rate_limit_retries < self.policy.max_rate_limit_retries
                         && retry_after.is_none_or(|wait| wait <= MAX_RETRY_AFTER) =>
@@ -791,7 +874,11 @@ impl LlmClient {
                         .unwrap_or_default()
                         .max(self.policy.rate_limit_min_wait);
                     tracing::warn!(?wait, attempt = rate_limit_retries, "LLM 429; backing off");
+                    let sleep_start = tokio::time::Instant::now();
                     tokio::time::sleep(wait).await;
+                    if let Some(last) = attempts.last_mut() {
+                        last.backoff = sleep_start.elapsed();
+                    }
                 }
                 Err(
                     err @ (LlmCallError::GatewayUnavailable { .. } | LlmCallError::ClientTimeout),
@@ -799,9 +886,45 @@ impl LlmClient {
                     gateway_retries += 1;
                     tracing::warn!(error = %err, attempt = gateway_retries, "LLM gateway failure; retrying");
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    return RawCall {
+                        content: Err(err.into()),
+                        retries,
+                        attempts,
+                    };
+                }
             }
         }
+    }
+
+    /// One HTTP attempt under the `in_flight` limit (the permit is held
+    /// for the attempt only), plus its [`Attempt`] timing. `Err` only if
+    /// the limiter is closed.
+    async fn limited_send(
+        &self,
+        request: &ChatCompletionRequest<'_>,
+    ) -> anyhow::Result<(Result<String, LlmCallError>, Attempt)> {
+        let queue_start = tokio::time::Instant::now();
+        let _permit = match &self.in_flight {
+            Some(sem) => Some(
+                sem.acquire()
+                    .await
+                    .map_err(|err| anyhow::anyhow!("in-flight limiter closed: {err}"))?,
+            ),
+            None => None,
+        };
+        let send_start = tokio::time::Instant::now();
+        let attempt = self.send_once(request).await;
+        let timing = Attempt {
+            outcome: match &attempt {
+                Ok(_) => "success",
+                Err(err) => err.outcome_label(),
+            },
+            queued: send_start.duration_since(queue_start),
+            send: send_start.elapsed(),
+            backoff: std::time::Duration::ZERO,
+        };
+        Ok((attempt, timing))
     }
 
     /// One HTTP attempt, classified.
@@ -865,51 +988,36 @@ impl LlmClient {
         description: &str,
         reference_date: DateTime<Utc>,
     ) -> anyhow::Result<PrimaryExtraction> {
+        let content = self
+            .primary_raw(summary, description, reference_date)
+            .await
+            .content?;
+        parse_primary(&content)
+    }
+
+    /// The primary pass's request (real prompt and schema) without the
+    /// parse step: `extract_primary` is exactly this followed by
+    /// [`parse_primary`]. Split out so the model-eval harness (`eval`) can
+    /// record the raw output and score it later, offline, through the same
+    /// parse path.
+    pub(crate) async fn primary_raw(
+        &self,
+        summary: &str,
+        description: &str,
+        reference_date: DateTime<Utc>,
+    ) -> RawCall {
         let user_content = format!(
             "This incident was first reported around {}. Resolve any year-less date in the text below \
              relative to that reference date.\nSummary: {summary}\nDescription: {description}",
             reference_date.to_rfc3339()
         );
-        let content = self
-            .chat_completion(
-                PRIMARY_PROMPT,
-                user_content,
-                PRIMARY_SCHEMA_NAME,
-                primary_schema(),
-            )
-            .await?;
-        let mut extraction: PrimaryExtraction = serde_json::from_str(&content)
-            .map_err(|err| anyhow::anyhow!("primary extraction returned malformed JSON: {err}"))?;
-        if extraction.periods.is_empty() {
-            // Design §1: an empty `periods` array parses without a schema
-            // error (no `minItems`), but recording it as a "successful"
-            // extraction would permanently short-circuit `process_incident`'s
-            // unchanged-text guard for this incident on every subsequent
-            // sweep/reclaim pass. Treat it as a hard parse failure instead --
-            // discarded, existing columns untouched, sweep retries later.
-            anyhow::bail!("primary extraction returned an empty `periods` array");
-        }
-        // Decision 3 of docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md:
-        // an over-cap response used to be a hard failure here (discarded,
-        // sweep retries forever, all NLP-derived severity signal lost for
-        // this incident). Instead, keep the MAX_PERIODS most-severe/soonest
-        // periods and let extraction succeed -- `dropped_period_count`
-        // records how many were cut, so `process_incident` (main.rs) can
-        // log/count it without any downstream step (extract_adversarial,
-        // extract_severity_adversarial, combine::combine_periods,
-        // queries::write_extraction) needing to know anything unusual
-        // happened; they only ever see an already-in-bounds `periods` list.
-        let original_count = extraction.periods.len();
-        if original_count > MAX_PERIODS {
-            extraction.periods = select_periods_within_cap(extraction.periods);
-        }
-        extraction.dropped_period_count = original_count.saturating_sub(MAX_PERIODS);
-        // Before the adversarial passes, which echo each period's scope back
-        // and are checked against exactly what was sent.
-        for period in &mut extraction.periods {
-            bound_scope_description(&mut period.scope_description);
-        }
-        Ok(extraction)
+        self.chat_completion(
+            PRIMARY_PROMPT,
+            user_content,
+            PRIMARY_SCHEMA_NAME,
+            primary_schema(),
+        )
+        .await
     }
 
     /// `periods` is the primary pass's already-segmented period list
@@ -922,19 +1030,37 @@ impl LlmClient {
         description: &str,
         periods: &[ExtractionPeriod],
     ) -> anyhow::Result<Vec<AdversarialPeriodVerdict>> {
-        let user_content = build_period_user_content(summary, description, periods)?;
         let content = self
-            .chat_completion(
-                ADVERSARIAL_PROMPT,
-                user_content,
-                ADVERSARIAL_SCHEMA_NAME,
-                adversarial_schema(),
-            )
-            .await?;
-        let extraction: AdversarialExtraction = serde_json::from_str(&content).map_err(|err| {
-            anyhow::anyhow!("adversarial extraction returned malformed JSON: {err}")
-        })?;
-        Ok(extraction.periods)
+            .adversarial_raw(summary, description, periods)
+            .await
+            .content?;
+        parse_adversarial(&content)
+    }
+
+    /// `extract_adversarial` minus the parse step (see [`Self::primary_raw`]).
+    pub(crate) async fn adversarial_raw(
+        &self,
+        summary: &str,
+        description: &str,
+        periods: &[ExtractionPeriod],
+    ) -> RawCall {
+        let user_content = match build_period_user_content(summary, description, periods) {
+            Ok(content) => content,
+            Err(err) => {
+                return RawCall {
+                    content: Err(err),
+                    retries: 0,
+                    attempts: Vec::new(),
+                };
+            }
+        };
+        self.chat_completion(
+            ADVERSARIAL_PROMPT,
+            user_content,
+            ADVERSARIAL_SCHEMA_NAME,
+            adversarial_schema(),
+        )
+        .await
     }
 
     pub(crate) async fn extract_severity_adversarial(
@@ -943,21 +1069,98 @@ impl LlmClient {
         description: &str,
         periods: &[ExtractionPeriod],
     ) -> anyhow::Result<Vec<SeverityAdversarialPeriodVerdict>> {
-        let user_content = build_period_user_content(summary, description, periods)?;
         let content = self
-            .chat_completion(
-                SEVERITY_ADVERSARIAL_PROMPT,
-                user_content,
-                SEVERITY_ADVERSARIAL_SCHEMA_NAME,
-                severity_adversarial_schema(),
-            )
-            .await?;
-        let extraction: SeverityAdversarialExtraction =
-            serde_json::from_str(&content).map_err(|err| {
-                anyhow::anyhow!("severity adversarial extraction returned malformed JSON: {err}")
-            })?;
-        Ok(extraction.periods)
+            .severity_adversarial_raw(summary, description, periods)
+            .await
+            .content?;
+        parse_severity_adversarial(&content)
     }
+
+    /// `extract_severity_adversarial` minus the parse step (see
+    /// [`Self::primary_raw`]).
+    pub(crate) async fn severity_adversarial_raw(
+        &self,
+        summary: &str,
+        description: &str,
+        periods: &[ExtractionPeriod],
+    ) -> RawCall {
+        let user_content = match build_period_user_content(summary, description, periods) {
+            Ok(content) => content,
+            Err(err) => {
+                return RawCall {
+                    content: Err(err),
+                    retries: 0,
+                    attempts: Vec::new(),
+                };
+            }
+        };
+        self.chat_completion(
+            SEVERITY_ADVERSARIAL_PROMPT,
+            user_content,
+            SEVERITY_ADVERSARIAL_SCHEMA_NAME,
+            severity_adversarial_schema(),
+        )
+        .await
+    }
+}
+
+/// Parses (and post-processes) the primary pass's raw `content`: the
+/// non-empty check, the `MAX_PERIODS` cap and the scope-description bound.
+/// Pure, so recorded model output can be re-scored offline exactly as the
+/// service would have read it.
+pub(crate) fn parse_primary(content: &str) -> anyhow::Result<PrimaryExtraction> {
+    let mut extraction: PrimaryExtraction = serde_json::from_str(content)
+        .map_err(|err| anyhow::anyhow!("primary extraction returned malformed JSON: {err}"))?;
+    if extraction.periods.is_empty() {
+        // Design §1: an empty `periods` array parses without a schema
+        // error (no `minItems`), but recording it as a "successful"
+        // extraction would permanently short-circuit `process_incident`'s
+        // unchanged-text guard for this incident on every subsequent
+        // sweep/reclaim pass. Treat it as a hard parse failure instead --
+        // discarded, existing columns untouched, sweep retries later.
+        anyhow::bail!("primary extraction returned an empty `periods` array");
+    }
+    // Decision 3 of docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md:
+    // an over-cap response used to be a hard failure here (discarded,
+    // sweep retries forever, all NLP-derived severity signal lost for
+    // this incident). Instead, keep the MAX_PERIODS most-severe/soonest
+    // periods and let extraction succeed -- `dropped_period_count`
+    // records how many were cut, so `process_incident` (main.rs) can
+    // log/count it without any downstream step (extract_adversarial,
+    // extract_severity_adversarial, combine::combine_periods,
+    // queries::write_extraction) needing to know anything unusual
+    // happened; they only ever see an already-in-bounds `periods` list.
+    let original_count = extraction.periods.len();
+    if original_count > MAX_PERIODS {
+        extraction.periods = select_periods_within_cap(extraction.periods);
+    }
+    extraction.dropped_period_count = original_count.saturating_sub(MAX_PERIODS);
+    // Before the adversarial passes, which echo each period's scope back
+    // and are checked against exactly what was sent.
+    for period in &mut extraction.periods {
+        bound_scope_description(&mut period.scope_description);
+    }
+    Ok(extraction)
+}
+
+/// Parses the resolution-adversarial pass's raw `content` (see
+/// [`parse_primary`]).
+pub(crate) fn parse_adversarial(content: &str) -> anyhow::Result<Vec<AdversarialPeriodVerdict>> {
+    let extraction: AdversarialExtraction = serde_json::from_str(content)
+        .map_err(|err| anyhow::anyhow!("adversarial extraction returned malformed JSON: {err}"))?;
+    Ok(extraction.periods)
+}
+
+/// Parses the severity-adversarial pass's raw `content` (see
+/// [`parse_primary`]).
+pub(crate) fn parse_severity_adversarial(
+    content: &str,
+) -> anyhow::Result<Vec<SeverityAdversarialPeriodVerdict>> {
+    let extraction: SeverityAdversarialExtraction =
+        serde_json::from_str(content).map_err(|err| {
+            anyhow::anyhow!("severity adversarial extraction returned malformed JSON: {err}")
+        })?;
+    Ok(extraction.periods)
 }
 
 /// `None` (whether from a wholly absent `date_range`, or an explicit
@@ -1837,6 +2040,161 @@ mod tests {
         assert!(client.is_provider_transient(&err), "{err:?}");
     }
 
+    /// The model-eval harness's per-attempt record: a gateway failure that
+    /// a retry recovered still shows up as a failed attempt, and a 429's
+    /// back-off is kept apart from the attempt's own send time.
+    #[tokio::test]
+    async fn raw_call_records_every_attempt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(504))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(ProviderPolicy {
+                rate_limit_min_wait: std::time::Duration::from_millis(50),
+                ..fast_retry_policy()
+            });
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(raw.content.is_ok());
+        assert_eq!(raw.retries, 2);
+        let outcomes: Vec<&str> = raw.attempts.iter().map(|a| a.outcome).collect();
+        assert_eq!(outcomes, ["gateway_error", "rate_limited", "success"]);
+        // The back-off is booked on the 429 attempt only, not as send time.
+        assert_eq!(raw.attempts[0].backoff, std::time::Duration::ZERO);
+        assert!(raw.attempts[1].backoff >= std::time::Duration::from_millis(50));
+        assert_eq!(raw.attempts[2].backoff, std::time::Duration::ZERO);
+    }
+
+    /// With `max_in_flight` 1: the permit is held for one HTTP attempt only,
+    /// not through a 429 back-off (B runs while A sleeps one off), and an
+    /// attempt's time waiting for the permit is booked as `queued`, apart
+    /// from its `send` time (C waits for A's retry). Timeline, from the
+    /// start: A gets a 429 at ~0 and sleeps 1.5 s; B sends at 0.15 s and
+    /// is answered at ~0.95 s; A resends at ~1.5 s and holds the permit
+    /// until ~2.3 s; C asks at 1.8 s, so it queues ~0.5 s, then sends for
+    /// ~0.8 s. Every assertion leaves at least ~250 ms of slack.
+    #[tokio::test]
+    async fn permit_is_released_during_429_backoff_and_queueing_is_not_send_time() {
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(1500);
+        const RESPONSE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(flat_primary_body())
+                    .set_delay(RESPONSE_DELAY),
+            )
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(ProviderPolicy {
+                max_in_flight: Some(1),
+                rate_limit_min_wait: BACKOFF,
+                max_rate_limit_retries: 1,
+                ..ProviderPolicy::default()
+            });
+        let call_after = |delay_ms: u64| {
+            let client = &client;
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let start = tokio::time::Instant::now();
+                let raw = client.primary_raw("s", "d", reference_date()).await;
+                (raw, start.elapsed())
+            }
+        };
+        let ((a, _), (b, b_total), (c, c_total)) =
+            tokio::join!(call_after(0), call_after(150), call_after(1800));
+        for raw in [&a, &b, &c] {
+            assert!(raw.content.is_ok(), "{:?}", raw.content);
+        }
+
+        let outcomes: Vec<&str> = a.attempts.iter().map(|x| x.outcome).collect();
+        assert_eq!(outcomes, ["rate_limited", "success"]);
+        assert!(a.attempts[0].backoff >= BACKOFF);
+        // B finished while A was still backing off: the permit was free.
+        assert!(
+            b_total < std::time::Duration::from_millis(1250),
+            "B took {b_total:?}"
+        );
+        assert!(b.attempts[0].queued < std::time::Duration::from_millis(250));
+
+        // C waited for A's retry to release the permit, and that wait is
+        // `queued`, not `send`.
+        let c = &c.attempts[0];
+        assert!(c.queued >= std::time::Duration::from_millis(250), "{c:?}");
+        assert!(c.send >= RESPONSE_DELAY, "{c:?}");
+        assert!(
+            c.queued + c.send <= c_total + std::time::Duration::from_millis(50),
+            "queued {:?} + send {:?} exceeds the call's {c_total:?}",
+            c.queued,
+            c.send
+        );
+    }
+
+    /// A client timeout recovered by a gateway retry: the call succeeds,
+    /// but its first attempt is recorded as `timeout`.
+    #[tokio::test]
+    async fn raw_call_keeps_a_recovered_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(flat_primary_body())
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(
+            server.uri(),
+            None,
+            "m".into(),
+            std::time::Duration::from_millis(500),
+        )
+        .with_provider_policy(ProviderPolicy {
+            // Headroom in case a timed-out request never reaches the server
+            // (see the client-timeout test below).
+            max_gateway_retries: 3,
+            ..ProviderPolicy::default()
+        });
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(raw.content.is_ok(), "{:?}", raw.content.err());
+        assert_eq!(raw.attempts[0].outcome, "timeout");
+        assert!(raw.attempts[0].send >= std::time::Duration::from_millis(500));
+        assert_eq!(raw.attempts.last().map(|a| a.outcome), Some("success"));
+        assert_eq!(
+            raw.attempts.len(),
+            usize::try_from(raw.retries).unwrap() + 1
+        );
+    }
+
     #[tokio::test]
     async fn default_policy_does_not_retry_a_504() {
         let server = MockServer::start().await;
@@ -2580,6 +2938,7 @@ mod tests {
                 primary_schema(),
             )
             .await
+            .content
             .expect("raw chat completion should succeed");
         eprintln!(
             "=== RAW CONTENT ({} bytes) ===\n{raw}\n=== END RAW CONTENT ===",
