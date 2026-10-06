@@ -4,6 +4,7 @@
 //! docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md and
 //! docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md.
 
+mod auth;
 mod churn;
 mod combine;
 mod config;
@@ -57,6 +58,15 @@ async fn run() -> anyhow::Result<()> {
             config.metrics_port,
             &[(&common::metrics::metric_name(LLM_DURATION_METRIC), &buckets)],
         )?;
+    }
+
+    // The LLM credential, validated before anything else connects: a
+    // workload identity mode with a missing ID or an unmounted token file
+    // fails the pod at startup (after the metrics recorder, so its counters
+    // register).
+    let llm_auth = config.llm_auth.auth(config.llm_api_key.as_ref())?;
+    if llm_auth.is_federated() {
+        tracing::info!(auth = ?config.llm_auth.llm_auth, "LLM workload identity federation on");
     }
 
     let (ready, progress) = health_http::spawn_worker(&config.health);
@@ -124,13 +134,13 @@ async fn run() -> anyhow::Result<()> {
     // docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md, §5.
     let llm = LlmClient::new(
         config.llm_base_url.clone(),
-        config
-            .llm_api_key
-            .as_ref()
-            .map(|key| key.expose().to_string()),
+        None,
         config.llm_model.clone(),
         Duration::from_secs(config.llm_request_timeout_secs),
     )
+    // `LLM_AUTH`: in the default `api-key` mode this is `LLM_API_KEY`, mapped
+    // exactly as before.
+    .with_auth(llm_auth)
     // Every provider-policy knob defaults to "off" (see `ProviderPolicy`).
     .with_provider_policy(config.provider.policy());
     let enricher = Arc::new(Enricher {
@@ -493,7 +503,8 @@ fn record_llm_call_metrics(call: &'static str, elapsed: Duration, outcome: &'sta
 }
 
 /// `success` plus the typed `llm::LlmCallError` labels (`rate_limited`,
-/// `gateway_error`, `timeout`, `http_error`, `empty_content`), falling back
+/// `quota_exhausted`, `gateway_error`, `timeout`, `http_error`,
+/// `empty_content`, `refused`, `auth_error`, `unauthorized`), falling back
 /// to `error` (malformed JSON, connection refused, ...).
 fn llm_outcome<T>(result: &anyhow::Result<T>) -> &'static str {
     match result {

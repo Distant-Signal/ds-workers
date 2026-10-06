@@ -12,7 +12,10 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ProviderPolicyConfig};
+use common::secret::Secret;
+
+use crate::auth::LlmAuthMode;
+use crate::config::{Config, LlmAuthConfig, ProviderPolicyConfig};
 use crate::eval::pipeline::TargetLabel;
 use crate::llm::{LlmClient, ProviderPolicy};
 
@@ -35,8 +38,17 @@ pub(crate) struct Target {
     /// `LLM_MODEL`.
     pub model: String,
     /// NAME of the env var holding the API key (never the key itself).
+    /// The normal eval route, `OpenAI` included.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// `LLM_AUTH`: `api-key` (default), `openai-wif-authentik` or
+    /// `openai-wif-kubernetes`. The workload identity modes need a projected
+    /// service-account token, so they only work from a pod in the cluster.
+    #[serde(default)]
+    pub auth: LlmAuthMode,
+    /// The workload identity settings, for the `openai-wif-*` modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_identity: Option<WorkloadIdentityTarget>,
     /// `LLM_REQUEST_TIMEOUT_SECS`. Perf benchmark only.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
@@ -65,6 +77,53 @@ pub(crate) struct Target {
     /// `LLM_GATEWAY_RETRIES`.
     #[serde(default = "default_gateway_retries")]
     pub gateway_retries: u32,
+}
+
+/// `[targets.workload_identity]`: the service's WIF env vars, by the same
+/// names in lower case without the `LLM_`/`OPENAI_` prefix. Unset keys take
+/// the service's defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkloadIdentityTarget {
+    /// `OPENAI_IDENTITY_PROVIDER_ID`.
+    #[serde(default)]
+    pub identity_provider_id: Option<String>,
+    /// `OPENAI_SERVICE_ACCOUNT_ID`.
+    #[serde(default)]
+    pub service_account_id: Option<String>,
+    /// `LLM_IDENTITY_TOKEN_FILE`.
+    #[serde(default)]
+    pub identity_token_file: Option<std::path::PathBuf>,
+    /// `LLM_TOKEN_EXCHANGE_URL`.
+    #[serde(default)]
+    pub token_exchange_url: Option<String>,
+    /// `LLM_AUTHENTIK_TOKEN_URL`.
+    #[serde(default)]
+    pub authentik_token_url: Option<String>,
+    /// `LLM_AUTHENTIK_CLIENT_ID`.
+    #[serde(default)]
+    pub authentik_client_id: Option<String>,
+    /// `LLM_AUTHENTIK_SCOPE`.
+    #[serde(default)]
+    pub authentik_scope: Option<String>,
+    /// `LLM_TOKEN_REFRESH_SKEW_SECS`.
+    #[serde(default)]
+    pub token_refresh_skew_secs: Option<u64>,
+}
+
+impl WorkloadIdentityTarget {
+    fn from_config(config: &LlmAuthConfig) -> Self {
+        Self {
+            identity_provider_id: config.openai_identity_provider_id.clone(),
+            service_account_id: config.openai_service_account_id.clone(),
+            identity_token_file: Some(config.llm_identity_token_file.clone()),
+            token_exchange_url: Some(config.llm_token_exchange_url.clone()),
+            authentik_token_url: config.llm_authentik_token_url.clone(),
+            authentik_client_id: config.llm_authentik_client_id.clone(),
+            authentik_scope: config.llm_authentik_scope.clone(),
+            token_refresh_skew_secs: Some(config.llm_token_refresh_skew_secs),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -130,6 +189,30 @@ impl Target {
             rate_limit_min_wait: Duration::from_secs(self.rate_limit_retry_secs),
             max_rate_limit_retries: self.rate_limit_retries,
             max_gateway_retries: self.gateway_retries,
+            gateway_backoff: crate::llm::DEFAULT_GATEWAY_BACKOFF,
+        }
+    }
+
+    /// This target's `LLM_AUTH` settings, unset keys at the service's
+    /// defaults.
+    pub(crate) fn auth_config(&self) -> LlmAuthConfig {
+        let wif = self.workload_identity.clone().unwrap_or_default();
+        LlmAuthConfig {
+            llm_auth: self.auth,
+            openai_identity_provider_id: wif.identity_provider_id,
+            openai_service_account_id: wif.service_account_id,
+            llm_identity_token_file: wif
+                .identity_token_file
+                .unwrap_or_else(|| service_default("llm_identity_token_file")),
+            llm_token_exchange_url: wif
+                .token_exchange_url
+                .unwrap_or_else(|| service_default("llm_token_exchange_url")),
+            llm_authentik_token_url: wif.authentik_token_url,
+            llm_authentik_client_id: wif.authentik_client_id,
+            llm_authentik_scope: wif.authentik_scope,
+            llm_token_refresh_skew_secs: wif
+                .token_refresh_skew_secs
+                .unwrap_or_else(|| service_default("llm_token_refresh_skew_secs")),
         }
     }
 
@@ -145,12 +228,17 @@ impl Target {
             })?),
             None => None,
         };
+        let auth = self
+            .auth_config()
+            .auth(api_key.map(Secret::new).as_ref())
+            .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
         Ok(LlmClient::new(
             self.base_url.clone(),
-            api_key,
+            None,
             self.model.clone(),
             Duration::from_secs(timeout_secs),
         )
+        .with_auth(auth)
         .with_provider_policy(self.policy()))
     }
 
@@ -224,6 +312,7 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
         })
     };
     let policy = ProviderPolicyConfig::parse_from(["eval"]);
+    let auth = LlmAuthConfig::parse_from(["eval"]);
     Ok(vec![Target {
         name: std::env::var("EVAL_TARGET_NAME").unwrap_or_else(|_| "env".to_string()),
         environment: std::env::var("EVAL_ENVIRONMENT").ok(),
@@ -232,6 +321,9 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
         api_key_env: std::env::var("LLM_API_KEY")
             .is_ok()
             .then(|| "LLM_API_KEY".to_string()),
+        auth: auth.llm_auth,
+        workload_identity: (auth.llm_auth != LlmAuthMode::ApiKey)
+            .then(|| WorkloadIdentityTarget::from_config(&auth)),
         request_timeout_secs: crate::eval::env_parse(
             "LLM_REQUEST_TIMEOUT_SECS",
             default_request_timeout_secs(),
@@ -276,6 +368,28 @@ mod tests {
         }
     }
 
+    /// The `OpenAI` example target (docs/enricher-openai.md): effort `none`,
+    /// no `max_tokens`, and the documented retry/concurrency settings.
+    #[test]
+    fn example_openai_target_has_the_documented_settings() {
+        let targets = parse_targets(
+            include_str!("../../eval/targets.example.toml"),
+            Some(&["openai-gpt-6-luna-none".to_string()]),
+        )
+        .unwrap();
+        let target = &targets[0];
+        assert_eq!(target.base_url, "https://api.openai.com/v1");
+        assert_eq!(target.model, "gpt-6-luna");
+        assert_eq!(target.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(target.request_timeout_secs, 120);
+        let policy = target.policy();
+        assert_eq!(policy.reasoning_effort.as_deref(), Some("none"));
+        assert_eq!(policy.max_tokens, None);
+        assert_eq!(policy.max_in_flight, Some(3));
+        assert_eq!(policy.max_rate_limit_retries, 3);
+        assert_eq!(policy.max_gateway_retries, 1);
+    }
+
     #[test]
     fn minimal_target_takes_service_defaults() {
         let targets = parse_targets(
@@ -296,6 +410,8 @@ mod tests {
         assert_eq!(target.rate_limit_retries, 0);
         assert_eq!(target.gateway_retries, 0);
         assert_eq!(target.file_stem(), "a-b");
+        assert_eq!(target.auth, LlmAuthMode::ApiKey);
+        assert!(target.workload_identity.is_none());
         let policy = target.policy();
         assert_eq!(policy.max_tokens, None);
         assert_eq!(policy.max_gateway_retries, 0);
@@ -314,6 +430,45 @@ mod tests {
         assert!(parse_targets(dup, None).is_err());
         let typo = "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\ntimeout = 1\n";
         assert!(parse_targets(typo, None).is_err());
+    }
+
+    /// A target can select a workload identity mode; its settings default
+    /// to the service's, and its validation is the service's.
+    #[test]
+    fn workload_identity_target_parses_and_validates() {
+        let targets = parse_targets(
+            "[[targets]]\nname = \"wif\"\nbase_url = \"https://api.openai.com/v1\"\n\
+             model = \"gpt-6-luna\"\nauth = \"openai-wif-kubernetes\"\n\
+             [targets.workload_identity]\nidentity_provider_id = \"idp_1\"\n\
+             service_account_id = \"svc_1\"\n\
+             identity_token_file = \"/surely/absent/enricher-eval-token\"\n",
+            None,
+        )
+        .unwrap();
+        let target = &targets[0];
+        assert_eq!(target.auth, LlmAuthMode::OpenaiWifKubernetes);
+        let config = target.auth_config();
+        assert_eq!(
+            config.llm_token_exchange_url,
+            "https://auth.openai.com/oauth/token"
+        );
+        assert_eq!(config.llm_token_refresh_skew_secs, 60);
+        let federation = config.federation(None).unwrap().unwrap();
+        assert_eq!(federation.identity_provider_id, "idp_1");
+        // Out of cluster there is no projected token: the client refuses.
+        let err = target.client(1).err().unwrap().to_string();
+        assert!(err.contains("not readable"), "{err}");
+
+        let typo = "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\n\
+                    [targets.workload_identity]\nidentity_provider = \"x\"\n";
+        assert!(parse_targets(typo, None).is_err());
+        let bad_mode =
+            "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\nauth = \"gcp\"\n";
+        assert!(parse_targets(bad_mode, None).is_err());
+        let missing_ids = "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\n\
+                           auth = \"openai-wif-authentik\"\n";
+        let target = &parse_targets(missing_ids, None).unwrap()[0];
+        assert!(target.client(1).is_err());
     }
 
     #[test]

@@ -19,6 +19,25 @@
 #   rate_limit_retries    LLM_RATE_LIMIT_RETRIES
 #   rate_limit_retry_secs LLM_RATE_LIMIT_RETRY_SECS
 #   gateway_retries       LLM_GATEWAY_RETRIES
+#   auth                  LLM_AUTH: "api-key" (default), "openai-wif-authentik"
+#                         or "openai-wif-kubernetes"
+#
+# api_key_env is the normal route, OpenAI included. The keyless workload
+# identity modes (docs/enricher-openai.md, "Keyless auth") need a projected
+# Kubernetes service-account token, so they only work from a pod in the
+# cluster. Their settings go in a [targets.workload_identity] table, named
+# like the service's env vars in lower case without the LLM_/OPENAI_
+# prefix: identity_provider_id, service_account_id, identity_token_file,
+# token_exchange_url, authentik_token_url, authentik_client_id,
+# authentik_scope, token_refresh_skew_secs. For example:
+#
+#   auth = "openai-wif-authentik"
+#   [targets.workload_identity]
+#   identity_provider_id = "<identity-provider-id>"
+#   service_account_id = "<openai-service-account-id>"
+#   authentik_token_url = "https://sso.example.com/application/o/token/"
+#   authentik_client_id = "<client-id>"
+#   authentik_scope = "profile"
 #
 # environment is free text, but fill it in: perf numbers are meaningless
 # without knowing the hardware/host they came from.
@@ -47,5 +66,19 @@ request_timeout_secs = 320
 max_tokens = 8192
 reasoning_effort = "low"
 max_in_flight = 2
+rate_limit_retries = 3
+gateway_retries = 1
+
+[[targets]]
+name = "openai-gpt-6-luna-none"
+environment = "OpenAI platform (api.openai.com, US processing), Tier 1; see docs/enricher-openai.md"
+base_url = "https://api.openai.com/v1"
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+# Must be "none": any other effort forbids the temperature 0 every request
+# sends. No max_tokens: this model rejects it.
+reasoning_effort = "none"
+request_timeout_secs = 120
+max_in_flight = 3
 rate_limit_retries = 3
 gateway_retries = 1

@@ -1757,7 +1757,10 @@ mod tests {
                 "two",
                 Pass::Primary,
                 FakeReply::Error {
-                    error: || LlmCallError::GatewayUnavailable { status: 504 },
+                    error: || LlmCallError::GatewayUnavailable {
+                        status: 504,
+                        retry_after: None,
+                    },
                     retries: 1,
                 },
             )

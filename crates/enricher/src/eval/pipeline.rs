@@ -122,8 +122,10 @@ pub(crate) struct CallRecord {
     /// In-call retries the target's provider policy spent.
     pub retries: u32,
     /// `success`, or `main.rs::llm_outcome`'s label for the error
-    /// (`timeout`, `gateway_error`, `rate_limited`, `http_error`,
-    /// `empty_content`, `error`). The *final* outcome: an attempt that
+    /// (`timeout`, `gateway_error`, `rate_limited`, `quota_exhausted`,
+    /// `http_error`, `empty_content`, `refused`, `auth_error`,
+    /// `unauthorized`, `error`). The *final*
+    /// outcome: an attempt that
     /// timed out and was retried successfully shows only in `attempts`.
     pub outcome: String,
     /// Every HTTP attempt, in order. Empty when the call failed before
@@ -135,6 +137,11 @@ pub(crate) struct CallRecord {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The provider's token counts for the successful attempt, when it sent
+    /// any (`OpenAI`: prompt, completion, reasoning and cached tokens).
+    /// Absent for providers that omit `usage` and in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<llm::TokenUsage>,
 }
 
 /// One pipeline run of one case: the unit both runners record.
@@ -206,7 +213,8 @@ pub(crate) enum FailureKind {
     Transport,
     /// The model answered, but with output the service rejects: empty
     /// content (e.g. a reasoning model that spent `max_tokens` thinking --
-    /// a model/config problem, not the environment), malformed or
+    /// a model/config problem, not the environment), a safety refusal
+    /// (`message.refusal`), malformed or
     /// schema-violating JSON, an empty `periods` array, or adversarial
     /// verdicts that don't align with the primary periods.
     InvalidOutput,
@@ -255,10 +263,11 @@ impl PipelineRecord {
             });
         };
         let Some(content) = &call.content else {
-            // Empty content is the model's answer (typically a reasoning
-            // model out of `max_tokens`), so it scores as invalid output;
-            // perf still sees the call's own `empty_content` label.
-            let kind = if call.outcome == EMPTY_CONTENT {
+            // Empty content (typically a reasoning model out of
+            // `max_tokens`) and a safety refusal are the model's answer, so
+            // they score as invalid output; perf still sees the call's own
+            // `empty_content` / `refused` label.
+            let kind = if MODEL_ANSWER_FAILURES.contains(&call.outcome.as_str()) {
                 FailureKind::InvalidOutput
             } else {
                 FailureKind::Transport
@@ -279,8 +288,10 @@ impl PipelineRecord {
     }
 }
 
-/// `LlmCallError::EmptyContent`'s outcome label.
-const EMPTY_CONTENT: &str = "empty_content";
+/// Outcome labels of failed calls that are nonetheless the model's answer
+/// (`LlmCallError::EmptyContent` and `LlmCallError::Refused`), not a
+/// transport failure.
+const MODEL_ANSWER_FAILURES: [&str; 2] = ["empty_content", "refused"];
 
 pub(crate) fn millis(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
@@ -308,6 +319,7 @@ async fn timed_call<B: Backend>(
         attempts: raw.attempts.iter().map(AttemptRecord::from).collect(),
         content,
         error,
+        usage: raw.usage,
     }
 }
 
@@ -482,6 +494,7 @@ impl FakeBackend {
                 content: Ok(content),
                 retries: 0,
                 attempts: vec![self.attempt("success")],
+                usage: None,
             },
             Some(FakeReply::Agree) => {
                 let verdicts: Vec<serde_json::Value> = periods
@@ -504,6 +517,7 @@ impl FakeBackend {
                     content: Ok(serde_json::json!({ "periods": verdicts }).to_string()),
                     retries: 0,
                     attempts: vec![self.attempt("success")],
+                    usage: None,
                 }
             }
             Some(FakeReply::Error { error, retries }) => {
@@ -512,6 +526,7 @@ impl FakeBackend {
                     content: Err(error().into()),
                     retries,
                     attempts: (0..=retries).map(|_| self.attempt(label)).collect(),
+                    usage: None,
                 }
             }
             Some(FakeReply::Retried { failed, then }) => {
@@ -533,6 +548,7 @@ impl FakeBackend {
                 )),
                 retries: 0,
                 attempts: Vec::new(),
+                usage: None,
             },
         }
     }
@@ -661,6 +677,66 @@ mod tests {
         let failure = record.outcome().unwrap_err();
         assert_eq!(failure.kind, FailureKind::InvalidOutput);
         assert_eq!(failure.outcome, "empty_content");
+    }
+
+    /// A safety refusal is the model's answer: invalid output, labelled
+    /// `refused`. An exhausted quota is the account's problem: transport.
+    #[tokio::test]
+    async fn refusal_is_invalid_output_and_quota_is_transport() {
+        let backend = FakeBackend::default().with(
+            "a",
+            Pass::Primary,
+            FakeReply::Error {
+                error: || llm::LlmCallError::Refused {
+                    refusal: "I can't help with that.".into(),
+                },
+                retries: 0,
+            },
+        );
+        let record = run_pipeline(&backend, &label(), &case("a"), 0).await;
+        assert_eq!(record.calls[0].outcome, "refused");
+        let failure = record.outcome().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::InvalidOutput);
+        assert_eq!(failure.outcome, "refused");
+
+        let backend = FakeBackend::default().with(
+            "a",
+            Pass::Primary,
+            FakeReply::Error {
+                error: || llm::LlmCallError::QuotaExhausted {
+                    code: "insufficient_quota".into(),
+                },
+                retries: 0,
+            },
+        );
+        let failure = run_pipeline(&backend, &label(), &case("a"), 0)
+            .await
+            .outcome()
+            .unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Transport);
+        assert_eq!(failure.outcome, "quota_exhausted");
+    }
+
+    /// Token usage is optional on a record: an old record (no `usage` key)
+    /// still parses, and a recorded one round-trips.
+    #[test]
+    fn usage_is_optional_and_round_trips() {
+        let old =
+            r#"{"pass":"primary","elapsed_ms":1,"retries":0,"outcome":"success","content":"{}"}"#;
+        let call: CallRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(call.usage, None);
+        let with = CallRecord {
+            usage: Some(llm::TokenUsage {
+                prompt_tokens: Some(1200),
+                completion_tokens: Some(80),
+                reasoning_tokens: Some(0),
+                cached_tokens: Some(1024),
+            }),
+            ..call
+        };
+        let line = serde_json::to_string(&with).unwrap();
+        assert!(line.contains("\"cached_tokens\":1024"), "{line}");
+        assert_eq!(serde_json::from_str::<CallRecord>(&line).unwrap(), with);
     }
 
     #[tokio::test]

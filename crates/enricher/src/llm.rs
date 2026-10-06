@@ -1,5 +1,5 @@
 //! Client for the generic OpenAI-compatible Chat Completions REST API.
-//! Deliberately vendor-agnostic: `base_url`/`api_key`/`model` are the only
+//! Deliberately vendor-agnostic: `base_url`/credential/`model` are the only
 //! things that vary between a local llama.cpp/vLLM/Ollama server and any
 //! hosted provider that speaks the same schema.
 //!
@@ -190,7 +190,9 @@ pub(crate) struct SeverityAdversarialPeriodVerdict {
 
 pub(crate) struct LlmClient {
     base_url: String,
-    api_key: Option<String>,
+    /// The endpoint's credential (see `auth.rs`): none, `LLM_API_KEY`, or a
+    /// workload-identity-federated `OpenAI` token.
+    auth: crate::auth::LlmAuth,
     model: String,
     http: reqwest::Client,
     /// See [`ProviderPolicy`]; the default is today's behaviour.
@@ -221,6 +223,58 @@ pub(crate) struct RawCall {
         expect(dead_code, reason = "read only by the test-only model-eval harness")
     )]
     pub attempts: Vec<Attempt>,
+    /// The successful attempt's `usage`, when the provider sent one (see
+    /// [`TokenUsage`]). Observation only, like `attempts`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read only by the test-only model-eval harness")
+    )]
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token counts from a response's `usage` object. Every field is optional:
+/// `OpenAI` sends all four (`reasoning_tokens` under
+/// `completion_tokens_details`, `cached_tokens` under
+/// `prompt_tokens_details`); Ollama and others send some or none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the provider's own field names, so a record reads like the API's usage object"
+)]
+pub(crate) struct TokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Reads a response's `usage` value tolerantly: a missing or
+    /// odd-shaped field is just `None`, never a failed response.
+    fn from_response(usage: &serde_json::Value) -> Option<Self> {
+        let count = |parent: Option<&serde_json::Value>, key: &str| {
+            parent
+                .and_then(|p| p.get(key))
+                .and_then(serde_json::Value::as_u64)
+        };
+        let parsed = Self {
+            prompt_tokens: count(Some(usage), "prompt_tokens"),
+            completion_tokens: count(Some(usage), "completion_tokens"),
+            reasoning_tokens: count(usage.get("completion_tokens_details"), "reasoning_tokens"),
+            cached_tokens: count(usage.get("prompt_tokens_details"), "cached_tokens"),
+        };
+        (parsed != Self::default()).then_some(parsed)
+    }
+}
+
+/// A successful attempt: the raw `content` plus its token usage.
+struct Completion {
+    content: String,
+    usage: Option<TokenUsage>,
 }
 
 /// One HTTP attempt of a [`RawCall`], for the model-eval harness's perf
@@ -234,7 +288,8 @@ pub(crate) struct Attempt {
     pub queued: std::time::Duration,
     /// The attempt itself (`send_once`): what `request_timeout` bounds.
     pub send: std::time::Duration,
-    /// 429 back-off slept after this attempt, before the next one.
+    /// Back-off slept after this attempt, before the next one (a 429's, or
+    /// a 502/503/504's).
     pub backoff: std::time::Duration,
 }
 
@@ -276,6 +331,10 @@ pub(crate) struct ProviderPolicy {
     /// provider is a provider-side condition, not something the incident's
     /// text caused -- see [`LlmClient::is_provider_transient`].
     pub max_gateway_retries: u32,
+    /// Base of the back-off before a 502/503/504 retry that carries no
+    /// `Retry-After` (see [`DEFAULT_GATEWAY_BACKOFF`]). Not an env knob;
+    /// tests shorten it.
+    pub gateway_backoff: std::time::Duration,
 }
 
 impl Default for ProviderPolicy {
@@ -287,9 +346,20 @@ impl Default for ProviderPolicy {
             rate_limit_min_wait: std::time::Duration::from_secs(20),
             max_rate_limit_retries: 0,
             max_gateway_retries: 0,
+            gateway_backoff: DEFAULT_GATEWAY_BACKOFF,
         }
     }
 }
+
+/// Base of the short exponential back-off before an in-call gateway retry
+/// (502/503/504) when the response carries no `Retry-After`: 2 s, 4 s, 8 s,
+/// ... capped at [`MAX_GATEWAY_BACKOFF`]. A client timeout is retried at
+/// once, as before -- it has already waited a whole request timeout.
+pub(crate) const DEFAULT_GATEWAY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cap on the computed gateway back-off (not on a server's `Retry-After`,
+/// which is capped by [`MAX_RETRY_AFTER`] like a 429's).
+const MAX_GATEWAY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Typed classification of one failed chat-completion attempt, so callers
 /// can tell "the provider is busy" apart from "this text can't be
@@ -300,8 +370,20 @@ pub(crate) enum LlmCallError {
     RateLimited {
         retry_after: Option<std::time::Duration>,
     },
+    /// A 429 whose body says the account is out of credit
+    /// (`insufficient_quota`) or at its billing hard limit -- `OpenAI` uses
+    /// the same status as a real rate limit for these
+    /// (<https://developers.openai.com/api/docs/guides/error-codes>). No
+    /// wait fixes it, so it is never retried in-call; `code` is the body's
+    /// `error.code` (or `error.type`).
+    QuotaExhausted {
+        code: String,
+    },
+    /// 502/503/504. `retry_after` is the response's `Retry-After`, if any
+    /// (`OpenAI`'s 503 `server_is_overloaded` may carry one).
     GatewayUnavailable {
         status: u16,
+        retry_after: Option<std::time::Duration>,
     },
     ClientTimeout,
     Status {
@@ -312,8 +394,30 @@ pub(crate) enum LlmCallError {
     EmptyContent {
         finish_reason: Option<String>,
     },
+    /// 200 OK with `message.refusal` set (and no content): the model
+    /// declined on safety grounds. The model's answer to this text, so it
+    /// is neither retried in-call nor provider-transient.
+    Refused {
+        refusal: String,
+    },
+    /// Workload identity federation could not produce a token (the
+    /// projected token file is unreadable, or a token endpoint refused or
+    /// failed): nothing was sent to the LLM. `stage` is `authentik` or
+    /// `openai`; `kind` is the `enricher_llm_token_exchange_total` outcome.
+    /// Provider-side, so it never feeds the per-text backoff.
+    CredentialUnavailable {
+        stage: &'static str,
+        kind: &'static str,
+    },
+    /// The endpoint answered 401 to a federated token, and again to a
+    /// freshly exchanged one. Provider-side (the mapping, the project or
+    /// the service account), not the text's fault.
+    Unauthorized,
     Other(anyhow::Error),
 }
+
+/// Longest refusal text kept in an error message / log line.
+const MAX_REFUSAL_CHARS: usize = 200;
 
 impl std::fmt::Display for LlmCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -324,8 +428,20 @@ impl std::fmt::Display for LlmCallError {
                     "LLM endpoint rate-limited (429, retry_after={retry_after:?})"
                 )
             }
-            Self::GatewayUnavailable { status } => {
-                write!(f, "LLM endpoint gateway error/timeout ({status})")
+            Self::QuotaExhausted { code } => write!(
+                f,
+                "LLM endpoint quota or billing limit exhausted (429 {code}); not retrying -- \
+                 check the provider account's credit and limits"
+            ),
+            Self::GatewayUnavailable {
+                status,
+                retry_after,
+            } => {
+                write!(
+                    f,
+                    "LLM endpoint gateway error/overload/timeout ({status}, \
+                     retry_after={retry_after:?})"
+                )
             }
             Self::ClientTimeout => write!(f, "LLM request exceeded the client timeout"),
             Self::Status { status } => write!(f, "LLM endpoint returned HTTP {status}"),
@@ -333,6 +449,20 @@ impl std::fmt::Display for LlmCallError {
                 f,
                 "LLM returned no content (finish_reason={finish_reason:?}); likely exhausted \
                  max_tokens on reasoning"
+            ),
+            Self::Refused { refusal } => {
+                let shown: String = refusal.chars().take(MAX_REFUSAL_CHARS).collect();
+                write!(f, "LLM refused to answer: {shown:?}")
+            }
+            Self::CredentialUnavailable { stage, kind } => write!(
+                f,
+                "no LLM access token: the {stage} token exchange failed ({kind}); see \
+                 enricher_llm_token_exchange_total and docs/enricher-openai.md"
+            ),
+            Self::Unauthorized => write!(
+                f,
+                "LLM endpoint rejected a freshly exchanged access token (401 twice); check the \
+                 OpenAI service account, its project and the WIF mapping"
             ),
             Self::Other(err) => write!(f, "{err}"),
         }
@@ -346,13 +476,104 @@ impl LlmCallError {
     pub(crate) fn outcome_label(&self) -> &'static str {
         match self {
             Self::RateLimited { .. } => "rate_limited",
+            Self::QuotaExhausted { .. } => "quota_exhausted",
             Self::GatewayUnavailable { .. } => "gateway_error",
             Self::ClientTimeout => "timeout",
             Self::Status { .. } => "http_error",
             Self::EmptyContent { .. } => "empty_content",
+            Self::Refused { .. } => "refused",
+            Self::CredentialUnavailable { .. } => "auth_error",
+            Self::Unauthorized => "unauthorized",
             Self::Other(_) => "error",
         }
     }
+}
+
+/// `error.code` / `error.type` values on a 429 that mean "out of money",
+/// not "slow down" (`OpenAI`; other providers simply never send them).
+const QUOTA_ERROR_CODES: [&str; 3] = [
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "billing_not_active",
+];
+
+/// The `error` object of an OpenAI-style error body
+/// (`{"error": {"message", "type", "param", "code"}}`). Every field is
+/// optional: other providers send other shapes, or none.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ApiError {
+    code: Option<String>,
+    kind: Option<String>,
+}
+
+/// Best-effort parse of an error response body; `None` for anything that
+/// isn't the `OpenAI` shape (HTML from a proxy, an empty body, ...).
+fn parse_api_error(body: &str) -> Option<ApiError> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let text = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    Some(ApiError {
+        code: text("code"),
+        kind: text("type"),
+    })
+}
+
+/// Classifies a non-2xx response. Pure, so the `OpenAI` error bodies can be
+/// tested without a server.
+fn classify_error_status(
+    status: u16,
+    retry_after: Option<std::time::Duration>,
+    api_error: Option<&ApiError>,
+) -> LlmCallError {
+    match status {
+        429 => {
+            let quota = api_error.and_then(|e| {
+                [e.code.as_deref(), e.kind.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|c| QUOTA_ERROR_CODES.contains(c))
+            });
+            match quota {
+                Some(code) => LlmCallError::QuotaExhausted {
+                    code: code.to_string(),
+                },
+                None => LlmCallError::RateLimited { retry_after },
+            }
+        }
+        502..=504 => LlmCallError::GatewayUnavailable {
+            status,
+            retry_after,
+        },
+        _ => LlmCallError::Status { status },
+    }
+}
+
+/// The back-off before gateway retry number `retry` (1-based): the
+/// server's `Retry-After` when it sent one, else `base * 2^(retry-1)`
+/// capped at [`MAX_GATEWAY_BACKOFF`].
+fn gateway_backoff(
+    base: std::time::Duration,
+    retry: u32,
+    retry_after: Option<std::time::Duration>,
+) -> std::time::Duration {
+    retry_after.unwrap_or_else(|| {
+        let factor = 1_u32 << retry.saturating_sub(1).min(16);
+        base.saturating_mul(factor).min(MAX_GATEWAY_BACKOFF)
+    })
+}
+
+/// `x-request-id` from a response, for log lines on failures (`OpenAI`
+/// support asks for it; absent on most self-hosted servers).
+fn request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
@@ -403,6 +624,10 @@ struct JsonSchemaSpec {
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    /// Kept as a raw value and read by [`TokenUsage::from_response`], so an
+    /// unexpected `usage` shape can never fail an otherwise good response.
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -420,6 +645,12 @@ struct ChatChoiceMessage {
     /// error.
     #[serde(default)]
     content: Option<String>,
+    /// `OpenAI` structured outputs: a safety refusal arrives here, with
+    /// `content` null
+    /// (<https://developers.openai.com/api/docs/guides/structured-outputs>).
+    /// Typed as [`LlmCallError::Refused`]. Absent or null elsewhere.
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 const PRIMARY_SCHEMA_NAME: &str = "incident_extraction";
@@ -466,6 +697,16 @@ fn bound_scope_description(scope: &mut Option<String>) {
 /// `resolution_status_confidence`/`severity_confidence` (design §1) --
 /// those don't exist until the combination step runs against the
 /// adversarial passes' output.
+///
+/// All three schemas are written in the subset `OpenAI`'s strict structured
+/// outputs accept (2026-10), which every other backend we use also
+/// understands: every object has `additionalProperties: false` and lists
+/// every property in `required`, the root is a plain object, a nullable
+/// scalar is a `["<type>", "null"]` union, and a nullable *object* is an
+/// `anyOf` of the object and `{"type": "null"}`
+/// (<https://developers.openai.com/api/docs/guides/structured-outputs>).
+/// The JSON a model emits is the same shape as before, so the serde types
+/// above are unchanged. `strict_schema_tests` (below) enforces the subset.
 fn primary_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -478,21 +719,33 @@ fn primary_schema() -> serde_json::Value {
                     "properties": {
                         "scope_description": { "type": ["string", "null"] },
                         "date_range": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "from_date": { "type": ["string", "null"] },
-                                "to_date": { "type": ["string", "null"] }
-                            },
-                            "required": ["from_date", "to_date"]
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "from_date": { "type": ["string", "null"] },
+                                        "to_date": { "type": ["string", "null"] }
+                                    },
+                                    "required": ["from_date", "to_date"],
+                                    "additionalProperties": false
+                                },
+                                { "type": "null" }
+                            ]
                         },
                         "schedule_window": {
-                            "type": ["object", "null"],
-                            "properties": {
-                                "days_of_week": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 7 } },
-                                "start_time": { "type": "string" },
-                                "end_time": { "type": "string" }
-                            },
-                            "required": ["days_of_week", "start_time", "end_time"]
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "days_of_week": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 7 } },
+                                        "start_time": { "type": "string" },
+                                        "end_time": { "type": "string" }
+                                    },
+                                    "required": ["days_of_week", "start_time", "end_time"],
+                                    "additionalProperties": false
+                                },
+                                { "type": "null" }
+                            ]
                         },
                         "resolution_status": { "type": "string", "enum": ["ongoing", "residual", "resolved"] },
                         "apparent_severity": { "type": "string", "enum": ["normal", "moderate_disruption", "severe_disruption", "blocked_or_suspended"] },
@@ -501,11 +754,13 @@ fn primary_schema() -> serde_json::Value {
                             "enum": ["rail_replacement_bus", "no_scheduled_service", "diversion", null]
                         }
                     },
-                    "required": ["scope_description", "date_range", "schedule_window", "resolution_status", "apparent_severity", "impact_type"]
+                    "required": ["scope_description", "date_range", "schedule_window", "resolution_status", "apparent_severity", "impact_type"],
+                    "additionalProperties": false
                 }
             }
         },
-        "required": ["category", "periods"]
+        "required": ["category", "periods"],
+        "additionalProperties": false
     })
 }
 
@@ -630,11 +885,13 @@ fn adversarial_schema() -> serde_json::Value {
                         "scope_description": { "type": ["string", "null"] },
                         "resolution_status": { "type": "string", "enum": ["ongoing", "residual", "resolved"] }
                     },
-                    "required": ["period_index", "scope_description", "resolution_status"]
+                    "required": ["period_index", "scope_description", "resolution_status"],
+                    "additionalProperties": false
                 }
             }
         },
-        "required": ["periods"]
+        "required": ["periods"],
+        "additionalProperties": false
     })
 }
 
@@ -673,11 +930,13 @@ fn severity_adversarial_schema() -> serde_json::Value {
                             "enum": ["normal", "moderate_disruption", "severe_disruption", "blocked_or_suspended"]
                         }
                     },
-                    "required": ["period_index", "scope_description", "apparent_severity"]
+                    "required": ["period_index", "scope_description", "apparent_severity"],
+                    "additionalProperties": false
                 }
             }
         },
-        "required": ["periods"]
+        "required": ["periods"],
+        "additionalProperties": false
     })
 }
 
@@ -759,12 +1018,19 @@ impl LlmClient {
             .expect("reqwest client with a timeout must build");
         Self {
             base_url,
-            api_key,
+            auth: crate::auth::LlmAuth::from_api_key(api_key),
             model,
             http,
             policy: ProviderPolicy::default(),
             in_flight: None,
         }
+    }
+
+    /// Replaces the credential `new` derived from its `api_key` (e.g. with a
+    /// workload-identity-federated one, `LLM_AUTH`).
+    pub(crate) fn with_auth(mut self, auth: crate::auth::LlmAuth) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Opts into a non-default [`ProviderPolicy`].
@@ -781,20 +1047,27 @@ impl LlmClient {
     /// so it must not feed `RetryBackoff`'s per-text backoff (30 min -> 24 h):
     ///
     /// - 429 and 502/503 always are -- nothing about the text causes them.
+    ///   That includes an exhausted quota/billing limit (a 429 too): it is
+    ///   not retried in-call, but it is the account's problem, not the
+    ///   text's, so reclaim keeps retrying at its normal cadence.
     /// - A client timeout or 504 is ambiguous: a runaway generation on one
     ///   particular text also ends that way. Under the default policy it
     ///   keeps backing off exactly as before; once the operator opts into
     ///   gateway retries (`max_gateway_retries > 0`, i.e. a provider whose
     ///   gateway is known to cut slow calls) it counts as transient.
+    /// - A refusal is the model's answer to this text: not transient.
+    /// - A credential failure (no federated token, or a 401 to a fresh one)
+    ///   is the deployment's problem: transient.
     #[expect(
         clippy::match_same_arms,
         reason = "separate arms document distinct cases"
     )]
     pub(crate) fn is_provider_transient(&self, err: &anyhow::Error) -> bool {
         match err.downcast_ref::<LlmCallError>() {
-            Some(LlmCallError::RateLimited { .. }) => true,
+            Some(LlmCallError::RateLimited { .. } | LlmCallError::QuotaExhausted { .. }) => true,
+            Some(LlmCallError::CredentialUnavailable { .. } | LlmCallError::Unauthorized) => true,
             Some(
-                LlmCallError::GatewayUnavailable { status: 504 } | LlmCallError::ClientTimeout,
+                LlmCallError::GatewayUnavailable { status: 504, .. } | LlmCallError::ClientTimeout,
             ) => self.policy.max_gateway_retries > 0,
             Some(LlmCallError::GatewayUnavailable { .. }) => true,
             _ => false,
@@ -853,16 +1126,18 @@ impl LlmClient {
                         content: Err(err),
                         retries,
                         attempts,
+                        usage: None,
                     };
                 }
             };
             attempts.push(timing);
             match attempt {
-                Ok(content) => {
+                Ok(completion) => {
                     return RawCall {
-                        content: Ok(content),
+                        content: Ok(completion.content),
                         retries,
                         attempts,
+                        usage: completion.usage,
                     };
                 }
                 Err(LlmCallError::RateLimited { retry_after })
@@ -880,17 +1155,41 @@ impl LlmClient {
                         last.backoff = sleep_start.elapsed();
                     }
                 }
-                Err(
-                    err @ (LlmCallError::GatewayUnavailable { .. } | LlmCallError::ClientTimeout),
-                ) if gateway_retries < self.policy.max_gateway_retries => {
+                // 502/503/504 (provider-neutral: NVIDIA's gateway 504s and
+                // OpenAI's 503 `server_is_overloaded` alike). Honours a
+                // `Retry-After` under the same cap as a 429's; otherwise a
+                // short bounded back-off rather than an instant re-send
+                // into an overloaded server.
+                Err(err @ LlmCallError::GatewayUnavailable { retry_after, .. })
+                    if gateway_retries < self.policy.max_gateway_retries
+                        && retry_after.is_none_or(|wait| wait <= MAX_RETRY_AFTER) =>
+                {
+                    gateway_retries += 1;
+                    let wait =
+                        gateway_backoff(self.policy.gateway_backoff, gateway_retries, retry_after);
+                    tracing::warn!(error = %err, ?wait, attempt = gateway_retries, "LLM gateway failure; backing off");
+                    let sleep_start = tokio::time::Instant::now();
+                    tokio::time::sleep(wait).await;
+                    if let Some(last) = attempts.last_mut() {
+                        last.backoff = sleep_start.elapsed();
+                    }
+                }
+                // A client timeout has already waited a whole request
+                // timeout: retried at once, as before.
+                Err(err @ LlmCallError::ClientTimeout)
+                    if gateway_retries < self.policy.max_gateway_retries =>
+                {
                     gateway_retries += 1;
                     tracing::warn!(error = %err, attempt = gateway_retries, "LLM gateway failure; retrying");
                 }
+                // Everything else -- including a refusal, empty content and
+                // an exhausted quota -- fails the call at once.
                 Err(err) => {
                     return RawCall {
                         content: Err(err.into()),
                         retries,
                         attempts,
+                        usage: None,
                     };
                 }
             }
@@ -903,7 +1202,7 @@ impl LlmClient {
     async fn limited_send(
         &self,
         request: &ChatCompletionRequest<'_>,
-    ) -> anyhow::Result<(Result<String, LlmCallError>, Attempt)> {
+    ) -> anyhow::Result<(Result<Completion, LlmCallError>, Attempt)> {
         let queue_start = tokio::time::Instant::now();
         let _permit = match &self.in_flight {
             Some(sem) => Some(
@@ -927,54 +1226,111 @@ impl LlmClient {
         Ok((attempt, timing))
     }
 
-    /// One HTTP attempt, classified.
-    async fn send_once(&self, request: &ChatCompletionRequest<'_>) -> Result<String, LlmCallError> {
-        let mut req = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(request);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
+    /// One HTTP attempt, classified. Every failure after a response arrived
+    /// is logged with the response's `x-request-id` (when sent), which is
+    /// what a provider's support needs to trace the call.
+    ///
+    /// With a federated credential, a 401 drops the cached token and the
+    /// request is sent once more with a freshly exchanged one; a second 401
+    /// is [`LlmCallError::Unauthorized`]. That happens here, before the
+    /// 429/5xx classification, so it spends none of the provider policy's
+    /// retry budgets. A 403 is never refreshed: a new token for the same
+    /// service account would be refused the same way.
+    async fn send_once(
+        &self,
+        request: &ChatCompletionRequest<'_>,
+    ) -> Result<Completion, LlmCallError> {
+        let mut refreshed = false;
+        let response = loop {
+            let bearer = self.auth.bearer().await?;
+            let mut req = self
+                .http
+                .post(format!("{}/chat/completions", self.base_url))
+                .json(request);
+            if let Some(token) = &bearer {
+                req = req.bearer_auth(token.expose());
+            }
 
-        let response = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                LlmCallError::ClientTimeout
-            } else {
-                LlmCallError::Other(err.into())
+            let response = req.send().await.map_err(|err| {
+                if err.is_timeout() {
+                    LlmCallError::ClientTimeout
+                } else {
+                    LlmCallError::Other(err.into())
+                }
+            })?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED || !self.auth.is_federated() {
+                break response;
             }
-        })?;
+            let request_id = request_id(response.headers());
+            if let Some(token) = &bearer {
+                self.auth.invalidate(token);
+            }
+            if refreshed {
+                let err = LlmCallError::Unauthorized;
+                tracing::warn!(
+                    status = 401,
+                    request_id = request_id.as_deref(),
+                    outcome = err.outcome_label(),
+                    "LLM call failed"
+                );
+                return Err(err);
+            }
+            tracing::info!(
+                request_id = request_id.as_deref(),
+                "LLM endpoint returned 401 to the federated token; exchanging a new one"
+            );
+            refreshed = true;
+        };
         let status = response.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(LlmCallError::RateLimited {
-                retry_after: parse_retry_after(response.headers()),
-            });
-        }
-        if matches!(status.as_u16(), 502..=504) {
-            return Err(LlmCallError::GatewayUnavailable {
-                status: status.as_u16(),
-            });
-        }
+        let request_id = request_id(response.headers());
         if !status.is_success() {
-            return Err(LlmCallError::Status {
-                status: status.as_u16(),
-            });
+            let retry_after = parse_retry_after(response.headers());
+            // Best effort: the body only refines the classification (a
+            // quota 429) and the log line.
+            let body = response.text().await.unwrap_or_default();
+            let api_error = parse_api_error(&body);
+            let err = classify_error_status(status.as_u16(), retry_after, api_error.as_ref());
+            let api_error = api_error.unwrap_or_default();
+            tracing::warn!(
+                status = status.as_u16(),
+                request_id = request_id.as_deref(),
+                error_code = api_error.code.as_deref(),
+                error_type = api_error.kind.as_deref(),
+                outcome = err.outcome_label(),
+                "LLM call failed"
+            );
+            return Err(err);
         }
+        let failed = |err: LlmCallError| {
+            tracing::warn!(
+                request_id = request_id.as_deref(),
+                outcome = err.outcome_label(),
+                error = %err,
+                "LLM call failed"
+            );
+            err
+        };
         let body: ChatCompletionResponse = response.json().await.map_err(|err| {
-            if err.is_timeout() {
+            failed(if err.is_timeout() {
                 LlmCallError::ClientTimeout
             } else {
                 LlmCallError::Other(err.into())
-            }
+            })
         })?;
+        let usage = body.usage.as_ref().and_then(TokenUsage::from_response);
         let choice = body.choices.into_iter().next().ok_or_else(|| {
-            LlmCallError::Other(anyhow::anyhow!("chat completion response had no choices"))
+            failed(LlmCallError::Other(anyhow::anyhow!(
+                "chat completion response had no choices"
+            )))
         })?;
+        if let Some(refusal) = choice.message.refusal.filter(|r| !r.trim().is_empty()) {
+            return Err(failed(LlmCallError::Refused { refusal }));
+        }
         match choice.message.content {
-            Some(content) if !content.trim().is_empty() => Ok(content),
-            _ => Err(LlmCallError::EmptyContent {
+            Some(content) if !content.trim().is_empty() => Ok(Completion { content, usage }),
+            _ => Err(failed(LlmCallError::EmptyContent {
                 finish_reason: choice.finish_reason,
-            }),
+            })),
         }
     }
 
@@ -1051,6 +1407,7 @@ impl LlmClient {
                     content: Err(err),
                     retries: 0,
                     attempts: Vec::new(),
+                    usage: None,
                 };
             }
         };
@@ -1091,6 +1448,7 @@ impl LlmClient {
                     content: Err(err),
                     retries: 0,
                     attempts: Vec::new(),
+                    usage: None,
                 };
             }
         };
@@ -1285,10 +1643,372 @@ mod scope_bound_tests {
     }
 }
 
+/// The three pass schemas against `OpenAI`'s strict structured-outputs rules
+/// (<https://developers.openai.com/api/docs/guides/structured-outputs>),
+/// plus a check that model output shaped like the shipped eval dataset's
+/// gold labels still validates against the tightened schemas *and* parses
+/// through the service's own parsers.
+#[cfg(test)]
+mod strict_schema_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// Keywords strict mode rejects (or that we must never rely on).
+    const UNSUPPORTED: [&str; 12] = [
+        "allOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentRequired",
+        "dependentSchemas",
+        "patternProperties",
+        "minLength",
+        "maxLength",
+        "$ref",
+    ];
+
+    fn schemas() -> [(&'static str, Value); 3] {
+        [
+            (PRIMARY_SCHEMA_NAME, primary_schema()),
+            (ADVERSARIAL_SCHEMA_NAME, adversarial_schema()),
+            (
+                SEVERITY_ADVERSARIAL_SCHEMA_NAME,
+                severity_adversarial_schema(),
+            ),
+        ]
+    }
+
+    fn types(node: &serde_json::Map<String, Value>) -> Vec<&str> {
+        match node.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Walks one schema node, collecting every strict-mode violation.
+    fn check_strict(node: &Value, at: &str, errors: &mut Vec<String>) {
+        let Some(node) = node.as_object() else {
+            errors.push(format!("{at}: schema node is not an object"));
+            return;
+        };
+        for keyword in UNSUPPORTED {
+            if node.contains_key(keyword) {
+                errors.push(format!("{at}: unsupported keyword {keyword}"));
+            }
+        }
+        if let Some(branches) = node.get("anyOf") {
+            let branches = branches.as_array().map_or(&[][..], Vec::as_slice);
+            if branches.is_empty() {
+                errors.push(format!("{at}: empty anyOf"));
+            }
+            for (i, branch) in branches.iter().enumerate() {
+                check_strict(branch, &format!("{at}.anyOf[{i}]"), errors);
+            }
+            return;
+        }
+        let types = types(node);
+        if types.is_empty() {
+            errors.push(format!("{at}: no type"));
+        }
+        if types.contains(&"object") {
+            if types.len() > 1 {
+                errors.push(format!(
+                    "{at}: nullable object as a type union; use anyOf with {{\"type\":\"null\"}}"
+                ));
+            }
+            if node.get("additionalProperties") != Some(&Value::Bool(false)) {
+                errors.push(format!("{at}: additionalProperties is not false"));
+            }
+            let properties = node.get("properties").and_then(Value::as_object);
+            let Some(properties) = properties else {
+                errors.push(format!("{at}: object without properties"));
+                return;
+            };
+            let mut required: Vec<&str> = node
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|r| r.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            required.sort_unstable();
+            let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            if required != keys {
+                errors.push(format!(
+                    "{at}: required {required:?} != properties {keys:?}"
+                ));
+            }
+            for (key, child) in properties {
+                check_strict(child, &format!("{at}.{key}"), errors);
+            }
+        }
+        if types.contains(&"array") {
+            match node.get("items") {
+                Some(items) => check_strict(items, &format!("{at}[]"), errors),
+                None => errors.push(format!("{at}: array without items")),
+            }
+        }
+    }
+
+    #[test]
+    fn every_schema_conforms_to_openai_strict_mode() {
+        let mut objects = 0;
+        for (name, schema) in schemas() {
+            assert_eq!(
+                schema.get("type"),
+                Some(&Value::String("object".into())),
+                "{name}: the root must be a plain object"
+            );
+            assert!(schema.get("anyOf").is_none(), "{name}: root anyOf");
+            let mut errors = Vec::new();
+            check_strict(&schema, name, &mut errors);
+            assert!(errors.is_empty(), "{name}: {errors:#?}");
+            objects += schema
+                .to_string()
+                .matches("\"additionalProperties\"")
+                .count();
+        }
+        // The primary root, its period, date_range and schedule_window, and
+        // each adversarial schema's root and verdict.
+        assert_eq!(objects, 8);
+    }
+
+    /// The walker itself catches the shapes strict mode rejects.
+    #[test]
+    fn the_strict_walker_rejects_the_old_shapes() {
+        let old = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": ["object", "null"], "properties": { "x": { "type": "string", "maxLength": 5 } }, "required": ["x"] },
+                "b": { "type": "string" }
+            },
+            "required": ["a"]
+        });
+        let mut errors = Vec::new();
+        check_strict(&old, "old", &mut errors);
+        let joined = errors.join("\n");
+        for needle in [
+            "old: additionalProperties is not false",
+            "old: required",
+            "old.a: nullable object as a type union",
+            "old.a.x: unsupported keyword maxLength",
+        ] {
+            assert!(joined.contains(needle), "missing {needle:?} in:\n{joined}");
+        }
+    }
+
+    /// A deliberately small JSON-schema validator for exactly the keywords
+    /// these schemas use (type, properties, required, additionalProperties,
+    /// items, enum, anyOf, minimum, maximum).
+    fn validate(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
+        let node = schema.as_object().ok_or(format!("{at}: bad schema"))?;
+        if let Some(branches) = node.get("anyOf").and_then(Value::as_array) {
+            return if branches.iter().any(|b| validate(b, value, at).is_ok()) {
+                Ok(())
+            } else {
+                Err(format!("{at}: matches no anyOf branch: {value}"))
+            };
+        }
+        let type_ok = types(node).iter().any(|t| match *t {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "null" => value.is_null(),
+            _ => false,
+        });
+        if !type_ok {
+            return Err(format!("{at}: wrong type for {value}"));
+        }
+        let in_enum = node
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_none_or(|allowed| allowed.contains(value));
+        if !in_enum {
+            return Err(format!("{at}: {value} not in enum"));
+        }
+        if let Some(n) = value.as_i64() {
+            let min = node.get("minimum").and_then(Value::as_i64);
+            let max = node.get("maximum").and_then(Value::as_i64);
+            if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                return Err(format!("{at}: {n} out of range"));
+            }
+        }
+        if let (Some(object), Some(properties)) = (
+            value.as_object(),
+            node.get("properties").and_then(Value::as_object),
+        ) {
+            for key in object.keys() {
+                if !properties.contains_key(key) {
+                    return Err(format!("{at}: unexpected property {key}"));
+                }
+            }
+            for required in node
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if !object.contains_key(required) {
+                    return Err(format!("{at}: missing {required}"));
+                }
+            }
+            for (key, child) in object {
+                validate(&properties[key], child, &format!("{at}.{key}"))?;
+            }
+        }
+        if let (Some(items), Some(schema)) = (value.as_array(), node.get("items")) {
+            for (i, item) in items.iter().enumerate() {
+                validate(schema, item, &format!("{at}[{i}]"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn first_accepted(gold: Option<&Value>, fallback: Value) -> Value {
+        match gold {
+            Some(Value::Array(values)) => values.first().cloned().unwrap_or(fallback),
+            Some(value) => value.clone(),
+            None => fallback,
+        }
+    }
+
+    /// One model-shaped primary period from one gold period of the dataset.
+    fn model_period(gold: &Value) -> Value {
+        let date_range = match gold.get("date_range") {
+            Some(range) => range.clone(),
+            None if gold.get("from_date").is_some() || gold.get("to_date").is_some() => {
+                serde_json::json!({
+                    "from_date": gold.get("from_date").cloned().unwrap_or(Value::Null),
+                    "to_date": gold.get("to_date").cloned().unwrap_or(Value::Null),
+                })
+            }
+            None => Value::Null,
+        };
+        serde_json::json!({
+            "scope_description": gold.get("scope_hint").cloned().unwrap_or(Value::Null),
+            "date_range": date_range,
+            "schedule_window": gold.get("schedule_window").cloned().unwrap_or(Value::Null),
+            "resolution_status": first_accepted(gold.get("resolution_status"), "ongoing".into()),
+            "apparent_severity": first_accepted(gold.get("apparent_severity"), "normal".into()),
+            "impact_type": first_accepted(gold.get("impact_type"), Value::Null),
+        })
+    }
+
+    /// Every labelled case in `crates/enricher/eval/dataset.jsonl`, turned
+    /// into the answer a perfect model would give, validates against the
+    /// tightened schemas -- null and non-null `date_range` and
+    /// `schedule_window` included -- and parses through `parse_primary` /
+    /// `parse_adversarial` / `parse_severity_adversarial` unchanged.
+    #[test]
+    fn shipped_eval_fixtures_validate_and_parse_under_the_strict_schemas() {
+        let (mut null_ranges, mut ranges, mut null_windows, mut windows) = (0, 0, 0, 0);
+        let mut cases = 0;
+        for line in include_str!("../eval/dataset.jsonl").lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let case: Value = serde_json::from_str(line).unwrap();
+            let Some(gold_periods) = case["expected"]["periods"].as_array() else {
+                continue;
+            };
+            cases += 1;
+            let periods: Vec<Value> = gold_periods.iter().map(model_period).collect();
+            for p in &periods {
+                if p["date_range"].is_null() {
+                    null_ranges += 1;
+                } else {
+                    ranges += 1;
+                }
+                if p["schedule_window"].is_null() {
+                    null_windows += 1;
+                } else {
+                    windows += 1;
+                }
+            }
+            let category =
+                first_accepted(case["expected"].get("category_any_of"), "unknown".into());
+            let primary = serde_json::json!({ "category": category, "periods": periods });
+            validate(&primary_schema(), &primary, &case["id"].to_string())
+                .unwrap_or_else(|e| panic!("primary: {e}"));
+            let parsed = parse_primary(&primary.to_string()).unwrap();
+            assert_eq!(parsed.periods.len(), periods.len().min(MAX_PERIODS));
+            for (p, json) in parsed.periods.iter().zip(&periods) {
+                assert_eq!(p.date_range.is_none(), json["date_range"].is_null());
+                assert_eq!(
+                    p.schedule_window.is_none(),
+                    json["schedule_window"].is_null()
+                );
+            }
+
+            let verdicts = |field: &str, pick: fn(&ExtractionPeriod) -> &str| {
+                let v: Vec<Value> = parsed
+                    .periods
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let mut verdict = serde_json::json!({
+                            "period_index": i,
+                            "scope_description": p.scope_description,
+                        });
+                        verdict[field] = pick(p).into();
+                        verdict
+                    })
+                    .collect();
+                serde_json::json!({ "periods": v })
+            };
+            let resolution = verdicts("resolution_status", |p| &p.resolution_status);
+            validate(&adversarial_schema(), &resolution, "resolution").unwrap();
+            assert_eq!(
+                parse_adversarial(&resolution.to_string()).unwrap().len(),
+                parsed.periods.len()
+            );
+            let severity = verdicts("apparent_severity", |p| &p.apparent_severity);
+            validate(&severity_adversarial_schema(), &severity, "severity").unwrap();
+            assert_eq!(
+                parse_severity_adversarial(&severity.to_string())
+                    .unwrap()
+                    .len(),
+                parsed.periods.len()
+            );
+        }
+        assert!(cases >= 5, "only {cases} labelled cases");
+        // Both arms of both nullable objects are exercised.
+        assert!(
+            null_ranges > 0 && ranges > 0 && null_windows > 0 && windows > 0,
+            "{null_ranges} {ranges} {null_windows} {windows}"
+        );
+    }
+
+    /// The validator rejects output the strict schemas forbid, so the test
+    /// above is not vacuous.
+    #[test]
+    fn the_validator_rejects_extra_and_missing_properties() {
+        let period = serde_json::json!({
+            "scope_description": null, "date_range": {"from_date": null, "to_date": null, "tz": "x"},
+            "schedule_window": null, "resolution_status": "ongoing",
+            "apparent_severity": "normal", "impact_type": null
+        });
+        let extra = serde_json::json!({ "category": "c", "periods": [period] });
+        assert!(validate(&primary_schema(), &extra, "extra").is_err());
+        let missing = serde_json::json!({ "periods": [] });
+        assert!(validate(&primary_schema(), &missing, "missing").is_err());
+        let bad_day = serde_json::json!({ "category": "c", "periods": [{
+            "scope_description": null, "date_range": null,
+            "schedule_window": {"days_of_week": [8], "start_time": "00:00", "end_time": "23:59"},
+            "resolution_status": "ongoing", "apparent_severity": "normal", "impact_type": null
+        }]});
+        assert!(validate(&primary_schema(), &bad_day, "bad_day").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1958,6 +2678,7 @@ mod tests {
             rate_limit_min_wait: std::time::Duration::from_millis(10),
             max_rate_limit_retries: 3,
             max_gateway_retries: 2,
+            gateway_backoff: std::time::Duration::from_millis(10),
         }
     }
 
@@ -2073,10 +2794,14 @@ mod tests {
         assert_eq!(raw.retries, 2);
         let outcomes: Vec<&str> = raw.attempts.iter().map(|a| a.outcome).collect();
         assert_eq!(outcomes, ["gateway_error", "rate_limited", "success"]);
-        // The back-off is booked on the 429 attempt only, not as send time.
-        assert_eq!(raw.attempts[0].backoff, std::time::Duration::ZERO);
+        // Each back-off is booked on the attempt it followed (the 504's
+        // short gateway back-off, the 429's wait), never as send time.
+        assert!(raw.attempts[0].backoff >= std::time::Duration::from_millis(10));
+        assert!(raw.attempts[0].backoff < std::time::Duration::from_millis(50));
         assert!(raw.attempts[1].backoff >= std::time::Duration::from_millis(50));
         assert_eq!(raw.attempts[2].backoff, std::time::Duration::ZERO);
+        // The default mock body has no `usage`: none recorded.
+        assert_eq!(raw.usage, None);
     }
 
     /// With `max_in_flight` 1: the permit is held for one HTTP attempt only,
@@ -2372,25 +3097,677 @@ mod tests {
     fn outcome_labels_are_distinct_per_error_kind() {
         let labels = [
             LlmCallError::RateLimited { retry_after: None }.outcome_label(),
-            LlmCallError::GatewayUnavailable { status: 504 }.outcome_label(),
+            LlmCallError::QuotaExhausted {
+                code: "insufficient_quota".into(),
+            }
+            .outcome_label(),
+            LlmCallError::GatewayUnavailable {
+                status: 504,
+                retry_after: None,
+            }
+            .outcome_label(),
             LlmCallError::ClientTimeout.outcome_label(),
             LlmCallError::Status { status: 500 }.outcome_label(),
             LlmCallError::EmptyContent {
                 finish_reason: None,
             }
             .outcome_label(),
+            LlmCallError::Refused {
+                refusal: "no".into(),
+            }
+            .outcome_label(),
+            LlmCallError::CredentialUnavailable {
+                stage: "openai",
+                kind: "invalid_grant",
+            }
+            .outcome_label(),
+            LlmCallError::Unauthorized.outcome_label(),
             LlmCallError::Other(anyhow::anyhow!("x")).outcome_label(),
         ];
         assert_eq!(
             labels,
             [
                 "rate_limited",
+                "quota_exhausted",
                 "gateway_error",
                 "timeout",
                 "http_error",
                 "empty_content",
+                "refused",
+                "auth_error",
+                "unauthorized",
                 "error"
             ]
+        );
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len());
+    }
+
+    // -- Workload identity federation (auth.rs) --
+
+    /// A client on `server` whose credential is a federated token minted by
+    /// `server`'s `/oauth/token` (kubernetes mode, token file `file`).
+    fn federated_client(server: &MockServer, file: &std::path::Path) -> LlmClient {
+        let source = crate::auth::FederatedTokenSource::new(crate::auth::tests::kubernetes_config(
+            server, file,
+        ))
+        .unwrap();
+        LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_auth(crate::auth::LlmAuth::Federated(std::sync::Arc::new(source)))
+            .with_provider_policy(fast_retry_policy())
+    }
+
+    /// `/oauth/token` hands out `tokens` in order, the last one forever.
+    async fn mount_exchange(server: &MockServer, tokens: &[&str]) {
+        for (i, token) in tokens.iter().enumerate() {
+            let mock = Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(crate::auth::tests::openai_token(token, 3600));
+            let mock = if i + 1 < tokens.len() {
+                mock.up_to_n_times(1)
+            } else {
+                mock
+            };
+            mock.mount(server).await;
+        }
+    }
+
+    fn exchanges(requests: &[wiremock::Request]) -> usize {
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/oauth/token")
+            .count()
+    }
+
+    /// A 401 to a federated token: drop it, exchange once more, resend.
+    /// The provider policy's retry budgets are untouched.
+    #[tokio::test]
+    async fn federated_401_refreshes_once_and_succeeds() {
+        let server = MockServer::start().await;
+        let file = crate::auth::tests::token_file(crate::auth::tests::K8S_TOKEN);
+        mount_exchange(&server, &["oai-old", "oai-new"]).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer oai-old"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer oai-new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = federated_client(&server, file.path());
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        raw.content.unwrap();
+        assert_eq!(raw.retries, 0, "the 401 refresh is not an in-call retry");
+        assert_eq!(raw.attempts.len(), 1);
+        assert_eq!(raw.attempts[0].outcome, "success");
+        assert_eq!(exchanges(&server.received_requests().await.unwrap()), 2);
+    }
+
+    /// A second 401, to a freshly exchanged token, is `Unauthorized`:
+    /// provider-transient, and not retried.
+    #[tokio::test]
+    async fn federated_401_twice_is_unauthorized() {
+        let server = MockServer::start().await;
+        let file = crate::auth::tests::token_file(crate::auth::tests::K8S_TOKEN);
+        mount_exchange(&server, &["oai-1", "oai-2", "oai-3"]).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = federated_client(&server, file.path());
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Unauthorized)
+            ),
+            "{err:?}"
+        );
+        assert!(client.is_provider_transient(&err));
+        assert_eq!(exchanges(&server.received_requests().await.unwrap()), 2);
+    }
+
+    /// A 403 is not a stale token: no refresh, an ordinary `http_error`.
+    #[tokio::test]
+    async fn federated_403_does_not_refresh() {
+        let server = MockServer::start().await;
+        let file = crate::auth::tests::token_file(crate::auth::tests::K8S_TOKEN);
+        mount_exchange(&server, &["oai-1"]).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = federated_client(&server, file.path());
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Status { status: 403 })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(exchanges(&server.received_requests().await.unwrap()), 1);
+    }
+
+    /// No token: nothing is sent to the LLM, the outcome is `auth_error`,
+    /// and it is provider-transient (kept out of the per-text backoff).
+    #[tokio::test]
+    async fn no_federated_token_is_an_auth_error_and_sends_nothing() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = federated_client(&server, &dir.path().join("absent"));
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        let err = raw.content.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::CredentialUnavailable {
+                    stage: "openai",
+                    kind: "token_file_error"
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(raw.attempts[0].outcome, "auth_error");
+        assert!(client.is_provider_transient(&err));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `api-key` mode is unchanged: the key goes out as `Bearer <key>`, no
+    /// key means no `Authorization` header, the requests are otherwise
+    /// byte-identical, and a 401 is a plain `http_error` with no retry.
+    #[tokio::test]
+    async fn api_key_mode_requests_are_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let keyed = LlmClient::new(
+            server.uri(),
+            Some("sk-test".into()),
+            "m".into(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let keyless = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        keyed
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+        keyless
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let [with_key, without_key] = requests.as_slice() else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(
+            with_key.headers.get("authorization").unwrap(),
+            "Bearer sk-test"
+        );
+        assert!(without_key.headers.get("authorization").is_none());
+        assert_eq!(with_key.body, without_key.body);
+        let mut other_headers = with_key.headers.clone();
+        other_headers.remove("authorization");
+        assert_eq!(other_headers, without_key.headers);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let keyed = LlmClient::new(
+            server.uri(),
+            Some("sk-test".into()),
+            "m".into(),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .with_provider_policy(fast_retry_policy());
+        let err = keyed
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Status { status: 401 })
+            ),
+            "{err:?}"
+        );
+        assert!(!keyed.is_provider_transient(&err));
+    }
+
+    // -- OpenAI platform specifics (docs/enricher-openai.md) --
+
+    /// `OpenAI`'s 429 bodies
+    /// (<https://developers.openai.com/api/docs/guides/error-codes>).
+    fn openai_error(message: &str, kind: &str, code: Option<&str>) -> String {
+        serde_json::json!({
+            "error": { "message": message, "type": kind, "param": null, "code": code }
+        })
+        .to_string()
+    }
+
+    fn insufficient_quota_body() -> String {
+        openai_error(
+            "You exceeded your current quota, please check your plan and billing details.",
+            "insufficient_quota",
+            Some("insufficient_quota"),
+        )
+    }
+
+    fn rate_limit_body() -> String {
+        openai_error(
+            "Rate limit reached for gpt-6-luna in organization org-x on requests per min (RPM): \
+             Limit 500, Used 500, Requested 1. Please try again in 120ms.",
+            "requests",
+            Some("rate_limit_exceeded"),
+        )
+    }
+
+    #[test]
+    fn a_429_is_classified_by_its_error_body() {
+        let wait = Some(std::time::Duration::from_secs(1));
+        let classify =
+            |body: &str| classify_error_status(429, wait, parse_api_error(body).as_ref());
+        assert!(matches!(
+            classify(&insufficient_quota_body()),
+            LlmCallError::QuotaExhausted { code } if code == "insufficient_quota"
+        ));
+        // Billing hard limit: matched on `code` or `type`.
+        let billing = openai_error(
+            "Billing hard limit has been reached",
+            "invalid_request_error",
+            Some("billing_hard_limit_reached"),
+        );
+        assert!(matches!(
+            classify(&billing),
+            LlmCallError::QuotaExhausted { code } if code == "billing_hard_limit_reached"
+        ));
+        let by_type = openai_error("quota", "insufficient_quota", None);
+        assert!(matches!(
+            classify(&by_type),
+            LlmCallError::QuotaExhausted { .. }
+        ));
+        // A real rate limit, and bodies that aren't OpenAI's: unchanged.
+        for body in [rate_limit_body(), String::new(), "<html>busy</html>".into()] {
+            assert!(
+                matches!(classify(&body), LlmCallError::RateLimited { retry_after } if retry_after == wait),
+                "{body}"
+            );
+        }
+        // Other statuses ignore the body.
+        assert!(matches!(
+            classify_error_status(503, wait, parse_api_error(&insufficient_quota_body()).as_ref()),
+            LlmCallError::GatewayUnavailable { status: 503, retry_after } if retry_after == wait
+        ));
+        assert!(matches!(
+            classify_error_status(500, None, None),
+            LlmCallError::Status { status: 500 }
+        ));
+    }
+
+    /// `insufficient_quota` fails at once, with retries to spare, and stays
+    /// out of the per-text backoff (it isn't the text's fault).
+    #[tokio::test]
+    async fn insufficient_quota_fails_fast_instead_of_burning_rate_limit_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("x-request-id", "req_quota")
+                    .set_body_raw(insufficient_quota_body(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(ProviderPolicy {
+                rate_limit_min_wait: std::time::Duration::from_secs(30),
+                ..fast_retry_policy()
+            });
+        let started = std::time::Instant::now();
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(raw.retries, 0);
+        assert_eq!(raw.attempts[0].outcome, "quota_exhausted");
+        let err = raw.content.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::QuotaExhausted { code }) if code == "insufficient_quota"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(crate::llm_outcome::<()>(&Err(err)), "quota_exhausted");
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(client.is_provider_transient(&err));
+    }
+
+    /// A real `OpenAI` rate limit keeps the Retry-After behaviour.
+    #[tokio::test]
+    async fn an_openai_rate_limit_body_is_still_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_raw(rate_limit_body(), "application/json"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(raw.content.is_ok(), "{:?}", raw.content.err());
+        let outcomes: Vec<&str> = raw.attempts.iter().map(|a| a.outcome).collect();
+        assert_eq!(outcomes, ["rate_limited", "success"]);
+    }
+
+    fn overloaded_body() -> String {
+        openai_error(
+            "The server is overloaded or not ready yet.",
+            "server_error",
+            Some("server_is_overloaded"),
+        )
+    }
+
+    /// A 503 `server_is_overloaded` with `Retry-After` waits that long
+    /// before the gateway retry, instead of re-sending at once.
+    #[tokio::test]
+    async fn overloaded_503_honours_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "1")
+                    .set_body_raw(overloaded_body(), "application/json"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(raw.content.is_ok(), "{:?}", raw.content.err());
+        assert_eq!(raw.retries, 1);
+        assert_eq!(raw.attempts[0].outcome, "gateway_error");
+        assert!(raw.attempts[0].backoff >= std::time::Duration::from_secs(1));
+    }
+
+    /// A 503 whose `Retry-After` is past the cap fails at once (still
+    /// provider-transient), like a 429's.
+    #[tokio::test]
+    async fn overloaded_503_with_a_huge_retry_after_fails_fast() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header(
+                        "retry-after",
+                        (MAX_RETRY_AFTER.as_secs() + 1).to_string().as_str(),
+                    )
+                    .set_body_raw(overloaded_body(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let started = std::time::Instant::now();
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(client.is_provider_transient(&err), "{err:?}");
+    }
+
+    /// Without `Retry-After` the gateway back-off is short, exponential and
+    /// bounded; a `Retry-After` replaces it.
+    #[test]
+    fn gateway_backoff_is_short_and_bounded() {
+        let base = DEFAULT_GATEWAY_BACKOFF;
+        let secs = |retry| gateway_backoff(base, retry, None).as_secs();
+        assert_eq!([secs(1), secs(2), secs(3), secs(4)], [2, 4, 8, 16]);
+        assert_eq!(gateway_backoff(base, 5, None), MAX_GATEWAY_BACKOFF);
+        assert_eq!(gateway_backoff(base, u32::MAX, None), MAX_GATEWAY_BACKOFF);
+        let told = std::time::Duration::from_secs(7);
+        assert_eq!(gateway_backoff(base, 1, Some(told)), told);
+    }
+
+    /// NVIDIA-style gateway 504s (no body, no `Retry-After`) are still
+    /// retried within budget, now after the short back-off.
+    #[tokio::test]
+    async fn gateway_504_without_retry_after_backs_off_briefly() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(504))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(raw.content.is_ok());
+        assert_eq!(raw.retries, 2);
+        // 10 ms then 20 ms (base 10 ms, doubling).
+        assert!(raw.attempts[0].backoff >= std::time::Duration::from_millis(10));
+        assert!(raw.attempts[1].backoff >= std::time::Duration::from_millis(20));
+    }
+
+    /// A safety refusal (`message.refusal`, null content) is typed, not
+    /// retried even with retries to spare, and not provider-transient.
+    #[tokio::test]
+    async fn refusal_is_typed_not_retried_and_not_transient() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-request-id", "req_refused")
+                    .set_body_json(serde_json::json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "model": "gpt-6-luna",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "refusal": "I'm sorry, I cannot assist with that request."
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_provider_policy(fast_retry_policy());
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(raw.attempts[0].outcome, "refused");
+        let err = raw.content.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Refused { refusal }) if refusal.starts_with("I'm sorry")
+            ),
+            "{err:?}"
+        );
+        assert!(!client.is_provider_transient(&err));
+        assert_eq!(crate::llm_outcome::<()>(&Err(err)), "refused");
+    }
+
+    /// A `refusal: null` (`OpenAI`'s normal success shape) changes nothing.
+    #[tokio::test]
+    async fn null_refusal_with_content_is_a_success() {
+        let server = MockServer::start().await;
+        let mut body = flat_primary_body();
+        body["choices"][0]["message"]["refusal"] = serde_json::Value::Null;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+    }
+
+    /// `OpenAI`'s `usage` (reasoning and cached tokens nested) is recorded on
+    /// the call; a partial or odd-shaped one is tolerated.
+    #[tokio::test]
+    async fn usage_is_recorded_when_present_and_tolerated_when_odd() {
+        let server = MockServer::start().await;
+        let mut body = flat_primary_body();
+        body["usage"] = serde_json::json!({
+            "prompt_tokens": 2400,
+            "completion_tokens": 150,
+            "total_tokens": 2550,
+            "prompt_tokens_details": { "cached_tokens": 2048, "audio_tokens": 0 },
+            "completion_tokens_details": { "reasoning_tokens": 0, "accepted_prediction_tokens": 0 }
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert_eq!(
+            raw.usage,
+            Some(TokenUsage {
+                prompt_tokens: Some(2400),
+                completion_tokens: Some(150),
+                reasoning_tokens: Some(0),
+                cached_tokens: Some(2048),
+            })
+        );
+
+        // Ollama-style (no details), and garbage: never a failed call.
+        let partial = TokenUsage::from_response(
+            &serde_json::json!({ "prompt_tokens": 10, "completion_tokens": 2 }),
+        );
+        assert_eq!(partial.and_then(|u| u.reasoning_tokens), None);
+        assert_eq!(
+            TokenUsage::from_response(&serde_json::json!({ "prompt_tokens": "lots" })),
+            None
+        );
+        server.reset().await;
+        let mut odd = flat_primary_body();
+        odd["usage"] = serde_json::json!("not an object");
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(odd))
+            .mount(&server)
+            .await;
+        let raw = client.primary_raw("s", "d", reference_date()).await;
+        assert!(raw.content.is_ok(), "{:?}", raw.content.err());
+        assert_eq!(raw.usage, None);
+    }
+
+    #[test]
+    fn request_id_is_read_from_the_response_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(request_id(&headers), None);
+        headers.insert("x-request-id", "req_abc123".parse().unwrap());
+        assert_eq!(request_id(&headers).as_deref(), Some("req_abc123"));
+    }
+
+    /// gpt-6-luna at `LLM_REASONING_EFFORT=none`: `reasoning_effort` is
+    /// sent as `"none"`, `temperature` stays 0 (allowed at `none` only),
+    /// and with `LLM_MAX_TOKENS` unset no `max_tokens` is sent.
+    #[tokio::test]
+    async fn reasoning_effort_none_is_sent_with_temperature_and_without_max_tokens() {
+        use clap::Parser;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let policy = crate::config::ProviderPolicyConfig::parse_from([
+            "enricher",
+            "--llm-reasoning-effort",
+            "none",
+        ])
+        .policy();
+        let client = LlmClient::new(
+            server.uri(),
+            Some("sk-test".into()),
+            "gpt-6-luna".into(),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .with_provider_policy(policy);
+        client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap();
+        let request = &server.received_requests().await.unwrap()[0];
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["temperature"], 0.0);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            "Bearer sk-test"
         );
     }
 

@@ -21,6 +21,12 @@ apart:
 Run quality once per model (on any host that can serve it, however slowly),
 and perf once per model *per environment* you might deploy to.
 
+For OpenAI's own API (`gpt-6-luna` at reasoning effort `none`), see
+[Using the OpenAI API](enricher-openai.md): settings, schema strictness,
+cost, data handling and the checklist to complete before switching
+production. Its eval target is `openai-gpt-6-luna-none` in
+`targets.example.toml`.
+
 ## How it works
 
 Code: `crates/enricher/src/eval/`. It is test-only, like the existing
@@ -39,7 +45,10 @@ Code: `crates/enricher/src/eval/`. It is test-only, like the existing
   (`prompt_fingerprint`), and for each pass its raw output or error, end-to-end latency, final
   outcome label, in-call retry count and every HTTP attempt (`attempts`:
   outcome, time queued for a `max_in_flight` permit, send time, and any 429
-  back-off slept after it).
+  or 502/503/504 back-off slept after it). When the provider reports token
+  usage, each call also keeps it (`usage`: `prompt_tokens`,
+  `completion_tokens`, and OpenAI's `reasoning_tokens` and
+  `cached_tokens`). Providers that send none simply have no `usage`.
 - What the service would have written is derived from a record by
   replaying it through the same parsers. Quality scoring is a pure function
   of records, so saved records can be re-scored without the model.
@@ -272,7 +281,8 @@ split in two:
 - **Invalid output**: the model answered, but with something the service
   rejects: empty content (typically a reasoning model that used up
   `max_tokens`, which depends on the model and its config, not the
-  environment), malformed or schema-violating JSON, an empty `periods`
+  environment), a safety refusal (`refused`: OpenAI's `message.refusal`),
+  malformed or schema-violating JSON, an empty `periods`
   array, or adversarial verdicts that don't align with the primary
   periods. That's a quality problem.
 
@@ -341,18 +351,18 @@ Other sections:
 
 - **Calls**: per pass and overall, giving the final outcome counts (the
   service's `enricher_llm_call_total` labels: `success`, `timeout`,
-  `gateway_error`, `rate_limited`, `http_error`, `empty_content`,
-  `error`), timeout and error rates, in-call retries, timed-out attempts
+  `gateway_error`, `rate_limited`, `quota_exhausted`, `http_error`,
+  `empty_content`, `refused`, `auth_error`, `unauthorized`, `error`), timeout and error rates, in-call retries, timed-out attempts
   (including timeouts a gateway retry recovered) and three kinds of
   latency. Percentiles use the nearest-rank method.
   - End-to-end call latency (p50 to "Max incl. failures"): successful
-    calls, with retries, `max_in_flight` queueing and 429 waits included,
+    calls, with retries, `max_in_flight` queueing and 429/gateway back-off included,
     like `enricher_llm_call_duration_seconds`. "Max incl. failures" is
     how long a failing call held the loop.
   - Send latency: one successful HTTP attempt. (The timeout fit uses a
     wider set, below.)
-  - Wait: per call, time queued for a `max_in_flight` permit plus 429
-    back-off sleeps.
+  - Wait: per call, time queued for a `max_in_flight` permit plus 429 and
+    502/503/504 back-off sleeps.
 - **Documents**: all three passes, end to end. Shows completion,
   transport failures and invalid outputs separately, failures by stage,
   latency of completed documents, and throughput at the chosen
