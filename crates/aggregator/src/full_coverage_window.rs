@@ -736,6 +736,8 @@ mod tests {
             headcode_prefixes: vec![],
             full_coverage_enabled: enabled,
             pass_through: Vec::new(),
+            crs_aliases: std::collections::BTreeMap::new(),
+            trunk_for: Vec::new(),
         }
     }
 
