@@ -436,13 +436,18 @@ curl -sS https://api.openai.com/v1/chat/completions -H "Authorization: Bearer $O
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-6-luna","reasoning_effort":"none","messages":[{"role":"user","content":"Say OK."}]}' | jq .choices[0].message.content
 
+# 5. The allowlist is in force: any other model is refused (403
+#    model_not_found). Send no reasoning_effort here: a model that doesn't
+#    take it answers 400 before the allowlist is consulted, which proves nothing.
+curl -sS https://api.openai.com/v1/chat/completions -H "Authorization: Bearer $OAI" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say OK."}]}' | jq .error
+
 unset K8S AK OAI
 ```
 
 On failure, print the error bodies instead of piping into `jq -r
 .access_token` (an OAuth `error` and `error_description`, never a token).
-Then check that a model other than `gpt-6-luna` is refused, so the
-allowlist is in force.
 
 After deploying, check the enricher's logs for `LLM workload identity
 federation on` and `LLM token issued` (once per stage), and its `/metrics`
