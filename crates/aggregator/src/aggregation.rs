@@ -299,8 +299,9 @@ pub(crate) fn in_effect_now(status: &LineStatus, now: DateTime<Utc>) -> bool {
 
 /// Whether an incident should still contribute a `LineStatus` to any line
 /// it matches. `is_cleared` isn't rechecked here -- `queries::load_incidents`
-/// already excludes cleared rows at the SQL layer, so by the time an
-/// incident reaches this function it's already known not to be cleared.
+/// already excludes cleared rows (and rows the feed no longer lists,
+/// `source_removed_at`) at the SQL layer, so by the time an incident
+/// reaches this function it's already known to be neither.
 fn is_active(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
     let incident = &loaded.message;
     let validity_ok =

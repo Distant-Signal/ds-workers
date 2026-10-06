@@ -39,10 +39,15 @@ pub(crate) fn incidents_needing_extraction(
         .collect()
 }
 
+/// Live incidents only: not cleared, and still listed by the feed. An
+/// incident the feed stopped listing ("ended", `source_removed_at`, see
+/// docs/superpowers/specs/2026-10-06-incident-source-removal-design.md)
+/// can never be shown as live again without being re-listed, and a
+/// re-listed one clears `source_removed_at` and is swept again.
 pub(crate) async fn fetch_sweep_rows(pool: &PgPool) -> anyhow::Result<Vec<SweepRow>> {
     let rows = sqlx::query_as::<_, SweepRowRecord>(
         "SELECT incident_id, summary, description, source_text_hash, extraction_model_version \
-         FROM incidents WHERE NOT is_cleared",
+         FROM incidents WHERE NOT is_cleared AND source_removed_at IS NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -106,6 +111,42 @@ mod tests {
             incidents_needing_extraction(&rows, "gpt-oss-20b"),
             vec!["A"]
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p enricher \
+                sweep -- --ignored --test-threads=1`"]
+    async fn the_sweep_loads_only_live_incidents() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        let cleanup = "DELETE FROM incidents WHERE incident_id LIKE 'TEST-SWEEP-%'";
+        sqlx::query(cleanup).execute(&pool).await.expect("cleanup");
+        sqlx::query(
+            "INSERT INTO incidents \
+                (incident_id, summary, description, operators, affected_stations, priority, \
+                 is_planned, is_cleared, source_removed_at) \
+             VALUES \
+                ('TEST-SWEEP-ACTIVE', 's', 'd', '{}', '{}', 1, false, false, NULL), \
+                ('TEST-SWEEP-CLEARED', 's', 'd', '{}', '{}', 1, false, true, NULL), \
+                ('TEST-SWEEP-ENDED', 's', 'd', '{}', '{}', 1, true, false, now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let rows = fetch_sweep_rows(&pool).await.expect("sweep rows");
+        sqlx::query(cleanup).execute(&pool).await.expect("cleanup");
+
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r.incident_id.as_str())
+            .filter(|id| id.starts_with("TEST-SWEEP-"))
+            .collect();
+        assert_eq!(ids, vec!["TEST-SWEEP-ACTIVE"]);
     }
 
     #[test]

@@ -146,13 +146,17 @@ fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
     ))
 }
 
+/// Live incidents only: not cleared by RDM, and still listed by the feed
+/// (`source_removed_at IS NULL`). An incident the feed stopped listing
+/// without clearing it is "ended", not live (2026-10-06,
+/// docs/superpowers/specs/2026-10-06-incident-source-removal-design.md).
 pub(crate) async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
                 priority, validity_periods, is_planned, is_cleared, first_seen_at, \
                 source_text_hash, extracted_periods \
          FROM incidents \
-         WHERE NOT is_cleared",
+         WHERE NOT is_cleared AND source_removed_at IS NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -1606,11 +1610,14 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO incidents \
-                (incident_id, summary, description, operators, affected_stations, priority, validity_periods, is_planned, is_cleared) \
+                (incident_id, summary, description, operators, affected_stations, priority, validity_periods, is_planned, is_cleared, source_removed_at) \
              VALUES \
-                ('TEST-ACTIVE', 'active', 'active incident', '{}', '{}', 0, '[]', false, false), \
-                ('TEST-CLEARED', 'cleared', 'cleared incident', '{}', '{}', 0, '[]', false, true) \
-             ON CONFLICT (incident_id) DO UPDATE SET is_cleared = EXCLUDED.is_cleared",
+                ('TEST-ACTIVE', 'active', 'active incident', '{}', '{}', 0, '[]', false, false, NULL), \
+                ('TEST-CLEARED', 'cleared', 'cleared incident', '{}', '{}', 0, '[]', false, true, NULL), \
+                ('TEST-ENDED', 'ended', 'unlisted incident', '{}', '{}', 0, '[]', false, false, now()), \
+                ('TEST-ENDED-PLANNED', 'ended', 'unlisted planned work', '{}', '{}', 0, '[]', true, false, now()) \
+             ON CONFLICT (incident_id) DO UPDATE SET is_cleared = EXCLUDED.is_cleared, \
+                 is_planned = EXCLUDED.is_planned, source_removed_at = EXCLUDED.source_removed_at",
         )
         .execute(&pool)
         .await
@@ -1622,10 +1629,13 @@ mod tests {
             .map(|i| i.message.incident_id.as_str())
             .collect();
 
-        sqlx::query("DELETE FROM incidents WHERE incident_id IN ('TEST-ACTIVE', 'TEST-CLEARED')")
-            .execute(&pool)
-            .await
-            .expect("cleanup fixture rows");
+        sqlx::query(
+            "DELETE FROM incidents WHERE incident_id IN \
+                ('TEST-ACTIVE', 'TEST-CLEARED', 'TEST-ENDED', 'TEST-ENDED-PLANNED')",
+        )
+        .execute(&pool)
+        .await
+        .expect("cleanup fixture rows");
 
         assert!(
             ids.contains(&"TEST-ACTIVE"),
@@ -1634,6 +1644,10 @@ mod tests {
         assert!(
             !ids.contains(&"TEST-CLEARED"),
             "cleared incident should be excluded"
+        );
+        assert!(
+            !ids.contains(&"TEST-ENDED") && !ids.contains(&"TEST-ENDED-PLANNED"),
+            "an incident the feed no longer lists is not live, planned or not"
         );
     }
 
