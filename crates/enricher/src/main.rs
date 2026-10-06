@@ -589,8 +589,8 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
     // model version. Captured now, before `write_extraction` overwrites it.
     let churn_baseline =
         churn::baseline_for_text_change_rerun(incident_id, &state, &text_hash, model_version);
-    let (summary, description, first_seen_at) =
-        (state.summary, state.description, state.first_seen_at);
+    let (summary, description, reference_date) =
+        (state.summary, state.description, state.reference_date);
 
     // Guards every caller (stream loop, sweep, reclaim) against running the
     // LLM again over text it already successfully extracted -- e.g. a
@@ -686,7 +686,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
 
     let primary_start = std::time::Instant::now();
     let primary_result = llm
-        .extract_primary(&summary, &description, first_seen_at)
+        .extract_primary(&summary, &description, reference_date)
         .await;
     record_llm_call_metrics(
         "primary",

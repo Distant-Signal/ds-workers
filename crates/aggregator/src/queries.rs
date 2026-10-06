@@ -11,13 +11,17 @@ use common::{IncidentMessage, LineStatusReport, StationSample};
 use sqlx::{PgConnection, PgExecutor, PgPool, Row};
 
 /// One incident loaded from the `incidents` table for this aggregation
-/// cycle, paired with our own `first_seen_at` clock. Deliberately not part
+/// cycle, paired with our own `active_since` clock. Deliberately not part
 /// of `common::IncidentMessage` -- the wire type pollers/the API share --
-/// since `first_seen_at` is a fact only this crate's staleness check cares
+/// since `active_since` is a fact only this crate's staleness check cares
 /// about. See docs/superpowers/specs/2026-07-16-stale-incident-handling-design.md.
 pub(crate) struct LoadedIncident {
     pub message: IncidentMessage,
-    pub first_seen_at: DateTime<Utc>,
+    /// When the incident's current episode began: `incidents.active_since`
+    /// (stamped on insert, on a reopen and on a text change while uncleared;
+    /// 2026-10-06), or `first_seen_at` for a row written before that column
+    /// existed. The rail-day cutoff runs from here.
+    pub active_since: DateTime<Utc>,
     /// `Vec<ExtractionPeriod>` JSON (see
     /// docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md
     /// §1/§3), or `None` if no extraction has succeeded yet. Deserialized
@@ -65,7 +69,7 @@ impl LoadedIncident {
     /// `has_recurring_schedule`) is covered by construction.
     pub(crate) fn new(
         message: IncidentMessage,
-        first_seen_at: DateTime<Utc>,
+        active_since: DateTime<Utc>,
         source_text_hash: Option<&str>,
         extracted_periods: Option<serde_json::Value>,
     ) -> Self {
@@ -76,7 +80,7 @@ impl LoadedIncident {
         });
         LoadedIncident {
             message,
-            first_seen_at,
+            active_since,
             extracted_periods,
         }
     }
@@ -140,7 +144,7 @@ fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
     let source_text_hash: Option<String> = row.try_get("source_text_hash")?;
     Ok(LoadedIncident::new(
         message,
-        row.try_get("first_seen_at")?,
+        row.try_get("active_since")?,
         source_text_hash.as_deref(),
         row.try_get("extracted_periods")?,
     ))
@@ -153,7 +157,8 @@ fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
 pub(crate) async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
-                priority, validity_periods, is_planned, is_cleared, first_seen_at, \
+                priority, validity_periods, is_planned, is_cleared, \
+                COALESCE(active_since, first_seen_at) AS active_since, \
                 source_text_hash, extracted_periods \
          FROM incidents \
          WHERE NOT is_cleared AND source_removed_at IS NULL",
@@ -274,13 +279,18 @@ pub(crate) async fn load_custom_lines(pool: &PgPool) -> Result<Vec<common::Custo
 }
 
 /// Every station's name (`stations`, the station reference feed), for
-/// resolving "No trains between X and Y" against a line
-/// (`no_trains::closed_section`). About 2,600 short rows.
-pub(crate) async fn load_station_names(pool: &PgPool) -> Result<crate::no_trains::StationNames> {
+/// resolving the places an incident names (`common::station_resolver`, the
+/// matcher's station evidence since 2026-10-06) and "No trains between X
+/// and Y" against a line (`no_trains::closed_section`). About 2,600 short
+/// rows. The api's `load_station_gazetteer` runs the same query at ingest,
+/// so `incidents.affected_lines` and the live statuses agree.
+pub(crate) async fn load_station_names(
+    pool: &PgPool,
+) -> Result<crate::no_trains::StationGazetteer> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT crs::text, name FROM stations")
         .fetch_all(pool)
         .await?;
-    Ok(crate::no_trains::StationNames::new(rows))
+    Ok(crate::no_trains::StationGazetteer::new(rows))
 }
 
 /// Every `full_coverage_line_stats` row with `availability = 'available'`
@@ -717,11 +727,17 @@ fn normalize_sample_counts(reason: &str) -> String {
 /// so this function still works standalone for callers/tests that don't
 /// need batching -- just `pool.acquire().await?` first and pass
 /// `&mut *conn`.
+///
+/// `upcoming` (2026-10-06) is written to `line_status.upcoming` every time.
+/// It is a note beside the statuses, not part of them, so a change to it
+/// alone never adds a `line_status_history` row.
 pub(crate) async fn write_line_status(
     conn: &mut PgConnection,
     report: &LineStatusReport,
+    upcoming: &[common::UpcomingDisruption],
 ) -> Result<()> {
     let fresh_statuses_json = serde_json::to_value(&report.statuses)?;
+    let upcoming_json = serde_json::to_value(upcoming)?;
     let existing = existing_statuses(&mut *conn, &report.id).await?;
 
     // Carry forward `from_date` for any `ldbws-inferred` entry whose content
@@ -741,15 +757,17 @@ pub(crate) async fn write_line_status(
 
     sqlx::query(
         r"
-        INSERT INTO line_status (line_id, name, mode_name, operators, statuses, computed_at, source)
-        VALUES ($1, $2, $3, $4, $5, NOW(), 'aggregator')
+        INSERT INTO line_status (line_id, name, mode_name, operators, statuses, computed_at, source,
+                                 upcoming)
+        VALUES ($1, $2, $3, $4, $5, NOW(), 'aggregator', $6)
         ON CONFLICT (line_id) DO UPDATE SET
             name        = EXCLUDED.name,
             mode_name   = EXCLUDED.mode_name,
             operators   = EXCLUDED.operators,
             statuses    = EXCLUDED.statuses,
             computed_at = NOW(),
-            source      = 'aggregator'
+            source      = 'aggregator',
+            upcoming    = EXCLUDED.upcoming
         ",
     )
     .bind(&report.id)
@@ -757,6 +775,7 @@ pub(crate) async fn write_line_status(
     .bind(&report.mode_name)
     .bind(&report.operators)
     .bind(&statuses_json)
+    .bind(&upcoming_json)
     .execute(&mut *conn)
     .await?;
 
@@ -1651,6 +1670,142 @@ mod tests {
         );
     }
 
+    /// 2026-10-06: the cutoff's anchor is `active_since`, falling back to
+    /// `first_seen_at` for a row written before the column existed; and an
+    /// incident the feed no longer lists stays out even when its extraction
+    /// would exempt it from the cutoff (a strike day, today) -- "Ended"
+    /// beats every rule.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                load_incidents_anchors_on_active_since -- --ignored --test-threads=1`"]
+    async fn load_incidents_anchors_on_active_since_and_ended_beats_exemptions() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        let summary = "Industrial action to affect services today";
+        let hash = common::text_hash::text_hash(summary, "");
+        let today = Utc::now().to_rfc3339();
+        let periods = serde_json::json!([{
+            "scope_description": null,
+            "date_range": {"from_date": today, "to_date": today},
+            "schedule_window": null,
+            "resolution_status": "ongoing",
+            "apparent_severity": "severe_disruption",
+            "resolution_status_confidence": "high",
+            "severity_confidence": "low",
+            "impact_type": null
+        }]);
+        sqlx::query(
+            "INSERT INTO incidents \
+                (incident_id, summary, description, operators, affected_stations, priority, \
+                 validity_periods, is_planned, is_cleared, first_seen_at, active_since, \
+                 source_removed_at, source_text_hash, extracted_periods) \
+             VALUES \
+                ('TEST-AS-ARMED', $1, '', '{}', '{}', 0, '[]', false, false, \
+                 now() - interval '9 days', now() - interval '1 hour', NULL, $2, $3), \
+                ('TEST-AS-LEGACY', $1, '', '{}', '{}', 0, '[]', false, false, \
+                 now() - interval '9 days', NULL, NULL, $2, $3), \
+                ('TEST-AS-ENDED', $1, '', '{}', '{}', 0, '[]', false, false, \
+                 now() - interval '9 days', now() - interval '1 hour', now(), $2, $3) \
+             ON CONFLICT (incident_id) DO UPDATE SET active_since = EXCLUDED.active_since, \
+                 first_seen_at = EXCLUDED.first_seen_at, \
+                 source_removed_at = EXCLUDED.source_removed_at",
+        )
+        .bind(summary)
+        .bind(&hash)
+        .bind(&periods)
+        .execute(&pool)
+        .await
+        .expect("seed fixture rows");
+
+        let loaded = load_incidents(&pool).await.expect("load_incidents");
+        sqlx::query(
+            "DELETE FROM incidents WHERE incident_id IN \
+                ('TEST-AS-ARMED', 'TEST-AS-LEGACY', 'TEST-AS-ENDED')",
+        )
+        .execute(&pool)
+        .await
+        .expect("cleanup fixture rows");
+
+        let find = |id: &str| loaded.iter().find(|i| i.message.incident_id == id);
+        let now = Utc::now();
+        let armed = find("TEST-AS-ARMED").expect("live row is loaded");
+        assert!(now - armed.active_since < chrono::Duration::hours(2));
+        assert!(
+            armed.extracted_periods.is_some(),
+            "the extraction is current"
+        );
+        let legacy = find("TEST-AS-LEGACY").expect("live row is loaded");
+        assert!(
+            now - legacy.active_since > chrono::Duration::days(8),
+            "a NULL active_since reads as first_seen_at"
+        );
+        assert!(
+            find("TEST-AS-ENDED").is_none(),
+            "source_removed_at beats a strike-day exemption"
+        );
+    }
+
+    /// `line_status.upcoming` (2026-10-06) is written every cycle without a
+    /// history row of its own.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                write_line_status_stores_upcoming -- --ignored --test-threads=1`"]
+    async fn write_line_status_stores_upcoming_without_history() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        const LINE: &str = "test-upcoming-line";
+        let report = LineStatusReport {
+            id: LINE.to_string(),
+            name: "Upcoming".to_string(),
+            mode_name: "national-rail".to_string(),
+            operators: vec!["TP".to_string()],
+            statuses: vec![],
+        };
+        let note = common::UpcomingDisruption {
+            from: "2026-10-10T23:00:00Z".parse().unwrap(),
+            to: Some("2026-10-11T23:00:00Z".parse().unwrap()),
+            summary: "Industrial action on Sunday 11 October".to_string(),
+            incident_id: "1D3D4694".to_string(),
+        };
+        let mut conn = pool.acquire().await.unwrap();
+        write_line_status(&mut conn, &report, std::slice::from_ref(&note))
+            .await
+            .unwrap();
+        write_line_status(&mut conn, &report, &[]).await.unwrap();
+        write_line_status(&mut conn, &report, std::slice::from_ref(&note))
+            .await
+            .unwrap();
+        let (upcoming, history): (serde_json::Value, i64) = sqlx::query_as(
+            "SELECT upcoming, (SELECT COUNT(*) FROM line_status_history WHERE line_id = $1) \
+             FROM line_status WHERE line_id = $1",
+        )
+        .bind(LINE)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM line_status_history WHERE line_id = $1")
+            .bind(LINE)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM line_status WHERE line_id = $1")
+            .bind(LINE)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let stored: Vec<common::UpcomingDisruption> = serde_json::from_value(upcoming).unwrap();
+        assert_eq!(stored, vec![note]);
+        assert_eq!(history, 1, "only the first write adds history");
+    }
+
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 load_incidents_skips_one_malformed_row_instead_of_failing_the_batch -- --ignored --test-threads=1`"]
@@ -2128,7 +2283,7 @@ mod tests {
             &samples,
             &registry,
             &defaults,
-            &crate::no_trains::StationNames::default(),
+            &crate::no_trains::StationGazetteer::default(),
         );
         let report1 = reports1.get(LINE_ID).expect("line should have a report");
         assert_eq!(
@@ -2140,7 +2295,7 @@ mod tests {
         // comment) rather than `&PgPool`, so a standalone caller acquires
         // one explicitly rather than passing the pool directly.
         let mut conn = pool.acquire().await.expect("acquire connection");
-        write_line_status(&mut conn, report1)
+        write_line_status(&mut conn, report1, &[])
             .await
             .expect("write_line_status cycle 1");
 
@@ -2160,12 +2315,12 @@ mod tests {
             &samples,
             &registry,
             &defaults,
-            &crate::no_trains::StationNames::default(),
+            &crate::no_trains::StationGazetteer::default(),
         );
         let report2 = reports2.get(LINE_ID).expect("line should have a report");
         let fresh_from_date_cycle_2 = serde_json::to_value(report2.statuses[0].validity.from_date)
             .expect("serialize fresh from_date");
-        write_line_status(&mut conn, report2)
+        write_line_status(&mut conn, report2, &[])
             .await
             .expect("write_line_status cycle 2");
 
@@ -2280,7 +2435,7 @@ mod tests {
         // already committed -- must survive a LATER chunk's failure
         // untouched.
         let mut tx1 = pool.begin().await.expect("begin chunk 1");
-        write_line_status(&mut tx1, &report(COMMITTED_CHUNK_LINE))
+        write_line_status(&mut tx1, &report(COMMITTED_CHUNK_LINE), &[])
             .await
             .expect("write committed-chunk line");
         tx1.commit().await.expect("commit chunk 1");
@@ -2292,7 +2447,7 @@ mod tests {
         // "some later write in this chunk fails" that doesn't require
         // hacking write_line_status itself to fail on demand.
         let mut tx2 = pool.begin().await.expect("begin chunk 2");
-        write_line_status(&mut tx2, &report(ROLLED_BACK_LINE))
+        write_line_status(&mut tx2, &report(ROLLED_BACK_LINE), &[])
             .await
             .expect("write rolled-back line (should succeed within the still-open transaction)");
         let conflict_result = sqlx::query(
@@ -2423,7 +2578,7 @@ mod tests {
         for chunk in reports.chunks(crate::WRITE_CHUNK_SIZE) {
             let mut tx = pool.begin().await.expect("begin chunk");
             for report in chunk {
-                write_line_status(&mut tx, report)
+                write_line_status(&mut tx, report, &[])
                     .await
                     .expect("write line in chunk");
             }

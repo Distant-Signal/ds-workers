@@ -19,8 +19,6 @@
 //! See the "Decisions (2026-10-02, incident sections)" section of
 //! docs/superpowers/specs/2026-09-27-full-coverage-windowed-stats-design.md.
 
-use std::collections::HashMap;
-
 use common::{LineDefinition, Severity};
 
 /// The phrases that introduce a closed section. "No service(s) between" is
@@ -84,82 +82,44 @@ pub(crate) struct ClosedSection {
     pub severity: Severity,
 }
 
-/// `crs -> name` for every station (the `stations` reference table),
-/// normalised for matching.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct StationNames {
-    normalised: HashMap<String, String>,
-}
-
-impl StationNames {
-    pub(crate) fn new<I, C, N>(names: I) -> Self
-    where
-        I: IntoIterator<Item = (C, N)>,
-        C: AsRef<str>,
-        N: AsRef<str>,
-    {
-        Self {
-            normalised: names
-                .into_iter()
-                .map(|(crs, name)| (crs.as_ref().trim().to_uppercase(), normalise(name.as_ref())))
-                .collect(),
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.normalised.is_empty()
-    }
-
-    fn get(&self, crs: &str) -> Option<&str> {
-        self.normalised.get(crs).map(String::as_str)
-    }
-}
-
-/// Lowercase; apostrophes dropped ("Shepherd's" = "Shepherds"); a
-/// parenthesised qualifier dropped ("Richmond (London)"); "&" read as "and";
-/// every other non-alphanumeric a space; spaces collapsed.
-fn normalise(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut depth = 0u32;
-    for c in name.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth > 0 => {}
-            '\'' | '\u{2019}' => {}
-            '&' => out.push_str(" and "),
-            c if c.is_alphanumeric() => out.extend(c.to_lowercase()),
-            _ => out.push(' '),
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+/// Every station's names (the `stations` reference table plus aliases),
+/// normalised. Shared with the matcher's place resolver since 2026-10-06
+/// (`common::station_resolver`), so "No trains between Seaford and Lewes"
+/// resolves "Seaford" (reference name "Seaford Sussex") here too.
+pub(crate) use common::station_resolver::StationGazetteer;
+use common::station_resolver::normalise_name;
 
 /// The index in `line.stations` of the station `part` names: an exact
-/// (normalised) name, else "London <part>", else the one station whose
-/// name starts with `part` (at least 4 characters: "Falmouth Dock" for
-/// Falmouth Docks). `None` when nothing, or more than one, matches.
-fn resolve(part: &str, line: &LineDefinition, names: &StationNames) -> Option<usize> {
-    let wanted = normalise(part);
+/// (normalised) name or alias, else "London <part>", else the one station
+/// whose name starts with `part` (at least 4 characters: "Falmouth Dock"
+/// for Falmouth Docks). `None` when nothing, or more than one, matches.
+fn resolve(part: &str, line: &LineDefinition, names: &StationGazetteer) -> Option<usize> {
+    let wanted = normalise_name(part);
     if wanted.is_empty() {
         return None;
     }
-    let candidates: Vec<(usize, &str)> = line
+    let candidates: Vec<(usize, &[String])> = line
         .stations
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| names.get(&s.crs.trim().to_uppercase()).map(|n| (i, n)))
+        .map(|(i, s)| (i, names.names_of(&s.crs)))
+        .filter(|(_, n)| !n.is_empty())
         .collect();
     let london = format!("london {wanted}");
     for target in [wanted.as_str(), london.as_str()] {
-        if let Some((i, _)) = candidates.iter().find(|(_, n)| *n == target) {
+        if let Some((i, _)) = candidates
+            .iter()
+            .find(|(_, n)| n.iter().any(|name| name == target))
+        {
             return Some(*i);
         }
     }
     if wanted.chars().count() < 4 {
         return None;
     }
-    let mut prefixed = candidates.iter().filter(|(_, n)| n.starts_with(&wanted));
+    let mut prefixed = candidates
+        .iter()
+        .filter(|(_, n)| n.iter().any(|name| name.starts_with(&wanted)));
     match (prefixed.next(), prefixed.next()) {
         (Some((i, _)), None) => Some(*i),
         _ => None,
@@ -168,7 +128,7 @@ fn resolve(part: &str, line: &LineDefinition, names: &StationNames) -> Option<us
 
 /// The resolved stations of one side ("Caterham / Tattenham Corner"): at
 /// least one alternative must be on the line.
-fn resolve_side(side: &str, line: &LineDefinition, names: &StationNames) -> Vec<usize> {
+fn resolve_side(side: &str, line: &LineDefinition, names: &StationGazetteer) -> Vec<usize> {
     side.split('/')
         .filter_map(|part| resolve(part, line, names))
         .collect()
@@ -181,7 +141,7 @@ fn resolve_side(side: &str, line: &LineDefinition, names: &StationNames) -> Vec<
 pub(crate) fn closed_section(
     summary: &str,
     line: &LineDefinition,
-    names: &StationNames,
+    names: &StationGazetteer,
 ) -> Option<ClosedSection> {
     if names.is_empty() || line.stations.is_empty() {
         return None;
@@ -236,6 +196,8 @@ pub(crate) fn closed_section(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn line(id: &str, crs: &[&str]) -> LineDefinition {
@@ -264,8 +226,8 @@ mod tests {
         }
     }
 
-    fn names() -> StationNames {
-        StationNames::new([
+    fn names() -> StationGazetteer {
+        StationGazetteer::new([
             ("PAR", "Par"),
             ("LUX", "Luxulyan"),
             ("BGL", "Bugle"),
@@ -388,7 +350,7 @@ mod tests {
             closed_section(
                 "No trains between Par and Newquay",
                 &a,
-                &StationNames::default()
+                &StationGazetteer::default()
             ),
             None,
             "no station names loaded"
@@ -398,7 +360,7 @@ mod tests {
     #[test]
     fn the_second_name_ends_at_the_sentence_or_the_cause() {
         let abbey = line("lnwr-abbey-line", &["WFJ", "X01", "X02", "SAA"]);
-        let n = StationNames::new([("WFJ", "Watford Junction"), ("SAA", "St Albans Abbey")]);
+        let n = StationGazetteer::new([("WFJ", "Watford Junction"), ("SAA", "St Albans Abbey")]);
         for summary in [
             "No trains between Watford Junction and St. Albans Abbey",
             "No trains between Watford Junction and St Albans Abbey.",

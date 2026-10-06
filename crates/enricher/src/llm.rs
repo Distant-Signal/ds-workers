@@ -1334,8 +1334,10 @@ impl LlmClient {
         }
     }
 
-    /// `reference_date` is the incident's `first_seen_at` (or, if the
-    /// caller has nothing better, the current time) -- threaded into the
+    /// `reference_date` is when the incident's current text was first
+    /// recorded (`queries::IncidentState::reference_date`; until 2026-10-06
+    /// its `first_seen_at`), or, if the caller has nothing better, the
+    /// current time -- threaded into the
     /// user content so the model can resolve year-less dates in the text
     /// against a concrete anchor (design §1's "year inference" convention).
     pub(crate) async fn extract_primary(

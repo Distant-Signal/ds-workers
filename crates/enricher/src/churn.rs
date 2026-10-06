@@ -470,7 +470,7 @@ mod tests {
             description: String::new(),
             source_text_hash: hash.map(str::to_string),
             extraction_model_version: version.map(str::to_string),
-            first_seen_at: Utc::now(),
+            reference_date: Utc::now(),
             extracted_category: Some("signal_failure".to_string()),
             extracted_periods: periods,
         }

@@ -476,14 +476,16 @@ async fn run_cycle(
     // the same live-only view. See `aggregation::drop_stale_samples`.
     let stale_samples_dropped = aggregation::drop_stale_samples(&mut samples, chrono::Utc::now());
 
-    // Station names resolve "No trains between X and Y" against each
-    // matched line (`no_trains`). Fail-open: without them such incidents
-    // are classified exactly as before.
+    // Station names resolve the places each incident names into line
+    // evidence (`common::station_resolver`), and "No trains between X and
+    // Y" against each matched line (`no_trains`). Fail-open: without them
+    // every incident is matched and classified as before 2026-10-06
+    // (keyword, else operator-wide).
     let station_names = queries::load_station_names(pool)
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(error = ?err, "failed to load station names; \"no trains between\" incidents are not resolved this cycle");
-            no_trains::StationNames::default()
+            no_trains::StationGazetteer::default()
         });
     let mut reports = aggregation::aggregate(
         &lines,
@@ -492,6 +494,14 @@ async fn run_cycle(
         &registry,
         defaults,
         &station_names,
+    );
+    // Future disruption notes beside each line's status (2026-10-06).
+    let upcoming = aggregation::upcoming_by_line(
+        &lines,
+        &incidents,
+        &registry,
+        &station_names,
+        chrono::Utc::now(),
     );
     // Layer 3 (Decision 3): merges a per-line materialized full-coverage
     // signal onto the reports Layer 1/2 already built. `full-coverage-consumer`
@@ -573,7 +583,8 @@ async fn run_cycle(
     for chunk in report_list.chunks(WRITE_CHUNK_SIZE) {
         let mut tx = pool.begin().await?;
         for report in chunk.iter().copied() {
-            queries::write_line_status(&mut tx, report).await?;
+            let upcoming = upcoming.get(&report.id).map_or(&[][..], Vec::as_slice);
+            queries::write_line_status(&mut tx, report, upcoming).await?;
         }
         tx.commit().await?;
     }

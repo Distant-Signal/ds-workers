@@ -26,7 +26,7 @@ use serde::Deserialize;
 use common::matcher::{Match, MatchScope, lines_affected_by};
 use common::segments::SegmentRegistry;
 
-use crate::no_trains::{StationNames, closed_section};
+use crate::no_trains::{StationGazetteer, closed_section};
 use crate::queries::LoadedIncident;
 
 /// Merges DB-stored custom lines into the static catalogue, converting
@@ -46,18 +46,40 @@ pub(crate) fn merge_custom_lines(
     merged
 }
 
-#[expect(
-    clippy::format_push_string,
-    clippy::unwrap_used,
-    reason = "short strings off the hot path; format! reads clearer; reports holds an entry for every configured line, inserted above"
-)]
+/// [`aggregate_at`] at the current instant: every incident and status in
+/// one pass is judged against the same `now`.
 pub(crate) fn aggregate(
     lines: &HashMap<String, LineDefinition>,
     incidents: &[LoadedIncident],
     samples: &HashMap<String, StationSample>,
     registry: &SegmentRegistry,
     defaults: &Defaults,
-    station_names: &StationNames,
+    station_names: &StationGazetteer,
+) -> HashMap<String, LineStatusReport> {
+    aggregate_at(
+        lines,
+        incidents,
+        samples,
+        registry,
+        defaults,
+        station_names,
+        Utc::now(),
+    )
+}
+
+#[expect(
+    clippy::format_push_string,
+    clippy::unwrap_used,
+    reason = "short strings off the hot path; format! reads clearer; reports holds an entry for every configured line, inserted above"
+)]
+pub(crate) fn aggregate_at(
+    lines: &HashMap<String, LineDefinition>,
+    incidents: &[LoadedIncident],
+    samples: &HashMap<String, StationSample>,
+    registry: &SegmentRegistry,
+    defaults: &Defaults,
+    station_names: &StationGazetteer,
+    now: DateTime<Utc>,
 ) -> HashMap<String, LineStatusReport> {
     let mut reports: HashMap<String, LineStatusReport> = lines
         .values()
@@ -75,14 +97,16 @@ pub(crate) fn aggregate(
         })
         .collect();
 
-    // Layer 1: incidents. Filtered through `is_active` first -- a cleared,
-    // temporally-expired, or stale-past-the-rail-day-cutoff incident never
-    // reaches the matcher, so its line falls through to Layer 2 exactly as
-    // if the incident didn't exist.
-    let now = Utc::now();
-    for loaded in incidents.iter().filter(|loaded| is_active(loaded, now)) {
-        for m in lines_affected_by(&loaded.message, lines, registry) {
-            let status = status_from_incident(&m, loaded, now, station_names);
+    // Layer 1: incidents. Filtered through `keep_reason` first -- a
+    // temporally-expired, purely-future, or stale-past-the-rail-day-cutoff
+    // incident never reaches the matcher, so its line falls through to
+    // Layer 2 exactly as if the incident didn't exist.
+    for loaded in incidents {
+        let Some(keep) = keep_reason(loaded, now) else {
+            continue;
+        };
+        for m in lines_affected_by(&loaded.message, lines, registry, station_names) {
+            let status = status_from_incident(&m, loaded, now, station_names, keep);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
         }
     }
@@ -138,6 +162,75 @@ pub(crate) fn aggregate(
     reports
 }
 
+/// How far ahead a dated (non-strike) period is announced as upcoming.
+const UPCOMING_HORIZON_DAYS: i64 = 14;
+
+/// At most this many upcoming notes per line, soonest first.
+const MAX_UPCOMING_PER_LINE: usize = 5;
+
+/// Every line's upcoming disruptions (2026-10-06 user decision 10): for each
+/// live unplanned incident, every high-confidence, ongoing period that has
+/// not started yet and either is industrial action or starts within
+/// [`UPCOMING_HORIZON_DAYS`], on the lines the incident matches. Independent
+/// of the rail-day cutoff (a strike notice published two weeks ahead is
+/// stale by then, but its strike is not); the incident itself must still be
+/// listed and uncleared (`queries::load_incidents`). Soonest first, at most
+/// [`MAX_UPCOMING_PER_LINE`] per line. A line with none is absent.
+pub(crate) fn upcoming_by_line(
+    lines: &HashMap<String, LineDefinition>,
+    incidents: &[LoadedIncident],
+    registry: &SegmentRegistry,
+    station_names: &StationGazetteer,
+    now: DateTime<Utc>,
+) -> HashMap<String, Vec<common::UpcomingDisruption>> {
+    let mut out: HashMap<String, Vec<common::UpcomingDisruption>> = HashMap::new();
+    for loaded in incidents {
+        let incident = &loaded.message;
+        if incident.is_planned {
+            continue;
+        }
+        let strike = common::station_resolver::mentions_industrial_action(
+            &incident.summary,
+            &incident.description,
+        );
+        let mut notes: Vec<common::UpcomingDisruption> = parse_periods(loaded)
+            .iter()
+            .filter(|period| {
+                period.resolution_status == "ongoing"
+                    && period.resolution_status_confidence == "high"
+                    && period_phase(period, now) == PeriodPhase::NotStarted
+            })
+            .filter_map(|period| period_bounds(period.date_range.as_ref()?).ok())
+            .filter_map(|(from, to)| {
+                let from = from?;
+                (strike || from - now <= Duration::days(UPCOMING_HORIZON_DAYS)).then(|| {
+                    common::UpcomingDisruption {
+                        from,
+                        to,
+                        summary: incident.summary.trim().to_string(),
+                        incident_id: incident.incident_id.clone(),
+                    }
+                })
+            })
+            .collect();
+        if notes.is_empty() {
+            continue;
+        }
+        notes.sort_by_key(|note| note.from);
+        notes.dedup_by(|a, b| a.from == b.from && a.to == b.to);
+        for m in lines_affected_by(incident, lines, registry, station_names) {
+            out.entry(m.line.id.clone())
+                .or_default()
+                .extend(notes.iter().cloned());
+        }
+    }
+    for notes in out.values_mut() {
+        notes.sort_by(|a, b| a.from.cmp(&b.from).then(a.incident_id.cmp(&b.incident_id)));
+        notes.truncate(MAX_UPCOMING_PER_LINE);
+    }
+    out
+}
+
 // --- Incident path ---
 
 /// `now` is threaded in from `aggregate()`'s single `Utc::now()` rather than
@@ -151,7 +244,8 @@ fn status_from_incident(
     m: &Match<'_>,
     loaded: &LoadedIncident,
     now: DateTime<Utc>,
-    station_names: &StationNames,
+    station_names: &StationGazetteer,
+    keep: Keep,
 ) -> LineStatus {
     let incident = &loaded.message;
     // "No trains between X and Y" with both ends on this line (2026-10-02,
@@ -170,34 +264,44 @@ fn status_from_incident(
         base_severity = section.severity;
     }
     let (extracted_severity, extraction_annotation) = apply_extraction(base_severity, loaded, now);
-    let severity = match (&section, m.scope) {
-        // The weak scopes are capped at the section's own severity rather
-        // than at Minor / Severe Delays: a short section of a long line
-        // stays Reduced Service even if the text also says "suspended".
-        (Some(section), MatchScope::OperatorOnly | MatchScope::KeywordOnly) => {
-            demote_to_floor(extracted_severity, section.severity)
-        }
-        _ => demote_for_scope(extracted_severity, m.scope),
+    let severity = match &section {
+        // Capped at the section's own severity rather than at the scope's
+        // cap: a short section of a long line stays Reduced Service even if
+        // the text also says "suspended". Every scope since 2026-10-06: the
+        // section's ends now usually resolve to station evidence for this
+        // line (`common::station_resolver`), which is no reason to show the
+        // whole line at the section's text severity.
+        Some(section) => demote_to_floor(extracted_severity, section.severity),
+        None => demote_for_scope(extracted_severity, m.scope),
+    };
+    // An undated long-term notice kept past its first rail day (user
+    // decision 6): at most Reduced Service.
+    let severity = if keep == Keep::Undated {
+        demote_to_floor(severity, Severity::ReducedService)
+    } else {
+        severity
     };
 
-    let (affected_stations, affected_routes) = match &section {
-        Some(section) if m.evidence.stations.is_empty() => (
+    // The whole closed section, not just the two ends the text named.
+    let (affected_stations, affected_routes) = if let Some(section) = &section {
+        (
             section.stations.clone(),
             vec![AffectedRoute {
                 from_crs: section.from_crs.clone(),
                 to_crs: section.to_crs.clone(),
             }],
-        ),
-        _ => {
-            let stations = m.evidence.stations.clone();
-            let routes = routes_from_stations(m.line, &stations);
-            (stations, routes)
-        }
+        )
+    } else {
+        let stations = m.evidence.stations.clone();
+        let routes = routes_from_stations(m.line, &stations);
+        (stations, routes)
     };
 
     let mut reason = incident.summary.clone();
     match (m.scope, &section) {
-        (MatchScope::SharedSegment, _) => {
+        // A closed section names its own extent ("part of the line" below);
+        // the lines matched by its two ends are the ones it affects.
+        (MatchScope::SharedSegment, None) => {
             reason.push_str(" (shared trunk — also affects other lines)");
         }
         // Resolved to this line's stations: no longer just operator-wide.
@@ -213,6 +317,23 @@ fn status_from_incident(
     if let Some(annotation) = extraction_annotation {
         reason.push_str(&format!(" ({annotation})"));
     }
+    if keep == Keep::Undated {
+        reason.push_str(" (long-running notice)");
+    }
+
+    // Kept only by a dated exemption whose schedule window excludes now (a
+    // Sunday under a Monday-Saturday window): not in effect (user decision
+    // 7), so no LDBWS or full-coverage escalation attaches and the line
+    // also shows its own inferred status. The validity says when it next
+    // applies.
+    let validity = match (keep, next_window_start(loaded, now)) {
+        (Keep::Dated { in_effect: false }, Some(next)) => ValidityPeriod {
+            from_date: next,
+            to_date: None,
+            is_now: false,
+        },
+        _ => validity_for_output(&incident.validity),
+    };
 
     let disruption = Disruption {
         category: if incident.is_planned {
@@ -235,7 +356,7 @@ fn status_from_incident(
     LineStatus {
         severity,
         reason,
-        validity: validity_for_output(&incident.validity),
+        validity,
         disruption: Some(disruption),
         data_quality: if incident.is_planned {
             DataQuality::Planned
@@ -297,56 +418,165 @@ pub(crate) fn in_effect_now(status: &LineStatus, now: DateTime<Utc>) -> bool {
         || (status.data_quality != DataQuality::Planned && period_covers_now(&status.validity, now))
 }
 
+/// Why an incident still contributes a `LineStatus`, which decides how it
+/// is shown (2026-10-06 user decisions 4-7; see
+/// docs/superpowers/specs/2026-07-16-stale-incident-handling-design.md,
+/// "Decision (2026-10-06): cutoff anchor and exemptions", and
+/// docs/superpowers/specs/2026-10-06-incident-line-evidence-design.md §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// Planned works, or an unplanned incident still inside the rail day
+    /// its current episode began in (`active_since`): shown exactly as
+    /// before.
+    Current,
+    /// Past that rail day, kept by a dated exemption: an `Active`, ongoing,
+    /// high-confidence period with a stated end or a schedule window. In
+    /// effect only while such a period is inside its window (if any).
+    Dated { in_effect: bool },
+    /// Past that rail day, kept by an undated long-term notice ("until
+    /// further notice": an `Active`, ongoing, high-confidence period with no
+    /// end, no window, and a long-term phrase in the text). Capped at
+    /// Reduced Service.
+    Undated,
+}
+
 /// Whether an incident should still contribute a `LineStatus` to any line
-/// it matches. `is_cleared` isn't rechecked here -- `queries::load_incidents`
-/// already excludes cleared rows (and rows the feed no longer lists,
-/// `source_removed_at`) at the SQL layer, so by the time an incident
-/// reaches this function it's already known to be neither.
-fn is_active(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
+/// it matches, and why. `is_cleared` and `source_removed_at` aren't
+/// rechecked here -- `queries::load_incidents` already excludes cleared rows
+/// and rows the feed no longer lists, so "Ended" (`source_removed_at`) beats
+/// every rule below by construction.
+///
+/// 1. Its RDM validity must cover `now` (RDM's long-running unplanned rows
+///    are `is_now` with no end, so this rarely bites them).
+/// 2. An unplanned incident whose every parsed period is a high-confidence
+///    period that has not started yet (a strike notice) is not shown at
+///    all: it is a line's `upcoming` note ([`upcoming_by_line`]), never its
+///    severity.
+/// 3. Planned works are kept (their own validity is the truth).
+/// 4. An unplanned incident is kept until the next 02:00 Europe/London
+///    rail-day boundary after `active_since` -- its insert, its last reopen,
+///    or its last text change while uncleared -- so a reopened id (B852BEF3)
+///    or a re-stated notice is shown again for one rail day, while unchanged
+///    stale text (147D1B86) still drops at 02:00.
+/// 5. After that, only an exemption keeps it ([`Keep::Dated`],
+///    [`Keep::Undated`]).
+fn keep_reason(loaded: &LoadedIncident, now: DateTime<Utc>) -> Option<Keep> {
     let incident = &loaded.message;
     let validity_ok =
         incident.validity.is_empty() || incident.validity.iter().any(|p| period_covers_now(p, now));
-    let age_ok = incident.is_planned
-        || has_recurring_schedule(loaded, now)
-        || now < common::rail_day::next_rail_day_boundary(loaded.first_seen_at);
-    validity_ok && age_ok
+    if !validity_ok {
+        return None;
+    }
+    if incident.is_planned {
+        return Some(Keep::Current);
+    }
+    let periods = parse_periods(loaded);
+    if !periods.is_empty()
+        && periods.iter().all(|period| {
+            period.resolution_status_confidence == "high"
+                && period_phase(period, now) == PeriodPhase::NotStarted
+        })
+    {
+        return None;
+    }
+    if now < common::rail_day::next_rail_day_boundary(loaded.active_since) {
+        return Some(Keep::Current);
+    }
+    let exempting: Vec<&ExtractionPeriod> = periods
+        .iter()
+        .filter(|period| {
+            period_phase(period, now) == PeriodPhase::Active
+                && period.resolution_status == "ongoing"
+                && period.resolution_status_confidence == "high"
+        })
+        .collect();
+    let dated: Vec<&&ExtractionPeriod> = exempting
+        .iter()
+        .filter(|period| {
+            period.schedule_window.is_some()
+                || period
+                    .date_range
+                    .as_ref()
+                    .is_some_and(|range| range.to_date.is_some())
+        })
+        .collect();
+    if !dated.is_empty() {
+        let in_effect = dated.iter().any(|period| {
+            period
+                .schedule_window
+                .as_ref()
+                .is_none_or(|window| now_within_window(window, now))
+        });
+        return Some(Keep::Dated { in_effect });
+    }
+    if !exempting.is_empty() && is_long_term_notice(incident) {
+        return Some(Keep::Undated);
+    }
+    None
 }
 
-/// Whether `loaded` carries at least one currently-`Active` period with a
-/// high-confidence, successfully-parsed `schedule_window` -- evidence of a
-/// genuinely recurring, time-bounded disruption (e.g. nightly rail
-/// replacement while a fault is repaired) rather than the "SWR forgot about
-/// it" case the rail-day cutoff exists to catch. A real-time
-/// (non-`is_planned`) incident like that would otherwise still get evicted
-/// by the age cutoff the first time `now` crosses the next rail-day
-/// boundary after `first_seen_at`, even though it recurs every night for
-/// weeks -- so this exempts it from that cutoff the same way `is_planned`
-/// already is, in `is_active` above.
-///
-/// **Filtering to `Active` periods only is load-bearing, not incidental**
-/// (design doc §4): checking any period in the raw array, regardless of
-/// phase, would let an incident whose only recurring-schedule period has
-/// already elapsed keep exempting itself from the rail-day cutoff forever
-/// -- exactly the "SWR forgot about it" failure mode this cutoff exists to
-/// catch. An `Elapsed` period is allowed to contribute its synthetic
-/// demotion floor in `apply_extraction`, but must never be allowed to
-/// contribute a recurring-schedule *exemption* here.
-///
-/// Malformed or absent schedule-window data does NOT count: unlike
-/// `now_within_window`'s fail-safe direction (bad data must never
-/// manufacture a *demotion*), granting an age-cutoff *exemption* from bad
-/// data would be the unsafe direction here, so this requires an actual
-/// successful parse (a period whose `schedule_window` JSON doesn't match
-/// `ScheduleWindow`'s shape fails the whole `extracted_periods` parse via
-/// `parse_periods`, and is therefore excluded along with every other period
-/// on that incident -- the same fail-safe direction, just applied one level
-/// up).
-fn has_recurring_schedule(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
-    parse_periods(loaded).iter().any(|period| {
-        period_phase(period, now) == PeriodPhase::Active
-            && period.resolution_status_confidence == "high"
-            && period.schedule_window.is_some()
-    })
+/// [`keep_reason`] as a yes/no.
+#[cfg(test)]
+fn is_active(loaded: &LoadedIncident, now: DateTime<Utc>) -> bool {
+    keep_reason(loaded, now).is_some()
+}
+
+/// Phrases of an open-ended notice. An `Active`, ongoing, high-confidence
+/// period with no end date is the common single-fact extraction of every
+/// live incident ("Disruption between X and Y"), so on its own it cannot
+/// exempt an incident from the rail-day cutoff -- that would bring back the
+/// "SWR forgot about it" failure mode the cutoff exists for. Only text that
+/// says the notice is open-ended can.
+const LONG_TERM_MARKERS: [&str; 5] = [
+    "until further notice",
+    "foreseeable future",
+    "until further advice",
+    "until further advised",
+    "until further information",
+];
+
+fn is_long_term_notice(incident: &IncidentMessage) -> bool {
+    let text = format!("{} {}", incident.summary, incident.description).to_lowercase();
+    LONG_TERM_MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// Where a status kept by [`Keep::Dated`] outside its schedule window says
+/// it applies from: the start of the next window instance, so it is not "in
+/// effect now" ([`in_effect_now`]) and live data cannot raise it, while the
+/// notice itself still shows. `None` when no window gives a later start
+/// (a dated period with no window is always in effect while `Active`).
+fn next_window_start(loaded: &LoadedIncident, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    parse_periods(loaded)
+        .iter()
+        .filter(|period| {
+            period_phase(period, now) == PeriodPhase::Active
+                && period.resolution_status == "ongoing"
+                && period.resolution_status_confidence == "high"
+        })
+        .filter_map(|period| period.schedule_window.as_ref())
+        .filter_map(|window| window_start_after(window, now))
+        .min()
+}
+
+/// The first start of `window` strictly after `now`, within the next 8
+/// days. `None` for a malformed window (which [`now_within_window`] reads
+/// as "inside", so it never gets here).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "number_from_monday is 1..=7"
+)]
+fn window_start_after(window: &ScheduleWindow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let start = NaiveTime::parse_from_str(&window.start_time, "%H:%M").ok()?;
+    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
+    (0..=8)
+        .map(|offset| today + Duration::days(offset))
+        .filter(|date| {
+            window
+                .days_of_week
+                .contains(&(date.weekday().number_from_monday() as u8))
+        })
+        .map(|date| common::rail_day::london_to_utc(date, start))
+        .find(|at| *at > now)
 }
 
 /// Negation words this ladder recognizes immediately before a keyword
@@ -608,16 +838,7 @@ fn period_phase(period: &ExtractionPeriod, now: DateTime<Utc>) -> PeriodPhase {
     let Some(range) = &period.date_range else {
         return PeriodPhase::Active;
     };
-
-    let parse = |raw: &Option<String>| -> Result<Option<DateTime<Utc>>, ()> {
-        match raw {
-            None => Ok(None),
-            Some(s) => DateTime::parse_from_rfc3339(s)
-                .map(|dt| Some(dt.with_timezone(&Utc)))
-                .map_err(|_| ()),
-        }
-    };
-    let (Ok(from), Ok(to)) = (parse(&range.from_date), parse(&range.to_date)) else {
+    let Ok((from, to)) = period_bounds(range) else {
         return PeriodPhase::Active;
     };
 
@@ -638,18 +859,94 @@ fn period_phase(period: &ExtractionPeriod, now: DateTime<Utc>) -> PeriodPhase {
     PeriodPhase::Active
 }
 
+/// A period's `[from, to)` instants as the aggregator reads them
+/// (2026-10-06 user decision 8), or `Err` for an unparseable date:
+///
+/// - A bound at exactly 00:00 UTC is a calendar date the model wrote in
+///   UTC, and is read as that date's Europe/London midnight (in BST, 23:00Z
+///   the day before). The enricher is told to write London midnights, but
+///   strike days came back as UTC midnights (1D3D4694).
+/// - A `to_date` at or before its `from_date` (a zero-length "Sunday 11
+///   October" range, which never became `Active`) is the whole
+///   Europe/London day of `from_date`: 23, 24 or 25 hours long.
+fn period_bounds(range: &DateRange) -> Result<PeriodBounds, ()> {
+    let parse = |raw: &Option<String>| -> Result<Option<DateTime<Utc>>, ()> {
+        match raw {
+            None => Ok(None),
+            Some(s) => DateTime::parse_from_rfc3339(s)
+                .map(|dt| Some(london_date_bound(dt.with_timezone(&Utc))))
+                .map_err(|_| ()),
+        }
+    };
+    let (from, to) = (parse(&range.from_date)?, parse(&range.to_date)?);
+    if let (Some(from), Some(to)) = (from, to)
+        && to <= from
+    {
+        let day = from.with_timezone(&chrono_tz::Europe::London).date_naive();
+        return Ok((
+            Some(london_midnight(day)),
+            Some(london_midnight(day + Duration::days(1))),
+        ));
+    }
+    Ok((from, to))
+}
+
+/// A period's `(from, to)`, either end open.
+type PeriodBounds = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// See [`period_bounds`]: 00:00 UTC means "this date", in London.
+fn london_date_bound(at: DateTime<Utc>) -> DateTime<Utc> {
+    if at.time() == NaiveTime::MIN {
+        london_midnight(at.date_naive())
+    } else {
+        at
+    }
+}
+
+fn london_midnight(date: chrono::NaiveDate) -> DateTime<Utc> {
+    common::rail_day::london_to_utc(date, NaiveTime::MIN)
+}
+
 /// Deserializes `loaded.extracted_periods` into `Vec<ExtractionPeriod>`,
 /// treating a missing column or any parse failure (wrong-shaped JSON, a
 /// stale/foreign row, an empty array, ...) identically to "no periods at
 /// all" -- the same fail-safe posture as every other extraction consumer in
 /// this module: malformed or absent data never manufactures a demotion,
 /// escalation, or age-cutoff exemption on its own.
+///
+/// A period that only says normal service resumes ("Normal timetable
+/// expected to resume.", CD74FB58) is dropped: the model labels it
+/// `ongoing`, and from its start date it would otherwise escalate, exempt
+/// or announce a disruption that is in fact the end of one.
 fn parse_periods(loaded: &LoadedIncident) -> Vec<ExtractionPeriod> {
-    loaded
+    let periods: Vec<ExtractionPeriod> = loaded
         .extracted_periods
         .as_ref()
         .and_then(|value| serde_json::from_value(value.clone()).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    periods
+        .into_iter()
+        .filter(|period| !is_resumption(period))
+        .collect()
+}
+
+/// Whether a period only announces that normal service resumes.
+fn is_resumption(period: &ExtractionPeriod) -> bool {
+    let Some(scope) = period.scope_description.as_deref() else {
+        return false;
+    };
+    let scope = scope.to_lowercase();
+    [
+        "normal timetable",
+        "normal service",
+        "usual timetable",
+        "usual service",
+    ]
+    .iter()
+    .any(|normal| scope.contains(normal))
+        && ["resum", "return", "restor", "back to", "reinstat"]
+            .iter()
+            .any(|verb| scope.contains(verb))
 }
 
 /// Prefixes `text` with `period.scope_description` when present, per design
@@ -1684,7 +1981,7 @@ mod tests {
             .cloned()
             .map(|message| LoadedIncident {
                 message,
-                first_seen_at: Utc::now(),
+                active_since: Utc::now(),
                 extracted_periods: None,
             })
             .collect();
@@ -1694,7 +1991,7 @@ mod tests {
             &HashMap::new(),
             &registry,
             &defaults,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         )
     }
 
@@ -1769,8 +2066,8 @@ mod tests {
 
     // --- "No trains between X and Y" (2026-10-02) ---
 
-    fn station_names() -> StationNames {
-        StationNames::new([
+    fn station_names() -> StationGazetteer {
+        StationGazetteer::new([
             ("PAR", "Par"),
             ("NQY", "Newquay"),
             ("LYP", "Lymington Pier"),
@@ -1785,7 +2082,7 @@ mod tests {
     fn aggregate_with_names(
         lines: &HashMap<String, LineDefinition>,
         incidents: &[IncidentMessage],
-        names: &StationNames,
+        names: &StationGazetteer,
     ) -> HashMap<String, LineStatusReport> {
         let registry = SegmentRegistry::new(lines);
         let loaded: Vec<LoadedIncident> = incidents
@@ -1793,7 +2090,7 @@ mod tests {
             .cloned()
             .map(|message| LoadedIncident {
                 message,
-                first_seen_at: Utc::now(),
+                active_since: Utc::now(),
                 extracted_periods: None,
             })
             .collect();
@@ -1807,6 +2104,13 @@ mod tests {
         )
     }
 
+    fn has_kb_status(reports: &HashMap<String, LineStatusReport>, line: &str) -> bool {
+        reports[line]
+            .statuses
+            .iter()
+            .any(|s| s.data_quality == DataQuality::Knowledgebase)
+    }
+
     fn kb_status<'a>(reports: &'a HashMap<String, LineStatusReport>, line: &str) -> &'a LineStatus {
         reports[line]
             .statuses
@@ -1815,9 +2119,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{line} has no incident status"))
     }
 
-    /// The Atlantic Coast case: an operator-wide report that closes the
-    /// whole branch is Part Suspended on that line, scoped to its stations;
-    /// GWR's other lines (no Par AND Newquay) stay Minor Delays.
+    /// The Atlantic Coast case: a report that closes the whole branch is
+    /// Part Suspended on that line, scoped to its stations. Since
+    /// 2026-10-06 the two named places are also the incident's line
+    /// evidence, so GWR's other lines (no Par AND Newquay) no longer get an
+    /// operator-wide Minor Delays status at all.
     #[test]
     fn no_trains_between_a_branchs_ends_is_part_suspended() {
         let lines = load_all_lines();
@@ -1846,9 +2152,8 @@ mod tests {
             ("PAR", "NQY")
         );
         // Par is on the Cornish main line too, Newquay is not.
-        let other = kb_status(&reports, "gwr-cornish-main-line");
-        assert_eq!(other.severity, Severity::MinorDelays);
-        assert!(other.reason.ends_with("(operator-wide report)"));
+        assert!(!has_kb_status(&reports, "gwr-cornish-main-line"));
+        assert!(!has_kb_status(&reports, "gwr-main-line"));
 
         let inc = incident(
             "NT-2",
@@ -1867,7 +2172,8 @@ mod tests {
     /// Virginia Water to Weybridge is 4 of the Chertsey loop's 23
     /// stations: Reduced Service, naming the section, not the whole line at
     /// the Severe tier. Lines with only one end (Hounslow loop, Waterloo -
-    /// Reading) are unchanged.
+    /// Reading) are not affected (2026-10-06: no operator-wide fallback once
+    /// a place resolves).
     #[test]
     fn a_short_section_of_a_busy_line_is_reduced_service() {
         let lines = load_all_lines();
@@ -1894,14 +2200,10 @@ mod tests {
             "swr-waterloo-reading",
             "swr-south-west-main",
         ] {
-            assert_eq!(
-                kb_status(&reports, line_id).severity,
-                Severity::MinorDelays,
-                "{line_id}"
-            );
+            assert!(!has_kb_status(&reports, line_id), "{line_id}");
         }
         // "suspended" in the text does not lift a short section past its
-        // own severity under a weak match.
+        // own severity, whatever the match's scope.
         let inc = incident(
             "NT-4",
             "No trains between Virginia Water and Weybridge: services suspended",
@@ -1919,7 +2221,7 @@ mod tests {
     #[test]
     fn unresolved_cleared_planned_or_nameless_no_trains_reports_are_unchanged() {
         let lines = load_all_lines();
-        let unchanged = |summary: &str, planned: bool, names: &StationNames| {
+        let unchanged = |summary: &str, planned: bool, names: &StationGazetteer| {
             let mut inc = incident("NT-5", summary, "", &["GW"], &[]);
             inc.is_planned = planned;
             let reports = aggregate_with_names(&lines, &[inc], names);
@@ -1929,11 +2231,22 @@ mod tests {
                 .find(|s| s.disruption.is_some())
                 .map(|s| (s.severity, s.reason.clone()))
         };
-        // Looe is not a known name here; Liskeard is not on the line.
+        // Looe is not a known name here; Liskeard is not on the line, but
+        // it resolves to the lines it is on, so the Atlantic Coast line is
+        // not touched at all (2026-10-06).
+        assert_eq!(
+            unchanged(
+                "No trains between Liskeard and Looe",
+                false,
+                &station_names(),
+            ),
+            None
+        );
+        // With no station names at all, the operator-wide fallback.
         let (sev, reason) = unchanged(
             "No trains between Liskeard and Looe",
             false,
-            &station_names(),
+            &StationGazetteer::default(),
         )
         .unwrap();
         assert_eq!(sev, Severity::MinorDelays);
@@ -1948,7 +2261,7 @@ mod tests {
         let (sev, _) = unchanged(
             "No trains between Par and Newquay",
             false,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         )
         .unwrap();
         assert_eq!(sev, Severity::MinorDelays, "no station names loaded");
@@ -2959,7 +3272,7 @@ mod tests {
         );
         let loaded = LoadedIncident {
             message: inc,
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: None,
         };
         let reports = aggregate(
@@ -2968,7 +3281,7 @@ mod tests {
             &samples,
             &registry,
             &defaults,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         );
         let alton = &reports["swr-alton"];
         assert_eq!(
@@ -3025,7 +3338,7 @@ mod tests {
         );
         let loaded = LoadedIncident {
             message: inc,
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: None,
         };
         (lines, loaded, samples)
@@ -3046,7 +3359,7 @@ mod tests {
             &samples,
             &registry,
             &defaults,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         );
         let alton = &reports["swr-alton"];
         let planned = alton
@@ -3085,7 +3398,7 @@ mod tests {
             &samples,
             &registry,
             &Defaults::default(),
-            &StationNames::default(),
+            &StationGazetteer::default(),
         );
         let alton = &reports["swr-alton"];
         assert_eq!(alton.statuses.len(), 1, "{:?}", alton.statuses);
@@ -3151,7 +3464,7 @@ mod tests {
         );
         let loaded = LoadedIncident {
             message: inc,
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: None,
         };
         let reports = aggregate(
@@ -3160,7 +3473,7 @@ mod tests {
             &samples,
             &registry,
             &defaults,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         );
         assert_eq!(
             reports["swr-alton"].worst_severity(),
@@ -3210,10 +3523,10 @@ mod tests {
         assert!(!period_covers_now(&period, now));
     }
 
-    fn loaded_at(message: IncidentMessage, first_seen_at: DateTime<Utc>) -> LoadedIncident {
+    fn loaded_at(message: IncidentMessage, active_since: DateTime<Utc>) -> LoadedIncident {
         LoadedIncident {
             message,
-            first_seen_at,
+            active_since,
             extracted_periods: None,
         }
     }
@@ -3256,8 +3569,8 @@ mod tests {
     fn is_active_false_for_non_planned_incident_aged_past_the_rail_day_boundary() {
         let inc = incident("T4", "Delay", "Delay description", &[], &[]);
         let now = Utc::now();
-        let first_seen_at = now - Duration::days(2);
-        assert!(!is_active(&loaded_at(inc, first_seen_at), now));
+        let active_since = now - Duration::days(2);
+        assert!(!is_active(&loaded_at(inc, active_since), now));
     }
 
     #[test]
@@ -3271,8 +3584,8 @@ mod tests {
         );
         inc.is_planned = true;
         let now = Utc::now();
-        let first_seen_at = now - Duration::days(2);
-        assert!(is_active(&loaded_at(inc, first_seen_at), now));
+        let active_since = now - Duration::days(2);
+        assert!(is_active(&loaded_at(inc, active_since), now));
     }
 
     #[test]
@@ -3411,7 +3724,7 @@ mod tests {
         let defaults = Defaults::default();
         let loaded = LoadedIncident {
             message: inc,
-            first_seen_at: Utc::now() - Duration::days(5),
+            active_since: Utc::now() - Duration::days(5),
             extracted_periods: None,
         };
         let reports = aggregate(
@@ -3420,7 +3733,7 @@ mod tests {
             &HashMap::new(),
             &registry,
             &defaults,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         );
         for line_id in ["swr-south-west-main", "swr-portsmouth-direct", "swr-alton"] {
             assert_eq!(
@@ -3553,7 +3866,7 @@ mod tests {
         });
         LoadedIncident {
             message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(serde_json::Value::Array(vec![period])),
         }
     }
@@ -3575,7 +3888,7 @@ mod tests {
         });
         LoadedIncident {
             message: incident("EXT2", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(serde_json::Value::Array(vec![period])),
         }
     }
@@ -3586,7 +3899,7 @@ mod tests {
         // succeeded for this incident.
         let loaded = LoadedIncident {
             message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: None,
         };
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
@@ -3602,7 +3915,7 @@ mod tests {
         // read side) must behave identically to no extraction at all.
         let loaded = LoadedIncident {
             message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(serde_json::json!([])),
         };
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, Utc::now());
@@ -3799,7 +4112,7 @@ mod tests {
             ]);
             let loaded = LoadedIncident {
                 message: incident("EXT1", "Signal failure", "Delays expected", &[], &[]),
-                first_seen_at: Utc::now(),
+                active_since: Utc::now(),
                 extracted_periods: Some(periods),
             };
             let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
@@ -3955,7 +4268,7 @@ mod tests {
         });
         let loaded = LoadedIncident {
             message: incident("EXT3", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(serde_json::Value::Array(vec![period])),
         };
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
@@ -3986,7 +4299,7 @@ mod tests {
         let defaults = Defaults::default();
         let loaded = LoadedIncident {
             message: inc,
-            first_seen_at: Utc::now() - Duration::days(5),
+            active_since: Utc::now() - Duration::days(5),
             extracted_periods: None,
         };
         let reports = aggregate(
@@ -3995,7 +4308,7 @@ mod tests {
             &HashMap::new(),
             &registry,
             &defaults,
-            &StationNames::default(),
+            &StationGazetteer::default(),
         );
         assert_eq!(
             reports["swr-alton"].worst_severity(),
@@ -4130,7 +4443,7 @@ mod tests {
         ]);
         let loaded = LoadedIncident {
             message: incident("MULTI1", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
@@ -4183,7 +4496,7 @@ mod tests {
         ]);
         let loaded = LoadedIncident {
             message: incident("MULTI2", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
@@ -4231,7 +4544,7 @@ mod tests {
             }]);
             let loaded = LoadedIncident {
                 message: incident("MULTI3", "Signal failure", "Delays expected", &[], &[]),
-                first_seen_at: Utc::now(),
+                active_since: Utc::now(),
                 extracted_periods: Some(periods),
             };
             let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
@@ -4257,7 +4570,7 @@ mod tests {
         }]);
         let loaded = LoadedIncident {
             message: incident("MULTI4", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         let (severity, annotation) = apply_extraction(Severity::Suspended, &loaded, now);
@@ -4289,7 +4602,7 @@ mod tests {
         ]);
         let loaded = LoadedIncident {
             message: incident("MULTI5", "Signal failure", "Delays expected", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
@@ -4331,7 +4644,7 @@ mod tests {
     fn governing_impact_type_returns_none_with_no_periods() {
         let loaded = LoadedIncident {
             message: incident("GIT1", "Signal failure", "Delays", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: None,
         };
         assert_eq!(governing_impact_type(&loaded, Utc::now()), None);
@@ -4351,7 +4664,7 @@ mod tests {
         }]);
         let loaded = LoadedIncident {
             message: incident("GIT2", "Signal failure", "Delays", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         assert_eq!(governing_impact_type(&loaded, Utc::now()), None);
@@ -4377,7 +4690,7 @@ mod tests {
                 &[],
                 &[],
             ),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         assert_eq!(
@@ -4400,7 +4713,7 @@ mod tests {
         }]);
         let loaded = LoadedIncident {
             message: incident("GIT4", "Signal failure", "Delays", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         assert_eq!(governing_impact_type(&loaded, Utc::now()), None);
@@ -4433,7 +4746,7 @@ mod tests {
         ]);
         let loaded = LoadedIncident {
             message: incident("GIT5", "Engineering works", "Various", &[], &[]),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         assert_eq!(governing_impact_type(&loaded, now), None);
@@ -4473,7 +4786,7 @@ mod tests {
                 &[],
                 &[],
             ),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
 
@@ -4516,7 +4829,7 @@ mod tests {
                 &["SW"],
                 &["AHT"],
             ),
-            first_seen_at: Utc::now(),
+            active_since: Utc::now(),
             extracted_periods: Some(periods),
         };
         let m = Match {
@@ -4530,7 +4843,13 @@ mod tests {
             },
         };
 
-        let status = status_from_incident(&m, &loaded, now, &StationNames::default());
+        let status = status_from_incident(
+            &m,
+            &loaded,
+            now,
+            &StationGazetteer::default(),
+            Keep::Current,
+        );
 
         assert_eq!(
             status.disruption.unwrap().impact_type.as_deref(),
@@ -5008,21 +5327,21 @@ mod tests {
         current_description: &str,
         extracted_from_description: &str,
         periods: serde_json::Value,
-        first_seen_at: DateTime<Utc>,
+        active_since: DateTime<Utc>,
     ) -> LoadedIncident {
         let stamped = common::text_hash::text_hash(STALE_SUMMARY, extracted_from_description);
         LoadedIncident::new(
             incident("STALE1", STALE_SUMMARY, current_description, &[], &[]),
-            first_seen_at,
+            active_since,
             Some(&stamped),
             Some(periods),
         )
     }
 
-    fn never_enriched(current_description: &str, first_seen_at: DateTime<Utc>) -> LoadedIncident {
+    fn never_enriched(current_description: &str, active_since: DateTime<Utc>) -> LoadedIncident {
         LoadedIncident::new(
             incident("STALE1", STALE_SUMMARY, current_description, &[], &[]),
-            first_seen_at,
+            active_since,
             None,
             None,
         )
@@ -5204,5 +5523,671 @@ mod tests {
             )),
         );
         assert_eq!(loaded.extracted_periods, None);
+    }
+
+    // ---- 2026-10-06: cutoff anchor, exemptions, in-effect, dates, upcoming ----
+    //
+    // Fixtures are short excerpts of real production incidents (ids in the
+    // comments); times are the production timestamps.
+
+    fn at(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// One extracted period, as the enricher stores it.
+    fn period(
+        from: Option<&str>,
+        to: Option<&str>,
+        resolution_status: &str,
+        confidence: &str,
+        window: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "scope_description": null,
+            "date_range": if from.is_none() && to.is_none() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({ "from_date": from, "to_date": to })
+            },
+            "schedule_window": window,
+            "resolution_status": resolution_status,
+            "apparent_severity": "moderate_disruption",
+            "resolution_status_confidence": confidence,
+            "severity_confidence": "low",
+            "impact_type": null,
+        })
+    }
+
+    fn with_periods(
+        message: IncidentMessage,
+        active_since: DateTime<Utc>,
+        periods: Vec<serde_json::Value>,
+    ) -> LoadedIncident {
+        LoadedIncident {
+            message,
+            active_since,
+            extracted_periods: Some(serde_json::Value::Array(periods)),
+        }
+    }
+
+    /// B852BEF3, "Disruption between Purley and Gatwick Airport": cleared
+    /// on 11 Sep, reopened 12 Sep 10:19Z. The cutoff now runs from the
+    /// reopen (`active_since`), so it shows for that rail day and drops at
+    /// the next 02:00, until the next reopen re-arms it.
+    #[test]
+    fn a_reopened_incident_is_active_again_for_one_rail_day() {
+        let inc = incident(
+            "B852BEF3",
+            "Disruption between Purley and Gatwick Airport expected until 12:45",
+            "",
+            &["GX", "SN", "TL"],
+            &[],
+        );
+        let reopened = at("2026-09-12T10:19:00Z");
+        let loaded = loaded_at(inc, reopened);
+        assert!(is_active(&loaded, at("2026-09-12T10:20:00Z")));
+        assert!(is_active(&loaded, at("2026-09-13T00:59:00Z")), "01:59 BST");
+        assert!(!is_active(&loaded, at("2026-09-13T01:00:00Z")), "02:00 BST");
+        // The 13 Sep reopen re-arms it (the api stamps a new active_since).
+        let loaded = LoadedIncident {
+            active_since: at("2026-09-13T12:04:00Z"),
+            ..loaded
+        };
+        assert!(is_active(&loaded, at("2026-09-13T12:05:00Z")));
+    }
+
+    /// 147D1B86, "Lines reopened: major disruption between Woking and
+    /// Brookwood": last text edit 17 Sep 21:43 BST, then unchanged (and
+    /// uncleared) until 01:33 BST. It stays hidden after 02:00; a later text
+    /// edit would re-arm it.
+    #[test]
+    fn unchanged_stale_text_still_expires_at_two_and_a_text_edit_re_arms_it() {
+        let inc = incident(
+            "147D1B86",
+            "Lines reopened: major disruption between Woking and Brookwood",
+            "",
+            &["SW"],
+            &[],
+        );
+        // The stored extraction: resolved, low confidence -- no exemption.
+        let loaded = with_periods(
+            inc,
+            at("2026-09-17T20:43:00Z"),
+            vec![period(
+                None,
+                Some("2026-09-17T19:03:54Z"),
+                "resolved",
+                "low",
+                None,
+            )],
+        );
+        assert!(is_active(&loaded, at("2026-09-18T00:30:00Z")));
+        assert!(!is_active(&loaded, at("2026-09-18T01:00:00Z")));
+        assert!(!is_active(&loaded, at("2026-09-18T12:00:00Z")));
+        let edited = LoadedIncident {
+            active_since: at("2026-09-18T11:00:00Z"),
+            ..loaded
+        };
+        assert!(is_active(&edited, at("2026-09-18T12:00:00Z")));
+        assert!(!is_active(&edited, at("2026-09-19T01:00:00Z")));
+    }
+
+    /// 20197449: "No direct ... service between Pontypridd and Cardiff Bay
+    /// until at least the end of day on Friday 9 October", first seen 21
+    /// Sep. Kept past its first rail day by a dated exemption, and each of
+    /// the exemption's conditions is necessary.
+    #[test]
+    fn each_dated_exemption_condition_is_necessary() {
+        let inc = || {
+            incident(
+                "20197449",
+                "No direct Transport for Wales service between Pontypridd and Cardiff Bay",
+                "",
+                &["AW"],
+                &[],
+            )
+        };
+        let since = at("2026-09-21T08:23:57Z");
+        let now = at("2026-10-06T08:00:00Z");
+        let keep = |p: serde_json::Value| keep_reason(&with_periods(inc(), since, vec![p]), now);
+        let to = Some("2026-10-09T23:00:00Z");
+        assert_eq!(
+            keep(period(None, to, "ongoing", "high", None)),
+            Some(Keep::Dated { in_effect: true })
+        );
+        // Phase must be Active: an elapsed range does not exempt.
+        assert_eq!(
+            keep(period(
+                None,
+                Some("2026-10-01T23:00:00Z"),
+                "ongoing",
+                "high",
+                None
+            )),
+            None
+        );
+        // Must be ongoing.
+        assert_eq!(keep(period(None, to, "residual", "high", None)), None);
+        assert_eq!(keep(period(None, to, "resolved", "high", None)), None);
+        // Must be high confidence.
+        assert_eq!(keep(period(None, to, "ongoing", "low", None)), None);
+        // Must state an end or a window: an undated ongoing period is the
+        // ordinary single-fact extraction of any live incident.
+        assert_eq!(keep(period(None, None, "ongoing", "high", None)), None);
+        // A schedule window instead of an end date also exempts (the
+        // pre-2026-10-06 rule, now also requiring "ongoing").
+        let window = serde_json::json!({
+            "days_of_week": [1, 2, 3, 4, 5, 6, 7], "start_time": "00:00", "end_time": "23:59"
+        });
+        assert_eq!(
+            keep(period(None, None, "ongoing", "high", Some(window.clone()))),
+            Some(Keep::Dated { in_effect: true })
+        );
+        assert_eq!(
+            keep(period(None, None, "residual", "high", Some(window))),
+            None
+        );
+        // Within the first rail day nothing is needed.
+        let fresh = with_periods(
+            inc(),
+            now - Duration::hours(1),
+            vec![period(None, None, "ongoing", "low", None)],
+        );
+        assert_eq!(keep_reason(&fresh, now), Some(Keep::Current));
+    }
+
+    /// 1D3D4694: TPE industrial action on Sunday 11, 18
+    /// and 25 October, extracted as zero-length ranges at UTC midnight.
+    /// Not shown before the strike day (a purely future notice is an
+    /// upcoming note, not a status), shown on it, and the 25 Oct day is the
+    /// 25-hour BST-to-GMT day.
+    #[test]
+    fn a_strike_is_inactive_before_its_day_and_active_on_it() {
+        let inc = || {
+            incident(
+                "1D3D4694",
+                "Industrial action to affect TransPennine Express services on Sunday 11, 18 and \
+                 25 October",
+                "",
+                &["TP"],
+                &[],
+            )
+        };
+        let since = at("2026-10-03T06:04:00Z");
+        let day = |d: &str| {
+            period(
+                Some(&format!("2026-10-{d}T00:00:00Z")),
+                Some(&format!("2026-10-{d}T00:00:00Z")),
+                "ongoing",
+                "high",
+                None,
+            )
+        };
+        let loaded = with_periods(inc(), since, vec![day("11"), day("18"), day("25")]);
+        // Its first rail day: every period is in the future -> not a status.
+        assert_eq!(keep_reason(&loaded, at("2026-10-03T07:00:00Z")), None);
+        assert_eq!(keep_reason(&loaded, at("2026-10-10T22:59:00Z")), None);
+        // 11 Oct 00:00 BST = 10 Oct 23:00Z, through 11 Oct 23:59 BST.
+        for now in [
+            "2026-10-10T23:00:00Z",
+            "2026-10-11T12:00:00Z",
+            "2026-10-11T22:59:00Z",
+        ] {
+            assert_eq!(
+                keep_reason(&loaded, at(now)),
+                Some(Keep::Dated { in_effect: true }),
+                "{now}"
+            );
+        }
+        // Between strike days: one elapsed, the rest future -> not shown.
+        assert_eq!(keep_reason(&loaded, at("2026-10-12T12:00:00Z")), None);
+        // 25 Oct: clocks go back at 02:00 BST; the London day runs from
+        // 24 Oct 23:00Z to 26 Oct 00:00Z.
+        assert_eq!(keep_reason(&loaded, at("2026-10-24T22:30:00Z")), None);
+        assert_eq!(
+            keep_reason(&loaded, at("2026-10-24T23:30:00Z")),
+            Some(Keep::Dated { in_effect: true })
+        );
+        assert_eq!(
+            keep_reason(&loaded, at("2026-10-25T23:30:00Z")),
+            Some(Keep::Dated { in_effect: true }),
+            "23:30 GMT on 25 Oct"
+        );
+        assert_eq!(keep_reason(&loaded, at("2026-10-26T00:30:00Z")), None);
+    }
+
+    #[test]
+    fn period_bounds_read_dates_in_europe_london() {
+        let range = |from: Option<&str>, to: Option<&str>| DateRange {
+            from_date: from.map(ToString::to_string),
+            to_date: to.map(ToString::to_string),
+        };
+        // A zero-length range written as the London midnight is the same day.
+        assert_eq!(
+            period_bounds(&range(
+                Some("2026-10-10T23:00:00Z"),
+                Some("2026-10-10T23:00:00Z")
+            )),
+            Ok((
+                Some(at("2026-10-10T23:00:00Z")),
+                Some(at("2026-10-11T23:00:00Z"))
+            ))
+        );
+        // A reversed range: the whole London day of from_date.
+        assert_eq!(
+            period_bounds(&range(
+                Some("2026-10-11T09:00:00Z"),
+                Some("2026-10-11T08:00:00Z")
+            )),
+            Ok((
+                Some(at("2026-10-10T23:00:00Z")),
+                Some(at("2026-10-11T23:00:00Z"))
+            ))
+        );
+        // In GMT, UTC and London midnights coincide.
+        assert_eq!(
+            period_bounds(&range(Some("2026-11-02T00:00:00Z"), None)),
+            Ok((Some(at("2026-11-02T00:00:00Z")), None))
+        );
+        // A time of day is kept as written.
+        assert_eq!(
+            period_bounds(&range(None, Some("2026-10-09T17:30:00Z"))),
+            Ok((None, Some(at("2026-10-09T17:30:00Z"))))
+        );
+        assert_eq!(period_bounds(&range(Some("not a date"), None)), Err(()));
+    }
+
+    /// 7933A3FB (ZN, "Temporary amendments to some Southern services to /
+    /// from Uckfield until at least Monday 2 November"): a Monday-Saturday
+    /// window. On a Sunday it is kept but not in effect: live delays do not
+    /// escalate it, and the line also shows its own inferred status.
+    #[test]
+    fn a_sunday_under_a_monday_saturday_window_is_not_in_effect() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let names = StationGazetteer::new([("UCK", "Uckfield"), ("OXT", "Oxted")]);
+        let window = serde_json::json!({
+            "days_of_week": [1, 2, 3, 4, 5, 6], "start_time": "00:00", "end_time": "23:59"
+        });
+        let mut inc = incident(
+            "7933A3FB",
+            "Temporary amendments to some Southern services to / from Uckfield until at least \
+             Monday 2 November",
+            "<p>A speed restriction remains in place on the line between Oxted and Uckfield.</p>",
+            &["ZN"],
+            &[],
+        );
+        inc.validity = vec![ValidityPeriod {
+            from_date: at("2026-09-16T11:13:51Z"),
+            to_date: None,
+            is_now: true,
+        }];
+        let loaded = with_periods(
+            inc,
+            at("2026-10-03T06:49:00Z"),
+            vec![period(
+                None,
+                Some("2026-11-02T00:00:00Z"),
+                "ongoing",
+                "high",
+                Some(window),
+            )],
+        );
+        let late = |delay: i32| {
+            let mut d = departure("UCK", delay, false);
+            d.operator = "SN".to_string();
+            d
+        };
+        let samples: HashMap<String, StationSample> = ["OXT", "UCK", "EGR"]
+            .iter()
+            .map(|crs| {
+                (
+                    (*crs).to_string(),
+                    StationSample {
+                        crs: (*crs).to_string(),
+                        polled_at: Utc::now(),
+                        departures: vec![late(25), late(30), late(20), late(40)],
+                    },
+                )
+            })
+            .collect();
+        let run = |now: DateTime<Utc>| {
+            aggregate_at(
+                &lines,
+                std::slice::from_ref(&loaded),
+                &samples,
+                &registry,
+                &Defaults::default(),
+                &names,
+                now,
+            )
+        };
+
+        // Sunday 4 Oct, 12:00 BST.
+        let sunday = at("2026-10-04T11:00:00Z");
+        let reports = run(sunday);
+        let report = &reports["southern-oxted-uckfield"];
+        let notice = kb_status(&reports, "southern-oxted-uckfield");
+        assert!(!in_effect_now(notice, sunday));
+        assert_eq!(
+            notice.validity.from_date,
+            at("2026-10-04T23:00:00Z"),
+            "Monday 00:00 BST"
+        );
+        assert!(
+            !notice.reason.contains("live samples show"),
+            "no escalation on a non-window day: {}",
+            notice.reason
+        );
+        assert!(
+            report
+                .statuses
+                .iter()
+                .any(|s| s.data_quality != DataQuality::Knowledgebase
+                    && severity_rank(s.severity) > severity_rank(Severity::GoodService)),
+            "the line falls back to its own inferred status: {:?}",
+            report.statuses
+        );
+
+        // Monday 5 Oct, 12:00 BST: in effect, and escalated by live delays.
+        let monday = at("2026-10-05T11:00:00Z");
+        let reports = run(monday);
+        let notice = kb_status(&reports, "southern-oxted-uckfield");
+        assert!(in_effect_now(notice, monday));
+        assert!(
+            notice.reason.contains("live samples show"),
+            "{}",
+            notice.reason
+        );
+        assert_eq!(reports["southern-oxted-uckfield"].statuses.len(), 1);
+    }
+
+    /// 26505443: "Temporary reduced timetable on East Midlands Railway
+    /// Intercity routes until further notice", first seen 3 Sep. An undated
+    /// long-term notice stays while the feed lists it, at most Reduced
+    /// Service; without the long-term phrase the same period does not
+    /// exempt.
+    #[test]
+    fn an_undated_long_term_notice_is_capped_at_reduced_service() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let now = at("2026-10-06T08:00:00Z");
+        let since = at("2026-09-03T03:43:02Z");
+        // Station evidence, so the operator-wide Minor cap is not what caps it.
+        let inc = incident(
+            "26505443",
+            "Services suspended between Derby and Matlock until further notice",
+            "",
+            &["EM"],
+            &["DBY", "MAT"],
+        );
+        let loaded = with_periods(
+            inc.clone(),
+            since,
+            vec![period(None, None, "ongoing", "high", None)],
+        );
+        assert_eq!(keep_reason(&loaded, now), Some(Keep::Undated));
+        let reports = aggregate_at(
+            &lines,
+            std::slice::from_ref(&loaded),
+            &HashMap::new(),
+            &registry,
+            &Defaults::default(),
+            &StationGazetteer::default(),
+            now,
+        );
+        let status = kb_status(&reports, "emr-derwent-valley");
+        assert_eq!(status.severity, Severity::ReducedService);
+        assert!(
+            status.reason.ends_with("(long-running notice)"),
+            "{}",
+            status.reason
+        );
+        // Inside its first rail day it is shown uncapped.
+        let fresh = LoadedIncident {
+            active_since: now - Duration::hours(1),
+            ..with_periods(
+                inc.clone(),
+                since,
+                vec![period(None, None, "ongoing", "high", None)],
+            )
+        };
+        let reports = aggregate_at(
+            &lines,
+            std::slice::from_ref(&fresh),
+            &HashMap::new(),
+            &registry,
+            &Defaults::default(),
+            &StationGazetteer::default(),
+            now,
+        );
+        assert_eq!(
+            kb_status(&reports, "emr-derwent-valley").severity,
+            Severity::Suspended
+        );
+        // No long-term phrase: not exempt.
+        let mut plain = inc;
+        plain.summary = "Services suspended between Derby and Matlock".to_string();
+        let loaded = with_periods(
+            plain,
+            since,
+            vec![period(None, None, "ongoing", "high", None)],
+        );
+        assert_eq!(keep_reason(&loaded, now), None);
+    }
+
+    /// CD74FB58: the model labelled "Normal timetable expected to resume."
+    /// (from 12 Oct) as an ongoing, high-confidence, open-ended period. It
+    /// must not keep, escalate or announce anything.
+    #[test]
+    fn a_normal_service_resumes_period_is_ignored() {
+        let mut resume = period(Some("2026-10-12T00:00:00Z"), None, "ongoing", "high", None);
+        resume["scope_description"] = serde_json::json!("Normal timetable expected to resume.");
+        resume["apparent_severity"] = serde_json::json!("severe_disruption");
+        resume["severity_confidence"] = serde_json::json!("high");
+        let inc = incident(
+            "CD74FB58",
+            "Temporary changes to weekday off-peak services between Ore / Eastbourne and London \
+             Victoria - normal timetable expected from Monday 12 October",
+            "",
+            &["ZN"],
+            &[],
+        );
+        let loaded = with_periods(inc, at("2026-10-03T06:59:00Z"), vec![resume]);
+        assert!(parse_periods(&loaded).is_empty());
+        assert_eq!(keep_reason(&loaded, at("2026-10-13T12:00:00Z")), None);
+        let lines = load_all_lines();
+        let upcoming = upcoming_by_line(
+            &lines,
+            std::slice::from_ref(&loaded),
+            &SegmentRegistry::new(&lines),
+            &StationGazetteer::new([("EBN", "Eastbourne")]),
+            at("2026-10-06T08:00:00Z"),
+        );
+        assert!(upcoming.is_empty(), "{upcoming:?}");
+    }
+
+    /// 1D3D4694 again: the strike days are each TPE line's
+    /// upcoming notes, whole London days, before and between them; a dated
+    /// non-strike period only within two weeks.
+    #[test]
+    fn upcoming_strikes_and_near_dated_periods_are_line_notes() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let names = StationGazetteer::default();
+        let day = |d: &str| {
+            period(
+                Some(&format!("2026-10-{d}T00:00:00Z")),
+                Some(&format!("2026-10-{d}T00:00:00Z")),
+                "ongoing",
+                "high",
+                None,
+            )
+        };
+        let strike = with_periods(
+            incident(
+                "1D3D4694",
+                "Industrial action to affect TransPennine Express services on Sunday 11, 18 and \
+                 25 October",
+                "",
+                &["TP"],
+                &[],
+            ),
+            at("2026-10-03T06:04:00Z"),
+            vec![day("11"), day("18"), day("25")],
+        );
+        let now = at("2026-10-06T08:00:00Z");
+        let upcoming = upcoming_by_line(
+            &lines,
+            std::slice::from_ref(&strike),
+            &registry,
+            &names,
+            now,
+        );
+        assert_eq!(upcoming.len(), 9, "every TPE line: {:?}", upcoming.keys());
+        let tpe = &upcoming["tpe-north"];
+        assert_eq!(tpe.len(), 3);
+        assert_eq!(tpe[0].from, at("2026-10-10T23:00:00Z"));
+        assert_eq!(tpe[0].to, Some(at("2026-10-11T23:00:00Z")));
+        assert_eq!(tpe[2].to, Some(at("2026-10-26T00:00:00Z")), "25-hour day");
+        assert_eq!(tpe[0].incident_id, "1D3D4694");
+        // On the 11th, only the 18th and 25th remain.
+        let on_the_day = upcoming_by_line(
+            &lines,
+            std::slice::from_ref(&strike),
+            &registry,
+            &names,
+            at("2026-10-11T12:00:00Z"),
+        );
+        assert_eq!(on_the_day["tpe-north"].len(), 2);
+
+        // A non-strike dated period: within 14 days yes, beyond no; low
+        // confidence or a planned notice never.
+        let works = |from: &str, confidence: &str, planned: bool| {
+            let mut inc = incident(
+                "W1",
+                "Reduced service between Scarborough and Hull",
+                "",
+                &["NT"],
+                &["SCA", "HUL"],
+            );
+            inc.is_planned = planned;
+            with_periods(
+                inc,
+                now,
+                vec![period(Some(from), None, "ongoing", confidence, None)],
+            )
+        };
+        let notes =
+            |loaded: LoadedIncident| upcoming_by_line(&lines, &[loaded], &registry, &names, now);
+        assert!(
+            notes(works("2026-10-16T05:00:00Z", "high", false))
+                .contains_key("northern-hull-scarborough")
+        );
+        assert!(notes(works("2026-10-25T05:00:00Z", "high", false)).is_empty());
+        assert!(notes(works("2026-10-16T05:00:00Z", "low", false)).is_empty());
+        assert!(notes(works("2026-10-16T05:00:00Z", "high", true)).is_empty());
+    }
+
+    /// The network-marker rule end to end: the TPE strike is shown on every
+    /// TPE line on its day, operator-wide (Minor Delays); an EMR Intercity
+    /// timetable notice on every EMR line, capped; a local incident only on
+    /// its evidenced lines; one naming no place falls back to operator-wide.
+    #[test]
+    fn network_markers_and_local_incidents_end_to_end() {
+        let lines = load_all_lines();
+        let registry = SegmentRegistry::new(&lines);
+        let names =
+            StationGazetteer::new([("SCA", "Scarborough"), ("HUL", "Hull"), ("SEA", "Seamer")]);
+        let run = |loaded: LoadedIncident, now: DateTime<Utc>| {
+            aggregate_at(
+                &lines,
+                &[loaded],
+                &HashMap::new(),
+                &registry,
+                &Defaults::default(),
+                &names,
+                now,
+            )
+        };
+        let with_kb = |reports: &HashMap<String, LineStatusReport>| {
+            let mut ids: Vec<String> = reports
+                .values()
+                .filter(|r| {
+                    r.statuses
+                        .iter()
+                        .any(|s| s.data_quality == DataQuality::Knowledgebase)
+                })
+                .map(|r| r.id.clone())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let strike = with_periods(
+            incident(
+                "1D3D4694",
+                "Industrial action to affect TransPennine Express services on Sunday 11 October",
+                "",
+                &["TP"],
+                &[],
+            ),
+            at("2026-10-03T06:04:00Z"),
+            vec![period(
+                Some("2026-10-11T00:00:00Z"),
+                Some("2026-10-11T00:00:00Z"),
+                "ongoing",
+                "high",
+                None,
+            )],
+        );
+        let reports = run(strike, at("2026-10-11T12:00:00Z"));
+        let affected = with_kb(&reports);
+        assert_eq!(affected.len(), 9, "{affected:?}");
+        assert_eq!(
+            kb_status(&reports, "tpe-north").severity,
+            Severity::MinorDelays
+        );
+
+        let now = at("2026-10-06T08:00:00Z");
+        let emr = loaded_at(
+            incident(
+                "26505443",
+                "Temporary reduced timetable on East Midlands Railway Intercity routes until \
+                 further notice",
+                "<p>Cancelled services have been removed from journey planners.</p>",
+                &["EM"],
+                &[],
+            ),
+            now - Duration::hours(1),
+        );
+        let reports = run(emr, now);
+        assert_eq!(with_kb(&reports).len(), 10);
+        for id in with_kb(&reports) {
+            assert_eq!(
+                kb_status(&reports, &id).severity,
+                Severity::MinorDelays,
+                "{id}"
+            );
+        }
+
+        let local = loaded_at(
+            incident(
+                "0BD4F602",
+                "Disruption between Scarborough and Hull",
+                "",
+                &["NT"],
+                &[],
+            ),
+            now - Duration::hours(1),
+        );
+        assert_eq!(with_kb(&run(local, now)), ["northern-hull-scarborough"]);
+
+        let nowhere = loaded_at(
+            incident("N1", "Disruption to trains in the area", "", &["NT"], &[]),
+            now - Duration::hours(1),
+        );
+        assert!(with_kb(&run(nowhere, now)).len() > 30);
     }
 }

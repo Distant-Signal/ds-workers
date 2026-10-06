@@ -15,10 +15,17 @@ pub(crate) struct IncidentState {
     pub source_text_hash: Option<String>,
     pub extraction_model_version: Option<String>,
     /// Reference date threaded into `LlmClient::extract_primary` for
-    /// year-less-date resolution (design §1) -- the incident's own
-    /// `first_seen_at`, always populated (`NOT NULL DEFAULT NOW()` since
-    /// `20260716180000_incident_first_seen.sql`).
-    pub first_seen_at: DateTime<Utc>,
+    /// relative ("today", "Sunday") and year-less dates (design §1): when
+    /// the CURRENT summary and description were first recorded -- the
+    /// earliest `incident_history` row of the latest unbroken run with this
+    /// exact text -- falling back to `first_seen_at` (always populated)
+    /// when history has no such row.
+    ///
+    /// Until 2026-10-06 this was `first_seen_at` itself, so text published
+    /// days later was read against the wrong day: 6C20E627's "Reduced
+    /// service between Uckfield and Oxted today", set on 16 Sep, was
+    /// extracted as 9-10 Sep because the incident was first seen on 9 Sep.
+    pub reference_date: DateTime<Utc>,
     /// The previous extraction's output, read only so `churn` can compare
     /// it with its replacement before `write_extraction` overwrites it.
     /// Kept as raw JSON here (parsed leniently in `churn`) so a stored value
@@ -46,10 +53,25 @@ pub(crate) async fn fetch_incident_state(
     pool: &PgPool,
     incident_id: &str,
 ) -> anyhow::Result<Option<IncidentState>> {
+    // The current text's run starts after the last history row with
+    // different text (A -> B -> A reads from the second A), and the
+    // earliest row of it is when that text was first seen. Both lookups use
+    // `incident_history_id_time`.
     let row: Option<IncidentStateRow> = sqlx::query_as(
-        "SELECT summary, description, source_text_hash, extraction_model_version, first_seen_at, \
-                extracted_category, extracted_periods \
-         FROM incidents WHERE incident_id = $1",
+        "SELECT i.summary, i.description, i.source_text_hash, i.extraction_model_version, \
+                COALESCE( \
+                    (SELECT MIN(h.recorded_at) FROM incident_history h \
+                      WHERE h.incident_id = i.incident_id \
+                        AND h.summary = i.summary AND h.description = i.description \
+                        AND h.recorded_at > COALESCE( \
+                            (SELECT MAX(o.recorded_at) FROM incident_history o \
+                              WHERE o.incident_id = i.incident_id \
+                                AND (o.summary, o.description) \
+                                    IS DISTINCT FROM (i.summary, i.description)), \
+                            '-infinity'::timestamptz)), \
+                    i.first_seen_at) AS reference_date, \
+                i.extracted_category, i.extracted_periods \
+         FROM incidents i WHERE i.incident_id = $1",
     )
     .bind(incident_id)
     .fetch_optional(pool)
@@ -60,7 +82,7 @@ pub(crate) async fn fetch_incident_state(
             description,
             source_text_hash,
             extraction_model_version,
-            first_seen_at,
+            reference_date,
             extracted_category,
             extracted_periods,
         )| IncidentState {
@@ -68,7 +90,7 @@ pub(crate) async fn fetch_incident_state(
             description,
             source_text_hash,
             extraction_model_version,
-            first_seen_at,
+            reference_date,
             extracted_category,
             extracted_periods,
         },
@@ -407,6 +429,81 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed history");
+    }
+
+    async fn add_history_at(
+        pool: &PgPool,
+        incident_id: &str,
+        summary: &str,
+        recorded_at: DateTime<Utc>,
+    ) {
+        sqlx::query(
+            "INSERT INTO incident_history (incident_id, summary, description, operators, \
+                 affected_stations, is_planned, priority, recorded_at) \
+             VALUES ($1, $2, '', '{}', '{}', false, 3, $3)",
+        )
+        .bind(incident_id)
+        .bind(summary)
+        .bind(recorded_at)
+        .execute(pool)
+        .await
+        .expect("seed history");
+    }
+
+    /// The 6C20E627 pattern: first seen on 9 Sep, its summary changed to
+    /// "... today" on 16 Sep. "Today" must be read against 16 Sep, not the
+    /// first sighting; text that changes back reads from its latest run;
+    /// with no history at all, `first_seen_at`.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher fetch_incident_state -- --ignored --test-threads=1`"]
+    async fn fetch_incident_state_reference_date_is_when_the_current_text_appeared() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-REFERENCE-DATE-1";
+        let at = |raw: &str| raw.parse::<DateTime<Utc>>().unwrap();
+        let today = "Reduced service between Uckfield and Oxted today";
+        seed(&pool, incident_id, today, "").await;
+        sqlx::query("UPDATE incidents SET first_seen_at = $2 WHERE incident_id = $1")
+            .bind(incident_id)
+            .bind(at("2026-09-09T04:09:15Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reference = |pool: PgPool| async move {
+            fetch_incident_state(&pool, incident_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reference_date
+        };
+        // No history: the first sighting.
+        assert_eq!(reference(pool.clone()).await, at("2026-09-09T04:09:15Z"));
+
+        let first = "No trains between Uckfield and Oxted until the end of the day";
+        add_history_at(&pool, incident_id, first, at("2026-09-09T04:09:15Z")).await;
+        add_history_at(
+            &pool,
+            incident_id,
+            "Reduced service between Uckfield and Oxted: disruption until at least Saturday 19 \
+             September",
+            at("2026-09-13T17:26:00Z"),
+        )
+        .await;
+        add_history_at(&pool, incident_id, today, at("2026-09-16T11:08:00Z")).await;
+        // A later validity-only snapshot with the same text changes nothing.
+        add_history_at(&pool, incident_id, today, at("2026-09-16T15:00:00Z")).await;
+        assert_eq!(reference(pool.clone()).await, at("2026-09-16T11:08:00Z"));
+
+        // A -> B -> A: the second A's run, not the first A.
+        sqlx::query("UPDATE incidents SET summary = $2 WHERE incident_id = $1")
+            .bind(incident_id)
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        add_history_at(&pool, incident_id, first, at("2026-09-17T08:00:00Z")).await;
+        assert_eq!(reference(pool.clone()).await, at("2026-09-17T08:00:00Z"));
+
+        cleanup(&pool, incident_id).await;
     }
 
     async fn cleanup(pool: &PgPool, incident_id: &str) {
