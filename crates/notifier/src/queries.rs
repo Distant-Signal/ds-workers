@@ -1015,6 +1015,10 @@ pub(crate) struct CommittedLeg {
 /// is a current-snapshot table with no watermark to diff against). One row
 /// per leg, already carrying everything `skip_check::leg_is_skipped`
 /// (Task 9) needs -- no further per-leg query required.
+///
+/// A leg committed to a bus or ferry (`schedule_services.mode <> 'train'`)
+/// is left out (2026-10-06): it is timetable-only, gets no live alerts, and
+/// Darwin's board would only ever pair it with some other service.
 pub(crate) async fn list_committed_legs_for_today(
     pool: &PgPool,
     today: chrono::NaiveDate,
@@ -1033,7 +1037,11 @@ pub(crate) async fn list_committed_legs_for_today(
            AND ts.trains_id IS NOT NULL \
            AND jl.service_date = $1 \
            AND jl.origin_crs IS NOT NULL \
-           AND jl.destination_crs IS NOT NULL",
+           AND jl.destination_crs IS NOT NULL \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM schedule_services ss \
+               WHERE ss.service_date = tr.service_date AND ss.uid = tr.train_uid \
+                 AND ss.mode <> 'train')",
     )
     .bind(today)
     .fetch_all(pool)
@@ -1418,6 +1426,19 @@ pub(crate) async fn unmatched_auto_legs_for_commit_check(
 /// its wider return type, which this slimmed version doesn't need).
 /// Called from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) --
 /// also exercised directly by this module's own `sweep_tests`.
+/// One [`schedule_candidates_for_leg`] result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegCandidate {
+    pub train_uid: String,
+    pub day_offset: u8,
+    pub scheduled: chrono::NaiveTime,
+    /// `false` for a bus or ferry (`schedule_services.mode <> 'train'`),
+    /// which TRUST never reports; auto-commit picks one only when no train
+    /// fits (`decision::pick_preferring_trains`). `true` when there is no
+    /// `schedule_services` row.
+    pub is_train: bool,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is an independent input from the single caller; a struct would only wrap them"
@@ -1431,10 +1452,13 @@ pub(crate) async fn schedule_candidates_for_leg(
     depart_before: Option<chrono::NaiveTime>,
     arrive_after: Option<chrono::NaiveTime>,
     arrive_before: Option<chrono::NaiveTime>,
-) -> anyhow::Result<Vec<(String, u8, chrono::NaiveTime)>> {
-    let rows: Vec<(String, i16, chrono::NaiveTime)> = sqlx::query_as(
-        "SELECT main.train_uid, main.day_offset, main.scheduled \
+) -> anyhow::Result<Vec<LegCandidate>> {
+    let rows: Vec<(String, i16, chrono::NaiveTime, bool)> = sqlx::query_as(
+        "SELECT main.train_uid, main.day_offset, main.scheduled, \
+                COALESCE(ss.mode, 'train') = 'train' \
          FROM schedule_destination_departures main \
+         LEFT JOIN schedule_services ss \
+                ON ss.service_date = main.service_date AND ss.uid = main.train_uid \
          WHERE main.service_date = $1 \
            AND main.origin_crs = $2 \
            AND main.can_board IS NOT FALSE \
@@ -1487,7 +1511,12 @@ pub(crate) async fn schedule_candidates_for_leg(
         // `trip_planning::CallingPointRow::day_offset` at its own call
         // site) is `u8` -- same `unwrap_or(0)` fallback-to-same-day
         // conversion convention as those.
-        .map(|(uid, day_offset, scheduled)| (uid, u8::try_from(day_offset).unwrap_or(0), scheduled))
+        .map(|(train_uid, day_offset, scheduled, is_train)| LegCandidate {
+            train_uid,
+            day_offset: u8::try_from(day_offset).unwrap_or(0),
+            scheduled,
+            is_train,
+        })
         .collect())
 }
 

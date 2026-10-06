@@ -880,6 +880,19 @@ async fn run_retention(
     ))
     .increment(schedule_calling_points_full_pruned);
 
+    // Kept as long as a tracked `trains` row (and never shorter than the
+    // other schedule products): a tracked bus's page keeps its label for as
+    // long as the page exists. ~30k narrow rows a day, so 30 days is small.
+    let schedule_services_pruned = queries::prune_schedule_services(
+        pool,
+        trains_retention_days.max(schedule_derived_products_retention_days),
+    )
+    .await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_services_rows_pruned_total"
+    ))
+    .increment(schedule_services_pruned);
+
     let schedule_network_departures_pruned =
         queries::prune_schedule_network_departures(pool, schedule_derived_products_retention_days)
             .await?;

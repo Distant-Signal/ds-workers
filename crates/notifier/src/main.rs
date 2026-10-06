@@ -774,9 +774,9 @@ async fn run_template_sweep_cycle(
         // `day_offset` regressed past midnight before reaching this leg's
         // origin must still compare correctly against it. See
         // `decision::pick_nearest_to_now_candidate`'s own doc comment.
-        let day_offset_times: Vec<(u8, chrono::NaiveTime)> = candidates
+        let day_offset_times: Vec<(u8, chrono::NaiveTime, bool)> = candidates
             .iter()
-            .map(|(_, day_offset, t)| (*day_offset, *t))
+            .map(|c| (c.day_offset, c.scheduled, c.is_train))
             .collect();
         // A leg that names its own earliest time keeps nearest-to-now (an
         // already-departed candidate is a legitimate answer there -- the
@@ -784,10 +784,16 @@ async fn run_template_sweep_cycle(
         // with NO lower bound instead takes the next candidate still
         // upcoming, so "any train" can never resolve to one that has already
         // left. See `decision::commit_check_window`.
+        // Trains first: a bus or ferry is timetable-only (no live alerts),
+        // so it is chosen only when no train fits the leg at all.
         let winner_idx = if window.names_an_earliest_time() {
-            decision::pick_nearest_to_now_candidate(&day_offset_times, now_local)
+            decision::pick_preferring_trains(&day_offset_times, |times| {
+                decision::pick_nearest_to_now_candidate(times, now_local)
+            })
         } else {
-            decision::pick_next_upcoming_candidate(&day_offset_times, now_local)
+            decision::pick_preferring_trains(&day_offset_times, |times| {
+                decision::pick_next_upcoming_candidate(times, now_local)
+            })
         };
         let Some(winner_idx) = winner_idx else {
             // Only reachable for an open-ended leg whose every candidate has
@@ -804,7 +810,7 @@ async fn run_template_sweep_cycle(
             );
             continue;
         };
-        let (train_uid, _, _) = &candidates[winner_idx];
+        let train_uid = &candidates[winner_idx].train_uid;
 
         // Enriching find-or-create, NOT the bare one: a bare `trains` row
         // leaves `origin_crs`/`destination_crs`/`scheduled_departure` NULL,
@@ -2193,6 +2199,65 @@ mod sweep_cycle_tests {
         );
 
         cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Auto-commit prefers a train: with a bus leaving sooner (09:40) and a
+    /// train later (10:15), the leg is committed to the train; once only
+    /// the bus fits (the train row gone), a fresh leg takes the bus.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                auto_commit_prefers_a_train_and_falls_back_to_a_bus -- --ignored --test-threads=1`"]
+    async fn auto_commit_prefers_a_train_and_falls_back_to_a_bus() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-BUSPREF-USER";
+        let bus_uid = "TEST-SWEEP-BUSPREF-BUS";
+        let train_uid = "TEST-SWEEP-BUSPREF-TRAIN";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id =
+            seed_auto_template(&pool, user_id, "E2E Bus Preference", today, None, None).await;
+        seed_departure(&pool, today, bus_uid, 9, 40).await;
+        seed_departure(&pool, today, train_uid, 10, 15).await;
+        sqlx::query(
+            "INSERT INTO schedule_services (service_date, uid, mode, train_status, stp) \
+             VALUES ($1, $2, 'replacement_bus', '5', 'O') \
+             ON CONFLICT (service_date, uid) DO UPDATE SET mode = EXCLUDED.mode",
+        )
+        .bind(today)
+        .bind(bus_uid)
+        .execute(&pool)
+        .await
+        .expect("seed schedule_services");
+
+        sweep_and_drain(&pool, london_now(today, 9, 30), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
+        assert_eq!(
+            committed_train_uid(&pool, template_id).await.as_deref(),
+            Some(train_uid),
+            "a train that fits beats a sooner replacement bus"
+        );
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+
+        // Only the bus left: it is taken rather than leaving the leg empty.
+        seed_user(&pool, user_id).await;
+        let template_id =
+            seed_auto_template(&pool, user_id, "E2E Bus Fallback", today, None, None).await;
+        seed_departure(&pool, today, bus_uid, 9, 40).await;
+        sweep_and_drain(&pool, london_now(today, 9, 30), 120)
+            .await
+            .expect("run_template_sweep_cycle must succeed");
+        assert_eq!(
+            committed_train_uid(&pool, template_id).await.as_deref(),
+            Some(bus_uid),
+            "with no train at all, the bus is the leg's service"
+        );
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+        sqlx::query("DELETE FROM schedule_services WHERE uid = $1")
+            .bind(bus_uid)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     /// Finding 1's other half: a leg that names ONLY an upper bound

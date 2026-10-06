@@ -978,6 +978,25 @@ pub(crate) async fn prune_schedule_calling_points_full(
     Ok(result.rows_affected())
 }
 
+/// Prunes `schedule_services` rows (one per schedule per service date, the
+/// service-mode product) for service dates older than `retention_days`.
+/// The caller passes the tracked-`trains` window (30 days by default, never
+/// less than the other schedule products'), so a tracked bus's page keeps
+/// saying it is a bus for as long as the page exists. Same strictly-`<`
+/// comparison as the other schedule prunes.
+pub(crate) async fn prune_schedule_services(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_services \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Prunes `schedule_network_departures` rows for service dates older than
 /// `retention_days`.
 ///
@@ -4563,6 +4582,47 @@ mod tests {
     /// Dates are relative to `CURRENT_DATE`, never hardcoded -- the predicate
     /// is `service_date < CURRENT_DATE - $1`, so a fixed date would flip these
     /// tests' meaning as the calendar moved.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_schedule_derived -- --ignored --test-threads=1`"]
+    async fn prune_schedule_derived_services_prunes_stale_dates_and_keeps_today() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+
+        let today = Utc::now().date_naive();
+        for (service_date, uid) in [
+            (today - chrono::Duration::days(5), "TPSS-OLD"),
+            (today - chrono::Duration::days(1), "TPSS-NEW"),
+            (today, "TPSS-TODAY"),
+        ] {
+            sqlx::query(
+                "INSERT INTO schedule_services (service_date, uid, mode, stp) \
+                 VALUES ($1, $2, 'bus', 'P')",
+            )
+            .bind(service_date)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("seed fixture rows");
+        }
+
+        let pruned = prune_schedule_services(&pool, 2).await.expect("prune");
+        assert_eq!(pruned, 1, "only the 5-day-old row is pruned at 2 days");
+        prune_schedule_services(&pool, 0).await.expect("prune at 0");
+        let remaining: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schedule_services WHERE uid = 'TPSS-TODAY'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining.0, 1, "today's rows survive any retention value");
+
+        sqlx::query("DELETE FROM schedule_services WHERE uid LIKE 'TPSS-%'")
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 prune_schedule_derived -- --ignored --test-threads=1`"]

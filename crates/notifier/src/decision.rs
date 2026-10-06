@@ -305,6 +305,34 @@ pub(crate) fn pick_nearest_to_now_candidate(
         .map(|(i, _)| i)
 }
 
+/// Runs `pick` over the TRAIN candidates only and maps its answer back to an
+/// index into `candidates`; only when it finds no train does it run `pick`
+/// over the bus/ferry candidates. Each candidate is `(day_offset, scheduled,
+/// is_train)`. A bus or ferry is timetable-only -- TRUST never reports it,
+/// so a leg committed to one gets no live alerts -- so auto-commit takes
+/// one only when no train fits the leg.
+pub(crate) fn pick_preferring_trains(
+    candidates: &[(u8, chrono::NaiveTime, bool)],
+    pick: impl Fn(&[(u8, chrono::NaiveTime)]) -> Option<usize>,
+) -> Option<usize> {
+    for want_train in [true, false] {
+        let indices: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, is_train))| *is_train == want_train)
+            .map(|(i, _)| i)
+            .collect();
+        let times: Vec<(u8, chrono::NaiveTime)> = indices
+            .iter()
+            .map(|&i| (candidates[i].0, candidates[i].1))
+            .collect();
+        if let Some(found) = pick(&times) {
+            return indices.get(found).copied();
+        }
+    }
+    None
+}
+
 /// Candidate seconds past midnight on the leg's own `service_date` --
 /// `day_offset * 86_400 + seconds_from_midnight`, the shared arithmetic
 /// [`pick_nearest_to_now_candidate`] and [`pick_next_upcoming_candidate`]
@@ -561,6 +589,45 @@ mod sweep_tests {
         let now = Utc::now();
         let earliest_bound_utc = now - Duration::minutes(30);
         assert!(is_due_for_commit_check(now, earliest_bound_utc, 15));
+    }
+
+    #[test]
+    fn pick_preferring_trains_takes_a_later_train_over_a_sooner_bus() {
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        let candidates = [
+            (0, t(9, 40), false),
+            (0, t(10, 15), true),
+            (0, t(11, 0), true),
+        ];
+        let picked = pick_preferring_trains(&candidates, |times| {
+            pick_next_upcoming_candidate(times, t(9, 30))
+        });
+        assert_eq!(picked, Some(1));
+    }
+
+    #[test]
+    fn pick_preferring_trains_falls_back_to_a_bus_only_when_no_train_fits() {
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        // The only train has left; the bus has not.
+        let candidates = [(0, t(9, 0), true), (0, t(9, 40), false)];
+        let picked = pick_preferring_trains(&candidates, |times| {
+            pick_next_upcoming_candidate(times, t(9, 30))
+        });
+        assert_eq!(picked, Some(1));
+        // No candidates at all.
+        assert_eq!(
+            pick_preferring_trains(&[], |times| pick_next_upcoming_candidate(times, t(9, 30))),
+            None
+        );
+        // Buses only, nearest-to-now.
+        let buses = [(0, t(8, 0), false), (0, t(9, 25), false)];
+        assert_eq!(
+            pick_preferring_trains(&buses, |times| pick_nearest_to_now_candidate(
+                times,
+                t(9, 30)
+            )),
+            Some(1)
+        );
     }
 
     #[test]
