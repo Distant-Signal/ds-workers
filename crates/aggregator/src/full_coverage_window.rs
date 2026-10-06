@@ -735,6 +735,7 @@ mod tests {
             destination_crs_filter: vec![],
             headcode_prefixes: vec![],
             full_coverage_enabled: enabled,
+            pass_through: Vec::new(),
         }
     }
 
