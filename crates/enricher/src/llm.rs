@@ -271,6 +271,110 @@ impl TokenUsage {
     }
 }
 
+/// `enricher_llm_tokens_total{call, kind}`: tokens the provider reported in
+/// a response's `usage`, by call site and kind. Counted on every 2xx
+/// response that carries a `usage` object, including one the enricher then
+/// rejects (a refusal, empty content, a schema mismatch): the provider bills
+/// those too. A response without `usage` (Ollama and some gateways) counts
+/// nothing, and a kind the provider left out is not incremented.
+///
+/// Kinds follow `OpenAI`'s billing, where two are breakdowns, not extra
+/// tokens: `cached` is a subset of `prompt` (billed at the cached-input
+/// price) and `reasoning` a subset of `completion` (already billed as
+/// output). So spend = (prompt - cached) x input price + cached x cached
+/// price + completion x output price; never add `reasoning` on top.
+pub(crate) const TOKENS_METRIC: &str = "enricher_llm_tokens_total";
+
+/// `enricher_llm_model_info{model, base_url_host} 1`: which model and
+/// endpoint the token counter's numbers belong to, for joining a price onto
+/// them. An info metric rather than a `model` label on the counter, so
+/// switching model never multiplies the counter's series.
+pub(crate) const MODEL_INFO_METRIC: &str = "enricher_llm_model_info";
+
+/// Every `kind` label of [`TOKENS_METRIC`].
+pub(crate) const TOKEN_KINDS: [&str; 4] = ["prompt", "completion", "reasoning", "cached"];
+
+/// One of the enricher's three chat-completion call sites: the `call` label
+/// of the LLM metrics (`enricher_llm_call_total`,
+/// `enricher_llm_call_duration_seconds`, [`TOKENS_METRIC`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmCall {
+    Primary,
+    ResolutionAdversarial,
+    SeverityAdversarial,
+}
+
+impl LlmCall {
+    pub(crate) const ALL: [Self; 3] = [
+        Self::Primary,
+        Self::ResolutionAdversarial,
+        Self::SeverityAdversarial,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::ResolutionAdversarial => "resolution_adversarial",
+            Self::SeverityAdversarial => "severity_adversarial",
+        }
+    }
+}
+
+/// Registers every `{call, kind}` series of [`TOKENS_METRIC`] at 0 and sets
+/// [`MODEL_INFO_METRIC`] for this process's model and endpoint host. Called
+/// once at startup, after the recorder is installed.
+pub(crate) fn register_usage_metrics(model: &str, base_url: &str) {
+    for call in LlmCall::ALL {
+        for kind in TOKEN_KINDS {
+            metrics::counter!(
+                common::metrics::metric_name(TOKENS_METRIC),
+                "call" => call.label(),
+                "kind" => kind
+            )
+            .increment(0);
+        }
+    }
+    metrics::gauge!(
+        common::metrics::metric_name(MODEL_INFO_METRIC),
+        "model" => model.to_string(),
+        "base_url_host" => base_url_host(base_url)
+    )
+    .set(1.0);
+}
+
+/// `base_url`'s host (and port, when it has one): never its path, query or
+/// any userinfo, so a credential in the URL can't reach a label. `unknown`
+/// when it doesn't parse.
+fn base_url_host(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return "unknown".to_string();
+    };
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => "unknown".to_string(),
+    }
+}
+
+/// Adds one response's reported tokens to [`TOKENS_METRIC`].
+fn record_token_usage(call: LlmCall, usage: &TokenUsage) {
+    for (kind, count) in [
+        ("prompt", usage.prompt_tokens),
+        ("completion", usage.completion_tokens),
+        ("reasoning", usage.reasoning_tokens),
+        ("cached", usage.cached_tokens),
+    ] {
+        if let Some(count) = count {
+            metrics::counter!(
+                common::metrics::metric_name(TOKENS_METRIC),
+                "call" => call.label(),
+                "kind" => kind
+            )
+            .increment(count);
+        }
+    }
+}
+
 /// A successful attempt: the raw `content` plus its token usage.
 struct Completion {
     content: String,
@@ -589,6 +693,9 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
 
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
+    /// Which call site this is, for [`TOKENS_METRIC`]. Never sent.
+    #[serde(skip)]
+    call: LlmCall,
     model: &'a str,
     messages: Vec<ChatMessage>,
     response_format: ResponseFormat,
@@ -1079,12 +1186,14 @@ impl LlmClient {
     /// provider policy spent on it -- see [`RawCall`].
     async fn chat_completion(
         &self,
+        call: LlmCall,
         system_prompt: &str,
         user_content: String,
         schema_name: &'static str,
         schema: serde_json::Value,
     ) -> RawCall {
         let request = ChatCompletionRequest {
+            call,
             model: &self.model,
             messages: vec![
                 ChatMessage {
@@ -1318,6 +1427,9 @@ impl LlmClient {
             })
         })?;
         let usage = body.usage.as_ref().and_then(TokenUsage::from_response);
+        if let Some(usage) = &usage {
+            record_token_usage(request.call, usage);
+        }
         let choice = body.choices.into_iter().next().ok_or_else(|| {
             failed(LlmCallError::Other(anyhow::anyhow!(
                 "chat completion response had no choices"
@@ -1370,6 +1482,7 @@ impl LlmClient {
             reference_date.to_rfc3339()
         );
         self.chat_completion(
+            LlmCall::Primary,
             PRIMARY_PROMPT,
             user_content,
             PRIMARY_SCHEMA_NAME,
@@ -1414,6 +1527,7 @@ impl LlmClient {
             }
         };
         self.chat_completion(
+            LlmCall::ResolutionAdversarial,
             ADVERSARIAL_PROMPT,
             user_content,
             ADVERSARIAL_SCHEMA_NAME,
@@ -1455,6 +1569,7 @@ impl LlmClient {
             }
         };
         self.chat_completion(
+            LlmCall::SeverityAdversarial,
             SEVERITY_ADVERSARIAL_PROMPT,
             user_content,
             SEVERITY_ADVERSARIAL_SCHEMA_NAME,
@@ -3716,6 +3831,132 @@ mod tests {
         assert_eq!(raw.usage, None);
     }
 
+    /// The value of `enricher_llm_tokens_total{call, kind}` in `rendered`.
+    fn tokens(rendered: &str, call: &str, kind: &str) -> Option<u64> {
+        let prefix =
+            format!("distant_signal_enricher_llm_tokens_total{{call=\"{call}\",kind=\"{kind}\"}} ");
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(|v| v.parse().unwrap())
+    }
+
+    /// Reported usage is added to the token counter under the call's label,
+    /// kind by kind; a response without `usage` adds nothing; a kind the
+    /// provider left out is not incremented; and the label never reaches
+    /// the request body.
+    #[tokio::test]
+    async fn token_usage_increments_the_counter_only_when_present() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        register_usage_metrics("gpt-6-luna", "https://user:pw@api.openai.com/v1");
+        let rendered = handle.render();
+        for call in LlmCall::ALL {
+            for kind in TOKEN_KINDS {
+                assert_eq!(tokens(&rendered, call.label(), kind), Some(0), "{rendered}");
+            }
+        }
+        assert!(
+            rendered.contains(
+                "distant_signal_enricher_llm_model_info{model=\"gpt-6-luna\",base_url_host=\"api.openai.com\"} 1"
+            ),
+            "{rendered}"
+        );
+
+        let server = MockServer::start().await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        // No `usage`: nothing counted.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        assert!(
+            client
+                .primary_raw("s", "d", reference_date())
+                .await
+                .content
+                .is_ok()
+        );
+        let rendered = handle.render();
+        for kind in TOKEN_KINDS {
+            assert_eq!(tokens(&rendered, "primary", kind), Some(0), "{rendered}");
+        }
+
+        // OpenAI's full usage, twice on the primary call.
+        let mut body = flat_primary_body();
+        body["usage"] = serde_json::json!({
+            "prompt_tokens": 2400,
+            "completion_tokens": 150,
+            "prompt_tokens_details": { "cached_tokens": 2048 },
+            "completion_tokens_details": { "reasoning_tokens": 7 }
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        client.primary_raw("s", "d", reference_date()).await;
+        client.primary_raw("s", "d", reference_date()).await;
+        // Ollama-style partial usage on the severity call: only the two kinds sent.
+        let mut partial = flat_primary_body();
+        partial["usage"] = serde_json::json!({ "prompt_tokens": 10, "completion_tokens": 2 });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(partial))
+            .mount(&server)
+            .await;
+        client.severity_adversarial_raw("s", "d", &[]).await;
+
+        let rendered = handle.render();
+        assert_eq!(tokens(&rendered, "primary", "prompt"), Some(4800));
+        assert_eq!(tokens(&rendered, "primary", "completion"), Some(300));
+        assert_eq!(tokens(&rendered, "primary", "cached"), Some(4096));
+        assert_eq!(tokens(&rendered, "primary", "reasoning"), Some(14));
+        assert_eq!(
+            tokens(&rendered, "severity_adversarial", "prompt"),
+            Some(10)
+        );
+        assert_eq!(
+            tokens(&rendered, "severity_adversarial", "completion"),
+            Some(2)
+        );
+        assert_eq!(tokens(&rendered, "severity_adversarial", "cached"), Some(0));
+        assert_eq!(
+            tokens(&rendered, "severity_adversarial", "reasoning"),
+            Some(0)
+        );
+        for kind in TOKEN_KINDS {
+            assert_eq!(tokens(&rendered, "resolution_adversarial", kind), Some(0));
+        }
+
+        for request in server.received_requests().await.unwrap() {
+            let sent: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(
+                sent.get("call").is_none(),
+                "the call label was sent: {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_host_keeps_only_the_host_and_port() {
+        for (url, host) in [
+            ("https://api.openai.com/v1", "api.openai.com"),
+            (
+                "http://user:secret@llm.internal:8080/v1?key=x",
+                "llm.internal:8080",
+            ),
+            ("http://10.0.0.5:11434/v1", "10.0.0.5:11434"),
+            ("not a url", "unknown"),
+        ] {
+            assert_eq!(base_url_host(url), host, "{url}");
+        }
+    }
+
     #[test]
     fn request_id_is_read_from_the_response_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -4311,6 +4552,7 @@ mod tests {
         );
         let raw = client
             .chat_completion(
+                LlmCall::Primary,
                 PRIMARY_PROMPT,
                 user_content,
                 PRIMARY_SCHEMA_NAME,

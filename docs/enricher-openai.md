@@ -544,8 +544,9 @@ and gets a fresh one at the next call.
 
 ## Cost
 
-Prices: about **$0.10 per million input tokens** and **$0.50 per million
-output tokens** (model page, 2026-10; check before relying on it).
+Prices: about **$0.10 per million input tokens**, **$0.01 per million
+cached input tokens** and **$0.50 per million output tokens** (model page,
+2026-10; check before relying on it).
 
 Assumptions:
 
@@ -569,6 +570,60 @@ OpenAI project budget around $15 a month: the hard limit then surfaces as
 `quota_exhausted` instead of an unbounded bill. Switching the model also
 re-extracts every uncleared incident once (a one-off of a few cents per
 hundred incidents).
+
+### Estimating spend from the metrics
+
+The enricher counts the tokens each response reports, so spend can be
+estimated from Prometheus without an OpenAI admin key:
+
+- `distant_signal_enricher_llm_tokens_total{call, kind}`: `call` is
+  `primary`, `resolution_adversarial` or `severity_adversarial` (the same
+  labels as `enricher_llm_call_total`); `kind` is `prompt`, `completion`,
+  `reasoning` or `cached`. Every 2xx response that carries `usage` counts,
+  refusals and empty or unparseable content included, because OpenAI bills
+  them. All 12 series start at 0.
+- `distant_signal_enricher_llm_model_info{model, base_url_host}` is always
+  1 and names the model and endpoint host the counts belong to.
+
+How the kinds add up (OpenAI's billing, checked 2026-10-06 against the
+[reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
+and the [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)):
+
+- `cached` is part of `prompt` (`prompt_tokens_details.cached_tokens` is a
+  breakdown of `prompt_tokens`). Cached tokens are billed at the cached
+  price **instead of** the input price.
+- `reasoning` is part of `completion`: reasoning tokens "are billed as
+  output tokens" and `completion_tokens_details.reasoning_tokens` is a
+  breakdown of `completion_tokens`. **Never add `reasoning` on top.** It is
+  there to confirm that effort `none` adds none.
+
+So: cost = (prompt − cached) × input price + cached × cached price +
+completion × output price. With gpt-6-luna's prices, in USD over the last
+day (use `[30d]` for a rolling month):
+
+```promql
+(
+    (
+        sum(increase(distant_signal_enricher_llm_tokens_total{kind="prompt"}[1d]))
+      - sum(increase(distant_signal_enricher_llm_tokens_total{kind="cached"}[1d]))
+    ) * 0.10
+  + sum(increase(distant_signal_enricher_llm_tokens_total{kind="cached"}[1d])) * 0.01
+  + sum(increase(distant_signal_enricher_llm_tokens_total{kind="completion"}[1d])) * 0.50
+) / 1e6
+and on() count(distant_signal_enricher_llm_model_info{model="gpt-6-luna"})
+```
+
+The last line returns nothing unless the enricher is actually running
+gpt-6-luna, so a self-hosted model's tokens are never priced as OpenAI's.
+Per call site, replace each `sum(...)` with `sum by (call) (...)`. It is an
+estimate: tokens of a response that never arrived (a client timeout, a
+dropped connection) are billed but not counted, and a model switch inside
+the window prices the old model's tokens too. OpenAI's usage dashboard
+stays the source of truth.
+
+There is no spend alert in this chart: the OpenAI project's hard budget
+($15 a month, owned by Ranma-Config) is the limit, and it surfaces as
+`quota_exhausted`.
 
 **Tier 1 is enough.** The load is under one request a minute on average
 and at most 3 in flight (`LLM_MAX_IN_FLIGHT`). That is far below Tier 1's
@@ -643,7 +698,9 @@ processor of the incident text. Before the switch:
 6. Complete the legal follow-up above.
 7. Switch with the chart values above. Watch `enricher_llm_call_total` by
    outcome and `enricher_llm_call_duration_seconds` for a day, and expect
-   one re-extraction pass over uncleared incidents.
+   one re-extraction pass over uncleared incidents. Compare the
+   [spend estimate](#estimating-spend-from-the-metrics) with OpenAI's usage
+   dashboard after that day.
 8. Rollback: restore the previous `enricher.llm.*` values. The model
    version changes back, so incidents re-extract with the self-hosted
    model.

@@ -58,6 +58,9 @@ async fn run() -> anyhow::Result<()> {
             config.metrics_port,
             &[(&common::metrics::metric_name(LLM_DURATION_METRIC), &buckets)],
         )?;
+        // Token counters at 0 and the model info series, for the
+        // cost-estimate query (docs/enricher-openai.md, "Cost").
+        llm::register_usage_metrics(&config.llm_model, &config.llm_base_url);
     }
 
     // The LLM credential, validated before anything else connects: a
@@ -689,7 +692,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         .extract_primary(&summary, &description, reference_date)
         .await;
     record_llm_call_metrics(
-        "primary",
+        llm::LlmCall::Primary.label(),
         primary_start.elapsed(),
         llm_outcome(&primary_result),
     );
@@ -733,7 +736,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         .extract_adversarial(&summary, &description, &primary.periods)
         .await;
     record_llm_call_metrics(
-        "resolution_adversarial",
+        llm::LlmCall::ResolutionAdversarial.label(),
         resolution_adversarial_start.elapsed(),
         llm_outcome(&resolution_adversarial_result),
     );
@@ -751,7 +754,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         .extract_severity_adversarial(&summary, &description, &primary.periods)
         .await;
     record_llm_call_metrics(
-        "severity_adversarial",
+        llm::LlmCall::SeverityAdversarial.label(),
         severity_adversarial_start.elapsed(),
         llm_outcome(&severity_adversarial_result),
     );
