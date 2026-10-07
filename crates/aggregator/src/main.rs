@@ -93,6 +93,10 @@ async fn run() -> anyhow::Result<()> {
     let pool = common::pg::PoolSettings::from_env("distant-signal-aggregator", 10)?
         .connect(config.database_url.expose())
         .await?;
+    // The schema gate (spec §12.2): no loop and no readiness until the
+    // schema and grants this build needs are there; exits after 15 minutes.
+    ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Aggregator, Some(&progress))
+        .await?;
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let static_lines: HashMap<String, LineDefinition> = config

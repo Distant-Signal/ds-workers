@@ -95,6 +95,10 @@ async fn run() -> anyhow::Result<()> {
     let pool = common::pg::PoolSettings::from_env("distant-signal-enricher", 5)?
         .connect(config.database_url.expose())
         .await?;
+    // The schema gate (spec §12.2): no loop and no readiness until the
+    // schema and grants this build needs are there; exits after 15 minutes.
+    ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Enricher, Some(&progress))
+        .await?;
 
     let redis_url = common::redis_auth::redis_url_with_credentials(
         config.redis_url.expose(),

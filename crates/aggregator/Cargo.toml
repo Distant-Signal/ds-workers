@@ -13,6 +13,8 @@ chrono-tz = "0.10"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common", features = ["postgres"] }
 dotenvy = "0.15.7"
+# The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.3).
+ds-store = { path = "../ds-store" }
 futures-util = "0.3"
 md-5 = "0.10"
 metrics = "0.24"
