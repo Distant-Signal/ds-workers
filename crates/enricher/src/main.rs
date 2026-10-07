@@ -96,8 +96,9 @@ async fn run() -> anyhow::Result<()> {
         .connect(config.database_url.expose())
         .await?;
 
-    let redis_url = common::redis_auth::redis_url_with_password(
+    let redis_url = common::redis_auth::redis_url_with_credentials(
         config.redis_url.expose(),
+        config.redis_username.as_deref(),
         config.redis_password.as_ref(),
     )?;
     let redis_client = redis::Client::open(redis_url.expose())?;

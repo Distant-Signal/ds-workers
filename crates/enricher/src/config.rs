@@ -24,6 +24,12 @@ pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub redis_password: Option<Secret>,
 
+    /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
+    /// Unset or empty: the `default` user, exactly as before. Combined with
+    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    #[arg(long, env)]
+    pub redis_username: Option<String>,
+
     /// Base URL of an OpenAI-compatible Chat Completions endpoint, e.g.
     /// `http://localhost:8080/v1` for a local server. No vendor is assumed.
     #[arg(long, env)]
