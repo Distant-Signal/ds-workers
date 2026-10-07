@@ -1439,7 +1439,7 @@ pub(crate) async fn prune_half_hourly_stats(pool: &PgPool, retention_hours: i64)
 //
 // Sibling pair of record_daily_stats/record_half_hourly_stats above, same
 // accumulate-upsert shape, `resolved_windows` in place of `sample_cycles`.
-// See crates/api/migrations/20260903200000_line_status_daily_coverage_stats.sql's
+// See crates/ds-store/migrations/20260903200000_line_status_daily_coverage_stats.sql's
 // own doc comment for why this is a wholly separate table rather than a
 // `source` column on the existing one.
 //
