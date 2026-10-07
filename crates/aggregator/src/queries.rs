@@ -1050,6 +1050,25 @@ pub(crate) async fn prune_schedule_line_population(
     Ok(result.rows_affected())
 }
 
+/// Prunes `line_train_summaries` rows for service dates older than
+/// `retention_days` -- called with `schedule_line_population`'s own
+/// retention right after it, since these rows are derived from that table
+/// (one row per train per line per date, rewritten with each population
+/// publish; see the table's migration). A reader that finds no rows falls
+/// back to the population, so the two never need pruning atomically.
+pub(crate) async fn prune_line_train_summaries(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM line_train_summaries \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Batch size for `prune_trains`'s delete loop -- mirrors
 /// `crates/api/src/data/legacy_backfill.rs`'s own `BATCH` precedent for
 /// bounding one statement's row count, just sized for a DELETE instead of
@@ -4777,6 +4796,70 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM schedule_line_population WHERE line_id LIKE 'test-prune-pop-%'")
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// `line_train_summaries` follows `schedule_line_population`'s
+    /// retention: stale dates go, today's rows stay at any retention.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_line_train_summaries -- --ignored --test-threads=1`"]
+    async fn prune_line_train_summaries_prunes_stale_dates_and_keeps_today() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::query("DELETE FROM line_train_summaries WHERE line_id = 'test-prune-lts'")
+            .execute(&pool)
+            .await
+            .expect("clean fixture rows");
+
+        let today = Utc::now().date_naive();
+        for (service_date, uid) in [
+            (today - chrono::Duration::days(5), "TLTS-OLD1"),
+            (today - chrono::Duration::days(5), "TLTS-OLD2"),
+            (today - chrono::Duration::days(1), "TLTS-NEW"),
+            (today, "TLTS-TODAY"),
+        ] {
+            sqlx::query(
+                "INSERT INTO line_train_summaries \
+                     (line_id, service_date, uid, has_scope, derivation) \
+                 VALUES ('test-prune-lts', $1, $2, true, 'x')",
+            )
+            .bind(service_date)
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("seed fixture rows");
+        }
+
+        // At least this fixture's two stale rows (the shared database may
+        // hold other tests' old rows too).
+        let pruned = prune_line_train_summaries(&pool, 2).await.expect("prune");
+        assert!(pruned >= 2, "{pruned}");
+        let after_two: Vec<(String,)> = sqlx::query_as(
+            "SELECT uid FROM line_train_summaries WHERE line_id = 'test-prune-lts' ORDER BY uid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after_two,
+            [("TLTS-NEW".to_string(),), ("TLTS-TODAY".to_string(),)]
+        );
+        prune_line_train_summaries(&pool, 0)
+            .await
+            .expect("prune at 0");
+        let remaining: Vec<(String,)> = sqlx::query_as(
+            "SELECT uid FROM line_train_summaries WHERE line_id = 'test-prune-lts' ORDER BY uid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, [("TLTS-TODAY".to_string(),)]);
+
+        sqlx::query("DELETE FROM line_train_summaries WHERE line_id = 'test-prune-lts'")
             .execute(&pool)
             .await
             .ok();

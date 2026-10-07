@@ -66,7 +66,7 @@ async fn main() -> std::process::ExitCode {
     reason = "long but linear; splitting it would scatter its shared state across helpers"
 )]
 async fn run() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     let config = Config::parse();
 
     // Fail fast on a zero poll interval -- `tokio::time::interval` below

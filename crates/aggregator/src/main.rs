@@ -34,7 +34,7 @@ async fn main() -> std::process::ExitCode {
     reason = "long but linear; splitting it would scatter its shared state across helpers"
 )]
 async fn run() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     common::logging::init("aggregator");
 
@@ -908,6 +908,13 @@ async fn run_retention(
         "aggregator_schedule_line_population_rows_pruned_total"
     ))
     .increment(schedule_line_population_pruned);
+
+    let line_train_summaries_pruned =
+        queries::prune_line_train_summaries(pool, schedule_line_population_retention_days).await?;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_line_train_summaries_rows_pruned_total"
+    ))
+    .increment(line_train_summaries_pruned);
 
     let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
     metrics::counter!(common::metrics::metric_name(

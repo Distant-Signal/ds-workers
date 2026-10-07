@@ -21,10 +21,15 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
+# tini as PID 1 (signal forwarding, zombie reaping): see
+# docker/api.Dockerfile's runtime stage for why, and for the version pin.
+ARG TINI_VERSION=0.19.0-1
+
 # hadolint ignore=DL3008 # apt versions unpinned on purpose; see .hadolint.yaml
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates "tini=${TINI_VERSION}*" \
     && rm -rf /var/lib/apt/lists/* \
+    && tini --version \
     && groupadd --system --gid 1000 enricher \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 enricher
 
@@ -40,4 +45,4 @@ COPY --from=builder /usr/local/bin/enricher /usr/local/bin/enricher
 # stays in sync with the group ownership set via COPY --chown/groupadd.
 USER 1000:1000
 
-ENTRYPOINT ["/usr/local/bin/enricher"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/enricher"]
