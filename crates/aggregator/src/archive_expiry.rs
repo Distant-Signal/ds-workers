@@ -53,9 +53,15 @@ use object_store::{ObjectStore, ObjectStoreExt};
 pub(crate) const MIN_RETENTION_DAYS: i64 = 90;
 
 /// The table directories the archive writes (`archive.tables: [trains]`
-/// writes all three) and therefore the only ones expiry lists.
-pub(crate) const EXPIRY_TABLES: &[&str] =
-    &["trains", "train_movement_events", "train_current_state"];
+/// writes all four) and therefore the only ones expiry lists. Must name
+/// every `crate::archive` trains-group export, or that table's objects
+/// would never expire (checked by a unit test in `crate::archive`).
+pub(crate) const EXPIRY_TABLES: &[&str] = &[
+    "trains",
+    "train_movement_events",
+    "train_current_state",
+    "train_reasons",
+];
 
 /// Stop a run after this many consecutive failed DELETEs: the store is
 /// probably down, and the next run retries.

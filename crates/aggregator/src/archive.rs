@@ -19,9 +19,9 @@
 //! # Which tables can be archived
 //!
 //! Only [`ARCHIVABLE_TABLES`] -- today just `trains`, which archives the
-//! `trains` row together with the `train_movement_events` and
-//! `train_current_state` rows that `ON DELETE CASCADE` would otherwise
-//! remove with it. Everything else is rejected at startup, and two groups
+//! `trains` row together with the `train_movement_events`,
+//! `train_current_state` and `train_reasons` rows that `ON DELETE CASCADE`
+//! would otherwise remove with it. Everything else is rejected at startup, and two groups
 //! are rejected with a specific explanation because archiving them would
 //! break a licensing safeguard rather than merely being unimplemented:
 //!
@@ -51,7 +51,8 @@
 //! date changes between the failed attempt and the retry (e.g. a
 //! subscription is added to a 14-day-old train), the retry's first id can
 //! differ, leaving the stale object behind; every row carries its primary
-//! key `id`, so an offline reader dedupes on it (`docs/cold-archive.md`).
+//! key (`id`, or `train_reasons`' `(trains_id, msg_type)`), so an offline
+//! reader dedupes on it (`docs/cold-archive.md`).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -218,7 +219,8 @@ fn validate_tables(tables: &[String]) -> Result<Vec<String>> {
         anyhow::ensure!(
             ARCHIVABLE_TABLES.contains(&table),
             "ARCHIVE_TABLES entry {table:?} is not archivable; supported: {ARCHIVABLE_TABLES:?} \
-             (\"trains\" also covers its cascaded train_movement_events and train_current_state)"
+             (\"trains\" also covers its cascaded train_movement_events, train_current_state \
+             and train_reasons)"
         );
         if !out.iter().any(|t| t == table) {
             out.push(table.to_string());
@@ -518,12 +520,34 @@ const TRAINS_GROUP_EXPORTS: &[TableExport] = &[
         order: "t.trains_id, t.id",
     },
     TableExport {
+        // TRUST cancellation / change-of-origin reason codes, one row per
+        // (train, message type); no `id` column, so ordered by its primary
+        // key.
+        table: "train_reasons",
+        row: "to_jsonb(t)",
+        filter: "t.trains_id = ANY($1)",
+        order: "t.trains_id, t.msg_type",
+    },
+    TableExport {
         table: "trains",
         row: "to_jsonb(t)",
         filter: "t.id = ANY($1)",
         order: "t.id",
     },
 ];
+
+/// Tables that reference `trains` with `ON DELETE CASCADE` but are
+/// deliberately NOT archived, each with the reason. Every other cascading
+/// child of `trains` must be in [`TRAINS_GROUP_EXPORTS`]; the DB test
+/// `every_cascading_child_of_trains_is_archived` checks that against the
+/// migrated schema, so a new child table cannot be pruned unarchived by
+/// accident.
+#[cfg_attr(not(test), expect(dead_code, reason = "read by the schema test only"))]
+const TRAINS_CASCADE_NOT_ARCHIVED: &[(&str, &str)] = &[(
+    "notifier_forward_queue",
+    "a transient push-forwarding signal for notifier (consumed within seconds), \
+     not history; its content is derived from the archived movement events",
+)];
 
 /// Outcome of one [`archive_and_prune_trains`] run.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -557,10 +581,9 @@ impl TrainsArchiveOutcome {
 /// storage is being talked to):
 ///
 /// 1. **Export**, in a short `REPEATABLE READ READ ONLY` transaction: the
-///    batch's `trains`, `train_movement_events` and `train_current_state`
-///    rows are encoded, and a fingerprint (row count plus a sum of row
-///    hashes) is taken of each table's rows from the same snapshot. No row
-///    is locked.
+///    batch's rows of every [`TRAINS_GROUP_EXPORTS`] table are encoded,
+///    and a fingerprint (row count plus a sum of row hashes) is taken of
+///    each table's rows from the same snapshot. No row is locked.
 /// 2. **Upload** each object and verify it (size and ETag/MD5, see
 ///    `Archiver::put_verified`), with no transaction open.
 /// 3. **Delete**, in a short transaction: lock the batch's `trains` rows
@@ -1182,7 +1205,8 @@ mod tests {
     }
 
     /// Seeds `count` trains on `date` (uid prefix `tag`), each with two
-    /// movement events and one current-state row. Returns the ids.
+    /// movement events, one current-state row and one `train_reasons` row.
+    /// Returns the ids.
     async fn seed(pool: &PgPool, tag: &str, date: NaiveDate, count: i64) -> Vec<i64> {
         sqlx::query("DELETE FROM trains WHERE train_uid LIKE $1 || '%'")
             .bind(tag)
@@ -1216,6 +1240,14 @@ mod tests {
             }
             sqlx::query(
                 "INSERT INTO train_current_state (trains_id, status) VALUES ($1, 'completed')",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO train_reasons (trains_id, msg_type, reason_code, canx_type) \
+                 VALUES ($1, '0002', 'TG', 'EN ROUTE')",
             )
             .bind(id)
             .execute(pool)
@@ -1270,8 +1302,20 @@ mod tests {
         assert!(!outcome.upload_failed);
         assert!(outcome.pruned >= 5);
         assert_eq!(remaining(&pool, &ids).await, (0, 0, 0));
+        let reasons_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM train_reasons WHERE trains_id = ANY($1)")
+                .bind(&ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reasons_left, 0);
 
-        for table in ["trains", "train_movement_events", "train_current_state"] {
+        for table in [
+            "trains",
+            "train_movement_events",
+            "train_current_state",
+            "train_reasons",
+        ] {
             let dir = format!("cold/distant-signal/{table}/service_date=2001-02-03");
             let paths = objects_under(store.as_ref(), &dir).await;
             let expected: Vec<Path> = [ids[0], ids[2], ids[4]]
@@ -1313,6 +1357,12 @@ mod tests {
             }
             if table == "train_current_state" {
                 assert_eq!(rows[0]["status"], "completed");
+            }
+            if table == "train_reasons" {
+                assert_eq!(rows[0]["trains_id"].as_i64().unwrap(), ids[0]);
+                assert_eq!(rows[0]["msg_type"], "0002");
+                assert_eq!(rows[0]["reason_code"], "TG");
+                assert_eq!(rows[0]["canx_type"], "EN ROUTE");
             }
         }
     }
@@ -1489,7 +1539,7 @@ mod tests {
         assert!(!outcome.upload_failed);
         assert_eq!(remaining(&pool, &ids).await, (0, 0, 0));
         let probes = flaky.lock_free_during_put.lock().unwrap().clone();
-        assert_eq!(probes.len(), 3, "one probe per uploaded object");
+        assert_eq!(probes.len(), 4, "one probe per uploaded object");
         assert!(
             probes.iter().all(|free| *free),
             "the batch's trains rows were locked during an upload: {probes:?}"
@@ -1565,5 +1615,79 @@ mod tests {
                 .is_err(),
             "an ETag that is not an MD5 cannot be verified"
         );
+    }
+
+    /// Expiry lists exactly the directories the archive writes: a table
+    /// exported but not listed would never expire (LEG-27), one listed but
+    /// not exported is dead weight.
+    #[test]
+    fn expiry_lists_every_exported_table() {
+        let mut exported: Vec<&str> = TRAINS_GROUP_EXPORTS.iter().map(|e| e.table).collect();
+        let mut expired = crate::archive_expiry::EXPIRY_TABLES.to_vec();
+        exported.sort_unstable();
+        expired.sort_unstable();
+        assert_eq!(exported, expired);
+    }
+
+    /// Every table whose rows `DELETE FROM trains` removes through an `ON
+    /// DELETE CASCADE` foreign key (directly, or through another cascaded
+    /// table) is either archived with its `trains` row or deliberately
+    /// excluded in [`TRAINS_CASCADE_NOT_ARCHIVED`]. Read from the migrated
+    /// schema's `pg_constraint`, so a migration that adds a child table
+    /// fails this test until the table is exported (or excluded with a
+    /// reason) instead of it being pruned unarchived. `trains` is the only
+    /// table the archive deletes from; every other exported table is one
+    /// of its children.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
+    async fn every_cascading_child_of_trains_is_archived() {
+        let pool = pool().await;
+        let cascaded: Vec<String> = sqlx::query_scalar(
+            "WITH RECURSIVE cascaded(rel) AS ( \
+                 SELECT 'trains'::regclass \
+                 UNION \
+                 SELECT c.conrelid::regclass FROM pg_constraint c \
+                 JOIN cascaded ON c.confrelid = cascaded.rel \
+                 WHERE c.contype = 'f' AND c.confdeltype = 'c' \
+             ) \
+             SELECT rel::text FROM cascaded WHERE rel <> 'trains'::regclass ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            cascaded.iter().any(|t| t == "train_movement_events"),
+            "sanity: the query sees the known children: {cascaded:?}"
+        );
+        let missing: Vec<&String> = cascaded
+            .iter()
+            .filter(|t| {
+                !TRAINS_GROUP_EXPORTS.iter().any(|e| e.table == t.as_str())
+                    && !TRAINS_CASCADE_NOT_ARCHIVED
+                        .iter()
+                        .any(|(n, _)| *n == t.as_str())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these tables lose rows to `ON DELETE CASCADE` when the archive deletes a trains \
+             batch, but are in neither TRAINS_GROUP_EXPORTS nor TRAINS_CASCADE_NOT_ARCHIVED: \
+             {missing:?}"
+        );
+        // No stale entries either way.
+        for (table, _) in TRAINS_CASCADE_NOT_ARCHIVED {
+            assert!(
+                cascaded.iter().any(|t| t == table),
+                "{table} no longer cascades from trains; drop it from TRAINS_CASCADE_NOT_ARCHIVED"
+            );
+        }
+        for export in TRAINS_GROUP_EXPORTS.iter().filter(|e| e.table != "trains") {
+            assert!(
+                cascaded.iter().any(|t| t == export.table),
+                "{} is exported but does not cascade from trains: its rows would outlive the \
+                 archive's delete",
+                export.table
+            );
+        }
     }
 }

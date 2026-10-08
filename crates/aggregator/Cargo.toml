@@ -28,6 +28,8 @@ zstd = "0.13"
 
 [dev-dependencies]
 async-trait = "0.1"
+# Only the retention-step metric test; already in the tree via `common`.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Only the query-count tests' `SqlxQueryCounter` layer; the binary's own
 # subscriber is `common::logging`.
 tracing-subscriber = "0.3.23"

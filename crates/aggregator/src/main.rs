@@ -135,6 +135,15 @@ async fn run() -> anyhow::Result<()> {
             metrics::counter!(common::metrics::metric_name(name)).increment(0);
         }
     }
+    if archiver.as_ref().is_some_and(|a| a.archives("trains")) {
+        // aggregator_archive_cycles_total{cycle="trains",result} and
+        // aggregator_archive_last_success_timestamp_seconds, seeded to
+        // process start like every other cycle gauge, so the chart's
+        // DistantSignalArchiveStale neither fires on a fresh pod nor stays
+        // silent on one whose every archive cycle fails.
+        common::metrics::register_cycle(ARCHIVE_METRICS_SERVICE, ARCHIVE_TRAINS_CYCLE);
+    }
+    register_retention_metrics();
     // Its own task: a slow LIST or a store outage touches neither
     // aggregation nor the retention prunes.
     let mut expiry = expirer.map(|expirer| {
@@ -268,14 +277,15 @@ async fn retention_loop(
     }
 }
 
-/// One retention run: every prune, each failure logged and left for the
-/// next run.
+/// One retention run: every prune, each in its own error scope
+/// (`retention_step`), so one failing prune never skips another; each
+/// failure is logged, counted and left for the next run.
 async fn run_retention_pass(
     pool: &sqlx::PgPool,
     settings: &RetentionSettings,
     archiver: Option<&archive::Archiver>,
 ) {
-    if let Err(err) = run_retention(
+    run_retention(
         pool,
         settings.history_retention_days,
         settings.daily_stats_retention_days,
@@ -289,29 +299,19 @@ async fn run_retention_pass(
         settings.full_coverage_line_stats_retention_days,
         archiver,
     )
-    .await
-    {
-        tracing::error!(error = ?err, "retention pruning failed; will retry next interval");
-    }
-    // In its own error scope, after every other prune: the tables come
-    // from an api migration, so an aggregator deployed before it must
-    // not lose its other prunes to "relation does not exist".
-    match full_coverage_window::prune_full_coverage_window_stats(
-        pool,
-        settings.full_coverage_window_stats_retention_days,
+    .await;
+    let pruned = retention_step(
+        "full_coverage_window_stats",
+        full_coverage_window::prune_full_coverage_window_stats(
+            pool,
+            settings.full_coverage_window_stats_retention_days,
+        ),
     )
-    .await
-    {
-        Ok(pruned) => {
-            metrics::counter!(common::metrics::metric_name(
-                "aggregator_full_coverage_window_stats_pruned_total"
-            ))
-            .increment(pruned);
-        }
-        Err(err) => {
-            tracing::warn!(error = ?err, "failed to prune full-coverage window stats; will retry next interval");
-        }
-    }
+    .await;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_full_coverage_window_stats_pruned_total"
+    ))
+    .increment(pruned);
 }
 
 /// Cap on how many lines' writes share a single `sqlx::Transaction` in
@@ -780,8 +780,8 @@ async fn run_retention(
     schedule_line_population_retention_days: i64,
     full_coverage_line_stats_retention_days: i64,
     archiver: Option<&archive::Archiver>,
-) -> anyhow::Result<()> {
-    let pruned = queries::prune_history(pool, retention_days).await?;
+) {
+    let pruned = retention_step("history", queries::prune_history(pool, retention_days)).await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_history_rows_pruned_total"
     ))
@@ -805,8 +805,11 @@ async fn run_retention(
              \"Scope decision: retention tier and the licensing safeguard\" section"
         );
     }
-    let trust_event_backlog_pruned =
-        queries::prune_trust_event_backlog(pool, trust_event_backlog_retention_days).await?;
+    let trust_event_backlog_pruned = retention_step(
+        "trust_event_backlog",
+        queries::prune_trust_event_backlog(pool, trust_event_backlog_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_trust_event_backlog_rows_pruned_total"
     ))
@@ -823,30 +826,47 @@ async fn run_retention(
     // With `trains` opted into the cold archive, the same two tiers are
     // archived to object storage batch by batch before each delete; see
     // archive::archive_and_prune_trains. An upload failure there is logged
-    // and counted rather than returned, so it never skips the LDBWS-ceiling
-    // prunes below.
+    // and counted rather than returned. Like every step here it has its own
+    // error scope: a database error in it skips no other prune, and no
+    // other prune's error skips it.
     let trains_pruned = match archiver.filter(|a| a.archives("trains")) {
         Some(archiver) => {
-            let outcome = archive::archive_and_prune_trains(
-                pool,
-                archiver,
-                trains_retention_days,
-                untracked_trains_retention_days,
-                archive::ARCHIVE_TRAINS_BATCH,
-            )
-            .await?;
-            tracing::info!(
-                pruned = outcome.pruned,
-                objects_written = outcome.objects_written,
-                archived_rows = ?outcome.archived_rows,
-                upload_failed = outcome.upload_failed,
-                "trains archive-then-prune complete"
-            );
-            outcome.pruned
+            retention_step("trains", async {
+                let result = archive::archive_and_prune_trains(
+                    pool,
+                    archiver,
+                    trains_retention_days,
+                    untracked_trains_retention_days,
+                    archive::ARCHIVE_TRAINS_BATCH,
+                )
+                .await;
+                // aggregator_archive_last_success_timestamp_seconds, read by
+                // the chart's DistantSignalArchiveStale: a cycle succeeds
+                // when it neither errored nor failed an upload (a run with
+                // nothing due yet is a success).
+                common::metrics::record_cycle(
+                    ARCHIVE_METRICS_SERVICE,
+                    ARCHIVE_TRAINS_CYCLE,
+                    result.as_ref().is_ok_and(|o| !o.upload_failed),
+                );
+                let outcome = result?;
+                tracing::info!(
+                    pruned = outcome.pruned,
+                    objects_written = outcome.objects_written,
+                    archived_rows = ?outcome.archived_rows,
+                    upload_failed = outcome.upload_failed,
+                    "trains archive-then-prune complete"
+                );
+                Ok(outcome.pruned)
+            })
+            .await
         }
         None => {
-            queries::prune_trains(pool, trains_retention_days, untracked_trains_retention_days)
-                .await?
+            retention_step(
+                "trains",
+                queries::prune_trains(pool, trains_retention_days, untracked_trains_retention_days),
+            )
+            .await
         }
     };
     metrics::counter!(common::metrics::metric_name(
@@ -859,11 +879,14 @@ async fn run_retention(
     // one row per departure) rather than wholesale-replacing a bounded key
     // space. See queries::prune_schedule_destination_departures' own doc
     // comment.
-    let schedule_destination_departures_pruned = queries::prune_schedule_destination_departures(
-        pool,
-        schedule_destination_departures_retention_days,
+    let schedule_destination_departures_pruned = retention_step(
+        "schedule_destination_departures",
+        queries::prune_schedule_destination_departures(
+            pool,
+            schedule_destination_departures_retention_days,
+        ),
     )
-    .await?;
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_schedule_destination_departures_rows_pruned_total"
     ))
@@ -878,9 +901,11 @@ async fn run_retention(
     // dimension and not the date one. See
     // Config::schedule_derived_products_retention_days and each prune
     // function's own doc comment.
-    let schedule_calling_points_full_pruned =
-        queries::prune_schedule_calling_points_full(pool, schedule_derived_products_retention_days)
-            .await?;
+    let schedule_calling_points_full_pruned = retention_step(
+        "schedule_calling_points_full",
+        queries::prune_schedule_calling_points_full(pool, schedule_derived_products_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_schedule_calling_points_full_rows_pruned_total"
     ))
@@ -889,55 +914,78 @@ async fn run_retention(
     // Kept as long as a tracked `trains` row (and never shorter than the
     // other schedule products): a tracked bus's page keeps its label for as
     // long as the page exists. ~30k narrow rows a day, so 30 days is small.
-    let schedule_services_pruned = queries::prune_schedule_services(
-        pool,
-        trains_retention_days.max(schedule_derived_products_retention_days),
+    let schedule_services_pruned = retention_step(
+        "schedule_services",
+        queries::prune_schedule_services(
+            pool,
+            trains_retention_days.max(schedule_derived_products_retention_days),
+        ),
     )
-    .await?;
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_schedule_services_rows_pruned_total"
     ))
     .increment(schedule_services_pruned);
 
-    let schedule_network_departures_pruned =
-        queries::prune_schedule_network_departures(pool, schedule_derived_products_retention_days)
-            .await?;
+    let schedule_network_departures_pruned = retention_step(
+        "schedule_network_departures",
+        queries::prune_schedule_network_departures(pool, schedule_derived_products_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_schedule_network_departures_rows_pruned_total"
     ))
     .increment(schedule_network_departures_pruned);
 
-    let schedule_line_population_pruned =
-        queries::prune_schedule_line_population(pool, schedule_line_population_retention_days)
-            .await?;
+    let schedule_line_population_pruned = retention_step(
+        "schedule_line_population",
+        queries::prune_schedule_line_population(pool, schedule_line_population_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_schedule_line_population_rows_pruned_total"
     ))
     .increment(schedule_line_population_pruned);
 
-    let line_train_summaries_pruned =
-        queries::prune_line_train_summaries(pool, schedule_line_population_retention_days).await?;
+    let line_train_summaries_pruned = retention_step(
+        "line_train_summaries",
+        queries::prune_line_train_summaries(pool, schedule_line_population_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_line_train_summaries_rows_pruned_total"
     ))
     .increment(line_train_summaries_pruned);
 
-    let daily_stats_pruned = queries::prune_daily_stats(pool, daily_stats_retention_days).await?;
+    let daily_stats_pruned = retention_step(
+        "daily_stats",
+        queries::prune_daily_stats(pool, daily_stats_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_daily_stats_pruned_total"
     ))
     .increment(daily_stats_pruned);
-    let half_hourly_stats_pruned =
-        queries::prune_half_hourly_stats(pool, half_hourly_stats_retention_hours).await?;
+    let half_hourly_stats_pruned = retention_step(
+        "half_hourly_stats",
+        queries::prune_half_hourly_stats(pool, half_hourly_stats_retention_hours),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_half_hourly_stats_pruned_total"
     ))
     .increment(half_hourly_stats_pruned);
 
-    let daily_coverage_stats_pruned =
-        queries::prune_daily_coverage_stats(pool, daily_stats_retention_days).await?;
-    let half_hourly_coverage_stats_pruned =
-        queries::prune_half_hourly_coverage_stats(pool, half_hourly_stats_retention_hours).await?;
+    let daily_coverage_stats_pruned = retention_step(
+        "daily_coverage_stats",
+        queries::prune_daily_coverage_stats(pool, daily_stats_retention_days),
+    )
+    .await;
+    let half_hourly_coverage_stats_pruned = retention_step(
+        "half_hourly_coverage_stats",
+        queries::prune_half_hourly_coverage_stats(pool, half_hourly_stats_retention_hours),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_coverage_stats_pruned_total"
     ))
@@ -945,9 +993,11 @@ async fn run_retention(
 
     // Per-(line, rail day) full-coverage results, kept since 2026-09-27 so
     // a day can be audited; see Config::full_coverage_line_stats_retention_days.
-    let full_coverage_line_stats_pruned =
-        queries::prune_full_coverage_line_stats(pool, full_coverage_line_stats_retention_days)
-            .await?;
+    let full_coverage_line_stats_pruned = retention_step(
+        "full_coverage_line_stats",
+        queries::prune_full_coverage_line_stats(pool, full_coverage_line_stats_retention_days),
+    )
+    .await;
     metrics::counter!(common::metrics::metric_name(
         "aggregator_full_coverage_line_stats_pruned_total"
     ))
@@ -963,10 +1013,72 @@ async fn run_retention(
         half_hourly_stats_pruned = half_hourly_stats_pruned,
         daily_coverage_stats_pruned = daily_coverage_stats_pruned,
         half_hourly_coverage_stats_pruned = half_hourly_coverage_stats_pruned,
-        "retention pruning complete"
+        "retention pruning complete (a failed step counts 0; see its own error log)"
     );
+}
 
-    Ok(())
+/// The `service` and `cycle` of the cold archive's cycle metrics
+/// (`common::metrics::register_cycle`):
+/// `aggregator_archive_cycles_total{cycle="trains",result}` and
+/// `aggregator_archive_last_success_timestamp_seconds{cycle="trains"}`.
+const ARCHIVE_METRICS_SERVICE: &str = "aggregator_archive";
+const ARCHIVE_TRAINS_CYCLE: &str = "trains";
+
+/// Every `task` label of `aggregator_retention_errors_total`, registered at
+/// 0 at startup so a first failure shows up in a plain `increase()`.
+const RETENTION_TASKS: &[&str] = &[
+    "history",
+    "trust_event_backlog",
+    "trains",
+    "schedule_destination_departures",
+    "schedule_calling_points_full",
+    "schedule_services",
+    "schedule_network_departures",
+    "schedule_line_population",
+    "line_train_summaries",
+    "daily_stats",
+    "half_hourly_stats",
+    "daily_coverage_stats",
+    "half_hourly_coverage_stats",
+    "full_coverage_line_stats",
+    "full_coverage_window_stats",
+];
+
+fn register_retention_metrics() {
+    for task in RETENTION_TASKS {
+        metrics::counter!(
+            common::metrics::metric_name("aggregator_retention_errors_total"),
+            "task" => *task
+        )
+        .increment(0);
+    }
+}
+
+/// Runs one retention step in its own error scope: an error is logged and
+/// counted in `aggregator_retention_errors_total{task}`, and reads as 0
+/// rows pruned, so the next step still runs. A failed step retries on the
+/// next retention interval.
+async fn retention_step(
+    task: &'static str,
+    step: impl Future<Output = anyhow::Result<u64>>,
+) -> u64 {
+    debug_assert!(RETENTION_TASKS.contains(&task), "unregistered task {task}");
+    match step.await {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::error!(
+                error = ?err,
+                task,
+                "retention step failed; the other steps still run, and this one retries next interval"
+            );
+            metrics::counter!(
+                common::metrics::metric_name("aggregator_retention_errors_total"),
+                "task" => task
+            )
+            .increment(1);
+            0
+        }
+    }
 }
 
 /// Selects the `(line_id, &LineDefinition)` pairs that qualify for a
@@ -1052,6 +1164,39 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    /// A failing retention step reads as 0 rows and is counted under its
+    /// own `task`; a passing one returns its count and counts nothing. So
+    /// the next step still runs (the caller never sees an `Err`).
+    #[test]
+    fn a_failed_retention_step_is_counted_and_does_not_propagate() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (failed, passed) = metrics::with_local_recorder(&recorder, || {
+            register_retention_metrics();
+            rt.block_on(async {
+                let failed = retention_step("history", async {
+                    Err(anyhow::anyhow!("relation does not exist"))
+                })
+                .await;
+                let passed = retention_step("trains", async { Ok(7) }).await;
+                (failed, passed)
+            })
+        });
+        assert_eq!((failed, passed), (0, 7));
+        let text = handle.render();
+        assert!(
+            text.contains(r#"distant_signal_aggregator_retention_errors_total{task="history"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"distant_signal_aggregator_retention_errors_total{task="trains"} 0"#),
+            "{text}"
+        );
+    }
 
     #[tokio::test]
     async fn cycle_interval_defaults_to_delay_not_burst_on_a_missed_tick() {
