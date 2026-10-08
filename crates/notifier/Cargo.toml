@@ -47,6 +47,9 @@ tokio = { version = "1.52.3", features = ["test-util"] }
 # Only the query-count tests' `SqlxQueryCounter` layer; the binary's own
 # subscriber is `common::logging`.
 tracing-subscriber = "0.3.23"
+# The stale line-history counter's test (ingest plan 3c.4) reads a local
+# recorder. Already in Cargo.lock, at the version the other crates use.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [lints]
 workspace = true

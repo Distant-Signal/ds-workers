@@ -269,6 +269,24 @@ struct LineHistoryRow {
     line_id: String,
     statuses: serde_json::Value,
     previous_statuses: Option<serde_json::Value>,
+    /// `computed_at` older than the poll's max age (`LINE_HISTORY_MAX_AGE_SECS`;
+    /// always false when that is off). See [`poll_line_candidates_with_max_age`].
+    stale: bool,
+}
+
+/// `notifier_line_history_skipped_total{reason="stale"}`: history rows the
+/// line poll passed over because their `computed_at` was older than
+/// `LINE_HISTORY_MAX_AGE_SECS` (ingest plan 3c.4).
+pub(crate) const LINE_HISTORY_SKIPPED_METRIC: &str = "notifier_line_history_skipped_total";
+
+/// Registers `notifier_line_history_skipped_total{reason="stale"}` at 0, so
+/// the series exists from startup.
+pub(crate) fn register_line_history_metrics() {
+    metrics::counter!(
+        common::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC),
+        "reason" => "stale"
+    )
+    .increment(0);
 }
 
 fn worst_rank(statuses: &[LineStatus]) -> u8 {
@@ -437,11 +455,48 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
     clippy::cast_possible_wrap,
     reason = "collection lengths stay far below i64::MAX"
 )]
+#[cfg(test)]
 pub(crate) async fn poll_line_candidates(
     pool: &PgPool,
     since_id: i64,
     batch_rows: i64,
 ) -> anyhow::Result<(Vec<LineCandidate>, PollWindow)> {
+    poll_line_candidates_with_max_age(pool, since_id, batch_rows, None).await
+}
+
+/// [`poll_line_candidates`] with the stale-history skip (ingest plan 3c.4,
+/// decision D13; `LINE_HISTORY_MAX_AGE_SECS`, `None` when it is `0`).
+///
+/// Once the ingest-writer applies `TfL` snapshots from its stream, a
+/// `line_status_history` row's `computed_at` is the snapshot's
+/// `produced_at`, not the time it was written: a backlog applied after a
+/// writer outage lands as a burst of rows stamped minutes or hours ago.
+/// Pushing each of their transitions now would announce disruptions that
+/// may be long over. So a row whose `computed_at` is older than `max_age`
+/// (by the database's clock) is **skipped**: never a candidate, counted in
+/// `notifier_line_history_skipped_total{reason="stale"}`. It still
+///
+/// - moves the cursor past it (it is in the [`PollWindow`] like any other
+///   row), and
+/// - is the "previous" status of the next row of its line (the `LAG` runs
+///   over every row, stale or not), so a fresh row is compared with the
+///   newest status, not with whatever preceded the burst.
+///
+/// The same skip also drops the changes a notifier outage longer than
+/// `max_age` left behind; that is accepted (plan 3c.4).
+pub(crate) async fn poll_line_candidates_with_max_age(
+    pool: &PgPool,
+    since_id: i64,
+    batch_rows: i64,
+    max_age: Option<chrono::Duration>,
+) -> anyhow::Result<(Vec<LineCandidate>, PollWindow)> {
+    // Whole seconds as float8 (`make_interval`'s `secs`); NULL turns the
+    // skip off.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a max age in seconds is far below f64's exact-integer range"
+    )]
+    let max_age_secs: Option<f64> = max_age.map(|age| age.num_seconds() as f64);
     // The head first: a batch that then comes back short has read every row
     // at or below it.
     let head: Option<i64> =
@@ -451,32 +506,36 @@ pub(crate) async fn poll_line_candidates(
             .await?;
     let rows = sqlx::query_as::<_, LineHistoryRow>(
         "WITH candidates AS ( \
-             SELECT id, line_id, statuses FROM line_status_history WHERE id > $1 \
-             ORDER BY id LIMIT $2 \
+             SELECT id, line_id, statuses, computed_at FROM line_status_history \
+             WHERE id > $1 ORDER BY id LIMIT $2 \
          ), \
          anchors AS ( \
-             SELECT DISTINCT ON (line_id) id, line_id, statuses \
+             SELECT DISTINCT ON (line_id) id, line_id, statuses, computed_at \
              FROM line_status_history \
              WHERE id <= $1 AND line_id IN (SELECT DISTINCT line_id FROM candidates) \
              ORDER BY line_id, id DESC \
          ), \
          combined AS ( \
-             SELECT id, line_id, statuses FROM candidates \
+             SELECT id, line_id, statuses, computed_at FROM candidates \
              UNION ALL \
-             SELECT id, line_id, statuses FROM anchors \
+             SELECT id, line_id, statuses, computed_at FROM anchors \
          ), \
          windowed AS ( \
-             SELECT id, line_id, statuses, \
+             SELECT id, line_id, statuses, computed_at, \
                     LAG(statuses) OVER (PARTITION BY line_id ORDER BY id) AS previous_statuses \
              FROM combined \
          ) \
-         SELECT id, line_id, statuses, previous_statuses \
+         SELECT id, line_id, statuses, previous_statuses, \
+                COALESCE($3::float8 IS NOT NULL \
+                         AND computed_at < now() - make_interval(secs => $3::float8), \
+                         false) AS stale \
          FROM windowed \
          WHERE id > $1 \
          ORDER BY id",
     )
     .bind(since_id)
     .bind(batch_rows)
+    .bind(max_age_secs)
     .fetch_all(pool)
     .await?;
 
@@ -485,10 +544,34 @@ pub(crate) async fn poll_line_candidates(
         observed_max_id: head.unwrap_or(since_id).max(batch_max_id),
         read_through: (rows.len() as i64 >= batch_rows).then_some(batch_max_id),
     };
+    let mut stale: u64 = 0;
     let candidates = rows
         .into_iter()
+        .filter(|row| {
+            if row.stale {
+                stale += 1;
+                tracing::debug!(
+                    line_status_history_id = row.id,
+                    line_id = %row.line_id,
+                    "skipping a line_status_history row older than LINE_HISTORY_MAX_AGE_SECS"
+                );
+            }
+            !row.stale
+        })
         .filter_map(line_candidate_from_row)
         .collect();
+    if stale > 0 {
+        tracing::info!(
+            stale,
+            "skipped stale line_status_history rows (computed_at older than \
+             LINE_HISTORY_MAX_AGE_SECS); the cursor moves past them"
+        );
+        metrics::counter!(
+            common::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC),
+            "reason" => "stale"
+        )
+        .increment(stale);
+    }
     Ok((candidates, window))
 }
 
@@ -2111,6 +2194,157 @@ mod tests {
             "an unchanged table must produce zero new candidates for this line on a repeat poll"
         );
 
+        cleanup_line_history(&pool, line_id).await;
+    }
+
+    /// Seeds `(severity, age in minutes)` history rows for `line_id`, oldest
+    /// id first, returning their ids.
+    async fn seed_aged_history(
+        pool: &PgPool,
+        line_id: &str,
+        rows: &[(common::Severity, i64)],
+    ) -> Vec<i64> {
+        let mut ids = Vec::new();
+        for (severity, age_minutes) in rows {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+                 VALUES ($1, $2, now() - make_interval(mins => $3::int)) RETURNING id",
+            )
+            .bind(line_id)
+            .bind(status_json(*severity))
+            .bind(*age_minutes as i32)
+            .fetch_one(pool)
+            .await
+            .expect("seed aged history row");
+            ids.push(id);
+        }
+        ids
+    }
+
+    fn stale_skips(rendered: &str) -> u64 {
+        let prefix = format!(
+            "{}{{reason=\"stale\"}} ",
+            common::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC)
+        );
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix)?.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Plan 3c.4: a burst of history rows, all but the last older than 15
+    /// minutes (a stream backlog applied late), yields only the last change
+    /// as a candidate; the rest are counted as stale, and the cursor's
+    /// window still covers them. The fresh row is compared with the newest
+    /// stale row's statuses, not with what preceded the burst. With the
+    /// skip off (`None`, `LINE_HISTORY_MAX_AGE_SECS=0`) every transition is
+    /// a candidate, as before.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p notifier \
+                stale_line_history -- --ignored --test-threads=1`"]
+    async fn stale_line_history_rows_are_skipped_but_advance_the_cursor_and_feed_previous() {
+        let pool = connect().await;
+        let line_id = "TEST-NOTIFIER-STALE-LINE";
+        cleanup_line_history(&pool, line_id).await;
+        let since: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM line_status_history")
+            .fetch_one(&pool)
+            .await
+            .expect("read the head id");
+
+        let ids = seed_aged_history(
+            &pool,
+            line_id,
+            &[
+                (common::Severity::GoodService, 60),
+                (common::Severity::SevereDelays, 45),
+                (common::Severity::GoodService, 30),
+                (common::Severity::MinorDelays, 20),
+                // Fresh: compared with MinorDelays (rank 3), not GoodService.
+                (common::Severity::SevereDelays, 0),
+            ],
+        )
+        .await;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (candidates, window) = {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            poll_line_candidates_with_max_age(
+                &pool,
+                since,
+                TEST_POLL_BATCH_ROWS,
+                Some(chrono::Duration::minutes(15)),
+            )
+            .await
+            .expect("poll with the skip on")
+        };
+        let ours: Vec<&LineCandidate> =
+            candidates.iter().filter(|c| c.line_id == line_id).collect();
+        assert_eq!(ours.len(), 1, "only the fresh row is a candidate");
+        assert_eq!(ours[0].id, ids[4]);
+        assert_eq!(
+            ours[0].previous_rank,
+            severity_rank(common::Severity::MinorDelays),
+            "the previous status is the newest stale row's"
+        );
+        assert_eq!(
+            ours[0].new_rank,
+            severity_rank(common::Severity::SevereDelays)
+        );
+        assert!(
+            window.observed_max_id >= ids[4],
+            "the cursor moves past every row, stale or not"
+        );
+        assert_eq!(stale_skips(&handle.render()), 4, "the four stale rows");
+
+        // Off: every transition, stale or not, is a candidate.
+        let (all, _) = poll_line_candidates_with_max_age(&pool, since, TEST_POLL_BATCH_ROWS, None)
+            .await
+            .expect("poll with the skip off");
+        let all_ours: Vec<i64> = all
+            .iter()
+            .filter(|c| c.line_id == line_id)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(all_ours, ids[1..].to_vec());
+
+        cleanup_line_history(&pool, line_id).await;
+    }
+
+    /// Plan 3c.4: a fresh row whose status equals the stale row before it is
+    /// no transition at all, even though it differs from the last row the
+    /// notifier saw before the burst.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p notifier \
+                stale_line_history -- --ignored --test-threads=1`"]
+    async fn stale_line_history_a_fresh_row_equal_to_the_stale_one_is_no_transition() {
+        let pool = connect().await;
+        let line_id = "TEST-NOTIFIER-STALE-SAME";
+        cleanup_line_history(&pool, line_id).await;
+        let anchor =
+            seed_aged_history(&pool, line_id, &[(common::Severity::GoodService, 90)]).await;
+        let _ = seed_aged_history(
+            &pool,
+            line_id,
+            &[
+                (common::Severity::SevereDelays, 40),
+                (common::Severity::SevereDelays, 0),
+            ],
+        )
+        .await;
+        // The anchor is at or below the cursor, as after an earlier cycle.
+        let (candidates, _) = poll_line_candidates_with_max_age(
+            &pool,
+            anchor[0],
+            TEST_POLL_BATCH_ROWS,
+            Some(chrono::Duration::minutes(15)),
+        )
+        .await
+        .expect("poll");
+        assert!(
+            candidates.iter().all(|c| c.line_id != line_id),
+            "Severe after a stale Severe is no change"
+        );
         cleanup_line_history(&pool, line_id).await;
     }
 

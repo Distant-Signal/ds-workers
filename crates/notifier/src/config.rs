@@ -45,6 +45,23 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 120)]
     pub cursor_grace_seconds: i64,
 
+    /// Line-status history rows whose `computed_at` is older than this many
+    /// seconds are skipped, not pushed (ingest plan 3c.4, decision D13):
+    /// the cursor moves past them, they still count as the "previous"
+    /// status of their line's next row, and each is counted in
+    /// `notifier_line_history_skipped_total{reason="stale"}`. `0` turns the
+    /// skip off (every row is a candidate, as before).
+    ///
+    /// Once the ingest-writer applies `TfL` snapshots from its stream,
+    /// `computed_at` is the snapshot's fetch time, so a backlog applied late
+    /// arrives as old rows; this keeps them from pushing disruptions that
+    /// may be long over. It must be deployed before the writer's `tfl`
+    /// stream goes to `apply`. Until then it only drops the changes a
+    /// notifier outage longer than this left behind. 900 s (15 minutes) is
+    /// three `TfL` polls.
+    #[arg(long, env, default_value_t = 900)]
+    pub line_history_max_age_secs: u64,
+
     /// Cadence for the forwarding-queue poll (Task 17/18) -- deliberately
     /// faster than `poll_interval_secs`, since the whole point of
     /// trust-consumer's forwarding signal is a quicker path to a push than
@@ -240,6 +257,17 @@ impl Config {
         Ok(())
     }
 
+    /// `LINE_HISTORY_MAX_AGE_SECS` as the poll's max age: `None` when `0`
+    /// (the skip is off).
+    pub(crate) fn line_history_max_age(&self) -> Option<chrono::Duration> {
+        (self.line_history_max_age_secs > 0).then(|| {
+            i64::try_from(self.line_history_max_age_secs)
+                .ok()
+                .and_then(chrono::Duration::try_seconds)
+                .unwrap_or(chrono::Duration::MAX)
+        })
+    }
+
     pub(crate) fn push_queue_config(&self) -> crate::push_queue::PushQueueConfig {
         crate::push_queue::PushQueueConfig {
             workers: self.push_workers,
@@ -264,6 +292,7 @@ mod tests {
             cooldown_minutes: 20,
             train_delay_threshold_minutes: 15,
             cursor_grace_seconds: 120,
+            line_history_max_age_secs: 900,
             forward_queue_poll_interval_secs: 15,
             skip_check_poll_interval_secs: 90,
             template_sweep_poll_interval_secs: 3600,
@@ -337,6 +366,38 @@ mod tests {
     #[test]
     fn a_fully_valid_config_passes() {
         assert!(valid_config().validate().is_ok());
+    }
+
+    /// Plan 3c.4: on by default at 900 s; `0` turns it off.
+    #[test]
+    fn line_history_max_age_defaults_to_fifteen_minutes_and_zero_disables_it() {
+        let parsed = Config::try_parse_from([
+            "notifier",
+            "--database-url",
+            "postgres://x",
+            "--vapid-private-key",
+            "k",
+            "--vapid-public-key",
+            "k",
+            "--vapid-subject",
+            "mailto:x@example.invalid",
+        ])
+        .expect("the required args parse");
+        assert_eq!(parsed.line_history_max_age_secs, 900);
+        assert_eq!(
+            parsed.line_history_max_age(),
+            Some(chrono::Duration::minutes(15))
+        );
+        let off = Config {
+            line_history_max_age_secs: 0,
+            ..valid_config()
+        };
+        assert_eq!(off.line_history_max_age(), None);
+        let huge = Config {
+            line_history_max_age_secs: u64::MAX,
+            ..valid_config()
+        };
+        assert_eq!(huge.line_history_max_age(), Some(chrono::Duration::MAX));
     }
 
     #[test]

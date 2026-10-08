@@ -151,6 +151,12 @@ async fn run() -> anyhow::Result<()> {
     ] {
         common::metrics::register_cycle("notifier", cycle);
     }
+    queries::register_line_history_metrics();
+    let line_history_max_age = config.line_history_max_age();
+    tracing::info!(
+        line_history_max_age_secs = config.line_history_max_age_secs,
+        "line-status history rows older than this are skipped (0: off)"
+    );
     let mut interval = poll_interval(config.poll_interval_secs);
     let mut forward_interval = poll_interval(config.forward_queue_poll_interval_secs);
     let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
@@ -177,6 +183,7 @@ async fn run() -> anyhow::Result<()> {
                     cooldown,
                     config.train_delay_threshold_minutes,
                     cursor_grace,
+                    line_history_max_age,
                 )
                 .await;
                 if let Err(err) = &result {
@@ -283,13 +290,17 @@ async fn run_cycle(
     cooldown: chrono::Duration,
     train_delay_threshold_minutes: i32,
     cursor_grace: chrono::Duration,
+    line_history_max_age: Option<chrono::Duration>,
 ) -> anyhow::Result<()> {
     // --- Lines (Decision 2/3/5) ---
     let line_cursor = queries::read_cursor(pool, "line_status_history").await?;
-    let (line_candidates, line_window) = queries::poll_line_candidates(
+    // Rows older than LINE_HISTORY_MAX_AGE_SECS are skipped but still
+    // advance the cursor (ingest plan 3c.4).
+    let (line_candidates, line_window) = queries::poll_line_candidates_with_max_age(
         pool,
         line_cursor.last_processed_id,
         queries::LINE_POLL_BATCH_ROWS,
+        line_history_max_age,
     )
     .await?;
 
@@ -925,6 +936,26 @@ mod drain_support {
         train_delay_threshold_minutes: i32,
         cursor_grace: chrono::Duration,
     ) -> anyhow::Result<()> {
+        cycle_and_drain_with_max_age(
+            pool,
+            now,
+            cooldown,
+            train_delay_threshold_minutes,
+            cursor_grace,
+            None,
+        )
+        .await
+    }
+
+    /// [`cycle_and_drain`] with `LINE_HISTORY_MAX_AGE_SECS` (plan 3c.4).
+    pub(crate) async fn cycle_and_drain_with_max_age(
+        pool: &PgPool,
+        now: DateTime<Utc>,
+        cooldown: chrono::Duration,
+        train_delay_threshold_minutes: i32,
+        cursor_grace: chrono::Duration,
+        line_history_max_age: Option<chrono::Duration>,
+    ) -> anyhow::Result<()> {
         let queue = test_queue(pool);
         let result = run_cycle(
             pool,
@@ -933,6 +964,7 @@ mod drain_support {
             cooldown,
             train_delay_threshold_minutes,
             cursor_grace,
+            line_history_max_age,
         )
         .await;
         drain(queue).await;
@@ -1345,6 +1377,7 @@ mod db_tests {
             chrono::Duration::minutes(20),
             15,
             chrono::Duration::zero(),
+            None,
         )
         .await
         .expect("run_cycle");
