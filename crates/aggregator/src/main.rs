@@ -60,6 +60,7 @@ async fn run() -> anyhow::Result<()> {
     }
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
+        ds_store::pool::register_metrics();
     }
     full_coverage_window::init_metrics();
     let window_settings =
@@ -90,7 +91,8 @@ async fn run() -> anyhow::Result<()> {
     // application_name, statement/idle-in-transaction timeouts and a short
     // acquire_timeout; see `common::pg`. The retention prunes and archive
     // batches raise the statement timeout for their own transactions.
-    let pool = common::pg::PoolSettings::from_env("distant-signal-aggregator", 10)?
+    // ds_store's wrapper adds the db_pool_* metrics.
+    let pool = ds_store::pool::PoolSettings::from_env("distant-signal-aggregator", 10)?
         .connect(config.database_url.expose())
         .await?;
     // The schema gate (spec §12.2): no loop and no readiness until the

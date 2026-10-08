@@ -97,6 +97,7 @@ async fn run() -> anyhow::Result<()> {
 
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
+        ds_store::pool::register_metrics();
     }
 
     let (ready, progress) = health_http::spawn_worker(&config.health);
@@ -117,8 +118,9 @@ async fn run() -> anyhow::Result<()> {
     )
     .await;
     // application_name, statement/idle-in-transaction timeouts and a short
-    // acquire_timeout; see `common::pg`.
-    let pool = common::pg::PoolSettings::from_env("distant-signal-notifier", 5)?
+    // acquire_timeout; see `common::pg`. ds_store's wrapper adds the
+    // db_pool_* metrics.
+    let pool = ds_store::pool::PoolSettings::from_env("distant-signal-notifier", 5)?
         .connect(config.database_url.expose())
         .await?;
     // The schema gate (spec §12.2): no loop and no readiness until the
