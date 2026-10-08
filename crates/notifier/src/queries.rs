@@ -451,10 +451,6 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
 /// the lowest `batch_rows` ids above the cursor, so per line it is still a
 /// contiguous run from the anchor onward. The returned [`PollWindow`] says
 /// how far the batch reached; see [`advance_cursor_with_grace_bounded`].
-#[expect(
-    clippy::cast_possible_wrap,
-    reason = "collection lengths stay far below i64::MAX"
-)]
 #[cfg(test)]
 pub(crate) async fn poll_line_candidates(
     pool: &PgPool,
@@ -484,6 +480,10 @@ pub(crate) async fn poll_line_candidates(
 ///
 /// The same skip also drops the changes a notifier outage longer than
 /// `max_age` left behind; that is accepted (plan 3c.4).
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "collection lengths stay far below i64::MAX"
+)]
 pub(crate) async fn poll_line_candidates_with_max_age(
     pool: &PgPool,
     since_id: i64,
