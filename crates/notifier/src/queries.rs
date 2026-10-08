@@ -3504,6 +3504,109 @@ mod tests {
         cleanup_user_skip(&pool, "TEST-SKIP-LEG-USER").await;
     }
 
+    /// 2026-10-08: trains can be tracked 28 days ahead (was 7). A far
+    /// tracked train gets no early notification: the skip check only polls
+    /// legs dated `today`, and train notifications come only from movement
+    /// events, which a train 20 days out has none of.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_train_tracked_20_days_ahead_is_not_notified_early -- --ignored --test-threads=1`"]
+    async fn a_train_tracked_20_days_ahead_is_not_notified_early() {
+        let pool = connect().await;
+        let user_id = "TEST-FAR-PIN-USER";
+        let uid = "TEST-FAR-PIN-UID";
+        sqlx::query("DELETE FROM trains WHERE train_uid = $1")
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .expect("pre-clean trains");
+        cleanup_user_skip(&pool, user_id).await;
+        seed_user(&pool, user_id).await;
+        let today: chrono::NaiveDate = Utc::now()
+            .with_timezone(&chrono_tz::Europe::London)
+            .date_naive();
+        let far = today + chrono::Duration::days(20);
+
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date, origin_crs) \
+             VALUES ($1, $2, 'PAD') RETURNING id",
+        )
+        .bind(uid)
+        .bind(far)
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+        let tracked_train_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions \
+                (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
+             VALUES ($1, $2, 'PAD', $3, $4, 'schedule_matched') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(far)
+        .bind(far.and_hms_opt(9, 0, 0).unwrap().and_utc())
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed train_subscriptions row");
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journeys row");
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'PAD', 'RDG', $2, $3, 'manual') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(far)
+        .bind(tracked_train_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_legs row");
+
+        let legs = list_committed_legs_for_today(&pool, today)
+            .await
+            .expect("list_committed_legs_for_today");
+        assert!(
+            !legs.iter().any(|leg| leg.journey_leg_id == journey_leg_id),
+            "a leg 20 days ahead is not skip-checked today"
+        );
+        let (candidates, _) = poll_train_candidates(&pool, 0, 0, TRAIN_POLL_BATCH_ROWS)
+            .await
+            .expect("poll_train_candidates");
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.tracked_train_id == tracked_train_id),
+            "no movement event, so no train notification"
+        );
+
+        sqlx::query("DELETE FROM journey_legs WHERE id = $1")
+            .bind(journey_leg_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(tracked_train_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user_skip(&pool, user_id).await;
+    }
+
     async fn cleanup_user_skip(pool: &PgPool, user_id: &str) {
         sqlx::query("DELETE FROM journey_leg_notification_state WHERE user_id = $1")
             .bind(user_id)

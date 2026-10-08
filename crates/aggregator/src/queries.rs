@@ -950,7 +950,8 @@ pub(crate) async fn prune_schedule_destination_departures(
 ///
 /// **The biggest of the three products that had no pruning job at all until
 /// 2026-09-25.** One row per calling point of every non-cancelled schedule,
-/// for eight forward dates per publish cycle -- realistically 2-3x
+/// for every date of the forward window per publish cycle (today to
+/// today+28 by default) -- realistically 2-3x
 /// `schedule_destination_departures`' ~377,000 rows per date, because unlike
 /// that product this one keeps the passing points and junction TIPLOCs too.
 /// Its wholesale replace is scoped to one `service_date`, and

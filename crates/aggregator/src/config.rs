@@ -201,8 +201,10 @@ pub(crate) struct Config {
     /// space, so steady-state size is trivial" -- was only ever half true: the
     /// KEY space is bounded, but `service_date` is not one of the bounds.
     /// `schedule-reference` publishes a new `service_date` on every delivery
-    /// (and, for `schedule_calling_points_full`, eight forward dates per
-    /// cycle), so each product grows by roughly a day's worth of rows per day,
+    /// (and, for `schedule_calling_points_full`, every date of its forward
+    /// window -- today to today+28 by default, `schedule-reference`'s
+    /// `SCHEDULE_FORWARD_PUBLISH_DAYS` -- per cycle), so each product grows
+    /// by roughly a day's worth of rows per day,
     /// forever. `schedule_calling_points_full` is the one that actually hurts:
     /// it is one row per calling point of every non-cancelled schedule --
     /// realistically 2-3x `schedule_destination_departures`' ~377,000 rows per
@@ -210,11 +212,13 @@ pub(crate) struct Config {
     /// product excludes.
     ///
     /// 8, matching `schedule_destination_departures_retention_days` above, for
-    /// the same reason: it is one day past the 7-day window
-    /// `crates/api/src/routes/trains.rs`'s `SEARCH_WINDOW_BACKWARD_DAYS` and
-    /// `schedule-reference`'s own `TRIP_PLANNING_FORWARD_DAYS` both work in, so
-    /// a boundary date cannot flake into a 404 because a prune ran moments
-    /// before a request for it landed.
+    /// the same reason: it is one day past the 7-day backward window
+    /// `crates/api/src/routes/trains.rs`'s `SEARCH_WINDOW_BACKWARD_DAYS` works
+    /// in, so a boundary date cannot flake into a 404 because a prune ran
+    /// moments before a request for it landed. Retention only ever prunes
+    /// PAST dates (`service_date < CURRENT_DATE - N`); the forward window
+    /// (`schedule-reference`'s `SCHEDULE_FORWARD_PUBLISH_DAYS`) is
+    /// independent of it.
     ///
     /// **One known consequence, stated rather than hidden:** beyond this
     /// window, `journey::build_journey_stops`' fallback read of
