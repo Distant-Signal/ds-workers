@@ -106,12 +106,20 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 120)]
     pub auto_commit_lead_minutes: i64,
 
-    /// VAPID keys, PEM-encoded EC private key (`openssl ecparam -genkey
-    /// -name prime256v1`) and the matching uncompressed public key --
-    /// wired into web-push's `VapidSignatureBuilder` in Task 6. Fails fast
-    /// at startup if either is empty (Task 6), matching this repo's
-    /// existing "refuse to start on a missing required secret" posture
-    /// (crates/api/src/app.rs's `internal_token` `ensure!`).
+    /// The VAPID P-256 private key and its matching public key. The private
+    /// key is parsed once at startup (`vapid_key`) and may be any of:
+    /// - PEM, SEC1 `EC PRIVATE KEY` (`openssl ecparam -genkey -name
+    ///   prime256v1 -noout`) or PKCS#8 `PRIVATE KEY`;
+    /// - that PEM with its newlines escaped as literal `\n` or collapsed
+    ///   into spaces;
+    /// - the raw 32-byte private key as base64url or base64, padding
+    ///   optional (what `npx web-push generate-vapid-keys` prints).
+    ///
+    /// The public key is the 65-byte uncompressed point, base64url. Startup
+    /// fails if either is empty, if the private key is in none of those
+    /// formats, or if the public key is not the one the private key derives
+    /// (every existing subscription is bound to it). Logs only the detected
+    /// format name, never key material.
     #[arg(long, env)]
     pub vapid_private_key: Secret,
     #[arg(long, env)]

@@ -20,11 +20,10 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use web_push::{
-    ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessage, WebPushMessageBuilder,
-};
+use web_push::{ContentEncoding, SubscriptionInfo, WebPushMessage, WebPushMessageBuilder};
 
 use crate::queries::PushSubscriptionRow;
+use crate::vapid_key::VapidKey;
 
 /// Bound on a single web-push send attempt -- 2026-09 security/bug review
 /// Medium finding M2: `web_push::HyperWebPushClient` configures no
@@ -81,11 +80,12 @@ pub(crate) enum SendOutcome {
 }
 
 /// The configured sender every production push goes through: the VAPID
-/// credentials plus the per-attempt timeout. `Clone` is cheap (two `Arc`s),
-/// so each `push_queue` worker can hold one.
+/// credentials (the private key parsed once at startup, see `vapid_key`)
+/// plus the per-attempt timeout. `Clone` is cheap (two `Arc`s), so each
+/// `push_queue` worker can hold one.
 #[derive(Clone)]
 pub(crate) struct Pusher {
-    vapid_private_key: std::sync::Arc<str>,
+    vapid_key: VapidKey,
     vapid_subject: std::sync::Arc<str>,
     per_attempt_timeout: Duration,
     /// `false` only for tests that target a local `http://127.0.0.1` mock,
@@ -96,7 +96,7 @@ pub(crate) struct Pusher {
 impl std::fmt::Debug for Pusher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pusher")
-            .field("vapid_private_key", &"<redacted>")
+            .field("vapid_key", &self.vapid_key)
             .field("vapid_subject", &self.vapid_subject)
             .field("per_attempt_timeout", &self.per_attempt_timeout)
             .field("revalidate_endpoint", &self.revalidate_endpoint)
@@ -107,9 +107,9 @@ impl std::fmt::Debug for Pusher {
 impl Pusher {
     /// The production sender: L9 send-time re-validation on, and
     /// `PUSH_SEND_TIMEOUT` per attempt.
-    pub(crate) fn new(vapid_private_key: &str, vapid_subject: &str) -> Self {
+    pub(crate) fn new(vapid_key: VapidKey, vapid_subject: &str) -> Self {
         Self {
-            vapid_private_key: vapid_private_key.into(),
+            vapid_key,
             vapid_subject: vapid_subject.into(),
             per_attempt_timeout: PUSH_SEND_TIMEOUT,
             revalidate_endpoint: true,
@@ -122,7 +122,7 @@ impl Pusher {
     #[cfg(test)]
     pub(crate) fn for_local_tests(per_attempt_timeout: Duration) -> Self {
         Self {
-            vapid_private_key: tests::TEST_VAPID_PRIVATE_KEY_PEM.into(),
+            vapid_key: tests::test_vapid_key(),
             vapid_subject: "mailto:test@example.com".into(),
             per_attempt_timeout,
             revalidate_endpoint: false,
@@ -138,7 +138,7 @@ impl Pusher {
             // Production: `new` always pairs this with `PUSH_SEND_TIMEOUT`,
             // which `send_to_subscription` applies itself.
             return send_to_subscription(
-                &self.vapid_private_key,
+                &self.vapid_key,
                 &self.vapid_subject,
                 subscription,
                 payload,
@@ -146,7 +146,7 @@ impl Pusher {
             .await;
         }
         send_to_subscription_with_timeout(
-            &self.vapid_private_key,
+            &self.vapid_key,
             &self.vapid_subject,
             subscription,
             payload,
@@ -157,7 +157,7 @@ impl Pusher {
 }
 
 pub(crate) async fn send_to_subscription(
-    vapid_private_key: &str,
+    vapid_key: &VapidKey,
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
     payload: &NotificationPayload,
@@ -192,7 +192,7 @@ pub(crate) async fn send_to_subscription(
     }
 
     send_to_subscription_with_timeout(
-        vapid_private_key,
+        vapid_key,
         vapid_subject,
         subscription,
         payload,
@@ -219,7 +219,7 @@ pub(crate) async fn send_to_subscription(
     reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
 )]
 async fn send_to_subscription_with_timeout(
-    vapid_private_key: &str,
+    vapid_key: &VapidKey,
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
     payload: &NotificationPayload,
@@ -231,14 +231,9 @@ async fn send_to_subscription_with_timeout(
         subscription.auth.clone(),
     );
 
-    let mut signature_builder =
-        match VapidSignatureBuilder::from_pem(vapid_private_key.as_bytes(), &subscription_info) {
-            Ok(builder) => builder,
-            Err(err) => {
-                tracing::error!(error = ?err, "invalid VAPID private key"); // startup-time fail-fast (Task 6) should prevent this in practice
-                return SendOutcome::TransientFailure;
-            }
-        };
+    // The key was parsed (and checked against VAPID_PUBLIC_KEY) once at
+    // startup; this only binds it to the subscription's audience.
+    let mut signature_builder = vapid_key.signature_builder(&subscription_info);
     signature_builder.add_claim("sub", vapid_subject);
     let signature = match signature_builder.build() {
         Ok(sig) => sig,
@@ -489,7 +484,7 @@ pub(crate) mod tests {
 
     // A real (freshly generated, single-purpose-for-this-test) P-256 EC
     // private key, `openssl ecparam -name prime256v1 -genkey -noout`
-    // output verbatim -- `VapidSignatureBuilder::from_pem` needs a real,
+    // output verbatim -- signing needs a real,
     // parseable SEC1 EC key to get past signature-building and actually
     // reach the network call this test means to exercise; a bogus/empty
     // string would fail at `signature_builder.build()`, before
@@ -501,6 +496,12 @@ AwEHoUQDQgAEZGCEGdhU+lVKPN9eP0esU1lUjQS/QenHXBw2+YsPSjQ28Tq+6trX
 MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
 -----END EC PRIVATE KEY-----
 ";
+
+    /// [`TEST_VAPID_PRIVATE_KEY_PEM`], parsed the way `main` parses the
+    /// configured key.
+    pub(crate) fn test_vapid_key() -> VapidKey {
+        VapidKey::parse(TEST_VAPID_PRIVATE_KEY_PEM).expect("test key parses")
+    }
 
     // A real, correctly-shaped P-256 uncompressed point (65 bytes, leading
     // 0x04) / 16-byte auth secret, base64url-no-padding -- same reasoning
@@ -567,7 +568,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         };
 
         let outcome = send_to_subscription_with_timeout(
-            TEST_VAPID_PRIVATE_KEY_PEM,
+            &test_vapid_key(),
             "mailto:test@example.com",
             &subscription,
             &payload,
@@ -607,7 +608,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         };
 
         let outcome = send_to_subscription_with_timeout(
-            TEST_VAPID_PRIVATE_KEY_PEM,
+            &test_vapid_key(),
             "mailto:test@example.com",
             &subscription,
             &payload(),
@@ -637,7 +638,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 auth: TEST_AUTH.to_string(),
             };
             let outcome = send_to_subscription_with_timeout(
-                TEST_VAPID_PRIVATE_KEY_PEM,
+                &test_vapid_key(),
                 "mailto:test@example.com",
                 &subscription,
                 &payload(),
@@ -677,7 +678,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         };
 
         let outcome = send_to_subscription(
-            "not-a-real-vapid-key",
+            &test_vapid_key(),
             "mailto:test@example.com",
             &subscription,
             &payload(),

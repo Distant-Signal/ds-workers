@@ -9,6 +9,7 @@ mod push_queue;
 mod queries;
 mod send;
 mod skip_check;
+mod vapid_key;
 
 use std::time::Duration;
 
@@ -95,6 +96,17 @@ async fn run() -> anyhow::Result<()> {
         common::logging::EnvFilter::new(&config.log_level),
     );
 
+    // Parse the private key once, in any accepted format, and refuse to
+    // start on a key the configured public key does not belong to: every
+    // existing subscription is bound to VAPID_PUBLIC_KEY, so signing with
+    // anything else would fail every send. See `vapid_key`.
+    let vapid_key = vapid_key::VapidKey::parse(config.vapid_private_key.expose())?;
+    vapid_key.verify_public_key(&config.vapid_public_key)?;
+    tracing::info!(
+        format = vapid_key.format().as_str(),
+        "VAPID private key loaded"
+    );
+
     if config.metrics_enabled {
         common::metrics::install(config.metrics_port)?;
         ds_store::pool::register_metrics();
@@ -133,10 +145,7 @@ async fn run() -> anyhow::Result<()> {
     // (SVC-02): a cycle only decides and enqueues, so a slow or tarpitting
     // push endpoint can no longer hold up any cycle.
     let queue = PushQueue::start(
-        PgBackend::new(
-            pool.clone(),
-            Pusher::new(config.vapid_private_key.expose(), &config.vapid_subject),
-        ),
+        PgBackend::new(pool.clone(), Pusher::new(vapid_key, &config.vapid_subject)),
         config.push_queue_config(),
     );
 
