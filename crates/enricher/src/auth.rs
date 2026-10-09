@@ -1,9 +1,10 @@
 //! Credentials for the LLM endpoint: none, a static API key, or a
-//! short-lived `OpenAI` access token minted by workload identity federation
-//! (WIF), with no static secret anywhere.
+//! short-lived `OpenAI` or Claude API access token minted by workload
+//! identity federation (WIF), with no static secret anywhere.
 //!
 //! See docs/enricher-openai.md, "Keyless auth (workload identity
-//! federation)". Two federated flows, chosen by `LLM_AUTH`:
+//! federation)", and docs/enricher-anthropic.md, "Keyless auth". Three
+//! federated flows, chosen by `LLM_AUTH`:
 //!
 //! - `openai-wif-authentik` (primary): the kubelet-projected service-account
 //!   token is sent to Authentik's token endpoint as a `client_assertion`
@@ -11,10 +12,18 @@
 //!   access token is the subject token of the `OpenAI` exchange.
 //! - `openai-wif-kubernetes` (fallback): the projected token is the subject
 //!   token itself (`OpenAI` verifies it against an uploaded k3s JWKS).
+//! - `anthropic-wif-authentik`: as `openai-wif-authentik`, but Authentik's
+//!   access token is the `assertion` of the Claude API's exchange
+//!   (`POST https://api.anthropic.com/v1/oauth/token`, RFC 7523
+//!   `jwt-bearer` grant). The Claude API accepts a JWT carrying a `jti` only
+//!   once, so every Claude exchange gets a FRESH Authentik token: the
+//!   Authentik token is never cached in this mode.
 //!
-//! Either way the `OpenAI` exchange (`POST https://auth.openai.com/oauth/token`,
-//! RFC 8693 token exchange) returns a bearer token lasting at most an hour,
-//! with no refresh token: renewing is exchanging again. Tokens are cached
+//! The `OpenAI` exchange (`POST https://auth.openai.com/oauth/token`, RFC
+//! 8693 token exchange) and the Claude one both return a bearer token
+//! lasting at most an hour (Claude: the rule's lifetime, capped at twice
+//! the presented JWT's remaining life), with no refresh token: renewing is
+//! exchanging again. Tokens are cached
 //! until shortly before they expire, refreshed single-flight, and never
 //! logged (every one is a [`Secret`], whose `Debug` prints no value).
 
@@ -35,13 +44,17 @@ pub(crate) const EXCHANGE_METRIC: &str = "enricher_llm_token_exchange_total";
 pub(crate) const REMAINING_METRIC: &str = "enricher_llm_token_remaining_seconds";
 
 /// Every `outcome` label of [`EXCHANGE_METRIC`]; registered at 0 so an
-/// alert's `increase()` sees the first failure.
-pub(crate) const EXCHANGE_OUTCOMES: [&str; 8] = [
+/// alert's `increase()` sees the first failure. `authentication_failed` is
+/// the Claude API's single, deliberately opaque denial (401
+/// `authentication_error`); its reason is only on the Console's
+/// authentication history page.
+pub(crate) const EXCHANGE_OUTCOMES: [&str; 9] = [
     "success",
     "token_file_error",
     "invalid_grant",
     "invalid_client",
     "invalid_subject_token",
+    "authentication_failed",
     "http_error",
     "timeout",
     "error",
@@ -63,6 +76,8 @@ const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_REMAINING: Duration = Duration::from_secs(5);
 
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+/// RFC 7523's grant, the Claude API's exchange.
+const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 const JWT_BEARER_ASSERTION: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
@@ -80,6 +95,17 @@ pub(crate) enum LlmAuthMode {
     OpenaiWifAuthentik,
     /// k8s token -> `OpenAI` token exchange.
     OpenaiWifKubernetes,
+    /// k8s token -> Authentik -> Claude API token exchange (a fresh
+    /// Authentik token per exchange). `LLM_PROVIDER=anthropic` only.
+    AnthropicWifAuthentik,
+}
+
+impl LlmAuthMode {
+    /// Whether this mode mints Claude API tokens (else `OpenAI` ones, or
+    /// none for `api-key`).
+    pub(crate) fn is_anthropic(self) -> bool {
+        self == Self::AnthropicWifAuthentik
+    }
 }
 
 /// Which token endpoint a failure (or success) belongs to; the `stage`
@@ -88,6 +114,7 @@ pub(crate) enum LlmAuthMode {
 pub(crate) enum Stage {
     Authentik,
     Openai,
+    Anthropic,
 }
 
 impl Stage {
@@ -95,6 +122,37 @@ impl Stage {
         match self {
             Self::Authentik => "authentik",
             Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+/// Which provider's token exchange a federated source calls, with that
+/// provider's identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExchangeTarget {
+    /// `OpenAI` (RFC 8693): the Workload Identity Provider and service
+    /// account IDs.
+    Openai {
+        identity_provider_id: String,
+        service_account_id: String,
+    },
+    /// The Claude API (RFC 7523): the federation rule (`fdrl_...`), the
+    /// organization UUID, the service account (`svac_...`) and, when the
+    /// rule spans several workspaces, the workspace (`wrkspc_...`).
+    Anthropic {
+        federation_rule_id: String,
+        organization_id: String,
+        service_account_id: String,
+        workspace_id: Option<String>,
+    },
+}
+
+impl ExchangeTarget {
+    fn stage(&self) -> Stage {
+        match self {
+            Self::Openai { .. } => Stage::Openai,
+            Self::Anthropic { .. } => Stage::Anthropic,
         }
     }
 }
@@ -113,14 +171,15 @@ pub(crate) struct AuthentikConfig {
 /// credential is the projected token file, read on every exchange.
 #[derive(Debug, Clone)]
 pub(crate) struct FederationConfig {
-    pub identity_provider_id: String,
-    pub service_account_id: String,
+    /// Whose exchange, and its identifiers.
+    pub target: ExchangeTarget,
     /// The kubelet-projected service-account token. Re-read on every
     /// exchange: the kubelet rotates it.
     pub identity_token_file: PathBuf,
-    /// `OpenAI`'s token-exchange endpoint.
+    /// The provider's token-exchange endpoint.
     pub token_exchange_url: String,
-    /// `Some` in `openai-wif-authentik` mode.
+    /// `Some` in the two Authentik modes (always in
+    /// `anthropic-wif-authentik`).
     pub authentik: Option<AuthentikConfig>,
     /// Lower bound of the refresh margin (`LLM_TOKEN_REFRESH_SKEW_SECS`); the
     /// margin is the larger of this and 10% of the token's lifetime.
@@ -136,7 +195,7 @@ pub(crate) enum LlmAuth {
     None,
     /// `LLM_API_KEY`, sent as-is.
     Static(Secret),
-    /// A workload-identity-federated `OpenAI` access token.
+    /// A workload-identity-federated `OpenAI` or Claude API access token.
     Federated(Arc<FederatedTokenSource>),
 }
 
@@ -161,14 +220,27 @@ impl LlmAuth {
         matches!(self, Self::Federated(_))
     }
 
-    /// The bearer token for the next request, if any. Only the federated
-    /// variant can fail (`LlmCallError::CredentialUnavailable`).
-    pub(crate) async fn bearer(&self) -> Result<Option<Secret>, LlmCallError> {
-        match self {
-            Self::None => Ok(None),
-            Self::Static(key) => Ok(Some(key.clone())),
-            Self::Federated(source) => source.bearer().await.map(Some),
-        }
+    /// The credential for the next request and how it goes on the wire.
+    /// Only the federated variant can fail
+    /// (`LlmCallError::CredentialUnavailable`).
+    /// `static_key` says how this provider takes a static API key
+    /// (`OpenAI`-compatible: `Authorization: Bearer`; Anthropic:
+    /// `x-api-key`). A minted (federated) token is always a bearer token
+    /// and never also sent as `x-api-key`: that is how `OpenAI`'s exchanged
+    /// tokens work today, and how the Claude API's own workload identity
+    /// federation tokens are presented (see [`Credential`]).
+    pub(crate) async fn credential(
+        &self,
+        static_key: StaticKeyHeader,
+    ) -> Result<Option<Credential>, LlmCallError> {
+        Ok(match self {
+            Self::None => None,
+            Self::Static(key) => Some(match static_key {
+                StaticKeyHeader::Bearer => Credential::Bearer(key.clone()),
+                StaticKeyHeader::XApiKey => Credential::ApiKey(key.clone()),
+            }),
+            Self::Federated(source) => Some(Credential::Bearer(source.bearer().await?)),
+        })
     }
 
     /// The endpoint rejected `rejected` (a 401): forget it, so the next
@@ -177,6 +249,67 @@ impl LlmAuth {
     pub(crate) fn invalidate(&self, rejected: &Secret) {
         if let Self::Federated(source) = self {
             source.invalidate(rejected);
+        }
+    }
+}
+
+/// How a provider takes a static API key (`LLM_API_KEY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticKeyHeader {
+    /// `Authorization: Bearer <key>` (`OpenAI` and every OpenAI-compatible
+    /// server).
+    Bearer,
+    /// `x-api-key: <key>` (the Claude API).
+    XApiKey,
+}
+
+/// One request's credential, as it goes on the wire.
+///
+/// The seam for keyless Claude auth (not implemented): the Claude API's
+/// workload identity federation exchanges a projected service-account JWT
+/// at `POST {base}/oauth/token` (RFC 7523 `jwt-bearer` grant; body fields
+/// `assertion`, `federation_rule_id`, `organization_id`,
+/// `service_account_id`, optional `workspace_id`) for an `access_token`
+/// with an `expires_in`, sent as `Authorization: Bearer` with no
+/// `x-api-key`. It would be another [`LlmAuth::Federated`] source (a new
+/// `LLM_AUTH` mode) whose token arrives here as [`Credential::Bearer`], so
+/// nothing in `llm.rs` changes. Two differences from the `OpenAI` source
+/// above: the subject JWT is single-use (its `jti` is checked), so a
+/// refresh must re-read the projected token file every time and never
+/// re-present one; and the token file path and settings should be named
+/// generically, not `openai`. Batches belong to the workspace, not the
+/// credential, so batch ids persisted under an API key stay valid after a
+/// switch to federation in the same workspace.
+#[derive(Clone)]
+pub(crate) enum Credential {
+    /// `Authorization: Bearer <token>`.
+    Bearer(Secret),
+    /// `x-api-key: <key>`.
+    ApiKey(Secret),
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer(_) => f.write_str("Credential::Bearer(***)"),
+            Self::ApiKey(_) => f.write_str("Credential::ApiKey(***)"),
+        }
+    }
+}
+
+impl Credential {
+    /// The secret itself (for [`LlmAuth::invalidate`] after a 401).
+    pub(crate) fn secret(&self) -> &Secret {
+        match self {
+            Self::Bearer(secret) | Self::ApiKey(secret) => secret,
+        }
+    }
+
+    /// Adds this credential's header to `request`.
+    pub(crate) fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::Bearer(token) => request.bearer_auth(token.expose()),
+            Self::ApiKey(key) => request.header("x-api-key", key.expose()),
         }
     }
 }
@@ -309,12 +442,15 @@ fn parse_exchange_error(body: &str) -> ExchangeErrorBody {
     }
 }
 
-/// The outcome label of a non-2xx token-endpoint response.
-fn exchange_outcome(body: &ExchangeErrorBody) -> &'static str {
+/// The outcome label of a non-2xx token-endpoint response. The Claude
+/// API answers every denial with the same 401 `authentication_error`.
+fn exchange_outcome(stage: Stage, status: u16, body: &ExchangeErrorBody) -> &'static str {
     match body.code.as_deref() {
         Some("invalid_grant") => "invalid_grant",
         Some("invalid_client") => "invalid_client",
         Some("invalid_subject_token") => "invalid_subject_token",
+        Some("authentication_error") => "authentication_failed",
+        _ if stage == Stage::Anthropic && status == 401 => "authentication_failed",
         _ => "http_error",
     }
 }
@@ -381,10 +517,12 @@ impl FederatedTokenSource {
 
     /// Every `{stage, outcome}` this mode can produce, at 0.
     fn register_metrics(&self) {
+        let target = self.config.target.stage();
+        let with_authentik = [Stage::Authentik, target];
         let stages: &[Stage] = if self.config.authentik.is_some() {
-            &[Stage::Authentik, Stage::Openai]
+            &with_authentik
         } else {
-            &[Stage::Openai]
+            &with_authentik[1..]
         };
         for stage in stages {
             for outcome in EXCHANGE_OUTCOMES {
@@ -480,8 +618,20 @@ impl FederatedTokenSource {
     }
 
     /// One full refresh: the subject token (file, or file -> Authentik),
-    /// then the `OpenAI` exchange. Caller holds the refresh lock.
+    /// then the provider's exchange. Caller holds the refresh lock.
     async fn refresh_locked(&self, state: &mut RefreshState) -> Result<Secret, ExchangeFailure> {
+        if let ExchangeTarget::Anthropic { .. } = &self.config.target {
+            // A JWT with a `jti` is accepted once: never re-present a
+            // cached Authentik token, not even after a 401 (whose
+            // re-exchange comes through here too).
+            state.authentik = None;
+            let Some(authentik) = &self.config.authentik else {
+                return Err(self.missing_authentik());
+            };
+            let assertion = self.authentik_token(authentik, state).await;
+            state.authentik = None;
+            return self.anthropic_exchange(&assertion?).await;
+        }
         let subject = match &self.config.authentik {
             None => self.read_identity_token(Stage::Openai)?,
             Some(authentik) => self.authentik_token(authentik, state).await?,
@@ -549,6 +699,64 @@ impl FederatedTokenSource {
         Ok(issued)
     }
 
+    /// `anthropic-wif-authentik` without Authentik settings: config
+    /// validation prevents it, so this is only a typed failure.
+    fn missing_authentik(&self) -> ExchangeFailure {
+        tracing::error!("anthropic-wif-authentik has no Authentik settings");
+        record_exchange(Stage::Anthropic, "error");
+        ExchangeFailure {
+            stage: Stage::Anthropic,
+            outcome: "error",
+        }
+    }
+
+    /// The Claude API's exchange: RFC 7523 `jwt-bearer`, JSON body, with
+    /// Authentik's (fresh) access token as the `assertion`.
+    async fn anthropic_exchange(&self, assertion: &Secret) -> Result<Secret, ExchangeFailure> {
+        #[derive(Serialize)]
+        struct ExchangeRequest<'a> {
+            grant_type: &'a str,
+            assertion: &'a str,
+            federation_rule_id: &'a str,
+            organization_id: &'a str,
+            service_account_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            workspace_id: Option<&'a str>,
+        }
+        let ExchangeTarget::Anthropic {
+            federation_rule_id,
+            organization_id,
+            service_account_id,
+            workspace_id,
+        } = &self.config.target
+        else {
+            return Err(self.missing_authentik());
+        };
+        let request = self
+            .http
+            .post(&self.config.token_exchange_url)
+            .json(&ExchangeRequest {
+                grant_type: JWT_BEARER_GRANT,
+                assertion: assertion.expose(),
+                federation_rule_id,
+                organization_id,
+                service_account_id,
+                workspace_id: workspace_id.as_deref(),
+            });
+        let token = self
+            .post_token(Stage::Anthropic, request, &[assertion])
+            .await?;
+        Ok(self.store(token))
+    }
+
+    /// Caches a freshly minted provider token and returns it.
+    fn store(&self, token: CachedToken) -> Secret {
+        let issued = token.token.clone();
+        record_remaining(token.expires_at.saturating_duration_since(self.clock.now()));
+        *self.lock_cached() = Some(token);
+        issued
+    }
+
     async fn openai_exchange(&self, subject: &Secret) -> Result<Secret, ExchangeFailure> {
         #[derive(Serialize)]
         struct ExchangeRequest<'a> {
@@ -558,6 +766,13 @@ impl FederatedTokenSource {
             identity_provider_id: &'a str,
             service_account_id: &'a str,
         }
+        let ExchangeTarget::Openai {
+            identity_provider_id,
+            service_account_id,
+        } = &self.config.target
+        else {
+            return Err(self.missing_authentik());
+        };
         let request = self
             .http
             .post(&self.config.token_exchange_url)
@@ -565,14 +780,11 @@ impl FederatedTokenSource {
                 grant_type: TOKEN_EXCHANGE_GRANT,
                 subject_token: subject.expose(),
                 subject_token_type: JWT_TOKEN_TYPE,
-                identity_provider_id: &self.config.identity_provider_id,
-                service_account_id: &self.config.service_account_id,
+                identity_provider_id,
+                service_account_id,
             });
         let token = self.post_token(Stage::Openai, request, &[subject]).await?;
-        let issued = token.token.clone();
-        record_remaining(token.expires_at.saturating_duration_since(self.clock.now()));
-        *self.lock_cached() = Some(token);
-        Ok(issued)
+        Ok(self.store(token))
     }
 
     /// Sends one token request and classifies the result. `redact` are the
@@ -601,7 +813,7 @@ impl FederatedTokenSource {
         let status = response.status();
         if !status.is_success() {
             let body = parse_exchange_error(&response.text().await.unwrap_or_default());
-            let outcome = exchange_outcome(&body);
+            let outcome = exchange_outcome(stage, status.as_u16(), &body);
             let description = body.description.map(|d| {
                 let mut shown: String = d.chars().take(MAX_DESCRIPTION_CHARS).collect();
                 for secret in redact {
@@ -666,6 +878,9 @@ impl FederatedTokenSource {
 }
 
 #[cfg(test)]
+mod anthropic_wif_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::io::Write as _;
 
@@ -688,8 +903,10 @@ pub(crate) mod tests {
         file: &std::path::Path,
     ) -> FederationConfig {
         FederationConfig {
-            identity_provider_id: "idp_test".into(),
-            service_account_id: "svc_acct_test".into(),
+            target: ExchangeTarget::Openai {
+                identity_provider_id: "idp_test".into(),
+                service_account_id: "svc_acct_test".into(),
+            },
             identity_token_file: file.to_path_buf(),
             token_exchange_url: format!("{}/oauth/token", server.uri()),
             authentik: None,
@@ -1087,7 +1304,11 @@ pub(crate) mod tests {
         ];
         for (body, outcome, description) in cases {
             let parsed = parse_exchange_error(body);
-            assert_eq!(exchange_outcome(&parsed), outcome, "{body}");
+            assert_eq!(
+                exchange_outcome(Stage::Openai, 400, &parsed),
+                outcome,
+                "{body}"
+            );
             assert_eq!(parsed.description.as_deref(), description, "{body}");
         }
     }
@@ -1225,10 +1446,17 @@ pub(crate) mod tests {
         let auth = LlmAuth::Federated(Arc::new(
             FederatedTokenSource::new(authentik_config(&server, file.path())).unwrap(),
         ));
-        let token = auth.bearer().await.unwrap().unwrap();
+        let credential = auth
+            .credential(StaticKeyHeader::XApiKey)
+            .await
+            .unwrap()
+            .unwrap();
+        // A minted token is a bearer token whatever the static-key header.
+        assert!(matches!(credential, Credential::Bearer(_)));
+        let token = credential.secret().clone();
         assert_eq!(token.expose(), "oai-secret-token");
         auth.invalidate(&token);
-        assert!(auth.bearer().await.is_err());
+        assert!(auth.credential(StaticKeyHeader::Bearer).await.is_err());
 
         let debug = format!(
             "{auth:?} {token:?} {:?}",

@@ -1,7 +1,15 @@
-//! Client for the generic OpenAI-compatible Chat Completions REST API.
-//! Deliberately vendor-agnostic: `base_url`/credential/`model` are the only
-//! things that vary between a local llama.cpp/vLLM/Ollama server and any
-//! hosted provider that speaks the same schema.
+//! The LLM client. Two providers (`LLM_PROVIDER`):
+//!
+//! - `openai` (the default): the generic OpenAI-compatible Chat Completions
+//!   REST API. Deliberately vendor-agnostic: `base_url`/credential/`model`
+//!   are the only things that vary between a local llama.cpp/vLLM/Ollama
+//!   server and any hosted provider that speaks the same schema.
+//! - `anthropic`: the Claude API's Messages API, plus its Message Batches
+//!   API for the sweep (`anthropic`, docs/enricher-anthropic.md).
+//!
+//! Both share everything above the wire: the prompts and schemas, the
+//! three call sites, [`ProviderPolicy`]'s retries and concurrency limit,
+//! the typed [`LlmCallError`]s and the metrics.
 //!
 //! See
 //! docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md
@@ -11,6 +19,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+pub(crate) mod anthropic;
 
 /// A date range as stated (or inferred) by the primary pass. `None` on
 /// either side is a real, distinct fact -- not "unknown":
@@ -188,8 +198,81 @@ pub(crate) struct SeverityAdversarialPeriodVerdict {
     pub apparent_severity: String,
 }
 
+/// `LLM_PROVIDER`: which wire API the client speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ProviderKind {
+    /// Any OpenAI-compatible Chat Completions endpoint (`OpenAI`, Ollama,
+    /// vLLM, NVIDIA, ...).
+    #[default]
+    Openai,
+    /// The Claude API (Messages and Message Batches).
+    Anthropic,
+}
+
+impl ProviderKind {
+    /// `LLM_PROVIDER` from the environment (default `openai`), for the
+    /// model-eval harness and the live evals.
+    #[cfg(test)]
+    pub(crate) fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("LLM_PROVIDER") {
+            Ok(value) if !value.trim().is_empty() => {
+                <Self as clap::ValueEnum>::from_str(value.trim(), true)
+                    .map_err(|err| anyhow::anyhow!("LLM_PROVIDER: {err}"))
+            }
+            _ => Ok(Self::Openai),
+        }
+    }
+}
+
+/// The provider and its provider-specific settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Provider {
+    OpenAi,
+    Anthropic(anthropic::AnthropicSettings),
+}
+
+/// One pass's request, provider-neutral: which call site, its static system
+/// prompt and schema, and the per-incident user content. Built by
+/// [`primary_spec`] and friends; sent by `LlmClient::chat_completion`, or
+/// as a Message Batch request (`LlmClient::batch_params`).
+pub(crate) struct CallSpec {
+    pub call: LlmCall,
+    system_prompt: String,
+    user_content: String,
+    schema_name: &'static str,
+    schema: serde_json::Value,
+}
+
+/// The sampling parameters sent with every call (from the active
+/// profile, `profile.rs`); `None` is not sent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Sampling {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+}
+
+impl Sampling {
+    /// What `LlmClient::new` sends: `temperature: 0`, as before profiles.
+    pub(crate) const OPENAI_DEFAULT: Self = Self {
+        temperature: Some(0.0),
+        top_p: None,
+    };
+    /// What `LlmClient::with_anthropic` sends: nothing.
+    pub(crate) const NONE: Self = Self {
+        temperature: None,
+        top_p: None,
+    };
+}
+
 pub(crate) struct LlmClient {
     base_url: String,
+    /// `temperature`/`top_p` (`profile.rs`).
+    sampling: Sampling,
+    /// The three system prompts (`profile::PromptSet`).
+    prompts: std::sync::Arc<crate::profile::PromptSet>,
+    /// `LLM_PROVIDER` (default `openai`).
+    provider: Provider,
     /// The endpoint's credential (see `auth.rs`): none, `LLM_API_KEY`, or a
     /// workload-identity-federated `OpenAI` token.
     auth: crate::auth::LlmAuth,
@@ -233,9 +316,11 @@ pub(crate) struct RawCall {
 }
 
 /// Token counts from a response's `usage` object. Every field is optional:
-/// `OpenAI` sends all four (`reasoning_tokens` under
+/// `OpenAI` sends the first four (`reasoning_tokens` under
 /// `completion_tokens_details`, `cached_tokens` under
-/// `prompt_tokens_details`); Ollama and others send some or none.
+/// `prompt_tokens_details`); Ollama and others send some or none. The
+/// Claude API's usage maps onto the same kinds plus `cache_write_tokens`
+/// (`anthropic::usage_from_message`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(
     clippy::struct_field_names,
@@ -250,6 +335,12 @@ pub(crate) struct TokenUsage {
     pub reasoning_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// Prompt tokens written to the prompt cache (the Claude API's
+    /// `cache_creation_input_tokens`, billed at the cache-write premium).
+    /// Part of `prompt_tokens`, like `cached_tokens`. `OpenAI` never sends
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -266,6 +357,7 @@ impl TokenUsage {
             completion_tokens: count(Some(usage), "completion_tokens"),
             reasoning_tokens: count(usage.get("completion_tokens_details"), "reasoning_tokens"),
             cached_tokens: count(usage.get("prompt_tokens_details"), "cached_tokens"),
+            cache_write_tokens: None,
         };
         (parsed != Self::default()).then_some(parsed)
     }
@@ -283,7 +375,20 @@ impl TokenUsage {
 /// price) and `reasoning` a subset of `completion` (already billed as
 /// output). So spend = (prompt - cached) x input price + cached x cached
 /// price + completion x output price; never add `reasoning` on top.
+///
+/// The Claude API adds `cache_write`, also a subset of `prompt` (billed at
+/// the cache-write premium): spend = (prompt - cached - `cache_write`) x
+/// input + cached x cache-read + `cache_write` x cache-write + completion x
+/// output (docs/enricher-anthropic.md, "Metrics and cost"). Message Batches
+/// results are counted in [`BATCH_TOKENS_METRIC`] instead, because they are
+/// billed at half price.
 pub(crate) const TOKENS_METRIC: &str = "enricher_llm_tokens_total";
+
+/// `enricher_llm_batch_tokens_total{call, kind}`: [`TOKENS_METRIC`]'s
+/// counts for Message Batches results (`LLM_SWEEP_MODE=batch`), which the
+/// Claude API bills at 50% of the synchronous price. Registered only when
+/// batch mode is on.
+pub(crate) const BATCH_TOKENS_METRIC: &str = "enricher_llm_batch_tokens_total";
 
 /// `enricher_llm_model_info{model, base_url_host} 1`: which model and
 /// endpoint the token counter's numbers belong to, for joining a price onto
@@ -292,7 +397,8 @@ pub(crate) const TOKENS_METRIC: &str = "enricher_llm_tokens_total";
 pub(crate) const MODEL_INFO_METRIC: &str = "enricher_llm_model_info";
 
 /// Every `kind` label of [`TOKENS_METRIC`].
-pub(crate) const TOKEN_KINDS: [&str; 4] = ["prompt", "completion", "reasoning", "cached"];
+pub(crate) const TOKEN_KINDS: [&str; 5] =
+    ["prompt", "completion", "reasoning", "cached", "cache_write"];
 
 /// One of the enricher's three chat-completion call sites: the `call` label
 /// of the LLM metrics (`enricher_llm_call_total`,
@@ -323,23 +429,30 @@ impl LlmCall {
 /// Registers every `{call, kind}` series of [`TOKENS_METRIC`] at 0 and sets
 /// [`MODEL_INFO_METRIC`] for this process's model and endpoint host. Called
 /// once at startup, after the recorder is installed.
-pub(crate) fn register_usage_metrics(model: &str, base_url: &str) {
+pub(crate) fn register_usage_metrics(model: &str, base_url: &str, profile: &str) {
+    register_token_series(TOKENS_METRIC);
+    metrics::gauge!(
+        common::metrics::metric_name(MODEL_INFO_METRIC),
+        "model" => model.to_string(),
+        "profile" => profile.to_string(),
+        "base_url_host" => base_url_host(base_url)
+    )
+    .set(1.0);
+}
+
+/// Registers every `{call, kind}` series of `metric` (one of the token
+/// counters) at 0.
+pub(crate) fn register_token_series(metric: &'static str) {
     for call in LlmCall::ALL {
         for kind in TOKEN_KINDS {
             metrics::counter!(
-                common::metrics::metric_name(TOKENS_METRIC),
+                common::metrics::metric_name(metric),
                 "call" => call.label(),
                 "kind" => kind
             )
             .increment(0);
         }
     }
-    metrics::gauge!(
-        common::metrics::metric_name(MODEL_INFO_METRIC),
-        "model" => model.to_string(),
-        "base_url_host" => base_url_host(base_url)
-    )
-    .set(1.0);
 }
 
 /// `base_url`'s host (and port, when it has one): never its path, query or
@@ -358,15 +471,22 @@ fn base_url_host(base_url: &str) -> String {
 
 /// Adds one response's reported tokens to [`TOKENS_METRIC`].
 fn record_token_usage(call: LlmCall, usage: &TokenUsage) {
+    record_token_usage_to(TOKENS_METRIC, call, usage);
+}
+
+/// Adds one response's reported tokens to `metric` ([`TOKENS_METRIC`] or
+/// [`BATCH_TOKENS_METRIC`]).
+pub(crate) fn record_token_usage_to(metric: &'static str, call: LlmCall, usage: &TokenUsage) {
     for (kind, count) in [
         ("prompt", usage.prompt_tokens),
         ("completion", usage.completion_tokens),
         ("reasoning", usage.reasoning_tokens),
         ("cached", usage.cached_tokens),
+        ("cache_write", usage.cache_write_tokens),
     ] {
         if let Some(count) = count {
             metrics::counter!(
-                common::metrics::metric_name(TOKENS_METRIC),
+                common::metrics::metric_name(metric),
                 "call" => call.label(),
                 "kind" => kind
             )
@@ -566,7 +686,7 @@ impl std::fmt::Display for LlmCallError {
             Self::Unauthorized => write!(
                 f,
                 "LLM endpoint rejected a freshly exchanged access token (401 twice); check the \
-                 OpenAI service account, its project and the WIF mapping"
+                 service account, its project or workspace and the federation mapping or rule"
             ),
             Self::Other(err) => write!(f, "{err}"),
         }
@@ -671,13 +791,16 @@ fn gateway_backoff(
     })
 }
 
-/// `x-request-id` from a response, for log lines on failures (`OpenAI`
-/// support asks for it; absent on most self-hosted servers).
+/// `x-request-id` (`OpenAI`) or `request-id` (the Claude API) from a
+/// response, for log lines on failures (both providers' support ask for
+/// it; absent on most self-hosted servers).
 fn request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    ["x-request-id", "request-id"].into_iter().find_map(|name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    })
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
@@ -699,13 +822,71 @@ struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage>,
     response_format: ResponseFormat,
-    temperature: f32,
+    /// The profile's `temperature` (0 by default); omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    /// Omitted when `None` (the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
     /// Omitted from the wire when `None` (the default policy).
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     /// Omitted from the wire when `None` (the default policy).
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+}
+
+/// One prepared request, on the wire of the client's provider.
+enum WireRequest<'a> {
+    Chat(ChatCompletionRequest<'a>),
+    /// A Claude Messages API body (`anthropic::messages_body`).
+    Messages {
+        call: LlmCall,
+        /// The `anthropic-version` header.
+        version: &'a str,
+        body: serde_json::Value,
+    },
+}
+
+impl WireRequest<'_> {
+    fn call(&self) -> LlmCall {
+        match self {
+            Self::Chat(request) => request.call,
+            Self::Messages { call, .. } => *call,
+        }
+    }
+}
+
+/// A Chat Completions response body: its usage (`None` if absent or odd)
+/// and its content or typed failure (a refusal, empty content, no choices).
+fn chat_completion_content(
+    body: serde_json::Value,
+) -> (Option<TokenUsage>, Result<String, LlmCallError>) {
+    let body: ChatCompletionResponse = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(err) => return (None, Err(LlmCallError::Other(err.into()))),
+    };
+    let usage = body.usage.as_ref().and_then(TokenUsage::from_response);
+    let Some(choice) = body.choices.into_iter().next() else {
+        return (
+            usage,
+            Err(LlmCallError::Other(anyhow::anyhow!(
+                "chat completion response had no choices"
+            ))),
+        );
+    };
+    if let Some(refusal) = choice.message.refusal.filter(|r| !r.trim().is_empty()) {
+        return (usage, Err(LlmCallError::Refused { refusal }));
+    }
+    match choice.message.content {
+        Some(content) if !content.trim().is_empty() => (usage, Ok(content)),
+        _ => (
+            usage,
+            Err(LlmCallError::EmptyContent {
+                finish_reason: choice.finish_reason,
+            }),
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -1064,16 +1245,26 @@ const SEVERITY_ADVERSARIAL_PROMPT: &str = "You are reviewing a UK National Rail 
 /// (The user-content wrappers in the `*_raw` methods aren't covered.)
 #[cfg(test)]
 pub(crate) fn prompt_fingerprint() -> String {
+    prompt_fingerprint_of(&crate::profile::PromptSet::builtin())
+}
+
+/// [`prompt_fingerprint`] of a given prompt set (a profile's overrides).
+#[cfg(test)]
+pub(crate) fn prompt_fingerprint_of(prompts: &crate::profile::PromptSet) -> String {
     let mut text = String::new();
     for (prompt, schema_name, schema) in [
-        (PRIMARY_PROMPT, PRIMARY_SCHEMA_NAME, primary_schema()),
         (
-            ADVERSARIAL_PROMPT,
+            prompts.primary.as_str(),
+            PRIMARY_SCHEMA_NAME,
+            primary_schema(),
+        ),
+        (
+            prompts.adversarial.as_str(),
             ADVERSARIAL_SCHEMA_NAME,
             adversarial_schema(),
         ),
         (
-            SEVERITY_ADVERSARIAL_PROMPT,
+            prompts.severity_adversarial.as_str(),
             SEVERITY_ADVERSARIAL_SCHEMA_NAME,
             severity_adversarial_schema(),
         ),
@@ -1125,6 +1316,9 @@ impl LlmClient {
             .expect("reqwest client with a timeout must build");
         Self {
             base_url,
+            sampling: Sampling::OPENAI_DEFAULT,
+            prompts: std::sync::Arc::new(crate::profile::PromptSet::builtin()),
+            provider: Provider::OpenAi,
             auth: crate::auth::LlmAuth::from_api_key(api_key),
             model,
             http,
@@ -1138,6 +1332,46 @@ impl LlmClient {
     pub(crate) fn with_auth(mut self, auth: crate::auth::LlmAuth) -> Self {
         self.auth = auth;
         self
+    }
+
+    /// Speaks the Claude API (`LLM_PROVIDER=anthropic`) instead of Chat
+    /// Completions. `base_url` is then e.g. `https://api.anthropic.com/v1`.
+    /// Also drops the default `temperature: 0` (the current Claude models
+    /// reject it); a profile can set sampling again with
+    /// [`Self::with_generation`].
+    pub(crate) fn with_anthropic(mut self, settings: anthropic::AnthropicSettings) -> Self {
+        self.provider = Provider::Anthropic(settings);
+        self.sampling = Sampling::NONE;
+        self
+    }
+
+    /// Applies a resolved profile (`profile::resolve`): sampling,
+    /// `max_tokens`, reasoning effort and (Claude) thinking. Call after
+    /// [`Self::with_provider_policy`] and [`Self::with_anthropic`].
+    pub(crate) fn with_generation(mut self, generation: &crate::profile::Generation) -> Self {
+        self.sampling = Sampling {
+            temperature: generation.temperature,
+            top_p: generation.top_p,
+        };
+        self.policy.max_tokens = generation.max_tokens;
+        self.policy
+            .reasoning_effort
+            .clone_from(&generation.reasoning_effort);
+        if let Provider::Anthropic(settings) = &mut self.provider {
+            settings.thinking.clone_from(&generation.thinking);
+        }
+        self
+    }
+
+    /// Uses these system prompts (`profile::PromptSet::load`).
+    pub(crate) fn with_prompts(mut self, prompts: crate::profile::PromptSet) -> Self {
+        self.prompts = std::sync::Arc::new(prompts);
+        self
+    }
+
+    /// The system prompts in use.
+    pub(crate) fn prompts(&self) -> &crate::profile::PromptSet {
+        &self.prompts
     }
 
     /// Opts into a non-default [`ProviderPolicy`].
@@ -1184,38 +1418,47 @@ impl LlmClient {
     /// One pass's chat completion, in-call retries included. Returns the raw
     /// `content` string (not yet parsed) and how many in-call retries the
     /// provider policy spent on it -- see [`RawCall`].
-    async fn chat_completion(
-        &self,
-        call: LlmCall,
-        system_prompt: &str,
-        user_content: String,
-        schema_name: &'static str,
-        schema: serde_json::Value,
-    ) -> RawCall {
-        let request = ChatCompletionRequest {
-            call,
-            model: &self.model,
-            messages: vec![
-                ChatMessage {
-                    role: "system",
-                    content: system_prompt.to_string(),
+    async fn chat_completion(&self, spec: CallSpec) -> RawCall {
+        let request = match &self.provider {
+            Provider::OpenAi => WireRequest::Chat(ChatCompletionRequest {
+                call: spec.call,
+                model: &self.model,
+                messages: vec![
+                    ChatMessage {
+                        role: "system",
+                        content: spec.system_prompt,
+                    },
+                    ChatMessage {
+                        role: "user",
+                        content: spec.user_content,
+                    },
+                ],
+                response_format: ResponseFormat {
+                    kind: "json_schema",
+                    json_schema: JsonSchemaSpec {
+                        name: spec.schema_name,
+                        strict: true,
+                        schema: spec.schema,
+                    },
                 },
-                ChatMessage {
-                    role: "user",
-                    content: user_content,
-                },
-            ],
-            response_format: ResponseFormat {
-                kind: "json_schema",
-                json_schema: JsonSchemaSpec {
-                    name: schema_name,
-                    strict: true,
-                    schema,
-                },
+                temperature: self.sampling.temperature,
+                top_p: self.sampling.top_p,
+                max_tokens: self.policy.max_tokens,
+                reasoning_effort: self.policy.reasoning_effort.as_deref(),
+            }),
+            Provider::Anthropic(settings) => WireRequest::Messages {
+                call: spec.call,
+                version: &settings.version,
+                body: anthropic::messages_body(
+                    &self.model,
+                    settings,
+                    &self.policy,
+                    self.sampling,
+                    &spec.system_prompt,
+                    &spec.user_content,
+                    &spec.schema,
+                ),
             },
-            temperature: 0.0,
-            max_tokens: self.policy.max_tokens,
-            reasoning_effort: self.policy.reasoning_effort.as_deref(),
         };
 
         // Bounded in-call retry for provider-transient failures. With the
@@ -1310,7 +1553,7 @@ impl LlmClient {
     /// the limiter is closed.
     async fn limited_send(
         &self,
-        request: &ChatCompletionRequest<'_>,
+        request: &WireRequest<'_>,
     ) -> anyhow::Result<(Result<Completion, LlmCallError>, Attempt)> {
         let queue_start = tokio::time::Instant::now();
         let _permit = match &self.in_flight {
@@ -1345,19 +1588,27 @@ impl LlmClient {
     /// 429/5xx classification, so it spends none of the provider policy's
     /// retry budgets. A 403 is never refreshed: a new token for the same
     /// service account would be refused the same way.
-    async fn send_once(
-        &self,
-        request: &ChatCompletionRequest<'_>,
-    ) -> Result<Completion, LlmCallError> {
+    async fn send_once(&self, request: &WireRequest<'_>) -> Result<Completion, LlmCallError> {
         let mut refreshed = false;
         let response = loop {
-            let bearer = self.auth.bearer().await?;
-            let mut req = self
-                .http
-                .post(format!("{}/chat/completions", self.base_url))
-                .json(request);
-            if let Some(token) = &bearer {
-                req = req.bearer_auth(token.expose());
+            let (mut req, static_key) = match request {
+                WireRequest::Chat(body) => (
+                    self.http
+                        .post(format!("{}/chat/completions", self.base_url))
+                        .json(body),
+                    crate::auth::StaticKeyHeader::Bearer,
+                ),
+                WireRequest::Messages { version, body, .. } => (
+                    self.http
+                        .post(format!("{}/messages", self.base_url))
+                        .header("anthropic-version", *version)
+                        .json(body),
+                    crate::auth::StaticKeyHeader::XApiKey,
+                ),
+            };
+            let credential = self.auth.credential(static_key).await?;
+            if let Some(credential) = &credential {
+                req = credential.apply(req);
             }
 
             let response = req.send().await.map_err(|err| {
@@ -1371,8 +1622,8 @@ impl LlmClient {
                 break response;
             }
             let request_id = request_id(response.headers());
-            if let Some(token) = &bearer {
-                self.auth.invalidate(token);
+            if let Some(credential) = &credential {
+                self.auth.invalidate(credential.secret());
             }
             if refreshed {
                 let err = LlmCallError::Unauthorized;
@@ -1398,7 +1649,14 @@ impl LlmClient {
             // quota 429) and the log line.
             let body = response.text().await.unwrap_or_default();
             let api_error = parse_api_error(&body);
-            let err = classify_error_status(status.as_u16(), retry_after, api_error.as_ref());
+            let err = match request {
+                WireRequest::Chat(_) => {
+                    classify_error_status(status.as_u16(), retry_after, api_error.as_ref())
+                }
+                WireRequest::Messages { .. } => {
+                    anthropic::classify_error_status(status.as_u16(), retry_after)
+                }
+            };
             let api_error = api_error.unwrap_or_default();
             tracing::warn!(
                 status = status.as_u16(),
@@ -1419,30 +1677,23 @@ impl LlmClient {
             );
             err
         };
-        let body: ChatCompletionResponse = response.json().await.map_err(|err| {
+        let body: serde_json::Value = response.json().await.map_err(|err| {
             failed(if err.is_timeout() {
                 LlmCallError::ClientTimeout
             } else {
                 LlmCallError::Other(err.into())
             })
         })?;
-        let usage = body.usage.as_ref().and_then(TokenUsage::from_response);
+        let (usage, content) = match request {
+            WireRequest::Chat(_) => chat_completion_content(body),
+            WireRequest::Messages { .. } => anthropic::completion_from_message(&body),
+        };
         if let Some(usage) = &usage {
-            record_token_usage(request.call, usage);
+            record_token_usage(request.call(), usage);
         }
-        let choice = body.choices.into_iter().next().ok_or_else(|| {
-            failed(LlmCallError::Other(anyhow::anyhow!(
-                "chat completion response had no choices"
-            )))
-        })?;
-        if let Some(refusal) = choice.message.refusal.filter(|r| !r.trim().is_empty()) {
-            return Err(failed(LlmCallError::Refused { refusal }));
-        }
-        match choice.message.content {
-            Some(content) if !content.trim().is_empty() => Ok(Completion { content, usage }),
-            _ => Err(failed(LlmCallError::EmptyContent {
-                finish_reason: choice.finish_reason,
-            })),
+        match content {
+            Ok(content) => Ok(Completion { content, usage }),
+            Err(err) => Err(failed(err)),
         }
     }
 
@@ -1476,18 +1727,12 @@ impl LlmClient {
         description: &str,
         reference_date: DateTime<Utc>,
     ) -> RawCall {
-        let user_content = format!(
-            "This incident was first reported around {}. Resolve any year-less date in the text below \
-             relative to that reference date.\nSummary: {summary}\nDescription: {description}",
-            reference_date.to_rfc3339()
-        );
-        self.chat_completion(
-            LlmCall::Primary,
-            PRIMARY_PROMPT,
-            user_content,
-            PRIMARY_SCHEMA_NAME,
-            primary_schema(),
-        )
+        self.chat_completion(primary_spec(
+            &self.prompts,
+            summary,
+            description,
+            reference_date,
+        ))
         .await
     }
 
@@ -1515,25 +1760,10 @@ impl LlmClient {
         description: &str,
         periods: &[ExtractionPeriod],
     ) -> RawCall {
-        let user_content = match build_period_user_content(summary, description, periods) {
-            Ok(content) => content,
-            Err(err) => {
-                return RawCall {
-                    content: Err(err),
-                    retries: 0,
-                    attempts: Vec::new(),
-                    usage: None,
-                };
-            }
-        };
-        self.chat_completion(
-            LlmCall::ResolutionAdversarial,
-            ADVERSARIAL_PROMPT,
-            user_content,
-            ADVERSARIAL_SCHEMA_NAME,
-            adversarial_schema(),
-        )
-        .await
+        match adversarial_spec(&self.prompts, summary, description, periods) {
+            Ok(spec) => self.chat_completion(spec).await,
+            Err(err) => RawCall::failed_before_sending(err),
+        }
     }
 
     pub(crate) async fn extract_severity_adversarial(
@@ -1557,26 +1787,87 @@ impl LlmClient {
         description: &str,
         periods: &[ExtractionPeriod],
     ) -> RawCall {
-        let user_content = match build_period_user_content(summary, description, periods) {
-            Ok(content) => content,
-            Err(err) => {
-                return RawCall {
-                    content: Err(err),
-                    retries: 0,
-                    attempts: Vec::new(),
-                    usage: None,
-                };
-            }
-        };
-        self.chat_completion(
-            LlmCall::SeverityAdversarial,
-            SEVERITY_ADVERSARIAL_PROMPT,
-            user_content,
-            SEVERITY_ADVERSARIAL_SCHEMA_NAME,
-            severity_adversarial_schema(),
-        )
-        .await
+        match severity_adversarial_spec(&self.prompts, summary, description, periods) {
+            Ok(spec) => self.chat_completion(spec).await,
+            Err(err) => RawCall::failed_before_sending(err),
+        }
     }
+}
+
+impl RawCall {
+    /// A call that failed while building its request: nothing was sent.
+    fn failed_before_sending(err: anyhow::Error) -> Self {
+        Self {
+            content: Err(err),
+            retries: 0,
+            attempts: Vec::new(),
+            usage: None,
+        }
+    }
+}
+
+/// The primary pass's request (see [`LlmClient::primary_raw`]).
+pub(crate) fn primary_spec(
+    prompts: &crate::profile::PromptSet,
+    summary: &str,
+    description: &str,
+    reference_date: DateTime<Utc>,
+) -> CallSpec {
+    CallSpec {
+        call: LlmCall::Primary,
+        system_prompt: prompts.primary.clone(),
+        user_content: format!(
+            "This incident was first reported around {}. Resolve any year-less date in the text below \
+             relative to that reference date.\nSummary: {summary}\nDescription: {description}",
+            reference_date.to_rfc3339()
+        ),
+        schema_name: PRIMARY_SCHEMA_NAME,
+        schema: primary_schema(),
+    }
+}
+
+/// The resolution-adversarial pass's request (see
+/// [`LlmClient::adversarial_raw`]).
+pub(crate) fn adversarial_spec(
+    prompts: &crate::profile::PromptSet,
+    summary: &str,
+    description: &str,
+    periods: &[ExtractionPeriod],
+) -> anyhow::Result<CallSpec> {
+    Ok(CallSpec {
+        call: LlmCall::ResolutionAdversarial,
+        system_prompt: prompts.adversarial.clone(),
+        user_content: build_period_user_content(summary, description, periods)?,
+        schema_name: ADVERSARIAL_SCHEMA_NAME,
+        schema: adversarial_schema(),
+    })
+}
+
+/// The severity-adversarial pass's request (see
+/// [`LlmClient::severity_adversarial_raw`]).
+pub(crate) fn severity_adversarial_spec(
+    prompts: &crate::profile::PromptSet,
+    summary: &str,
+    description: &str,
+    periods: &[ExtractionPeriod],
+) -> anyhow::Result<CallSpec> {
+    Ok(CallSpec {
+        call: LlmCall::SeverityAdversarial,
+        system_prompt: prompts.severity_adversarial.clone(),
+        user_content: build_period_user_content(summary, description, periods)?,
+        schema_name: SEVERITY_ADVERSARIAL_SCHEMA_NAME,
+        schema: severity_adversarial_schema(),
+    })
+}
+
+/// The three built-in system prompts: primary, resolution-adversarial,
+/// severity-adversarial (`profile::PromptSet::builtin`).
+pub(crate) fn builtin_prompts() -> [&'static str; 3] {
+    [
+        PRIMARY_PROMPT,
+        ADVERSARIAL_PROMPT,
+        SEVERITY_ADVERSARIAL_PROMPT,
+    ]
 }
 
 /// Parses (and post-processes) the primary pass's raw `content`: the
@@ -1709,25 +2000,61 @@ fn build_period_user_content(
 /// e.g. to give a cold-starting model extra room), and the SAME provider
 /// policy env vars the service parses (`config::ProviderPolicyConfig`), so a
 /// reasoning model gets its `reasoning_effort`/`max_tokens` in an eval too.
+/// `LLM_PROVIDER=anthropic` (with `LLM_PROMPT_CACHE`/`LLM_THINKING`) runs
+/// them against the Claude API, where `LLM_BASE_URL`/`LLM_MODEL` default.
 #[cfg(test)]
 pub(crate) fn live_client_from_env() -> LlmClient {
     use clap::Parser;
 
-    let base_url = std::env::var("LLM_BASE_URL").expect("LLM_BASE_URL must be set for live eval");
+    let provider = ProviderKind::from_env().expect("LLM_PROVIDER must be openai or anthropic");
+    let (base_url, model) = match provider {
+        ProviderKind::Openai => (
+            std::env::var("LLM_BASE_URL").expect("LLM_BASE_URL must be set for live eval"),
+            std::env::var("LLM_MODEL").expect("LLM_MODEL must be set for live eval"),
+        ),
+        ProviderKind::Anthropic => (
+            std::env::var("LLM_BASE_URL").unwrap_or_else(|_| anthropic::DEFAULT_BASE_URL.into()),
+            std::env::var("LLM_MODEL").unwrap_or_else(|_| anthropic::DEFAULT_MODEL.into()),
+        ),
+    };
     let api_key = std::env::var("LLM_API_KEY").ok();
-    let model = std::env::var("LLM_MODEL").expect("LLM_MODEL must be set for live eval");
     let timeout_secs: u64 = std::env::var("LIVE_EVAL_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(180);
-    let policy = crate::config::ProviderPolicyConfig::parse_from(["live-eval"]).policy();
-    LlmClient::new(
+    let policy_config = crate::config::ProviderPolicyConfig::parse_from(["live-eval"]);
+    let anthropic = crate::config::AnthropicConfig::parse_from(["live-eval"]);
+    let generation = crate::config::GenerationConfig::parse_from(["live-eval"]);
+    // The same profile resolution and prompts as the service.
+    let active = crate::profile::resolve(
+        provider,
+        &model,
+        generation.llm_profile.as_deref(),
+        crate::config::profile_overrides(
+            &generation,
+            &policy_config,
+            anthropic.llm_thinking.as_deref(),
+        )
+        .expect("LLM_TEMPERATURE/LLM_TOP_P must be numbers or `omit`"),
+    )
+    .expect("the LLM profile must resolve");
+    let prompts =
+        crate::profile::PromptSet::load(generation.llm_prompts_dir.as_deref(), active.profile)
+            .expect("LLM_PROMPTS_DIR must be readable");
+    let client = LlmClient::new(
         base_url,
         api_key,
         model,
         std::time::Duration::from_secs(timeout_secs),
     )
-    .with_provider_policy(policy)
+    .with_provider_policy(policy_config.policy());
+    let client = match provider {
+        ProviderKind::Openai => client,
+        ProviderKind::Anthropic => client.with_anthropic(anthropic.settings()),
+    };
+    client
+        .with_generation(&active.generation)
+        .with_prompts(prompts)
 }
 
 #[cfg(test)]
@@ -3806,6 +4133,7 @@ mod tests {
                 completion_tokens: Some(150),
                 reasoning_tokens: Some(0),
                 cached_tokens: Some(2048),
+                cache_write_tokens: None,
             })
         );
 
@@ -3850,7 +4178,11 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        register_usage_metrics("gpt-6-luna", "https://user:pw@api.openai.com/v1");
+        register_usage_metrics(
+            "gpt-6-luna",
+            "https://user:pw@api.openai.com/v1",
+            "openai-gpt-6-luna",
+        );
         let rendered = handle.render();
         for call in LlmCall::ALL {
             for kind in TOKEN_KINDS {
@@ -3859,7 +4191,7 @@ mod tests {
         }
         assert!(
             rendered.contains(
-                "distant_signal_enricher_llm_model_info{model=\"gpt-6-luna\",base_url_host=\"api.openai.com\"} 1"
+                "distant_signal_enricher_llm_model_info{model=\"gpt-6-luna\",profile=\"openai-gpt-6-luna\",base_url_host=\"api.openai.com\"} 1"
             ),
             "{rendered}"
         );
@@ -4551,13 +4883,13 @@ mod tests {
             "Summary: {WANDSWORTH_TOWN_SUMMARY}\nDescription: {WANDSWORTH_TOWN_DESCRIPTION}"
         );
         let raw = client
-            .chat_completion(
-                LlmCall::Primary,
-                PRIMARY_PROMPT,
+            .chat_completion(CallSpec {
+                call: LlmCall::Primary,
+                system_prompt: client.prompts().primary.clone(),
                 user_content,
-                PRIMARY_SCHEMA_NAME,
-                primary_schema(),
-            )
+                schema_name: PRIMARY_SCHEMA_NAME,
+                schema: primary_schema(),
+            })
             .await
             .content
             .expect("raw chat completion should succeed");

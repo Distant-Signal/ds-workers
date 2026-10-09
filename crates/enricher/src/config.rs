@@ -4,7 +4,11 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum as _};
 use common::secret::Secret;
 
-use crate::auth::{AuthentikConfig, FederatedTokenSource, FederationConfig, LlmAuth, LlmAuthMode};
+use crate::auth::{
+    AuthentikConfig, ExchangeTarget, FederatedTokenSource, FederationConfig, LlmAuth, LlmAuthMode,
+};
+use crate::llm::ProviderKind;
+use crate::llm::anthropic::{AnthropicSettings, PromptCache};
 
 /// CLI/env configuration for the `enricher` service.
 /// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
@@ -30,10 +34,18 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
-    /// Base URL of an OpenAI-compatible Chat Completions endpoint, e.g.
-    /// `http://localhost:8080/v1` for a local server. No vendor is assumed.
+    /// `LLM_PROVIDER`: `openai` (the default; any OpenAI-compatible Chat
+    /// Completions endpoint) or `anthropic` (the Claude API,
+    /// docs/enricher-anthropic.md).
+    #[arg(long, env, value_enum, default_value_t = ProviderKind::Openai)]
+    pub llm_provider: ProviderKind,
+
+    /// Base URL of the endpoint, `/v1` included. `openai`: an
+    /// OpenAI-compatible Chat Completions endpoint, e.g.
+    /// `http://localhost:8080/v1` for a local server (required; no vendor is
+    /// assumed). `anthropic`: defaults to `https://api.anthropic.com/v1`.
     #[arg(long, env)]
-    pub llm_base_url: String,
+    pub llm_base_url: Option<String>,
 
     /// Optional -- many local OpenAI-compatible servers don't require one.
     /// Only for `LLM_AUTH=api-key` (the default); setting it in a workload
@@ -46,9 +58,27 @@ pub(crate) struct Config {
     #[command(flatten)]
     pub llm_auth: LlmAuthConfig,
 
-    /// Model name/identifier as the endpoint expects it.
+    /// Model name/identifier as the endpoint expects it. Required for
+    /// `openai`; `anthropic` defaults to `claude-haiku-5-5`
+    /// (`llm::anthropic::DEFAULT_MODEL`).
     #[arg(long, env)]
-    pub llm_model: String,
+    pub llm_model: Option<String>,
+
+    /// The Claude-only settings (`LLM_ANTHROPIC_VERSION`, `LLM_PROMPT_CACHE`,
+    /// `LLM_THINKING`); ignored by `openai`.
+    #[command(flatten)]
+    pub anthropic: AnthropicConfig,
+
+    /// `LLM_SWEEP_MODE` and the Message Batches settings. Off by default
+    /// (`sync`).
+    #[command(flatten)]
+    pub batch: BatchConfig,
+
+    /// `LLM_PROFILE`, `LLM_TEMPERATURE`, `LLM_TOP_P`, `LLM_PROMPTS_DIR`
+    /// (`profile.rs`). All unset by default: the built-in profile for the
+    /// provider and model, with today's settings and prompts.
+    #[command(flatten)]
+    pub generation: GenerationConfig,
 
     /// Per-request timeout for a single LLM call (`LLM_REQUEST_TIMEOUT_SECS`).
     /// One incident makes three sequential calls (primary,
@@ -135,6 +165,184 @@ pub(crate) struct Config {
     pub health: common::service_args::HealthArgs,
 }
 
+/// The endpoint, model and provider after defaults and validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedLlm {
+    pub provider: ProviderKind,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl Config {
+    /// [`ResolvedLlm`] plus every cross-setting check, so a bad combination
+    /// fails the pod at startup instead of every extraction.
+    pub(crate) fn resolved_llm(&self) -> anyhow::Result<ResolvedLlm> {
+        resolve_llm(
+            self.llm_provider,
+            self.llm_base_url.as_deref(),
+            self.llm_model.as_deref(),
+            self.llm_auth.llm_auth,
+            self.llm_api_key.as_ref(),
+            self.batch.llm_sweep_mode,
+        )
+    }
+}
+
+/// See [`Config::resolved_llm`]; also used by the model-eval targets.
+pub(crate) fn resolve_llm(
+    provider: ProviderKind,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    auth: LlmAuthMode,
+    api_key: Option<&Secret>,
+    sweep_mode: SweepMode,
+) -> anyhow::Result<ResolvedLlm> {
+    let set = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let (base_url, model) = match provider {
+        ProviderKind::Openai => {
+            if auth.is_anthropic() {
+                anyhow::bail!(
+                    "LLM_AUTH=anthropic-wif-authentik mints Claude API tokens: it needs \
+                     LLM_PROVIDER=anthropic"
+                );
+            }
+            if sweep_mode == SweepMode::Batch {
+                anyhow::bail!(
+                    "LLM_SWEEP_MODE=batch needs LLM_PROVIDER=anthropic: the enricher has no \
+                     OpenAI Batch API support (docs/enricher-anthropic.md, \"Batch mode\")"
+                );
+            }
+            (
+                set(base_url).ok_or_else(|| anyhow::anyhow!("LLM_BASE_URL is required"))?,
+                set(model).ok_or_else(|| anyhow::anyhow!("LLM_MODEL is required"))?,
+            )
+        }
+        ProviderKind::Anthropic => {
+            // The OpenAI workload identity modes mint OpenAI tokens, which
+            // the Claude API refuses.
+            match auth {
+                LlmAuthMode::ApiKey => {
+                    if api_key.is_none_or(Secret::is_empty) {
+                        anyhow::bail!(
+                            "LLM_PROVIDER=anthropic needs LLM_API_KEY (a Claude API key) or \
+                             LLM_AUTH=anthropic-wif-authentik"
+                        );
+                    }
+                }
+                LlmAuthMode::AnthropicWifAuthentik => {}
+                LlmAuthMode::OpenaiWifAuthentik | LlmAuthMode::OpenaiWifKubernetes => {
+                    anyhow::bail!(
+                        "LLM_PROVIDER=anthropic supports LLM_AUTH=api-key or \
+                         anthropic-wif-authentik (the openai-wif-* modes mint OpenAI tokens)"
+                    );
+                }
+            }
+            (
+                set(base_url)
+                    .unwrap_or_else(|| crate::llm::anthropic::DEFAULT_BASE_URL.to_string()),
+                set(model).unwrap_or_else(|| crate::llm::anthropic::DEFAULT_MODEL.to_string()),
+            )
+        }
+    };
+    Ok(ResolvedLlm {
+        provider,
+        base_url: base_url.trim_end_matches('/').to_string(),
+        model,
+    })
+}
+
+/// The Claude API's own settings (`LLM_PROVIDER=anthropic` only).
+#[derive(Debug, Clone, Parser)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives each env var from the field name, so the prefix is part of the interface"
+)]
+pub(crate) struct AnthropicConfig {
+    /// The `anthropic-version` header.
+    #[arg(long, env, default_value = crate::llm::anthropic::DEFAULT_VERSION)]
+    pub llm_anthropic_version: String,
+    /// `LLM_PROMPT_CACHE`: `1h` (default), `5m` or `off` -- the
+    /// `cache_control` TTL on each call's static system prompt
+    /// (docs/enricher-anthropic.md, "Prompt caching").
+    #[arg(long, env, value_enum, default_value_t = PromptCache::OneHour)]
+    pub llm_prompt_cache: PromptCache,
+    /// `LLM_THINKING`: sent as `thinking: {"type": <this>}` when set (e.g.
+    /// `disabled` on Haiku 5.5, `between_tools` on Sonnet 5.5). Unset: the
+    /// model's default (adaptive thinking).
+    #[arg(long, env)]
+    pub llm_thinking: Option<String>,
+}
+
+impl AnthropicConfig {
+    pub(crate) fn settings(&self) -> AnthropicSettings {
+        AnthropicSettings {
+            version: self.llm_anthropic_version.clone(),
+            prompt_cache: self.llm_prompt_cache,
+            thinking: self
+                .llm_thinking
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+        }
+    }
+}
+
+/// `LLM_SWEEP_MODE`: how the reconciliation sweep runs its extractions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum SweepMode {
+    /// One incident at a time through the synchronous API, like the stream
+    /// loop (the default; the only mode before 2026-10).
+    #[default]
+    Sync,
+    /// Through the Claude Message Batches API (half price, results within
+    /// 24 h, usually under an hour), when the sweep finds at least
+    /// `LLM_BATCH_MIN_ITEMS` incidents. `anthropic` only.
+    Batch,
+}
+
+/// The batch-mode knobs (`batch.rs`).
+#[derive(Debug, Clone, Parser)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives each env var from the field name, so the prefix is part of the interface"
+)]
+pub(crate) struct BatchConfig {
+    /// `LLM_SWEEP_MODE`: `sync` (default) or `batch`.
+    #[arg(long, env, value_enum, default_value_t = SweepMode::Sync)]
+    pub llm_sweep_mode: SweepMode,
+    /// A sweep that finds fewer incidents than this runs them synchronously
+    /// as before: a batch's latency (minutes to hours) isn't worth half the
+    /// price of a handful of calls.
+    #[arg(long, env, default_value_t = 20)]
+    pub llm_batch_min_items: usize,
+    /// Most incidents in one Message Batch (each is 1 request in the
+    /// primary batch and 2 in the adversarial one). A bigger sweep is split.
+    #[arg(long, env, default_value_t = 2000)]
+    pub llm_batch_max_items: usize,
+    /// How often in-flight batches are polled, in seconds.
+    #[arg(long, env, default_value_t = 60)]
+    pub llm_batch_poll_secs: u64,
+}
+
+impl BatchConfig {
+    /// `Some` in batch mode.
+    pub(crate) fn settings(&self) -> Option<crate::batch::BatchSettings> {
+        (self.llm_sweep_mode == SweepMode::Batch).then(|| crate::batch::BatchSettings {
+            min_items: self.llm_batch_min_items.max(1),
+            max_items: self
+                .llm_batch_max_items
+                .clamp(1, crate::batch::MAX_BATCH_INCIDENTS),
+            poll_interval: Duration::from_secs(self.llm_batch_poll_secs.max(1)),
+        })
+    }
+}
+
 /// Per-provider request/retry knobs, flattened into [`Config`] and also
 /// parsed on its own by the ignored live evals (`llm::live_client_from_env`),
 /// so an eval run honours exactly the env vars the service does. Every knob
@@ -168,6 +376,54 @@ pub(crate) struct ProviderPolicyConfig {
     pub llm_gateway_retries: u32,
 }
 
+/// The profile layer's own knobs (`profile.rs`). `LLM_MAX_TOKENS`,
+/// `LLM_REASONING_EFFORT` and `LLM_THINKING` are overrides of the profile
+/// too; they stay where they were.
+#[derive(Debug, Clone, Parser)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "clap derives each env var from the field name, so the prefix is part of the interface"
+)]
+pub(crate) struct GenerationConfig {
+    /// `LLM_PROFILE`: a built-in profile by name; unset picks it by provider
+    /// and model.
+    #[arg(long, env)]
+    pub llm_profile: Option<String>,
+    /// `LLM_TEMPERATURE`: a number, or `omit` to send none; unset keeps the
+    /// profile's (0 for OpenAI-compatible endpoints, none for Claude).
+    #[arg(long, env)]
+    pub llm_temperature: Option<String>,
+    /// `LLM_TOP_P`: a number, or `omit`; unset keeps the profile's (none).
+    #[arg(long, env)]
+    pub llm_top_p: Option<String>,
+    /// `LLM_PROMPTS_DIR`: a directory of prompt overrides
+    /// (`<profile>.<call>.txt` or `<call>.txt`); unset uses the built-in
+    /// prompts.
+    #[arg(long, env)]
+    pub llm_prompts_dir: Option<PathBuf>,
+}
+
+/// The profile overrides from the service's env: `LLM_TEMPERATURE`,
+/// `LLM_TOP_P`, `LLM_MAX_TOKENS`, `LLM_REASONING_EFFORT` (`omit` drops the
+/// profile's) and `LLM_THINKING` (likewise).
+pub(crate) fn profile_overrides(
+    generation: &GenerationConfig,
+    policy: &ProviderPolicyConfig,
+    thinking: Option<&str>,
+) -> anyhow::Result<crate::profile::Overrides> {
+    use crate::profile::{Overrides, Setting, parse_setting};
+    Ok(Overrides {
+        temperature: parse_setting("LLM_TEMPERATURE", generation.llm_temperature.as_deref())?,
+        top_p: parse_setting("LLM_TOP_P", generation.llm_top_p.as_deref())?,
+        max_tokens: policy.llm_max_tokens.map(Setting::Set),
+        reasoning_effort: parse_setting(
+            "LLM_REASONING_EFFORT",
+            policy.llm_reasoning_effort.as_deref(),
+        )?,
+        thinking: parse_setting("LLM_THINKING", thinking)?,
+    })
+}
+
 impl ProviderPolicyConfig {
     pub(crate) fn policy(&self) -> crate::llm::ProviderPolicy {
         crate::llm::ProviderPolicy {
@@ -189,31 +445,52 @@ impl ProviderPolicyConfig {
 #[derive(Debug, Clone, Parser)]
 pub(crate) struct LlmAuthConfig {
     /// `api-key` (default), `openai-wif-authentik` (k8s token -> Authentik
-    /// -> `OpenAI` token exchange) or `openai-wif-kubernetes` (k8s token ->
-    /// `OpenAI` token exchange).
+    /// -> `OpenAI` token exchange), `openai-wif-kubernetes` (k8s token ->
+    /// `OpenAI` token exchange) or `anthropic-wif-authentik` (k8s token ->
+    /// Authentik -> Claude API token exchange; `LLM_PROVIDER=anthropic`).
     #[arg(long, env, value_enum, default_value_t = LlmAuthMode::ApiKey)]
     pub llm_auth: LlmAuthMode,
-    /// `OpenAI` Workload Identity Provider ID. Required in WIF modes.
-    #[arg(long, env)]
-    pub openai_identity_provider_id: Option<String>,
-    /// `OpenAI` service account ID the mapping resolves to. Required in WIF
+    /// `OpenAI` Workload Identity Provider ID. Required in the `openai-wif-*`
     /// modes.
     #[arg(long, env)]
+    pub openai_identity_provider_id: Option<String>,
+    /// `OpenAI` service account ID the mapping resolves to. Required in the
+    /// `openai-wif-*` modes.
+    #[arg(long, env)]
     pub openai_service_account_id: Option<String>,
+    /// Claude federation rule ID (`fdrl_...`). Required in
+    /// `anthropic-wif-authentik` mode. Named like the Claude SDKs' variable.
+    #[arg(long, env)]
+    pub anthropic_federation_rule_id: Option<String>,
+    /// Claude organization UUID. Required in `anthropic-wif-authentik` mode.
+    #[arg(long, env)]
+    pub anthropic_organization_id: Option<String>,
+    /// Claude service account ID (`svac_...`) the rule targets. Required in
+    /// `anthropic-wif-authentik` mode.
+    #[arg(long, env)]
+    pub anthropic_service_account_id: Option<String>,
+    /// Claude workspace ID (`wrkspc_...`): only needed when the rule spans
+    /// more than one workspace.
+    #[arg(long, env)]
+    pub anthropic_workspace_id: Option<String>,
     /// The kubelet-projected service-account token (re-read on every
     /// exchange). Must exist and be readable at startup in WIF modes.
     #[arg(long, env, default_value = "/var/run/secrets/openai/token")]
     pub llm_identity_token_file: PathBuf,
-    /// `OpenAI`'s token-exchange endpoint.
-    #[arg(long, env, default_value = "https://auth.openai.com/oauth/token")]
-    pub llm_token_exchange_url: String,
+    /// The provider's token-exchange endpoint. Unset: `OpenAI`'s
+    /// ([`OPENAI_TOKEN_EXCHANGE_URL`]) in the `openai-wif-*` modes, the
+    /// Claude API's ([`ANTHROPIC_TOKEN_EXCHANGE_URL`]) in
+    /// `anthropic-wif-authentik`.
+    #[arg(long, env)]
+    pub llm_token_exchange_url: Option<String>,
     /// Authentik's token endpoint (e.g.
-    /// `https://sso.example.com/application/o/token/`). Required in
-    /// `openai-wif-authentik` mode.
+    /// `https://sso.example.com/application/o/token/`). Required in the two
+    /// Authentik modes.
     #[arg(long, env)]
     pub llm_authentik_token_url: Option<String>,
-    /// Client ID of the Authentik `OAuth2` provider. Required in
-    /// `openai-wif-authentik` mode.
+    /// Client ID of the Authentik `OAuth2` provider. Required in the two
+    /// Authentik modes. For Claude, a provider of its own (its own client
+    /// ID and audience), so its tokens can't be replayed at `OpenAI`.
     #[arg(long, env)]
     pub llm_authentik_client_id: Option<String>,
     /// Sent as `scope` to Authentik when set (e.g. `profile`, whose mapping
@@ -226,7 +503,28 @@ pub(crate) struct LlmAuthConfig {
     pub llm_token_refresh_skew_secs: u64,
 }
 
+/// `OpenAI`'s token-exchange endpoint (`LLM_TOKEN_EXCHANGE_URL` default in
+/// the `openai-wif-*` modes).
+pub(crate) const OPENAI_TOKEN_EXCHANGE_URL: &str = "https://auth.openai.com/oauth/token";
+/// The Claude API's token-exchange endpoint (`LLM_TOKEN_EXCHANGE_URL`
+/// default in `anthropic-wif-authentik`).
+pub(crate) const ANTHROPIC_TOKEN_EXCHANGE_URL: &str = "https://api.anthropic.com/v1/oauth/token";
+
 impl LlmAuthConfig {
+    /// `LLM_TOKEN_EXCHANGE_URL`, or this mode's default.
+    pub(crate) fn token_exchange_url(&self) -> String {
+        match self
+            .llm_token_exchange_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            Some(url) => url.to_string(),
+            None if self.llm_auth.is_anthropic() => ANTHROPIC_TOKEN_EXCHANGE_URL.to_string(),
+            None => OPENAI_TOKEN_EXCHANGE_URL.to_string(),
+        }
+    }
+
     /// The federation settings for a WIF mode (`None` in `api-key` mode),
     /// validated without touching the file system.
     pub(crate) fn federation(
@@ -254,33 +552,58 @@ impl LlmAuthConfig {
                 .map(str::to_string)
                 .ok_or_else(|| anyhow::anyhow!("LLM_AUTH={mode} requires {name}"))
         };
-        let identity_provider_id = required(
-            &self.openai_identity_provider_id,
-            "OPENAI_IDENTITY_PROVIDER_ID",
-        )?;
-        let service_account_id =
-            required(&self.openai_service_account_id, "OPENAI_SERVICE_ACCOUNT_ID")?;
-        let authentik = match self.llm_auth {
-            LlmAuthMode::OpenaiWifAuthentik => Some(AuthentikConfig {
-                token_url: required(&self.llm_authentik_token_url, "LLM_AUTHENTIK_TOKEN_URL")?,
-                client_id: required(&self.llm_authentik_client_id, "LLM_AUTHENTIK_CLIENT_ID")?,
-                scope: self
-                    .llm_authentik_scope
+        let target = if self.llm_auth.is_anthropic() {
+            ExchangeTarget::Anthropic {
+                federation_rule_id: required(
+                    &self.anthropic_federation_rule_id,
+                    "ANTHROPIC_FEDERATION_RULE_ID",
+                )?,
+                organization_id: required(
+                    &self.anthropic_organization_id,
+                    "ANTHROPIC_ORGANIZATION_ID",
+                )?,
+                service_account_id: required(
+                    &self.anthropic_service_account_id,
+                    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+                )?,
+                workspace_id: self
+                    .anthropic_workspace_id
                     .as_deref()
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|w| !w.is_empty())
                     .map(str::to_string),
-            }),
+            }
+        } else {
+            ExchangeTarget::Openai {
+                identity_provider_id: required(
+                    &self.openai_identity_provider_id,
+                    "OPENAI_IDENTITY_PROVIDER_ID",
+                )?,
+                service_account_id: required(
+                    &self.openai_service_account_id,
+                    "OPENAI_SERVICE_ACCOUNT_ID",
+                )?,
+            }
+        };
+        let authentik = match self.llm_auth {
+            LlmAuthMode::OpenaiWifAuthentik | LlmAuthMode::AnthropicWifAuthentik => {
+                Some(AuthentikConfig {
+                    token_url: required(&self.llm_authentik_token_url, "LLM_AUTHENTIK_TOKEN_URL")?,
+                    client_id: required(&self.llm_authentik_client_id, "LLM_AUTHENTIK_CLIENT_ID")?,
+                    scope: self
+                        .llm_authentik_scope
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                })
+            }
             LlmAuthMode::OpenaiWifKubernetes | LlmAuthMode::ApiKey => None,
         };
-        if self.llm_token_exchange_url.trim().is_empty() {
-            anyhow::bail!("LLM_AUTH={mode} requires LLM_TOKEN_EXCHANGE_URL");
-        }
         Ok(Some(FederationConfig {
-            identity_provider_id,
-            service_account_id,
+            target,
             identity_token_file: self.llm_identity_token_file.clone(),
-            token_exchange_url: self.llm_token_exchange_url.trim().to_string(),
+            token_exchange_url: self.token_exchange_url(),
             authentik,
             refresh_skew: Duration::from_secs(self.llm_token_refresh_skew_secs),
             exchange_timeout: crate::auth::EXCHANGE_TIMEOUT,
@@ -347,8 +670,9 @@ mod tests {
             config.llm_identity_token_file,
             PathBuf::from("/var/run/secrets/openai/token")
         );
+        assert_eq!(config.llm_token_exchange_url, None);
         assert_eq!(
-            config.llm_token_exchange_url,
+            config.token_exchange_url(),
             "https://auth.openai.com/oauth/token"
         );
         assert_eq!(config.llm_token_refresh_skew_secs, 60);
@@ -393,8 +717,17 @@ mod tests {
         assert!(error_of(&config, Some(&Secret::new("sk-x"))).contains("unset LLM_API_KEY"));
         // An empty LLM_API_KEY is "unset".
         let federation = config.federation(Some(&Secret::new(""))).unwrap().unwrap();
-        assert_eq!(federation.identity_provider_id, "idp_1");
-        assert_eq!(federation.service_account_id, "svc_1");
+        assert_eq!(
+            federation.target,
+            ExchangeTarget::Openai {
+                identity_provider_id: "idp_1".into(),
+                service_account_id: "svc_1".into()
+            }
+        );
+        assert_eq!(
+            federation.token_exchange_url,
+            "https://auth.openai.com/oauth/token"
+        );
         assert!(federation.authentik.is_none());
         assert_eq!(federation.refresh_skew, Duration::from_secs(60));
 
@@ -464,6 +797,193 @@ mod tests {
     fn unknown_auth_mode_is_rejected() {
         assert!(
             LlmAuthConfig::try_parse_from(["enricher", "--llm-auth", "openai-wif-gcp"]).is_err()
+        );
+    }
+
+    fn config(args: &[&str]) -> Config {
+        let base = [
+            "enricher",
+            "--database-url",
+            "postgres://x",
+            "--redis-url",
+            "redis://x",
+        ];
+        Config::try_parse_from(base.iter().chain(args.iter()).copied()).unwrap()
+    }
+
+    /// Unset, the provider is `openai` and everything is as before: base
+    /// URL and model required, sync sweep, no batch settings.
+    #[test]
+    fn openai_is_the_default_and_needs_url_and_model() {
+        let config = config(&["--llm-base-url", "http://l/v1/", "--llm-model", "m"]);
+        assert_eq!(config.llm_provider, ProviderKind::Openai);
+        assert_eq!(config.batch.llm_sweep_mode, SweepMode::Sync);
+        assert!(config.batch.settings().is_none());
+        assert_eq!(config.anthropic.llm_prompt_cache, PromptCache::OneHour);
+        let resolved = config.resolved_llm().unwrap();
+        assert_eq!(resolved.base_url, "http://l/v1");
+        assert_eq!(resolved.model, "m");
+        let missing = |args: &[&str]| self::config(args).resolved_llm().unwrap_err().to_string();
+        assert!(missing(&["--llm-model", "m"]).contains("LLM_BASE_URL"));
+        assert!(missing(&["--llm-base-url", "http://l/v1"]).contains("LLM_MODEL"));
+        assert!(
+            missing(&[
+                "--llm-base-url",
+                "http://l/v1",
+                "--llm-model",
+                "m",
+                "--llm-sweep-mode",
+                "batch"
+            ])
+            .contains("needs LLM_PROVIDER=anthropic")
+        );
+    }
+
+    #[test]
+    fn anthropic_defaults_and_validation() {
+        let resolved = config(&["--llm-provider", "anthropic", "--llm-api-key", "sk-ant"])
+            .resolved_llm()
+            .unwrap();
+        assert_eq!(resolved.provider, ProviderKind::Anthropic);
+        assert_eq!(resolved.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(resolved.model, "claude-haiku-5-5");
+
+        let custom = config(&[
+            "--llm-provider",
+            "anthropic",
+            "--llm-api-key",
+            "sk-ant",
+            "--llm-model",
+            "claude-sonnet-5-5",
+            "--llm-prompt-cache",
+            "5m",
+            "--llm-thinking",
+            "between_tools",
+            "--llm-sweep-mode",
+            "batch",
+            "--llm-batch-max-items",
+            "999999",
+        ]);
+        assert_eq!(custom.resolved_llm().unwrap().model, "claude-sonnet-5-5");
+        let settings = custom.anthropic.settings();
+        assert_eq!(settings.prompt_cache, PromptCache::FiveMinutes);
+        assert_eq!(settings.thinking.as_deref(), Some("between_tools"));
+        assert_eq!(settings.version, "2023-06-01");
+        let batch = custom.batch.settings().unwrap();
+        assert_eq!(batch.min_items, 20);
+        assert_eq!(batch.max_items, crate::batch::MAX_BATCH_INCIDENTS);
+        assert_eq!(batch.poll_interval, Duration::from_secs(60));
+
+        let err = |args: &[&str]| config(args).resolved_llm().unwrap_err().to_string();
+        assert!(err(&["--llm-provider", "anthropic"]).contains("needs LLM_API_KEY"));
+        assert!(
+            err(&["--llm-provider", "anthropic", "--llm-api-key", ""])
+                .contains("needs LLM_API_KEY")
+        );
+        assert!(
+            err(&[
+                "--llm-provider",
+                "anthropic",
+                "--llm-auth",
+                "openai-wif-kubernetes"
+            ])
+            .contains("LLM_AUTH=api-key")
+        );
+        assert!(
+            Config::try_parse_from([
+                "enricher",
+                "--database-url",
+                "postgres://x",
+                "--redis-url",
+                "redis://x",
+                "--llm-prompt-cache",
+                "2h"
+            ])
+            .is_err()
+        );
+    }
+
+    /// `anthropic-wif-authentik`: Claude only, the Claude IDs and the
+    /// Authentik settings required, no API key, the Claude token endpoint
+    /// by default.
+    #[test]
+    fn anthropic_wif_authentik_settings() {
+        let wif = [
+            "--llm-provider",
+            "anthropic",
+            "--llm-auth",
+            "anthropic-wif-authentik",
+        ];
+        let ids = [
+            "--anthropic-federation-rule-id",
+            "fdrl_1",
+            "--anthropic-organization-id",
+            "org-uuid",
+            "--anthropic-service-account-id",
+            "svac_1",
+            "--llm-authentik-token-url",
+            "https://sso.example.com/application/o/token/",
+            "--llm-authentik-client-id",
+            "ds-enricher-anthropic",
+        ];
+        let with = |extra: &[&str]| {
+            let mut args = wif.to_vec();
+            args.extend_from_slice(extra);
+            config(&args)
+        };
+        // No key needed for the provider check.
+        assert_eq!(
+            with(&ids).resolved_llm().unwrap().provider,
+            ProviderKind::Anthropic
+        );
+        let federation = with(&ids).llm_auth.federation(None).unwrap().unwrap();
+        assert_eq!(
+            federation.target,
+            ExchangeTarget::Anthropic {
+                federation_rule_id: "fdrl_1".into(),
+                organization_id: "org-uuid".into(),
+                service_account_id: "svac_1".into(),
+                workspace_id: None,
+            }
+        );
+        assert_eq!(
+            federation.token_exchange_url,
+            "https://api.anthropic.com/v1/oauth/token"
+        );
+        assert_eq!(
+            federation.authentik.unwrap().client_id,
+            "ds-enricher-anthropic"
+        );
+        let mut workspace = ids.to_vec();
+        workspace.extend(["--anthropic-workspace-id", "wrkspc_ds"]);
+        assert!(matches!(
+            with(&workspace).llm_auth.federation(None).unwrap().unwrap().target,
+            ExchangeTarget::Anthropic { workspace_id: Some(w), .. } if w == "wrkspc_ds"
+        ));
+
+        let err = |config: Config| config.llm_auth.federation(None).unwrap_err().to_string();
+        assert!(err(with(&[])).contains("ANTHROPIC_FEDERATION_RULE_ID"));
+        assert!(err(with(&ids[..4])).contains("ANTHROPIC_SERVICE_ACCOUNT_ID"));
+        assert!(err(with(&ids[..6])).contains("LLM_AUTHENTIK_TOKEN_URL"));
+        // A static key is refused, as in the OpenAI modes.
+        let keyed = with(&ids);
+        assert!(
+            keyed
+                .llm_auth
+                .federation(Some(&Secret::new("sk-ant")))
+                .unwrap_err()
+                .to_string()
+                .contains("unset LLM_API_KEY")
+        );
+        // Claude tokens are useless to the openai provider.
+        let mut openai = vec!["--llm-auth", "anthropic-wif-authentik"];
+        openai.extend(["--llm-base-url", "http://l/v1", "--llm-model", "m"]);
+        assert!(
+            config(&openai)
+                .resolved_llm()
+                .unwrap_err()
+                .to_string()
+                .contains("needs LLM_PROVIDER=anthropic")
         );
     }
 }

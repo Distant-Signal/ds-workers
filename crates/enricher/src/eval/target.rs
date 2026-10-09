@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use common::secret::Secret;
 
 use crate::auth::LlmAuthMode;
-use crate::config::{Config, LlmAuthConfig, ProviderPolicyConfig};
+use crate::config::{AnthropicConfig, Config, LlmAuthConfig, ProviderPolicyConfig, SweepMode};
 use crate::eval::pipeline::TargetLabel;
-use crate::llm::{LlmClient, ProviderPolicy};
+use crate::llm::anthropic::{AnthropicSettings, PromptCache};
+use crate::llm::{LlmClient, ProviderKind, ProviderPolicy};
 
 /// Request timeout the quality eval uses unless a target overrides it:
 /// generous on purpose, so a slow environment doesn't show up as a quality
@@ -33,7 +34,11 @@ pub(crate) struct Target {
     /// quantization...). Shown in reports; perf numbers mean nothing without it.
     #[serde(default)]
     pub environment: Option<String>,
-    /// `LLM_BASE_URL`.
+    /// `LLM_PROVIDER`: `openai` (default) or `anthropic` (the Claude API;
+    /// docs/enricher-anthropic.md).
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// `LLM_BASE_URL` (e.g. `https://api.anthropic.com/v1` for `anthropic`).
     pub base_url: String,
     /// `LLM_MODEL`.
     pub model: String,
@@ -77,10 +82,34 @@ pub(crate) struct Target {
     /// `LLM_GATEWAY_RETRIES`.
     #[serde(default = "default_gateway_retries")]
     pub gateway_retries: u32,
+    /// `LLM_PROMPT_CACHE` (`anthropic` only): `1h` (default), `5m` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<PromptCache>,
+    /// `LLM_THINKING` (`anthropic` only), e.g. `disabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// `LLM_ANTHROPIC_VERSION` (`anthropic` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_version: Option<String>,
+    /// `LLM_PROFILE`: a built-in profile by name; unset picks it by
+    /// provider and model, as the service does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// `LLM_TEMPERATURE`: a number or `"omit"`; unset keeps the profile's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<String>,
+    /// `LLM_TOP_P`: a number or `"omit"`; unset keeps the profile's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<String>,
+    /// `LLM_PROMPTS_DIR`: prompt overrides (`<profile>.<call>.txt` or
+    /// `<call>.txt`), resolved like the targets file's other paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts_dir: Option<std::path::PathBuf>,
 }
 
 /// `[targets.workload_identity]`: the service's WIF env vars, by the same
-/// names in lower case without the `LLM_`/`OPENAI_` prefix. Unset keys take
+/// names in lower case without the `LLM_`/`OPENAI_` prefix (the Claude ones
+/// keep an `anthropic_` prefix where a name would clash). Unset keys take
 /// the service's defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +138,18 @@ pub(crate) struct WorkloadIdentityTarget {
     /// `LLM_TOKEN_REFRESH_SKEW_SECS`.
     #[serde(default)]
     pub token_refresh_skew_secs: Option<u64>,
+    /// `ANTHROPIC_FEDERATION_RULE_ID`.
+    #[serde(default)]
+    pub federation_rule_id: Option<String>,
+    /// `ANTHROPIC_ORGANIZATION_ID`.
+    #[serde(default)]
+    pub organization_id: Option<String>,
+    /// `ANTHROPIC_SERVICE_ACCOUNT_ID`.
+    #[serde(default)]
+    pub anthropic_service_account_id: Option<String>,
+    /// `ANTHROPIC_WORKSPACE_ID`.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 impl WorkloadIdentityTarget {
@@ -117,11 +158,15 @@ impl WorkloadIdentityTarget {
             identity_provider_id: config.openai_identity_provider_id.clone(),
             service_account_id: config.openai_service_account_id.clone(),
             identity_token_file: Some(config.llm_identity_token_file.clone()),
-            token_exchange_url: Some(config.llm_token_exchange_url.clone()),
+            token_exchange_url: config.llm_token_exchange_url.clone(),
             authentik_token_url: config.llm_authentik_token_url.clone(),
             authentik_client_id: config.llm_authentik_client_id.clone(),
             authentik_scope: config.llm_authentik_scope.clone(),
             token_refresh_skew_secs: Some(config.llm_token_refresh_skew_secs),
+            federation_rule_id: config.anthropic_federation_rule_id.clone(),
+            organization_id: config.anthropic_organization_id.clone(),
+            anthropic_service_account_id: config.anthropic_service_account_id.clone(),
+            workspace_id: config.anthropic_workspace_id.clone(),
         }
     }
 }
@@ -204,15 +249,27 @@ impl Target {
             llm_identity_token_file: wif
                 .identity_token_file
                 .unwrap_or_else(|| service_default("llm_identity_token_file")),
-            llm_token_exchange_url: wif
-                .token_exchange_url
-                .unwrap_or_else(|| service_default("llm_token_exchange_url")),
+            llm_token_exchange_url: wif.token_exchange_url,
+            anthropic_federation_rule_id: wif.federation_rule_id,
+            anthropic_organization_id: wif.organization_id,
+            anthropic_service_account_id: wif.anthropic_service_account_id,
+            anthropic_workspace_id: wif.workspace_id,
             llm_authentik_token_url: wif.authentik_token_url,
             llm_authentik_client_id: wif.authentik_client_id,
             llm_authentik_scope: wif.authentik_scope,
             llm_token_refresh_skew_secs: wif
                 .token_refresh_skew_secs
                 .unwrap_or_else(|| service_default("llm_token_refresh_skew_secs")),
+        }
+    }
+
+    /// The Claude settings, unset keys at the service's defaults.
+    pub(crate) fn anthropic_settings(&self) -> AnthropicSettings {
+        let defaults = AnthropicSettings::default();
+        AnthropicSettings {
+            version: self.anthropic_version.clone().unwrap_or(defaults.version),
+            prompt_cache: self.prompt_cache.unwrap_or(defaults.prompt_cache),
+            thinking: self.thinking.clone().filter(|t| !t.trim().is_empty()),
         }
     }
 
@@ -228,18 +285,64 @@ impl Target {
             })?),
             None => None,
         };
+        let api_key = api_key.map(Secret::new);
+        // The service's own provider validation (an `anthropic` target needs
+        // a key and LLM_AUTH=api-key).
+        let resolved = crate::config::resolve_llm(
+            self.provider,
+            Some(&self.base_url),
+            Some(&self.model),
+            self.auth,
+            api_key.as_ref(),
+            SweepMode::Sync,
+        )
+        .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
         let auth = self
             .auth_config()
-            .auth(api_key.map(Secret::new).as_ref())
+            .auth(api_key.as_ref())
             .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
-        Ok(LlmClient::new(
-            self.base_url.clone(),
+        let (active, prompts) = self
+            .profile_and_prompts(&resolved.model)
+            .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
+        let client = LlmClient::new(
+            resolved.base_url,
             None,
-            self.model.clone(),
+            resolved.model,
             Duration::from_secs(timeout_secs),
         )
         .with_auth(auth)
-        .with_provider_policy(self.policy()))
+        .with_provider_policy(self.policy());
+        let client = match self.provider {
+            ProviderKind::Openai => client,
+            ProviderKind::Anthropic => client.with_anthropic(self.anthropic_settings()),
+        };
+        Ok(client
+            .with_generation(&active.generation)
+            .with_prompts(prompts))
+    }
+
+    /// The target's profile (the service's resolution, with this target's
+    /// settings as the overrides) and its prompts.
+    pub(crate) fn profile_and_prompts(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<(crate::profile::Resolved, crate::profile::PromptSet)> {
+        use crate::profile::{Overrides, Setting, parse_setting};
+        let overrides = Overrides {
+            temperature: parse_setting("temperature", self.temperature.as_deref())?,
+            top_p: parse_setting("top_p", self.top_p.as_deref())?,
+            max_tokens: self.max_tokens.map(Setting::Set),
+            reasoning_effort: parse_setting("reasoning_effort", self.reasoning_effort.as_deref())?,
+            thinking: parse_setting("thinking", self.thinking.as_deref())?,
+        };
+        let active =
+            crate::profile::resolve(self.provider, model, self.profile.as_deref(), overrides)?;
+        let dir = self
+            .prompts_dir
+            .as_deref()
+            .map(|p| crate::eval::resolve(&p.to_string_lossy()));
+        let prompts = crate::profile::PromptSet::load(dir.as_deref(), active.profile)?;
+        Ok((active, prompts))
     }
 
     /// Safe in a file name.
@@ -313,11 +416,25 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
     };
     let policy = ProviderPolicyConfig::parse_from(["eval"]);
     let auth = LlmAuthConfig::parse_from(["eval"]);
+    let anthropic = AnthropicConfig::parse_from(["eval"]);
+    let generation = crate::config::GenerationConfig::parse_from(["eval"]);
+    let provider = ProviderKind::from_env()?;
+    // `anthropic` has defaults for both, like the service.
+    let (base_url, model) = match provider {
+        ProviderKind::Openai => (var("LLM_BASE_URL")?, var("LLM_MODEL")?),
+        ProviderKind::Anthropic => (
+            std::env::var("LLM_BASE_URL")
+                .unwrap_or_else(|_| crate::llm::anthropic::DEFAULT_BASE_URL.to_string()),
+            std::env::var("LLM_MODEL")
+                .unwrap_or_else(|_| crate::llm::anthropic::DEFAULT_MODEL.to_string()),
+        ),
+    };
     Ok(vec![Target {
         name: std::env::var("EVAL_TARGET_NAME").unwrap_or_else(|_| "env".to_string()),
         environment: std::env::var("EVAL_ENVIRONMENT").ok(),
-        base_url: var("LLM_BASE_URL")?,
-        model: var("LLM_MODEL")?,
+        provider,
+        base_url,
+        model,
         api_key_env: std::env::var("LLM_API_KEY")
             .is_ok()
             .then(|| "LLM_API_KEY".to_string()),
@@ -342,6 +459,13 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
         rate_limit_retries: policy.llm_rate_limit_retries,
         rate_limit_retry_secs: policy.llm_rate_limit_retry_secs,
         gateway_retries: policy.llm_gateway_retries,
+        prompt_cache: Some(anthropic.llm_prompt_cache),
+        thinking: anthropic.llm_thinking,
+        anthropic_version: Some(anthropic.llm_anthropic_version),
+        profile: generation.llm_profile,
+        temperature: generation.llm_temperature,
+        top_p: generation.llm_top_p,
+        prompts_dir: generation.llm_prompts_dir,
     }])
 }
 
@@ -449,12 +573,16 @@ mod tests {
         assert_eq!(target.auth, LlmAuthMode::OpenaiWifKubernetes);
         let config = target.auth_config();
         assert_eq!(
-            config.llm_token_exchange_url,
+            config.token_exchange_url(),
             "https://auth.openai.com/oauth/token"
         );
         assert_eq!(config.llm_token_refresh_skew_secs, 60);
         let federation = config.federation(None).unwrap().unwrap();
-        assert_eq!(federation.identity_provider_id, "idp_1");
+        assert!(matches!(
+            federation.target,
+            crate::auth::ExchangeTarget::Openai { ref identity_provider_id, .. }
+                if identity_provider_id == "idp_1"
+        ));
         // Out of cluster there is no projected token: the client refuses.
         let err = target.client(1).err().unwrap().to_string();
         assert!(err.contains("not readable"), "{err}");
@@ -469,6 +597,74 @@ mod tests {
                            auth = \"openai-wif-authentik\"\n";
         let target = &parse_targets(missing_ids, None).unwrap()[0];
         assert!(target.client(1).is_err());
+    }
+
+    /// The Claude example targets (docs/enricher-anthropic.md): the
+    /// provider, the documented model ids, and the service's validation (an
+    /// `anthropic` target without its key is refused).
+    #[test]
+    fn example_anthropic_targets_parse_and_validate() {
+        let targets = parse_targets(
+            include_str!("../../eval/targets.example.toml"),
+            Some(&[
+                "anthropic-claude-haiku-5-5".to_string(),
+                "anthropic-claude-sonnet-5-5".to_string(),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        for target in &targets {
+            assert_eq!(target.provider, ProviderKind::Anthropic);
+            assert_eq!(target.base_url, "https://api.anthropic.com/v1");
+            assert_eq!(target.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+            assert_eq!(
+                target.anthropic_settings().prompt_cache,
+                PromptCache::OneHour
+            );
+        }
+        assert_eq!(targets[0].model, "claude-haiku-5-5");
+        assert_eq!(targets[1].model, "claude-sonnet-5-5");
+
+        let keyless = parse_targets(
+            "[[targets]]\nname = \"c\"\nprovider = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com/v1\"\nmodel = \"claude-haiku-5-5\"\n",
+            None,
+        )
+        .unwrap();
+        let err = keyless[0].client(1).err().unwrap().to_string();
+        assert!(err.contains("needs LLM_API_KEY"), "{err}");
+        let typo =
+            "[[targets]]\nname = \"c\"\nprovider = \"claude\"\nbase_url = \"u\"\nmodel = \"m\"\n";
+        assert!(parse_targets(typo, None).is_err());
+    }
+
+    /// A target picks its profile like the service, and its own settings
+    /// override it; a known-rejected setting is refused before any call.
+    #[test]
+    fn targets_resolve_profiles_like_the_service() {
+        let parse = |extra: &str| {
+            parse_targets(
+                &format!(
+                    "[[targets]]\nname = \"t\"\nbase_url = \"http://l/v1\"\nmodel = \"m\"\n{extra}"
+                ),
+                None,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let (active, prompts) = parse("").profile_and_prompts("m").unwrap();
+        assert_eq!(active.profile, "openai-default");
+        assert_eq!(active.generation.temperature, Some(0.0));
+        assert!(prompts.is_builtin());
+        let (active, _) = parse("temperature = \"omit\"\ntop_p = \"0.8\"\n")
+            .profile_and_prompts("m")
+            .unwrap();
+        assert_eq!(active.generation.temperature, None);
+        assert_eq!(active.generation.top_p, Some(0.8));
+        let claude = parse("provider = \"anthropic\"\ntemperature = \"0.2\"\n");
+        assert!(claude.profile_and_prompts("claude-sonnet-5-5").is_err());
+        let named = parse("profile = \"nope\"\n");
+        assert!(named.profile_and_prompts("m").is_err());
     }
 
     #[test]

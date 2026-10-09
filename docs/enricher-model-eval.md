@@ -27,6 +27,11 @@ cost, data handling and the checklist to complete before switching
 production. Its eval target is `openai-gpt-6-luna-none` in
 `targets.example.toml`.
 
+For the Claude API (`provider = "anthropic"` in a target, or
+`LLM_PROVIDER=anthropic`), see [Using the Claude API](enricher-anthropic.md);
+its targets are `anthropic-claude-haiku-5-5` and
+`anthropic-claude-sonnet-5-5`.
+
 ## How it works
 
 Code: `crates/enricher/src/eval/`. It is test-only, like the existing

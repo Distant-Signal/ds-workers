@@ -5,12 +5,14 @@
 //! docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md.
 
 mod auth;
+mod batch;
 mod churn;
 mod combine;
 mod config;
 #[cfg(test)]
 mod eval;
 mod llm;
+mod profile;
 mod queries;
 #[cfg(test)]
 mod replay_eval;
@@ -52,6 +54,25 @@ async fn run() -> anyhow::Result<()> {
     common::logging::init("enricher");
 
     let config = Config::parse();
+    // `LLM_PROVIDER` with its defaults (`anthropic` fills in the base URL
+    // and model) and every cross-setting check.
+    let resolved = config.resolved_llm()?;
+    let batch_settings = config.batch.settings();
+    // The profile (`profile.rs`): generation settings for this provider and
+    // model, env overrides on top, a known-rejected sampling parameter
+    // refused here; then its prompts.
+    let active = profile::resolve(
+        resolved.provider,
+        &resolved.model,
+        config.generation.llm_profile.as_deref(),
+        config::profile_overrides(
+            &config.generation,
+            &config.provider,
+            config.anthropic.llm_thinking.as_deref(),
+        )?,
+    )?;
+    let prompts =
+        profile::PromptSet::load(config.generation.llm_prompts_dir.as_deref(), active.profile)?;
     if config.metrics_enabled {
         let buckets = llm_duration_buckets(config.llm_request_timeout_secs);
         common::metrics::install_with_buckets(
@@ -60,8 +81,36 @@ async fn run() -> anyhow::Result<()> {
         )?;
         // Token counters at 0 and the model info series, for the
         // cost-estimate query (docs/enricher-openai.md, "Cost").
-        llm::register_usage_metrics(&config.llm_model, &config.llm_base_url);
+        llm::register_usage_metrics(&resolved.model, &resolved.base_url, active.profile);
+        if batch_settings.is_some() {
+            batch::register_metrics();
+        }
         ds_store::pool::register_metrics();
+    }
+    tracing::info!(
+        provider = ?resolved.provider,
+        model = %resolved.model,
+        profile = active.profile,
+        generation = ?active.generation,
+        prompt_version = %prompts.version,
+        prompt_sources = ?prompts.sources,
+        sweep_mode = ?config.batch.llm_sweep_mode,
+        "LLM provider configured"
+    );
+    // Caching silently does nothing below the model's minimum prefix.
+    if resolved.provider == llm::ProviderKind::Anthropic
+        && config.anthropic.llm_prompt_cache != llm::anthropic::PromptCache::Off
+        && let Some(minimum) = profile::cache_minimum(&resolved.model)
+    {
+        let tokens = prompts.primary.chars().count() / 4;
+        if u32::try_from(tokens).unwrap_or(u32::MAX) < minimum {
+            tracing::warn!(
+                model = %resolved.model,
+                minimum,
+                prompt_tokens = tokens,
+                "the primary system prompt is below the model's cache minimum; prompt caching won't apply"
+            );
+        }
     }
 
     // The LLM credential, validated before anything else connects: a
@@ -142,10 +191,10 @@ async fn run() -> anyhow::Result<()> {
     // re-extraction via the sweep's existing mismatch check WITHOUT asking
     // the configured endpoint to serve a model name it doesn't have. See
     // docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md, §5.
-    let llm = LlmClient::new(
-        config.llm_base_url.clone(),
+    let mut llm = LlmClient::new(
+        resolved.base_url.clone(),
         None,
-        config.llm_model.clone(),
+        resolved.model.clone(),
         Duration::from_secs(config.llm_request_timeout_secs),
     )
     // `LLM_AUTH`: in the default `api-key` mode this is `LLM_API_KEY`, mapped
@@ -153,14 +202,25 @@ async fn run() -> anyhow::Result<()> {
     .with_auth(llm_auth)
     // Every provider-policy knob defaults to "off" (see `ProviderPolicy`).
     .with_provider_policy(config.provider.policy());
+    if resolved.provider == llm::ProviderKind::Anthropic {
+        llm = llm.with_anthropic(config.anthropic.settings());
+    }
+    // The profile's settings and prompts, last (they override the above).
+    let llm = llm
+        .with_generation(&active.generation)
+        .with_prompts(prompts);
+    // `<model>@periods-v2`, plus the prompt version when the prompts are
+    // overridden (a prompt change re-extracts).
+    let model_version = profile::model_version(&resolved.model, llm.prompts());
     let enricher = Arc::new(Enricher {
         pool,
         llm,
-        model_version: format!("{}@periods-v2", config.llm_model),
+        model_version,
         mismatch_tracker: MismatchTracker::default(),
         retry_backoff: RetryBackoff::default(),
         in_flight: InFlight::default(),
         carry_forward_noops: config.carry_forward_semantic_noops,
+        batch: batch_settings,
     });
     if enricher.carry_forward_noops {
         tracing::info!(
@@ -172,6 +232,11 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&enricher),
         config.sweep_interval_secs,
     ));
+    // Batch mode: resume polling every batch a previous process submitted,
+    // and keep polling the ones the sweep submits.
+    if let Some(settings) = enricher.batch.clone() {
+        tokio::spawn(batch::poll_loop(Arc::clone(&enricher), settings));
+    }
 
     let reclaim_redis = common::redis_conn::connect_until_ready(
         "Redis (reclaim connection)",
@@ -256,6 +321,9 @@ struct Enricher {
     in_flight: InFlight,
     /// `CARRY_FORWARD_SEMANTIC_NOOPS` (default off).
     carry_forward_noops: bool,
+    /// `LLM_SWEEP_MODE=batch` (default off): the sweep submits Message
+    /// Batches (`batch.rs`).
+    batch: Option<batch::BatchSettings>,
 }
 
 impl Enricher {
@@ -464,11 +532,17 @@ async fn sweep_loop(enricher: Arc<Enricher>, interval_secs: u64) {
         interval.tick().await;
         match sweep::fetch_sweep_rows(&enricher.pool).await {
             Ok(rows) => {
-                let ids = sweep::incidents_needing_extraction(&rows, &enricher.model_version);
+                let mut ids = sweep::incidents_needing_extraction(&rows, &enricher.model_version);
                 tracing::info!(
                     count = ids.len(),
                     "sweep found incidents needing extraction"
                 );
+                if let Some(settings) = &enricher.batch {
+                    // Submits a Message Batch when there are enough; leaves
+                    // the rest (or all, below the threshold) for the
+                    // synchronous path, minus any already in a batch.
+                    ids = batch::sweep_with_batches(&enricher, settings, ids).await;
+                }
                 let skipped = sweep_ids(&enricher, &ids).await;
                 if skipped > 0 {
                     tracing::info!(skipped, "sweep skipped incidents already in flight");
@@ -542,55 +616,55 @@ fn record_extraction_failure(
     }
 }
 
-/// Runs all three extraction passes for one incident and writes the result.
-/// Never propagates an error -- a bad response, a timeout, or a schema
-/// mismatch leaves the incident's existing columns untouched (or NULL, if
-/// this is the first attempt) and simply logs. This is deliberate per the
-/// spec: a broken enrichment step must never be able to take displayed
-/// status down with it.
-///
-/// Returns `true` when the caller should `ack` the stream entry -- a
-/// successful write, or a terminal case with nothing left to retry (the
-/// incident no longer exists) -- and `false` for a transient failure (LLM
-/// call error/timeout, DB error, or a length/ordinal-alignment mismatch
-/// between the primary and adversarial period arrays). On `false` the caller
-/// leaves the entry unacked in the consumer group's pending-entries list, so
-/// `stream::claim_stale`'s reclaim loop retries it once it's been idle long
-/// enough, rather than relying on the hourly sweep alone for a failure mode
-/// the sweep wasn't designed to catch quickly (it only re-triggers on a
-/// text or model-version change, not a bare processing failure).
-///
-/// `retry_backoff` may also make this a no-op that immediately returns
-/// `false` -- see `retry_backoff::RetryBackoff`'s own doc for why a second
-/// consecutive failure against the same text is backed off rather than
-/// retried at full LLM cost on every call.
-///
-/// Callers go through `Enricher::process_exclusive`, never straight here,
-/// so two loops never run this for the same incident at once.
+/// What [`preflight`] decided for one incident.
+enum Preflight {
+    /// Nothing for the LLM to do (or a reason not to call it now): the
+    /// value is whether to ack the stream entry, as `process_incident`'s.
+    Done(bool),
+    /// Run the three passes over this text.
+    Extract(Prepared),
+}
+
+/// One incident's current text and what the final write needs, after
+/// [`preflight`]. Built from the database (the synchronous path) or from a
+/// Message Batch's stored items (`batch.rs`, with no churn baseline).
+struct Prepared {
+    incident_id: String,
+    text_hash: String,
+    summary: String,
+    description: String,
+    reference_date: chrono::DateTime<chrono::Utc>,
+    /// See `churn`; `None` on the batch path.
+    churn_baseline: Option<churn::Baseline>,
+    edit_class: Option<text_delta::EditClass>,
+}
+
+/// Everything `process_incident` does before its first LLM call: fetch the
+/// text, skip it if already extracted, carry a semantic no-op forward,
+/// honour the per-text backoff. Shared with the batch path, which runs it
+/// for every incident it is about to submit.
 #[expect(
     clippy::too_many_lines,
     reason = "long but linear; splitting it would scatter its shared state across helpers"
 )]
-async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
+async fn preflight(enricher: &Enricher, incident_id: &str) -> Preflight {
     let Enricher {
         pool,
-        llm,
         model_version,
-        mismatch_tracker,
         retry_backoff,
         carry_forward_noops,
-        in_flight: _,
+        ..
     } = enricher;
     let (model_version, carry_forward_noops) = (model_version.as_str(), *carry_forward_noops);
     let state = match queries::fetch_incident_state(pool, incident_id).await {
         Ok(Some(state)) => state,
         Ok(None) => {
             tracing::warn!(incident_id, "incident vanished before extraction ran");
-            return true;
+            return Preflight::Done(true);
         }
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "failed to fetch incident text");
-            return false;
+            return Preflight::Done(false);
         }
     };
     let text_hash = common::text_hash::text_hash(&state.summary, &state.description);
@@ -617,7 +691,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
             incident_id,
             "text unchanged since last successful extraction; skipping"
         );
-        return true;
+        return Preflight::Done(true);
     }
 
     // Classify how the text moved since the stored extraction was computed -- only for a same-model
@@ -667,7 +741,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
                     incident_id,
                     "semantic no-op text change; carried the previous extraction forward without an LLM call"
                 );
-                return true;
+                return Preflight::Done(true);
             }
             Ok(false) => tracing::info!(
                 incident_id,
@@ -691,8 +765,60 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
             incident_id,
             "backing off a recently-failing extraction; skipping this attempt"
         );
-        return false;
+        return Preflight::Done(false);
     }
+
+    Preflight::Extract(Prepared {
+        incident_id: incident_id.to_string(),
+        text_hash,
+        summary,
+        description,
+        reference_date,
+        churn_baseline,
+        edit_class,
+    })
+}
+
+/// Runs all three extraction passes for one incident and writes the result.
+/// Never propagates an error -- a bad response, a timeout, or a schema
+/// mismatch leaves the incident's existing columns untouched (or NULL, if
+/// this is the first attempt) and simply logs. This is deliberate per the
+/// spec: a broken enrichment step must never be able to take displayed
+/// status down with it.
+///
+/// Returns `true` when the caller should `ack` the stream entry -- a
+/// successful write, or a terminal case with nothing left to retry (the
+/// incident no longer exists) -- and `false` for a transient failure (LLM
+/// call error/timeout, DB error, or a length/ordinal-alignment mismatch
+/// between the primary and adversarial period arrays). On `false` the caller
+/// leaves the entry unacked in the consumer group's pending-entries list, so
+/// `stream::claim_stale`'s reclaim loop retries it once it's been idle long
+/// enough, rather than relying on the hourly sweep alone for a failure mode
+/// the sweep wasn't designed to catch quickly (it only re-triggers on a
+/// text or model-version change, not a bare processing failure).
+///
+/// `retry_backoff` may also make this a no-op that immediately returns
+/// `false` -- see `retry_backoff::RetryBackoff`'s own doc for why a second
+/// consecutive failure against the same text is backed off rather than
+/// retried at full LLM cost on every call.
+///
+/// Callers go through `Enricher::process_exclusive`, never straight here,
+/// so two loops never run this for the same incident at once.
+async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
+    let prepared = match preflight(enricher, incident_id).await {
+        Preflight::Done(ack) => return ack,
+        Preflight::Extract(prepared) => prepared,
+    };
+    let llm = &enricher.llm;
+    let Prepared {
+        text_hash,
+        summary,
+        description,
+        reference_date,
+        ..
+    } = &prepared;
+    let (summary, description, reference_date) =
+        (summary.as_str(), description.as_str(), *reference_date);
 
     let primary_start = std::time::Instant::now();
     let primary_result = llm
@@ -712,31 +838,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         }
     };
 
-    // Decision 3 of docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md:
-    // a truncated primary extraction is NOT an error -- it already
-    // succeeded, and the pipeline below continues completely unaware
-    // anything unusual happened (extract_adversarial/
-    // extract_severity_adversarial/combine::combine_periods/
-    // write_extraction all just see an already-in-bounds `periods` list).
-    // This is purely operator-facing visibility: a counter for an alert
-    // rule to fire on, and a human-readable log line alongside it -- the
-    // same split MismatchTracker already uses (gauge for the alertable
-    // signal there, tracing::error! for the human-readable why), except a
-    // counter (not a gauge, no "currently outstanding" set to track) and
-    // tracing::warn! (not tracing::error!, since this run still succeeds
-    // and writes normally, unlike a persistent combine mismatch).
-    if primary.dropped_period_count > 0 {
-        tracing::warn!(
-            incident_id,
-            original_count = primary.periods.len() + primary.dropped_period_count,
-            kept_count = primary.periods.len(),
-            "primary extraction exceeded the period cap; truncated to the N most severe/soonest periods"
-        );
-        metrics::counter!(common::metrics::metric_name(
-            "enricher_period_truncations_total"
-        ))
-        .increment(1);
-    }
+    note_truncation(incident_id, &primary);
 
     let resolution_adversarial_start = std::time::Instant::now();
     let resolution_adversarial_result = llm
@@ -774,47 +876,87 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         }
     };
 
-    let periods = match combine::combine_periods(
-        &primary.periods,
+    finish_extraction(
+        enricher,
+        &prepared,
+        &primary,
         &resolution_adversarial,
         &severity_adversarial,
-    ) {
-        Ok(periods) => {
-            mismatch_tracker.record_success(incident_id);
-            // The extraction pipeline itself (all three LLM calls plus
-            // combination) demonstrably worked against this exact text --
-            // clear any backoff now rather than waiting for the write below
-            // to also succeed, since a subsequent write failure (DB error,
-            // or the stale-text race handled below) is not a reason to keep
-            // treating this text as one that fails extraction.
-            retry_backoff.record_success(incident_id);
-            periods
-        }
-        Err(err) => {
-            let consecutive = mismatch_tracker.record_failure(incident_id);
-            retry_backoff.record_failure(incident_id, &text_hash);
-            if consecutive > 1 {
-                // Distinguishable from the generic error path below on
-                // purpose -- design §7 item 3 wants this recognizable as
-                // "this one incident has been silently failing for a while"
-                // rather than folded into ordinary transient-failure noise.
-                tracing::error!(
-                    incident_id,
-                    consecutive_failures = consecutive,
-                    error = %err,
-                    "persistent length mismatch, likely needs prompt tuning"
-                );
-            } else {
-                tracing::error!(error = %err, incident_id, "period combination failed (length or ordinal-alignment mismatch)");
-            }
-            return false;
-        }
+    )
+    .await
+}
+
+/// Logs and counts a primary extraction that was cut to the period cap.
+///
+/// Decision 3 of docs/superpowers/specs/2026-09-01-enricher-period-cap-remediation-design.md:
+/// a truncated primary extraction is NOT an error -- it already
+/// succeeded, and the pipeline continues completely unaware anything
+/// unusual happened (`extract_adversarial`,
+/// `extract_severity_adversarial`, `combine::combine_periods` and
+/// `write_extraction` all just see an already-in-bounds `periods` list).
+/// This is purely operator-facing visibility: a counter for an alert
+/// rule to fire on, and a human-readable log line alongside it -- the
+/// same split `MismatchTracker` already uses (gauge for the alertable
+/// signal there, `tracing::error!` for the human-readable why), except a
+/// counter (not a gauge, no "currently outstanding" set to track) and
+/// `tracing::warn!` (not `tracing::error!`, since this run still succeeds
+/// and writes normally, unlike a persistent combine mismatch).
+fn note_truncation(incident_id: &str, primary: &llm::PrimaryExtraction) {
+    if primary.dropped_period_count > 0 {
+        tracing::warn!(
+            incident_id,
+            original_count = primary.periods.len() + primary.dropped_period_count,
+            kept_count = primary.periods.len(),
+            "primary extraction exceeded the period cap; truncated to the N most severe/soonest periods"
+        );
+        metrics::counter!(common::metrics::metric_name(
+            "enricher_period_truncations_total"
+        ))
+        .increment(1);
+    }
+}
+
+/// Combines the three passes' results and writes them: the end of
+/// `process_incident`, shared with the batch path (`batch.rs`). Returns
+/// whether to ack, as `process_incident` does.
+async fn finish_extraction(
+    enricher: &Enricher,
+    prepared: &Prepared,
+    primary: &llm::PrimaryExtraction,
+    resolution_adversarial: &[llm::AdversarialPeriodVerdict],
+    severity_adversarial: &[llm::SeverityAdversarialPeriodVerdict],
+) -> bool {
+    let Enricher {
+        pool,
+        model_version,
+        ..
+    } = enricher;
+    let model_version = model_version.as_str();
+    let Prepared {
+        incident_id,
+        text_hash,
+        summary,
+        description,
+        churn_baseline,
+        edit_class,
+        ..
+    } = prepared;
+    let incident_id = incident_id.as_str();
+    let Some(periods) = combine_or_record(
+        enricher,
+        incident_id,
+        text_hash,
+        primary,
+        resolution_adversarial,
+        severity_adversarial,
+    ) else {
+        return false;
     };
 
     // Compared before the write (cheap, pure, panic-free) but only
     // reported once the write has actually landed, so a stale-result
     // discard below is never counted as a re-run.
-    let churn_report = churn_baseline.map(|baseline| {
+    let churn_report = churn_baseline.as_ref().map(|baseline| {
         churn::compare(
             baseline.category.as_deref(),
             &baseline.periods,
@@ -834,9 +976,9 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
             &primary.category,
             &periods,
             model_version,
-            &text_hash,
-            &summary,
-            &description,
+            text_hash,
+            summary,
+            description,
         )
     })
     .await;
@@ -887,10 +1029,64 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         churn::record(
             incident_id,
             report,
-            edit_class.map_or("unknown", text_delta::EditClass::label),
+            (*edit_class).map_or("unknown", text_delta::EditClass::label),
         );
     }
     true
+}
+
+/// Combines the primary periods with the two verdict lists, recording the
+/// outcome in the mismatch tracker and the per-text backoff. `None` (logged)
+/// on a length or ordinal-alignment mismatch.
+fn combine_or_record(
+    enricher: &Enricher,
+    incident_id: &str,
+    text_hash: &str,
+    primary: &llm::PrimaryExtraction,
+    resolution_adversarial: &[llm::AdversarialPeriodVerdict],
+    severity_adversarial: &[llm::SeverityAdversarialPeriodVerdict],
+) -> Option<Vec<llm::ExtractionPeriod>> {
+    let Enricher {
+        mismatch_tracker,
+        retry_backoff,
+        ..
+    } = enricher;
+    match combine::combine_periods(
+        &primary.periods,
+        resolution_adversarial,
+        severity_adversarial,
+    ) {
+        Ok(periods) => {
+            mismatch_tracker.record_success(incident_id);
+            // The extraction pipeline itself (all three LLM calls plus
+            // combination) demonstrably worked against this exact text --
+            // clear any backoff now rather than waiting for the write below
+            // to also succeed, since a subsequent write failure (DB error,
+            // or the stale-text race handled below) is not a reason to keep
+            // treating this text as one that fails extraction.
+            retry_backoff.record_success(incident_id);
+            Some(periods)
+        }
+        Err(err) => {
+            let consecutive = mismatch_tracker.record_failure(incident_id);
+            retry_backoff.record_failure(incident_id, text_hash);
+            if consecutive > 1 {
+                // Distinguishable from the generic error path below on
+                // purpose -- design §7 item 3 wants this recognizable as
+                // "this one incident has been silently failing for a while"
+                // rather than folded into ordinary transient-failure noise.
+                tracing::error!(
+                    incident_id,
+                    consecutive_failures = consecutive,
+                    error = %err,
+                    "persistent length mismatch, likely needs prompt tuning"
+                );
+            } else {
+                tracing::error!(error = %err, incident_id, "period combination failed (length or ordinal-alignment mismatch)");
+            }
+            None
+        }
+    }
 }
 
 /// Attempts at the final `write_extraction` UPDATE (DB2-30).
@@ -1076,6 +1272,7 @@ mod tests {
             retry_backoff: RetryBackoff::default(),
             in_flight: InFlight::default(),
             carry_forward_noops,
+            batch: None,
         }
     }
 

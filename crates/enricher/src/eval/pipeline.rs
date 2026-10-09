@@ -57,6 +57,11 @@ pub(crate) trait Backend: Send + Sync {
         case: &Case,
         periods: &[ExtractionPeriod],
     ) -> impl Future<Output = RawCall> + Send;
+
+    /// [`llm::prompt_fingerprint`] of the prompts this backend sends.
+    fn prompt_fingerprint(&self) -> String {
+        llm::prompt_fingerprint()
+    }
 }
 
 impl Backend for LlmClient {
@@ -75,6 +80,10 @@ impl Backend for LlmClient {
                     .await
             }
         }
+    }
+
+    fn prompt_fingerprint(&self) -> String {
+        llm::prompt_fingerprint_of(self.prompts())
     }
 }
 
@@ -359,7 +368,7 @@ pub(crate) async fn run_pipeline<B: Backend>(
         label: label.clone(),
         case_id: case.id.clone(),
         input_hash: case.input_hash(),
-        prompt_fingerprint: llm::prompt_fingerprint(),
+        prompt_fingerprint: backend.prompt_fingerprint(),
         repetition,
         elapsed_ms: millis(start.elapsed()),
         calls,
@@ -731,6 +740,7 @@ mod tests {
                 completion_tokens: Some(80),
                 reasoning_tokens: Some(0),
                 cached_tokens: Some(1024),
+                cache_write_tokens: None,
             }),
             ..call
         };

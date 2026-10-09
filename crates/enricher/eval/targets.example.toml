@@ -7,7 +7,10 @@
 # enricher service itself defaults to, so an unset key benchmarks the
 # deployment as it would really run. Keys mirror the service's env vars:
 #
-#   base_url              LLM_BASE_URL (OpenAI-compatible, ends in /v1)
+#   provider              LLM_PROVIDER: "openai" (default; any OpenAI-compatible
+#                         Chat Completions endpoint) or "anthropic" (the Claude
+#                         API, docs/enricher-anthropic.md)
+#   base_url              LLM_BASE_URL (ends in /v1)
 #   model                 LLM_MODEL
 #   api_key_env           NAME of the env var holding the key (never the key)
 #   request_timeout_secs  LLM_REQUEST_TIMEOUT_SECS (perf benchmark only)
@@ -19,8 +22,24 @@
 #   rate_limit_retries    LLM_RATE_LIMIT_RETRIES
 #   rate_limit_retry_secs LLM_RATE_LIMIT_RETRY_SECS
 #   gateway_retries       LLM_GATEWAY_RETRIES
-#   auth                  LLM_AUTH: "api-key" (default), "openai-wif-authentik"
-#                         or "openai-wif-kubernetes"
+#   auth                  LLM_AUTH: "api-key" (default), "openai-wif-authentik",
+#                         "openai-wif-kubernetes" or "anthropic-wif-authentik"
+#   prompt_cache          LLM_PROMPT_CACHE (anthropic): "1h" (default), "5m", "off"
+#   thinking              LLM_THINKING (anthropic), e.g. "disabled"
+#   anthropic_version     LLM_ANTHROPIC_VERSION (anthropic)
+#   profile               LLM_PROFILE: a built-in profile by name (default:
+#                         picked by provider and model, as the service does)
+#   temperature, top_p    LLM_TEMPERATURE / LLM_TOP_P: a number or "omit"
+#                         (default: the profile's; OpenAI-compatible 0, Claude none)
+#   prompts_dir           LLM_PROMPTS_DIR: prompt overrides, <profile>.<call>.txt
+#                         or <call>.txt (call: primary, adversarial,
+#                         severity_adversarial); relative to the workspace root
+#
+# A target is resolved exactly like the service (src/profile.rs), so a
+# setting a model is known to reject fails before any call.
+#
+# For "anthropic", reasoning_effort is sent as output_config.effort and
+# max_tokens defaults to 16000 (the Messages API requires it).
 #
 # api_key_env is the normal route, OpenAI included. The keyless workload
 # identity modes (docs/enricher-openai.md, "Keyless auth") need a projected
@@ -38,6 +57,11 @@
 #   authentik_token_url = "https://sso.example.com/application/o/token/"
 #   authentik_client_id = "<client-id>"
 #   authentik_scope = "profile"
+#
+# For "anthropic-wif-authentik" (docs/enricher-anthropic.md, "Keyless
+# auth"): federation_rule_id, organization_id, anthropic_service_account_id,
+# workspace_id (optional), plus the authentik_* keys of the Claude
+# Authentik provider.
 #
 # environment is free text, but fill it in: perf numbers are meaningless
 # without knowing the hardware/host they came from.
@@ -82,3 +106,32 @@ request_timeout_secs = 120
 max_in_flight = 3
 rate_limit_retries = 3
 gateway_retries = 1
+
+# The Claude API (docs/enricher-anthropic.md). Haiku 5.5 is the service's
+# default model for LLM_PROVIDER=anthropic; Sonnet 5.5 is the quality
+# reference to compare it with. Both at the model's default effort and
+# adaptive thinking; add reasoning_effort = "low" (or thinking = "disabled"
+# on Haiku) as further targets to measure the cheaper settings.
+[[targets]]
+name = "anthropic-claude-haiku-5-5"
+environment = "Claude API (api.anthropic.com), standard tier; see docs/enricher-anthropic.md"
+provider = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+model = "claude-haiku-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+request_timeout_secs = 120
+max_in_flight = 3
+rate_limit_retries = 3
+gateway_retries = 2
+
+[[targets]]
+name = "anthropic-claude-sonnet-5-5"
+environment = "Claude API (api.anthropic.com), standard tier; see docs/enricher-anthropic.md"
+provider = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+model = "claude-sonnet-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+request_timeout_secs = 180
+max_in_flight = 3
+rate_limit_retries = 3
+gateway_retries = 2
