@@ -302,7 +302,7 @@ fn status_from_incident(
         // A closed section names its own extent ("part of the line" below);
         // the lines matched by its two ends are the ones it affects.
         (MatchScope::SharedSegment, None) => {
-            reason.push_str(" (shared trunk — also affects other lines)");
+            push_sentence(&mut reason, "Also affects other lines on this route.");
         }
         // Resolved to this line's stations: no longer just operator-wide.
         (MatchScope::OperatorOnly, None) => reason.push_str(" (operator-wide report)"),
@@ -954,6 +954,20 @@ fn is_resumption(period: &ExtractionPeriod) -> bool {
 /// keeps a multi-period incident's annotations attributable to the
 /// specific period they came from once several are semicolon-joined into
 /// one `reason` string.
+/// Appends `sentence` to a passenger-facing `reason` as its own sentence,
+/// closing the previous one with a full stop if it has none.
+fn push_sentence(reason: &mut String, sentence: &str) {
+    let trimmed_len = reason.trim_end().len();
+    reason.truncate(trimmed_len);
+    if !reason.is_empty() {
+        if !reason.ends_with(['.', '!', '?']) {
+            reason.push('.');
+        }
+        reason.push(' ');
+    }
+    reason.push_str(sentence);
+}
+
 fn scope_qualify(period: &ExtractionPeriod, text: String) -> String {
     match period.scope_description.as_deref() {
         Some(scope) if !scope.is_empty() => format!("{scope}: {text}"),
@@ -1116,35 +1130,20 @@ fn apply_extraction(
     // its own severity read is exactly the kind of model claim the
     // elapsed-floor logic below already distrusts in favor of computed
     // date arithmetic.
-    let escalation_candidates: Vec<(Severity, String)> = periods
+    // The escalation itself carries no annotation: "reported more severe
+    // than automatically classified" was internal pipeline vocabulary on a
+    // passenger-facing reason line. The raised severity speaks for itself.
+    let severity = periods
         .iter()
         .filter(|period| period_phase(period, now) == PeriodPhase::Active)
         .filter(|period| period.severity_confidence == "high")
-        .filter_map(|period| {
-            let ceiling = escalation_ceiling(&period.apparent_severity)?;
-            if severity_rank(ceiling) <= severity_rank(severity) {
-                return None;
-            }
-            let annotation = scope_qualify(
-                period,
-                format!(
-                    "reported more severe than automatically classified: {}",
-                    ceiling.description().to_lowercase()
-                ),
-            );
-            Some((ceiling, annotation))
-        })
-        .collect();
-
-    let (severity, escalation_annotation) = escalation_candidates
-        .into_iter()
-        .max_by_key(|(ceiling, _)| (severity_rank(*ceiling), std::cmp::Reverse(*ceiling)))
-        .map_or((severity, None), |(ceiling, annotation)| {
-            (ceiling, Some(annotation))
-        });
+        .filter_map(|period| escalation_ceiling(&period.apparent_severity))
+        .filter(|ceiling| severity_rank(*ceiling) > severity_rank(severity))
+        .max_by_key(|ceiling| (severity_rank(*ceiling), std::cmp::Reverse(*ceiling)))
+        .unwrap_or(severity);
 
     let mut floors: Vec<Severity> = Vec::new();
-    let mut annotations: Vec<String> = escalation_annotation.into_iter().collect();
+    let mut annotations: Vec<String> = Vec::new();
 
     for period in &periods {
         match period_phase(period, now) {
@@ -1512,7 +1511,8 @@ fn infer_from_samples(
         .filter_map(|d| d.delay_reason.as_deref().or(d.cancel_reason.as_deref()))
         .collect();
     if let Some(most_common) = most_common(&reasons) {
-        reason.push_str(&format!(" (most cited: {most_common})"));
+        let most_common = most_common.trim_end_matches('.');
+        push_sentence(&mut reason, &format!("Main cause: {most_common}."));
     }
 
     // `samples` is the single global map covering every station sampled
@@ -3818,6 +3818,27 @@ mod tests {
     }
 
     #[test]
+    fn push_sentence_closes_the_previous_sentence() {
+        let mut reason = "Signal failure at Woking".to_string();
+        push_sentence(&mut reason, "Also affects other lines on this route.");
+        assert_eq!(
+            reason,
+            "Signal failure at Woking. Also affects other lines on this route."
+        );
+
+        let mut reason = "5 of 9 sampled services delayed. ".to_string();
+        push_sentence(&mut reason, "Main cause: Signal failure.");
+        assert_eq!(
+            reason,
+            "5 of 9 sampled services delayed. Main cause: Signal failure."
+        );
+
+        let mut reason = String::new();
+        push_sentence(&mut reason, "Main cause: Signal failure.");
+        assert_eq!(reason, "Main cause: Signal failure.");
+    }
+
+    #[test]
     fn demote_for_scope_leaves_evidence_backed_scopes_untouched() {
         for scope in [
             MatchScope::ExclusiveSegment,
@@ -4196,7 +4217,7 @@ mod tests {
         let loaded = loaded_with_severity(Some("severe_disruption"), Some("high"));
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::SevereDelays);
-        assert!(annotation.unwrap().contains("more severe"));
+        assert_eq!(annotation, None, "an escalation adds no reason text");
     }
 
     #[test]
@@ -4207,7 +4228,7 @@ mod tests {
         let loaded = loaded_with_severity(Some("blocked_or_suspended"), Some("high"));
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::PartSuspended);
-        assert!(annotation.is_some());
+        assert_eq!(annotation, None);
     }
 
     #[test]
@@ -4248,7 +4269,7 @@ mod tests {
         let loaded = loaded_with_severity(Some("blocked_or_suspended"), Some("high"));
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::PartSuspended);
-        assert!(annotation.is_some());
+        assert_eq!(annotation, None, "an escalation adds no reason text");
     }
 
     #[test]
@@ -4275,8 +4296,8 @@ mod tests {
         assert_eq!(severity, Severity::MinorDelays);
         let annotation = annotation.unwrap();
         assert!(
-            annotation.contains("more severe"),
-            "escalation annotation missing: {annotation}"
+            !annotation.contains("more severe"),
+            "the escalation adds no reason text: {annotation}"
         );
         assert!(
             annotation.contains("reported resolved"),
@@ -4607,7 +4628,7 @@ mod tests {
         };
         let (severity, annotation) = apply_extraction(Severity::MinorDelays, &loaded, Utc::now());
         assert_eq!(severity, Severity::PartSuspended);
-        assert!(annotation.unwrap().contains("phase 2"));
+        assert_eq!(annotation, None, "an escalation adds no reason text");
     }
 
     #[test]

@@ -455,7 +455,7 @@ async fn existing_statuses(
 ///   `sample_stats` does, for the same underlying reason (they're computed
 ///   from the same live departure counts), so they need the same
 ///   normalization. See `normalize_sample_counts`'s own doc comment for why
-///   only the counts -- not the `"(most cited: ...)"` suffix
+///   only the counts -- not the `"Main cause: ..."` sentence
 ///   `infer_from_samples` also appends -- are stripped here.
 ///
 /// Without stripping all of these, a "change" would be seen on every single
@@ -620,7 +620,7 @@ fn strip_live_sample_annotation(reason: &str) -> &str {
 /// without a regex dependency or a full parse -- mirrors
 /// `strip_live_sample_annotation`'s marker-based approach.
 ///
-/// Deliberately does NOT touch the `" (most cited: ...)"` suffix
+/// Deliberately does NOT touch the `" Main cause: ..."` sentence
 /// `infer_from_samples` separately appends after `classify()` runs: unlike
 /// the raw counts, `most_common`'s pick of the most-cited free-text delay/
 /// cancel reason is real information about *why* services are disrupted,
@@ -2873,7 +2873,7 @@ mod tests {
     // --- normalize_sample_counts ---
     //
     // See that function's own doc comment for the reasoning behind
-    // stripping only the counts and deliberately leaving "(most cited:
+    // stripping only the counts and deliberately leaving "Main cause:
     // ...)" text untouched.
 
     #[test]
@@ -2901,10 +2901,8 @@ mod tests {
     #[test]
     fn normalize_sample_counts_leaves_the_most_cited_suffix_untouched() {
         assert_eq!(
-            normalize_sample_counts(
-                "5 of 9 sampled services delayed. (most cited: Signal failure)"
-            ),
-            "N of M sampled services delayed. (most cited: Signal failure)",
+            normalize_sample_counts("5 of 9 sampled services delayed. Main cause: Signal failure."),
+            "N of M sampled services delayed. Main cause: Signal failure.",
         );
     }
 
@@ -2964,10 +2962,10 @@ mod tests {
         assert_eq!(
             normalize_sample_counts(
                 "Platforms 1–3 closed at Queen’s Park — 5 of 9 sampled services delayed. \
-                 (most cited: Signal failure)"
+                 Main cause: Signal failure."
             ),
             "Platforms 1–3 closed at Queen’s Park — N of M sampled services delayed. \
-             (most cited: Signal failure)",
+             Main cause: Signal failure.",
         );
         // A count clause whose leading digit run is immediately preceded by
         // a multi-byte character (an em dash with no space, worst case for
@@ -3006,7 +3004,7 @@ mod tests {
         let a = serde_json::json!([
             {
                 "severity": "minor-delays",
-                "reason": "5 of 9 sampled services delayed. (most cited: Signal failure)",
+                "reason": "5 of 9 sampled services delayed. Main cause: Signal failure.",
                 "validity": {"from_date": "2026-07-09T10:00:00Z"},
                 "data_quality": "ldbws-inferred"
             }
@@ -3014,7 +3012,7 @@ mod tests {
         let b = serde_json::json!([
             {
                 "severity": "minor-delays",
-                "reason": "7 of 14 sampled services delayed. (most cited: Signal failure)",
+                "reason": "7 of 14 sampled services delayed. Main cause: Signal failure.",
                 "validity": {"from_date": "2026-07-09T10:05:00Z"},
                 "data_quality": "ldbws-inferred"
             }
@@ -3033,7 +3031,7 @@ mod tests {
         let a = serde_json::json!([
             {
                 "severity": "minor-delays",
-                "reason": "5 of 9 sampled services delayed. (most cited: Signal failure)",
+                "reason": "5 of 9 sampled services delayed. Main cause: Signal failure.",
                 "validity": {"from_date": "2026-07-09T10:00:00Z"},
                 "data_quality": "ldbws-inferred"
             }
@@ -3041,7 +3039,7 @@ mod tests {
         let b = serde_json::json!([
             {
                 "severity": "minor-delays",
-                "reason": "7 of 14 sampled services delayed. (most cited: Engineering works)",
+                "reason": "7 of 14 sampled services delayed. Main cause: Engineering works.",
                 "validity": {"from_date": "2026-07-09T10:05:00Z"},
                 "data_quality": "ldbws-inferred"
             }
