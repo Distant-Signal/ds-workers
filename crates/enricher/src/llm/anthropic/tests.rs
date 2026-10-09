@@ -48,7 +48,7 @@ fn primary_text() -> String {
 
 /// A Messages API response (the API reference's shape), with an (omitted)
 /// thinking block first, as adaptive thinking returns.
-fn message_body(text: &str, usage: Value) -> Value {
+fn message_body(text: &str, usage: &Value) -> Value {
     serde_json::json!({
         "id": "msg_01",
         "type": "message",
@@ -91,7 +91,7 @@ async fn mount_success(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/messages"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), plain_usage())),
+            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), &plain_usage())),
         )
         .mount(server)
         .await;
@@ -109,7 +109,7 @@ async fn messages_request_shape_and_successful_parse() {
         .and(header("x-api-key", KEY))
         .and(header("anthropic-version", DEFAULT_VERSION))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), plain_usage())),
+            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), &plain_usage())),
         )
         .mount(&server)
         .await;
@@ -400,14 +400,16 @@ async fn cache_usage_fields_feed_the_token_counter() {
     Mock::given(method("POST"))
         .and(path("/messages"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), write)),
+            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), &write)),
         )
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), read)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), &read)),
+        )
         .mount(&server)
         .await;
     let client = client(&server, AnthropicSettings::default());
@@ -597,7 +599,7 @@ async fn message_batch_lifecycle() {
         "{}\n{}\n",
         serde_json::json!({ "custom_id": "p-1", "result": { "type": "expired" } }),
         serde_json::json!({ "custom_id": "p-0", "result": {
-            "type": "succeeded", "message": message_body(&primary_text(), plain_usage()) } }),
+            "type": "succeeded", "message": message_body(&primary_text(), &plain_usage()) } }),
     );
     Mock::given(method("GET"))
         .and(path("/messages/batches/msgbatch_1/results"))
@@ -713,7 +715,7 @@ async fn a_federated_token_is_a_bearer_with_no_api_key() {
         .and(path("/messages"))
         .and(header("authorization", "Bearer sk-ant-oat01-minted"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), plain_usage())),
+            ResponseTemplate::new(200).set_body_json(message_body(&primary_text(), &plain_usage())),
         )
         .mount(&server)
         .await;

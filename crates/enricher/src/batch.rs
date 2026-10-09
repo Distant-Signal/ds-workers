@@ -327,7 +327,7 @@ pub(crate) fn plan_primary(
             }
             Err(Some(reason)) => {
                 plan.text_failures
-                    .push((item.incident_id, item.text_hash, reason))
+                    .push((item.incident_id, item.text_hash, reason));
             }
             Err(None) => {}
         }
@@ -857,7 +857,7 @@ mod tests {
         .to_string()
     }
 
-    fn message(text: &str, usage: serde_json::Value) -> serde_json::Value {
+    fn message(text: &str, usage: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "id": "msg_1",
             "type": "message",
@@ -873,7 +873,7 @@ mod tests {
             "custom_id": custom_id,
             "result": {
                 "type": "succeeded",
-                "message": message(text, serde_json::json!({
+                "message": message(text, &serde_json::json!({
                     "input_tokens": 120,
                     "cache_read_input_tokens": 2900,
                     "cache_creation_input_tokens": 0,

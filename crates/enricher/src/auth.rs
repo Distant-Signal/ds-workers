@@ -626,7 +626,7 @@ impl FederatedTokenSource {
             // re-exchange comes through here too).
             state.authentik = None;
             let Some(authentik) = &self.config.authentik else {
-                return Err(self.missing_authentik());
+                return Err(Self::missing_authentik());
             };
             let assertion = self.authentik_token(authentik, state).await;
             state.authentik = None;
@@ -701,7 +701,7 @@ impl FederatedTokenSource {
 
     /// `anthropic-wif-authentik` without Authentik settings: config
     /// validation prevents it, so this is only a typed failure.
-    fn missing_authentik(&self) -> ExchangeFailure {
+    fn missing_authentik() -> ExchangeFailure {
         tracing::error!("anthropic-wif-authentik has no Authentik settings");
         record_exchange(Stage::Anthropic, "error");
         ExchangeFailure {
@@ -730,7 +730,7 @@ impl FederatedTokenSource {
             workspace_id,
         } = &self.config.target
         else {
-            return Err(self.missing_authentik());
+            return Err(Self::missing_authentik());
         };
         let request = self
             .http
@@ -771,7 +771,7 @@ impl FederatedTokenSource {
             service_account_id,
         } = &self.config.target
         else {
-            return Err(self.missing_authentik());
+            return Err(Self::missing_authentik());
         };
         let request = self
             .http

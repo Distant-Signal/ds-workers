@@ -470,14 +470,13 @@ pub(crate) fn parse_results_jsonl(text: &str) -> HashMap<String, BatchOutcome> {
                 };
                 Some((custom_id, outcome))
             });
-        match parsed {
-            Some((custom_id, outcome)) => {
-                outcomes.insert(custom_id, outcome);
-            }
-            None => tracing::warn!(
+        if let Some((custom_id, outcome)) = parsed {
+            outcomes.insert(custom_id, outcome);
+        } else {
+            tracing::warn!(
                 line = %line.chars().take(200).collect::<String>(),
                 "unparseable Message Batch result line; skipping it"
-            ),
+            );
         }
     }
     outcomes
@@ -623,4 +622,8 @@ impl LlmClient {
 
 /// Mocked-HTTP fixtures for the Messages and Message Batches routes.
 #[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test code: scenario tests read top to bottom"
+)]
 mod tests;

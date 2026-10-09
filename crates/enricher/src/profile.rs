@@ -21,7 +21,7 @@
 //!
 //! **Prompts.** The three system prompts are the built-in shared ones
 //! unless `LLM_PROMPTS_DIR` (the chart mounts `enricher.llm.prompts`'s
-//! ConfigMap there) has `<profile>.<call>.txt` or `<call>.txt` for a call
+//! `ConfigMap` there) has `<profile>.<call>.txt` or `<call>.txt` for a call
 //! (`primary`, `adversarial`, `severity_adversarial`), most specific first.
 //! The schemas and parsers stay shared, so outputs stay compatible. The
 //! active prompt set's short hash is its `version`: logged, and part of
@@ -430,22 +430,18 @@ impl PromptSet {
                 dir.join(format!("{profile}.{call}.txt")),
                 dir.join(format!("{call}.txt")),
             ];
-            match candidates.iter().find(|p| p.is_file()) {
-                Some(path) => {
-                    let text = std::fs::read_to_string(path).map_err(|err| {
-                        anyhow::anyhow!("reading prompt {}: {err}", path.display())
-                    })?;
-                    let text = text.trim().to_string();
-                    if text.is_empty() {
-                        anyhow::bail!("prompt {} is empty", path.display());
-                    }
-                    texts[i] = text;
-                    sources[i] = path.display().to_string();
+            if let Some(path) = candidates.iter().find(|p| p.is_file()) {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|err| anyhow::anyhow!("reading prompt {}: {err}", path.display()))?;
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    anyhow::bail!("prompt {} is empty", path.display());
                 }
-                None => {
-                    texts[i] = defaults[i].clone();
-                    sources[i] = "built-in".to_string();
-                }
+                texts[i] = text;
+                sources[i] = path.display().to_string();
+            } else {
+                texts[i].clone_from(&defaults[i]);
+                sources[i] = "built-in".to_string();
             }
         }
         let version = prompt_version([&texts[0], &texts[1], &texts[2]]);
@@ -489,7 +485,7 @@ mod tests {
     }
 
     /// Without overrides the built-in profiles are today's requests:
-    /// OpenAI temperature 0, gpt-6-luna also effort `none`, Claude nothing.
+    /// `OpenAI` temperature 0, gpt-6-luna also effort `none`, Claude nothing.
     #[test]
     fn builtin_profiles_keep_todays_behaviour() {
         let none = Overrides::default();

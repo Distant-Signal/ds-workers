@@ -1415,11 +1415,10 @@ impl LlmClient {
         }
     }
 
-    /// One pass's chat completion, in-call retries included. Returns the raw
-    /// `content` string (not yet parsed) and how many in-call retries the
-    /// provider policy spent on it -- see [`RawCall`].
-    async fn chat_completion(&self, spec: CallSpec) -> RawCall {
-        let request = match &self.provider {
+    /// The provider's request body for `spec`: an `OpenAI` chat completion
+    /// or a Claude Messages API body.
+    fn wire_request(&self, spec: CallSpec) -> WireRequest<'_> {
+        match &self.provider {
             Provider::OpenAi => WireRequest::Chat(ChatCompletionRequest {
                 call: spec.call,
                 model: &self.model,
@@ -1459,7 +1458,14 @@ impl LlmClient {
                     &spec.schema,
                 ),
             },
-        };
+        }
+    }
+
+    /// One pass's chat completion, in-call retries included. Returns the raw
+    /// `content` string (not yet parsed) and how many in-call retries the
+    /// provider policy spent on it -- see [`RawCall`].
+    async fn chat_completion(&self, spec: CallSpec) -> RawCall {
+        let request = self.wire_request(spec);
 
         // Bounded in-call retry for provider-transient failures. With the
         // default policy both budgets are 0, so the first failure is
@@ -1589,58 +1595,7 @@ impl LlmClient {
     /// retry budgets. A 403 is never refreshed: a new token for the same
     /// service account would be refused the same way.
     async fn send_once(&self, request: &WireRequest<'_>) -> Result<Completion, LlmCallError> {
-        let mut refreshed = false;
-        let response = loop {
-            let (mut req, static_key) = match request {
-                WireRequest::Chat(body) => (
-                    self.http
-                        .post(format!("{}/chat/completions", self.base_url))
-                        .json(body),
-                    crate::auth::StaticKeyHeader::Bearer,
-                ),
-                WireRequest::Messages { version, body, .. } => (
-                    self.http
-                        .post(format!("{}/messages", self.base_url))
-                        .header("anthropic-version", *version)
-                        .json(body),
-                    crate::auth::StaticKeyHeader::XApiKey,
-                ),
-            };
-            let credential = self.auth.credential(static_key).await?;
-            if let Some(credential) = &credential {
-                req = credential.apply(req);
-            }
-
-            let response = req.send().await.map_err(|err| {
-                if err.is_timeout() {
-                    LlmCallError::ClientTimeout
-                } else {
-                    LlmCallError::Other(err.into())
-                }
-            })?;
-            if response.status() != reqwest::StatusCode::UNAUTHORIZED || !self.auth.is_federated() {
-                break response;
-            }
-            let request_id = request_id(response.headers());
-            if let Some(credential) = &credential {
-                self.auth.invalidate(credential.secret());
-            }
-            if refreshed {
-                let err = LlmCallError::Unauthorized;
-                tracing::warn!(
-                    status = 401,
-                    request_id = request_id.as_deref(),
-                    outcome = err.outcome_label(),
-                    "LLM call failed"
-                );
-                return Err(err);
-            }
-            tracing::info!(
-                request_id = request_id.as_deref(),
-                "LLM endpoint returned 401 to the federated token; exchanging a new one"
-            );
-            refreshed = true;
-        };
+        let response = self.send_with_refresh(request).await?;
         let status = response.status();
         let request_id = request_id(response.headers());
         if !status.is_success() {
@@ -1694,6 +1649,68 @@ impl LlmClient {
         match content {
             Ok(content) => Ok(Completion { content, usage }),
             Err(err) => Err(failed(err)),
+        }
+    }
+
+    /// Send `request` with the current credential and return the response
+    /// (any status). A federated credential's 401 is retried once with a
+    /// freshly exchanged token, and a second 401 is
+    /// [`LlmCallError::Unauthorized`] (see [`Self::send_once`]).
+    async fn send_with_refresh(
+        &self,
+        request: &WireRequest<'_>,
+    ) -> Result<reqwest::Response, LlmCallError> {
+        let mut refreshed = false;
+        loop {
+            let (mut req, static_key) = match request {
+                WireRequest::Chat(body) => (
+                    self.http
+                        .post(format!("{}/chat/completions", self.base_url))
+                        .json(body),
+                    crate::auth::StaticKeyHeader::Bearer,
+                ),
+                WireRequest::Messages { version, body, .. } => (
+                    self.http
+                        .post(format!("{}/messages", self.base_url))
+                        .header("anthropic-version", *version)
+                        .json(body),
+                    crate::auth::StaticKeyHeader::XApiKey,
+                ),
+            };
+            let credential = self.auth.credential(static_key).await?;
+            if let Some(credential) = &credential {
+                req = credential.apply(req);
+            }
+
+            let response = req.send().await.map_err(|err| {
+                if err.is_timeout() {
+                    LlmCallError::ClientTimeout
+                } else {
+                    LlmCallError::Other(err.into())
+                }
+            })?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED || !self.auth.is_federated() {
+                return Ok(response);
+            }
+            let request_id = request_id(response.headers());
+            if let Some(credential) = &credential {
+                self.auth.invalidate(credential.secret());
+            }
+            if refreshed {
+                let err = LlmCallError::Unauthorized;
+                tracing::warn!(
+                    status = 401,
+                    request_id = request_id.as_deref(),
+                    outcome = err.outcome_label(),
+                    "LLM call failed"
+                );
+                return Err(err);
+            }
+            tracing::info!(
+                request_id = request_id.as_deref(),
+                "LLM endpoint returned 401 to the federated token; exchanging a new one"
+            );
+            refreshed = true;
         }
     }
 

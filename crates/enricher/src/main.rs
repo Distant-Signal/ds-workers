@@ -822,7 +822,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
 
     let primary_start = std::time::Instant::now();
     let primary_result = llm
-        .extract_primary(&summary, &description, reference_date)
+        .extract_primary(summary, description, reference_date)
         .await;
     record_llm_call_metrics(
         llm::LlmCall::Primary.label(),
@@ -833,7 +833,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         Ok(p) => p,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "primary extraction failed");
-            record_extraction_failure(enricher, incident_id, &text_hash, &err);
+            record_extraction_failure(enricher, incident_id, text_hash, &err);
             return false;
         }
     };
@@ -842,7 +842,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
 
     let resolution_adversarial_start = std::time::Instant::now();
     let resolution_adversarial_result = llm
-        .extract_adversarial(&summary, &description, &primary.periods)
+        .extract_adversarial(summary, description, &primary.periods)
         .await;
     record_llm_call_metrics(
         llm::LlmCall::ResolutionAdversarial.label(),
@@ -853,14 +853,14 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "adversarial extraction failed");
-            record_extraction_failure(enricher, incident_id, &text_hash, &err);
+            record_extraction_failure(enricher, incident_id, text_hash, &err);
             return false;
         }
     };
 
     let severity_adversarial_start = std::time::Instant::now();
     let severity_adversarial_result = llm
-        .extract_severity_adversarial(&summary, &description, &primary.periods)
+        .extract_severity_adversarial(summary, description, &primary.periods)
         .await;
     record_llm_call_metrics(
         llm::LlmCall::SeverityAdversarial.label(),
@@ -871,7 +871,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(error = ?err, incident_id, "severity adversarial extraction failed");
-            record_extraction_failure(enricher, incident_id, &text_hash, &err);
+            record_extraction_failure(enricher, incident_id, text_hash, &err);
             return false;
         }
     };
