@@ -13,7 +13,7 @@ Code: `crates/aggregator/src/archive.rs`. Chart: `archive.*` in
 
 | `archive.tables` entry | Archived objects |
 | --- | --- |
-| `trains` | `trains`, `train_movement_events`, `train_current_state` and `train_reasons` (the child tables that `ON DELETE CASCADE` removes along with each `trains` row). `train_movement_events.raw_body` is left out (see below). `notifier_forward_queue` also cascades but is not archived: it is a transient push-forwarding signal, not history. |
+| `trains` | `trains`, `train_movement_events`, `train_current_state` and `train_reasons` (the child tables that `ON DELETE CASCADE` removes along with each `trains` row). `train_movement_events.raw_body` is left out (see below). `notifier_forward_queue` also cascades but is not archived: it is a transient push-forwarding signal, not history. Its rows leave only with their `trains` row, which `DistantSignalNotifierForwardQueueRetentionOverdue` watches ([alerts](alerts.md#distantsignalnotifierforwardqueueretentionoverdue)). |
 
 `train_reasons` was added on 2026-10-08. Before that, the archive deleted
 its rows through the cascade without archiving them, so archived batches

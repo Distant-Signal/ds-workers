@@ -878,6 +878,77 @@ pub(crate) async fn poll_forward_queue(
     ))
 }
 
+/// `notifier_forward_queue_rows`: rows in `notifier_forward_queue`, read
+/// after every forward-queue cycle. Nothing deletes a row once the notifier
+/// has read it; it goes only when the aggregator prunes its `trains` row
+/// (`ON DELETE CASCADE`), and it is not archived (decision 2026-10-08). So
+/// the table holds about `trainsRetentionDays` of signals, and this gauge
+/// growing past that is the chart's `DistantSignalNotifierForwardQueueLarge`.
+pub(crate) const FORWARD_QUEUE_ROWS_METRIC: &str = "notifier_forward_queue_rows";
+/// `notifier_forward_queue_oldest_age_seconds`: the age of the oldest row
+/// (`created_at`), 0 while the table is empty. Past the trains retention
+/// window, the prune that should have removed it is not running; the
+/// chart's `DistantSignalNotifierForwardQueueRetentionOverdue`.
+pub(crate) const FORWARD_QUEUE_OLDEST_AGE_METRIC: &str =
+    "notifier_forward_queue_oldest_age_seconds";
+
+/// Size and oldest row of `notifier_forward_queue`; see
+/// [`FORWARD_QUEUE_ROWS_METRIC`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardQueueStats {
+    pub rows: i64,
+    pub oldest_created_at: Option<DateTime<Utc>>,
+}
+
+impl ForwardQueueStats {
+    /// Seconds since the oldest row was written, 0 for an empty table (or
+    /// a row stamped after `now` by a skewed clock).
+    pub(crate) fn oldest_age_seconds(&self, now: DateTime<Utc>) -> i64 {
+        self.oldest_created_at
+            .map_or(0, |oldest| (now - oldest).num_seconds().max(0))
+    }
+}
+
+/// One scan of the whole queue. It holds a few hundred rows in production
+/// (2026-10-09: 315 rows, 216 kB, all for tracked trains), so a count every
+/// cycle is cheap; at `DistantSignalNotifierForwardQueueLarge`'s default
+/// threshold it is still a few milliseconds.
+pub(crate) async fn forward_queue_stats(pool: &PgPool) -> anyhow::Result<ForwardQueueStats> {
+    let (rows, oldest_created_at): (i64, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT count(*), min(created_at) FROM notifier_forward_queue")
+            .fetch_one(pool)
+            .await?;
+    Ok(ForwardQueueStats {
+        rows,
+        oldest_created_at,
+    })
+}
+
+/// Sets both forward-queue gauges from `stats`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric gauges take f64; a row count or an age in seconds stays far below 2^52"
+)]
+pub(crate) fn publish_forward_queue_stats(stats: &ForwardQueueStats, now: DateTime<Utc>) {
+    metrics::gauge!(common::metrics::metric_name(FORWARD_QUEUE_ROWS_METRIC)).set(stats.rows as f64);
+    metrics::gauge!(common::metrics::metric_name(
+        FORWARD_QUEUE_OLDEST_AGE_METRIC
+    ))
+    .set(stats.oldest_age_seconds(now) as f64);
+}
+
+/// Registers both forward-queue gauges at 0, so the series exist from
+/// startup.
+pub(crate) fn register_forward_queue_metrics() {
+    publish_forward_queue_stats(
+        &ForwardQueueStats {
+            rows: 0,
+            oldest_created_at: None,
+        },
+        Utc::now(),
+    );
+}
+
 pub(crate) async fn pinned_users_for_line(
     pool: &PgPool,
     line_id: &str,
@@ -3944,6 +4015,85 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    #[test]
+    fn forward_queue_oldest_age_is_zero_when_empty_or_in_the_future() {
+        let now: DateTime<Utc> = "2026-10-09T12:00:00Z".parse().unwrap();
+        let at = |oldest: Option<&str>| ForwardQueueStats {
+            rows: 1,
+            oldest_created_at: oldest.map(|t| t.parse().unwrap()),
+        };
+        assert_eq!(at(None).oldest_age_seconds(now), 0);
+        assert_eq!(at(Some("2026-10-09T12:00:05Z")).oldest_age_seconds(now), 0);
+        assert_eq!(
+            at(Some("2026-09-09T11:00:00Z")).oldest_age_seconds(now),
+            30 * 86_400 + 3_600
+        );
+    }
+
+    #[test]
+    fn forward_queue_stats_publish_both_gauges() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let now: DateTime<Utc> = "2026-10-09T12:00:00Z".parse().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            register_forward_queue_metrics();
+            publish_forward_queue_stats(
+                &ForwardQueueStats {
+                    rows: 315,
+                    oldest_created_at: Some("2026-10-09T11:59:00Z".parse().unwrap()),
+                },
+                now,
+            );
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "distant_signal_notifier_forward_queue_rows 315"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l == "distant_signal_notifier_forward_queue_oldest_age_seconds 60"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                forward_queue_stats_counts_rows_and_finds_the_oldest -- --ignored --test-threads=1`"]
+    async fn forward_queue_stats_counts_rows_and_finds_the_oldest() {
+        let pool = connect().await;
+        let trains_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-FWDQ-STATS-UID', '2026-08-30') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+        let before = forward_queue_stats(&pool).await.expect("stats before");
+        let oldest: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+        sqlx::query(
+            "INSERT INTO notifier_forward_queue (trains_id, event_summary, created_at) \
+             VALUES ($1, 'old', $2), ($1, 'new', now())",
+        )
+        .bind(trains_id)
+        .bind(oldest)
+        .execute(&pool)
+        .await
+        .expect("seed two forward-queue rows");
+
+        let after = forward_queue_stats(&pool).await.expect("stats after");
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .expect("delete the train (cascades to its queue rows)");
+
+        assert_eq!(after.rows, before.rows + 2);
+        assert_eq!(after.oldest_created_at, Some(oldest));
     }
 
     /// A `tracing_subscriber::Layer` counting `sqlx`'s own per-query

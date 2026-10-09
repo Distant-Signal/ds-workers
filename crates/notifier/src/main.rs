@@ -154,6 +154,7 @@ async fn run() -> anyhow::Result<()> {
         common::metrics::register_cycle("notifier", cycle);
     }
     queries::register_line_history_metrics();
+    queries::register_forward_queue_metrics();
     let line_history_max_age = config.line_history_max_age();
     tracing::info!(
         line_history_max_age_secs = config.line_history_max_age_secs,
@@ -206,6 +207,7 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier forward-queue cycle failed; will retry next interval");
                 }
                 common::metrics::record_cycle("notifier", FORWARD_QUEUE_CYCLE, result.is_ok());
+                sample_forward_queue(&pool, Utc::now()).await;
             }
             _ = progress.idle(skip_check_interval.tick()) => {
                 let result = run_skip_check_cycle(&pool, &queue, Utc::now()).await;
@@ -554,6 +556,22 @@ async fn run_forward_queue_cycle(
     )
     .await?;
     Ok(())
+}
+
+/// Samples `notifier_forward_queue`'s size and oldest row into
+/// `notifier_forward_queue_rows` / `notifier_forward_queue_oldest_age_seconds`
+/// (see [`queries::FORWARD_QUEUE_ROWS_METRIC`]) after every forward-queue
+/// cycle, whatever its result. A failed read only logs and leaves the
+/// gauges at their last value: it is not part of forwarding, and a database
+/// that refuses this also fails the cycle, which
+/// `DistantSignalNotifierCycleFailing` already covers.
+async fn sample_forward_queue(pool: &PgPool, now: DateTime<Utc>) {
+    match queries::forward_queue_stats(pool).await {
+        Ok(stats) => queries::publish_forward_queue_stats(&stats, now),
+        Err(err) => {
+            tracing::warn!(error = ?err, "could not read notifier_forward_queue's size; gauges keep their last value");
+        }
+    }
 }
 
 /// The station-skip check's own cycle (Task 9, §5.2) -- a full poll of
