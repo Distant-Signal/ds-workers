@@ -113,6 +113,10 @@ pub(crate) struct BatchItem {
     pub summary: String,
     pub description: String,
     pub reference_date: DateTime<Utc>,
+    /// `Prepared::text_seen_at`, for the latency metric. Absent from rows
+    /// written before it existed, which then record no latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_seen_at: Option<DateTime<Utc>>,
     /// The primary pass's raw output (adversarial stage only), re-parsed
     /// with `llm::parse_primary` when the adversarial results arrive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +132,7 @@ impl BatchItem {
             summary: prepared.summary.clone(),
             description: prepared.description.clone(),
             reference_date: prepared.reference_date,
+            text_seen_at: prepared.text_seen_at,
             primary_content: None,
         }
     }
@@ -141,6 +146,7 @@ impl BatchItem {
             reference_date: self.reference_date,
             churn_baseline: None,
             edit_class: None,
+            text_seen_at: self.text_seen_at,
         }
     }
 }
@@ -556,7 +562,9 @@ pub(crate) async fn sweep_with_batches(
             crate::record_in_flight_skip("sweep", id);
             continue;
         };
-        if let Preflight::Extract(ready) = crate::preflight(enricher, id).await {
+        if let Preflight::Extract(ready) =
+            crate::preflight(enricher, id, crate::latency::Path::Sweep).await
+        {
             prepared.push(ready);
         }
     }
@@ -808,6 +816,7 @@ async fn finish_adversarial_stage(
             &ready.primary,
             &ready.resolution,
             &ready.severity,
+            crate::latency::Path::Batch,
         )
         .await
         {
@@ -838,8 +847,28 @@ mod tests {
             summary: "Signal failure".to_string(),
             description: "Lines blocked".to_string(),
             reference_date: "2026-10-01T00:00:00Z".parse().unwrap(),
+            text_seen_at: None,
             primary_content: None,
         }
+    }
+
+    /// The latency start survives the `items` JSON round trip, and a row
+    /// written before the field existed still parses (recording nothing).
+    #[test]
+    fn text_seen_at_round_trips_and_defaults_for_old_rows() {
+        let seen: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+        let with = BatchItem {
+            text_seen_at: Some(seen),
+            ..item(0, "A")
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        let back: BatchItem = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.prepared().text_seen_at, Some(seen));
+
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("text_seen_at");
+        let back: BatchItem = serde_json::from_value(old).unwrap();
+        assert_eq!(back.prepared().text_seen_at, None);
     }
 
     fn primary_json() -> String {

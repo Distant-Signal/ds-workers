@@ -651,6 +651,18 @@ and at most 3 in flight (`LLM_MAX_IN_FLIGHT`). That is far below Tier 1's
 request and token limits (rate-limits guide), and 429s are still handled
 if a burst after an outage hits them.
 
+### Latency
+
+- `distant_signal_enricher_llm_call_duration_seconds{call}`: one LLM call,
+  in-call retries and 429 waits included.
+- `distant_signal_enricher_enrichment_latency_seconds{path, outcome}`: end
+  to end, from a text first being observed (its earliest `incident_history`
+  row) to its extraction being committed, once per new text. `path` is
+  `stream`, `reclaim`, `sweep` or `batch`; `outcome` is `stored` or
+  `carried_forward`. Unchanged-text skips, model-version re-extractions and
+  failed attempts record nothing. Details and PromQL:
+  [enricher-anthropic.md](enricher-anthropic.md#is-the-latency-acceptable).
+
 ## Model snapshot
 
 `gpt-6-luna` is a single, unpinned alias: OpenAI can update the model

@@ -11,6 +11,7 @@ mod combine;
 mod config;
 #[cfg(test)]
 mod eval;
+mod latency;
 mod llm;
 mod profile;
 mod queries;
@@ -77,7 +78,13 @@ async fn run() -> anyhow::Result<()> {
         let buckets = llm_duration_buckets(config.llm_request_timeout_secs);
         common::metrics::install_with_buckets(
             config.metrics_port,
-            &[(&common::metrics::metric_name(LLM_DURATION_METRIC), &buckets)],
+            &[
+                (&common::metrics::metric_name(LLM_DURATION_METRIC), &buckets),
+                (
+                    &common::metrics::metric_name(latency::METRIC),
+                    &latency::BUCKETS,
+                ),
+            ],
         )?;
         // Token counters at 0 and the model info series, for the
         // cost-estimate query (docs/enricher-openai.md, "Cost").
@@ -331,9 +338,9 @@ impl Enricher {
     /// the same incident, in which case it returns `None` without touching
     /// the DB or the LLM. The caller decides what "busy" means for it --
     /// see `InFlight`.
-    async fn process_exclusive(&self, incident_id: &str) -> Option<bool> {
+    async fn process_exclusive(&self, incident_id: &str, path: latency::Path) -> Option<bool> {
         let _claim = self.in_flight.try_claim(incident_id)?;
-        Some(process_incident(self, incident_id).await)
+        Some(process_incident(self, incident_id, path).await)
     }
 }
 
@@ -409,7 +416,10 @@ fn record_in_flight_skip(caller: &'static str, incident_id: &str) {
 
 /// One entry from the stream consumer loop. Returns whether to ack it.
 async fn process_stream_entry(enricher: &Enricher, entry_id: &str, incident_id: &str) -> bool {
-    match enricher.process_exclusive(incident_id).await {
+    match enricher
+        .process_exclusive(incident_id, latency::Path::Stream)
+        .await
+    {
         Some(true) => true,
         Some(false) => {
             tracing::warn!(
@@ -558,7 +568,11 @@ async fn sweep_loop(enricher: Arc<Enricher>, interval_secs: u64) {
 async fn sweep_ids(enricher: &Enricher, ids: &[String]) -> usize {
     let mut skipped = 0;
     for id in ids {
-        if enricher.process_exclusive(id).await.is_none() {
+        if enricher
+            .process_exclusive(id, latency::Path::Sweep)
+            .await
+            .is_none()
+        {
             record_in_flight_skip("sweep", id);
             skipped += 1;
         }
@@ -636,6 +650,11 @@ struct Prepared {
     reference_date: chrono::DateTime<chrono::Utc>,
     /// See `churn`; `None` on the batch path.
     churn_baseline: Option<churn::Baseline>,
+    /// When this text was first observed (`reference_date`), for the
+    /// end-to-end latency metric (`latency`); `None` for a re-run over the
+    /// already-extracted text (a model/prompt version change), which that
+    /// metric skips.
+    text_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     edit_class: Option<text_delta::EditClass>,
 }
 
@@ -647,7 +666,7 @@ struct Prepared {
     clippy::too_many_lines,
     reason = "long but linear; splitting it would scatter its shared state across helpers"
 )]
-async fn preflight(enricher: &Enricher, incident_id: &str) -> Preflight {
+async fn preflight(enricher: &Enricher, incident_id: &str, path: latency::Path) -> Preflight {
     let Enricher {
         pool,
         model_version,
@@ -675,6 +694,11 @@ async fn preflight(enricher: &Enricher, incident_id: &str) -> Preflight {
         churn::baseline_for_text_change_rerun(incident_id, &state, &text_hash, model_version);
     let (summary, description, reference_date) =
         (state.summary, state.description, state.reference_date);
+    let text_seen_at = text_seen_at(
+        state.source_text_hash.as_deref(),
+        &text_hash,
+        reference_date,
+    );
 
     // Guards every caller (stream loop, sweep, reclaim) against running the
     // LLM again over text it already successfully extracted -- e.g. a
@@ -737,6 +761,7 @@ async fn preflight(enricher: &Enricher, incident_id: &str) -> Preflight {
                     "enricher_extraction_carried_forward_total"
                 ))
                 .increment(1);
+                latency::record(path, latency::Outcome::CarriedForward, text_seen_at);
                 tracing::info!(
                     incident_id,
                     "semantic no-op text change; carried the previous extraction forward without an LLM call"
@@ -776,7 +801,19 @@ async fn preflight(enricher: &Enricher, incident_id: &str) -> Preflight {
         reference_date,
         churn_baseline,
         edit_class,
+        text_seen_at,
     })
+}
+
+/// The latency metric's start (see `latency`): the current text's
+/// `reference_date` when it differs from the extracted one (or nothing was
+/// extracted yet); `None` for a re-run over the same text.
+fn text_seen_at(
+    stored_hash: Option<&str>,
+    current_hash: &str,
+    reference_date: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    (stored_hash != Some(current_hash)).then_some(reference_date)
 }
 
 /// Runs all three extraction passes for one incident and writes the result.
@@ -804,8 +841,8 @@ async fn preflight(enricher: &Enricher, incident_id: &str) -> Preflight {
 ///
 /// Callers go through `Enricher::process_exclusive`, never straight here,
 /// so two loops never run this for the same incident at once.
-async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
-    let prepared = match preflight(enricher, incident_id).await {
+async fn process_incident(enricher: &Enricher, incident_id: &str, path: latency::Path) -> bool {
+    let prepared = match preflight(enricher, incident_id, path).await {
         Preflight::Done(ack) => return ack,
         Preflight::Extract(prepared) => prepared,
     };
@@ -882,6 +919,7 @@ async fn process_incident(enricher: &Enricher, incident_id: &str) -> bool {
         &primary,
         &resolution_adversarial,
         &severity_adversarial,
+        path,
     )
     .await
 }
@@ -918,13 +956,15 @@ fn note_truncation(incident_id: &str, primary: &llm::PrimaryExtraction) {
 
 /// Combines the three passes' results and writes them: the end of
 /// `process_incident`, shared with the batch path (`batch.rs`). Returns
-/// whether to ack, as `process_incident` does.
+/// whether to ack, as `process_incident` does. `path` labels the latency
+/// metric.
 async fn finish_extraction(
     enricher: &Enricher,
     prepared: &Prepared,
     primary: &llm::PrimaryExtraction,
     resolution_adversarial: &[llm::AdversarialPeriodVerdict],
     severity_adversarial: &[llm::SeverityAdversarialPeriodVerdict],
+    path: latency::Path,
 ) -> bool {
     let Enricher {
         pool,
@@ -939,6 +979,7 @@ async fn finish_extraction(
         description,
         churn_baseline,
         edit_class,
+        text_seen_at,
         ..
     } = prepared;
     let incident_id = incident_id.as_str();
@@ -1020,6 +1061,7 @@ async fn finish_extraction(
         }
     }
 
+    latency::record(path, latency::Outcome::Stored, *text_seen_at);
     tracing::info!(
         incident_id,
         period_count = periods.len(),
@@ -1177,7 +1219,10 @@ async fn reclaim_loop(
 async fn process_reclaimed(enricher: &Enricher, entries: Vec<(String, String)>) -> Vec<String> {
     let mut to_ack = Vec::new();
     for (entry_id, incident_id) in entries {
-        match enricher.process_exclusive(&incident_id).await {
+        match enricher
+            .process_exclusive(&incident_id, latency::Path::Reclaim)
+            .await
+        {
             Some(true) => to_ack.push(entry_id),
             Some(false) => tracing::warn!(
                 entry_id,
@@ -1362,7 +1407,7 @@ mod tests {
         let model_version = "test-model@periods-v1";
         let enricher = test_enricher(pool.clone(), &server, model_version, false);
 
-        let ok = process_incident(&enricher, incident_id).await;
+        let ok = process_incident(&enricher, incident_id, latency::Path::Stream).await;
         assert!(
             ok,
             "a truncated-but-successful extraction must return true (ack the entry), not false"
@@ -1464,7 +1509,7 @@ mod tests {
         let enricher = test_enricher(pool.clone(), &server, model_version, false);
 
         for attempt in 1..=2 {
-            let ok = process_incident(&enricher, incident_id).await;
+            let ok = process_incident(&enricher, incident_id, latency::Path::Stream).await;
             assert!(!ok, "a malformed response must never be treated as success");
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
@@ -1476,7 +1521,7 @@ mod tests {
 
         // Third attempt, same unchanged text: `RetryBackoff` must now skip
         // it locally -- the request count must stay at 2, not become 3.
-        let ok = process_incident(&enricher, incident_id).await;
+        let ok = process_incident(&enricher, incident_id, latency::Path::Stream).await;
         assert!(!ok, "a backed-off attempt still has nothing to ack");
         assert_eq!(
             server.received_requests().await.unwrap().len(),
@@ -1587,6 +1632,24 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    /// The latency metric times a new text from when it was first seen,
+    /// and skips a model/prompt-version re-run over the extracted text.
+    #[test]
+    fn text_seen_at_only_for_a_text_not_yet_extracted() {
+        let seen: chrono::DateTime<chrono::Utc> = "2026-10-09T08:00:00Z".parse().unwrap();
+        assert_eq!(
+            text_seen_at(None, "new", seen),
+            Some(seen),
+            "first extraction"
+        );
+        assert_eq!(
+            text_seen_at(Some("old"), "new", seen),
+            Some(seen),
+            "text change"
+        );
+        assert_eq!(text_seen_at(Some("new"), "new", seen), None, "same text");
+    }
+
     #[test]
     fn llm_duration_buckets_extend_past_the_configured_timeout() {
         let default = llm_duration_buckets(300);
@@ -1687,7 +1750,10 @@ mod tests {
         let enricher = test_enricher(pool.clone(), &server, model_version, false);
         seed_incident(&pool, done, "Signal failure", "Lines closed.").await;
         seed_incident(&pool, busy, "Points failure", "Lines closed.").await;
-        assert!(process_incident(&enricher, done).await, "first extraction");
+        assert!(
+            process_incident(&enricher, done, latency::Path::Stream).await,
+            "first extraction"
+        );
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
 
         let claim = enricher.in_flight.try_claim(busy).unwrap();
@@ -1739,7 +1805,7 @@ mod tests {
             let enricher = test_enricher(pool.clone(), &server, model_version, carry_forward);
             seed_incident(&pool, incident_id, summary, old_description).await;
             assert!(
-                process_incident(&enricher, incident_id).await,
+                process_incident(&enricher, incident_id, latency::Path::Stream).await,
                 "initial extraction"
             );
             assert_eq!(server.received_requests().await.unwrap().len(), 3);
@@ -1758,7 +1824,7 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            assert!(process_incident(&enricher, incident_id).await);
+            assert!(process_incident(&enricher, incident_id, latency::Path::Stream).await);
 
             let expected_calls = if carry_forward { 3 } else { 6 };
             assert_eq!(

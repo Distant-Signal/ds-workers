@@ -276,6 +276,86 @@ yet.** On gpt-6-luna the whole workload is about $4.50 a month
 re-extractions; half of that is cents. Revisit only if re-extractions become
 frequent or large.
 
+### Is the latency acceptable?
+
+`distant_signal_enricher_enrichment_latency_seconds{path, outcome}` is the
+end-to-end delay a reader sees: from when the incident's current text was
+first observed to when its extraction was committed.
+
+- **Start:** the earliest `incident_history` row of the current text's
+  latest unbroken run (the same `reference_date` the prompt gets), falling
+  back to `first_seen_at`. The poller writes that row, stamped with its
+  transaction's `NOW()`, in the transaction that changes the text, and
+  publishes the stream entry only after it commits. So it is the earliest
+  record of the text anywhere, and it exists on every path. A stream entry
+  id would time the publish, not the change, would be missing on the sweep
+  and batch paths, and a reclaimed entry can predate a later edit. The
+  poll interval (how late the poller saw a Knowledgebase edit) is not
+  included.
+- **End:** the moment `write_extraction` (or the carry-forward write)
+  committed, on the enricher's clock (clamped at 0 against clock skew).
+- `path`: `stream`, `reclaim`, `sweep` (synchronous, including a
+  carry-forward the batch-mode sweep does before submitting) or `batch`
+  (written when an adversarial batch ends).
+- `outcome`: `stored` (three LLM passes) or `carried_forward` (a semantic
+  no-op edit, `CARRY_FORWARD_SEMANTIC_NOOPS`).
+- Recorded **once per new text**. Not recorded: a text that was already
+  extracted (counted when it was stored; a redelivery would count it twice),
+  a re-extraction of unchanged text after a model or prompt change (its text
+  can be days old, which says nothing about how fast a change reaches
+  users), a failed attempt and a stale result discarded because the text
+  moved (each retry would add a sample; the eventual success carries the
+  delay the failures caused).
+- Buckets: 1 s, 5 s, 15 s, 30 s, 1, 2, 5, 10, 30 min, 1, 2, 4, 12, 24 and
+  30 h.
+
+How to read it:
+
+1. `stream` is what users get today: seconds to a few minutes. Its p95 is
+   the baseline.
+2. `reclaim` and `sweep` are the slow tails of the synchronous design (a
+   failed call retried after `RECLAIM_MIN_IDLE_SECS`, a missed event found
+   by the hourly sweep). Their share of the total says how often the fast
+   path already misses.
+3. `batch` is what a text gets when it goes through a Message Batch: two
+   stages, each up to 24 h. It only has samples when a sweep found at least
+   `LLM_BATCH_MIN_ITEMS` stale texts; model-version re-extractions are
+   excluded (see above). For the batch round trip alone, watch
+   `distant_signal_enricher_llm_batch_oldest_age_seconds`.
+4. Compare the `batch` p50/p95 with how long incident texts stay current.
+   A text replaced or cleared before its batch ends is never shown
+   enriched (`write_extraction` discards it), so batches are only
+   acceptable for text changes if their p95 is well below the usual text
+   lifetime. Batching the stream path is not supported; this metric is the
+   evidence for or against building it.
+
+p50 and p95 by path over the last day:
+
+```promql
+histogram_quantile(0.5, sum by (path, le) (
+  increase(distant_signal_enricher_enrichment_latency_seconds_bucket[1d])))
+histogram_quantile(0.95, sum by (path, le) (
+  increase(distant_signal_enricher_enrichment_latency_seconds_bucket[1d])))
+```
+
+Share of new texts enriched within 10 minutes, all paths (`le` must be a
+bucket boundary):
+
+```promql
+sum(increase(distant_signal_enricher_enrichment_latency_seconds_bucket{le="600"}[1d]))
+  / sum(increase(distant_signal_enricher_enrichment_latency_seconds_count[1d]))
+```
+
+Samples by path and outcome:
+
+```promql
+sum by (path, outcome) (increase(distant_signal_enricher_enrichment_latency_seconds_count[1d]))
+```
+
+There is no latency alert: the stream path's failure modes already alert
+(stream lag, LLM call failures, `DistantSignalEnricherBatchStuck`), and the
+metric is for judging the design.
+
 ## Prompt caching
 
 **Verdict: use it, with the 1-hour TTL, on the primary call's system
@@ -423,6 +503,10 @@ Unchanged metrics keep their meaning (`enricher_llm_call_total`,
 `enricher_llm_call_duration_seconds`, `enricher_llm_model_info`, which
 names the model and `base_url_host` `api.anthropic.com`). Changed or new:
 
+- `distant_signal_enricher_enrichment_latency_seconds{path, outcome}`
+  (histogram, all modes): from a text first being observed to its
+  extraction being committed; see
+  [Is the latency acceptable?](#is-the-latency-acceptable).
 - `distant_signal_enricher_llm_tokens_total{call, kind}` gains a fifth kind,
   `cache_write` (15 series, all registered at 0). For the Claude API:
   `prompt` is every input token (`input_tokens` +
