@@ -183,7 +183,7 @@ impl Config {
             self.llm_model.as_deref(),
             self.llm_auth.llm_auth,
             self.llm_api_key.as_ref(),
-            self.batch.llm_sweep_mode,
+            self.batch.batching_setting(),
         )
     }
 }
@@ -195,7 +195,8 @@ pub(crate) fn resolve_llm(
     model: Option<&str>,
     auth: LlmAuthMode,
     api_key: Option<&Secret>,
-    sweep_mode: SweepMode,
+    // The setting that turns Message Batches on (`BatchConfig::batching_setting`).
+    batching: Option<&str>,
 ) -> anyhow::Result<ResolvedLlm> {
     let set = |value: Option<&str>| {
         value
@@ -211,9 +212,9 @@ pub(crate) fn resolve_llm(
                      LLM_PROVIDER=anthropic"
                 );
             }
-            if sweep_mode == SweepMode::Batch {
+            if let Some(setting) = batching {
                 anyhow::bail!(
-                    "LLM_SWEEP_MODE=batch needs LLM_PROVIDER=anthropic: the enricher has no \
+                    "{setting} needs LLM_PROVIDER=anthropic: the enricher has no \
                      OpenAI Batch API support (docs/enricher-anthropic.md, \"Batch mode\")"
                 );
             }
@@ -293,7 +294,9 @@ impl AnthropicConfig {
     }
 }
 
-/// `LLM_SWEEP_MODE`: how the reconciliation sweep runs its extractions.
+/// `LLM_SWEEP_MODE`: how the reconciliation sweep runs its extractions in
+/// `LLM_MODE=normal`. Ignored in `LLM_MODE=batch` and `batch-only`, which
+/// set the sweep's behaviour themselves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum SweepMode {
     /// One incident at a time through the synchronous API, like the stream
@@ -306,6 +309,53 @@ pub(crate) enum SweepMode {
     Batch,
 }
 
+/// `LLM_MODE`: where extractions run. docs/enricher-anthropic.md, "LLM
+/// modes".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum LlmMode {
+    /// The stream loop and reclaim extract synchronously, seconds after a
+    /// text change; the hourly sweep follows `LLM_SWEEP_MODE` (the default,
+    /// and the only mode before 2026-10).
+    #[default]
+    Normal,
+    /// The stream loop and reclaim make no LLM call (they ACK and leave the
+    /// incident stale). A sweep every `LLM_BATCH_SWEEP_INTERVAL_SECS`
+    /// (default 120) batches what it finds when there are at least
+    /// `LLM_BATCH_MIN_ITEMS`, and extracts the rest synchronously right
+    /// away. `anthropic` only.
+    Batch,
+    /// As `batch`, but everything is batched, however few (no synchronous
+    /// extraction anywhere); the sweep runs every
+    /// `LLM_BATCH_SWEEP_INTERVAL_SECS` (default 300). `anthropic` only.
+    BatchOnly,
+}
+
+impl LlmMode {
+    /// The `LLM_MODE` value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Batch => "batch",
+            Self::BatchOnly => "batch-only",
+        }
+    }
+
+    /// `LLM_BATCH_SWEEP_INTERVAL_SECS`'s default (`None` in `normal`, which
+    /// sweeps every `SWEEP_INTERVAL_SECS`). `batch`: 120 s, so a quiet
+    /// period's text change waits at most ~2 minutes plus its three calls,
+    /// while a burst still has time to reach `LLM_BATCH_MIN_ITEMS`; each
+    /// sweep is one scan of the live incidents. `batch-only`: 300 s, small
+    /// next to a batch's own minutes-to-an-hour, and it keeps the batches
+    /// fewer and larger.
+    pub(crate) fn default_sweep_interval_secs(self) -> Option<u64> {
+        match self {
+            Self::Normal => None,
+            Self::Batch => Some(120),
+            Self::BatchOnly => Some(300),
+        }
+    }
+}
+
 /// The batch-mode knobs (`batch.rs`).
 #[derive(Debug, Clone, Parser)]
 #[expect(
@@ -313,12 +363,16 @@ pub(crate) enum SweepMode {
     reason = "clap derives each env var from the field name, so the prefix is part of the interface"
 )]
 pub(crate) struct BatchConfig {
-    /// `LLM_SWEEP_MODE`: `sync` (default) or `batch`.
+    /// `LLM_MODE`: `normal` (default), `batch` or `batch-only`.
+    #[arg(long, env, value_enum, default_value_t = LlmMode::Normal)]
+    pub llm_mode: LlmMode,
+    /// `LLM_SWEEP_MODE`: `sync` (default) or `batch`. `LLM_MODE=normal`
+    /// only; ignored otherwise.
     #[arg(long, env, value_enum, default_value_t = SweepMode::Sync)]
     pub llm_sweep_mode: SweepMode,
     /// A sweep that finds fewer incidents than this runs them synchronously
     /// as before: a batch's latency (minutes to hours) isn't worth half the
-    /// price of a handful of calls.
+    /// price of a handful of calls. Ignored in `batch-only` (effectively 1).
     #[arg(long, env, default_value_t = 20)]
     pub llm_batch_min_items: usize,
     /// Most incidents in one Message Batch (each is 1 request in the
@@ -328,18 +382,53 @@ pub(crate) struct BatchConfig {
     /// How often in-flight batches are polled, in seconds.
     #[arg(long, env, default_value_t = 60)]
     pub llm_batch_poll_secs: u64,
+    /// `LLM_MODE=batch`/`batch-only`: how often the sweep runs, in seconds,
+    /// in place of `SWEEP_INTERVAL_SECS` (still the `normal` sweep's).
+    /// Unset: 120 (`batch`) or 300 (`batch-only`); see
+    /// [`LlmMode::default_sweep_interval_secs`]. Ignored in `normal`.
+    #[arg(long, env)]
+    pub llm_batch_sweep_interval_secs: Option<u64>,
 }
 
 impl BatchConfig {
-    /// `Some` in batch mode.
+    /// The setting that turns Message Batches on, for messages
+    /// (`LLM_MODE=batch`, `LLM_SWEEP_MODE=batch`, ...), or `None`.
+    pub(crate) fn batching_setting(&self) -> Option<&'static str> {
+        match (self.llm_mode, self.llm_sweep_mode) {
+            (LlmMode::Batch, _) => Some("LLM_MODE=batch"),
+            (LlmMode::BatchOnly, _) => Some("LLM_MODE=batch-only"),
+            (LlmMode::Normal, SweepMode::Batch) => Some("LLM_SWEEP_MODE=batch"),
+            (LlmMode::Normal, SweepMode::Sync) => None,
+        }
+    }
+
+    /// `Some` whenever batches are on (see [`Self::batching_setting`]).
     pub(crate) fn settings(&self) -> Option<crate::batch::BatchSettings> {
-        (self.llm_sweep_mode == SweepMode::Batch).then(|| crate::batch::BatchSettings {
-            min_items: self.llm_batch_min_items.max(1),
+        self.batching_setting()?;
+        Some(crate::batch::BatchSettings {
+            // Batch-only has no synchronous fallback: one stale incident is
+            // a batch.
+            min_items: if self.llm_mode == LlmMode::BatchOnly {
+                1
+            } else {
+                self.llm_batch_min_items.max(1)
+            },
             max_items: self
                 .llm_batch_max_items
                 .clamp(1, crate::batch::MAX_BATCH_INCIDENTS),
             poll_interval: Duration::from_secs(self.llm_batch_poll_secs.max(1)),
+            mode: self.llm_mode,
         })
+    }
+
+    /// The sweep's interval in seconds: `LLM_BATCH_SWEEP_INTERVAL_SECS` (or
+    /// its per-mode default) in `batch`/`batch-only`, else
+    /// `sweep_interval_secs` (`SWEEP_INTERVAL_SECS`).
+    pub(crate) fn sweep_interval_secs(&self, sweep_interval_secs: u64) -> u64 {
+        match self.llm_mode.default_sweep_interval_secs() {
+            Some(default) => self.llm_batch_sweep_interval_secs.unwrap_or(default).max(1),
+            None => sweep_interval_secs,
+        }
     }
 }
 
@@ -984,6 +1073,104 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("needs LLM_PROVIDER=anthropic")
+        );
+    }
+
+    /// `LLM_MODE`: `normal` keeps `LLM_SWEEP_MODE`; `batch` keeps the
+    /// minimum and sweeps every 120 s; `batch-only` has a minimum of 1 and
+    /// sweeps every 300 s; both ignore `LLM_SWEEP_MODE`.
+    #[test]
+    fn llm_modes_settings_and_sweep_interval() {
+        let anthropic = ["--llm-provider", "anthropic", "--llm-api-key", "sk-ant"];
+        let with = |args: &[&str]| config(&[&anthropic[..], args].concat());
+
+        let normal = with(&[]);
+        assert_eq!(normal.batch.llm_mode, LlmMode::Normal);
+        assert!(normal.batch.settings().is_none());
+        assert_eq!(
+            normal.batch.sweep_interval_secs(normal.sweep_interval_secs),
+            3600
+        );
+        let sweep_batch = with(&[
+            "--llm-sweep-mode",
+            "batch",
+            "--llm-batch-sweep-interval-secs",
+            "60",
+        ]);
+        let settings = sweep_batch.batch.settings().unwrap();
+        assert_eq!(settings.mode, LlmMode::Normal);
+        assert!(!settings.defers_stream());
+        assert_eq!(
+            sweep_batch
+                .batch
+                .sweep_interval_secs(sweep_batch.sweep_interval_secs),
+            3600,
+            "normal ignores LLM_BATCH_SWEEP_INTERVAL_SECS"
+        );
+
+        // `batch`, with LLM_SWEEP_MODE=sync (ignored).
+        let batch = with(&["--llm-mode", "batch", "--llm-sweep-mode", "sync"]);
+        assert!(batch.resolved_llm().is_ok());
+        let settings = batch.batch.settings().unwrap();
+        assert_eq!(settings.mode, LlmMode::Batch);
+        assert!(settings.defers_stream() && !settings.batch_only());
+        assert_eq!(settings.min_items, 20);
+        assert_eq!(
+            batch.batch.sweep_interval_secs(batch.sweep_interval_secs),
+            120
+        );
+
+        let only = with(&["--llm-mode", "batch-only", "--llm-batch-min-items", "50"]);
+        let settings = only.batch.settings().unwrap();
+        assert!(settings.defers_stream() && settings.batch_only());
+        assert_eq!(settings.min_items, 1);
+        assert_eq!(
+            only.batch.sweep_interval_secs(only.sweep_interval_secs),
+            300
+        );
+
+        let tuned = with(&[
+            "--llm-mode",
+            "batch",
+            "--llm-batch-sweep-interval-secs",
+            "45",
+            "--sweep-interval-secs",
+            "900",
+        ]);
+        assert_eq!(
+            tuned.batch.sweep_interval_secs(tuned.sweep_interval_secs),
+            45
+        );
+
+        // Both refused on openai at startup.
+        for mode in ["batch", "batch-only"] {
+            let err = config(&[
+                "--llm-base-url",
+                "http://l/v1",
+                "--llm-model",
+                "m",
+                "--llm-mode",
+                mode,
+            ])
+            .resolved_llm()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("LLM_MODE={mode} needs LLM_PROVIDER=anthropic")),
+                "{err}"
+            );
+        }
+        assert!(
+            Config::try_parse_from([
+                "enricher",
+                "--database-url",
+                "postgres://x",
+                "--redis-url",
+                "redis://x",
+                "--llm-mode",
+                "nightly"
+            ])
+            .is_err()
         );
     }
 }

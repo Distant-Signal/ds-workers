@@ -1,14 +1,36 @@
-//! Batch mode (`LLM_SWEEP_MODE=batch`, Claude only): the reconciliation
-//! sweep sends its extractions through the Claude Message Batches API, at
-//! half the synchronous price, instead of one incident at a time.
-//! docs/enricher-anthropic.md, "Batch mode".
+//! Message Batches (Claude only): extractions sent through the Claude
+//! Message Batches API, at half the synchronous price, instead of one
+//! incident at a time. docs/enricher-anthropic.md, "LLM modes" and "Batch
+//! mode".
 //!
-//! **Where it applies.** Only the sweep. It is the bulk path: after a model
-//! or prompt change (`model_version`) it re-extracts every live incident,
-//! and nothing waits on it. The stream loop (a text change, seconds after
-//! it lands) and reclaim (its retries) stay synchronous: a batch can take
-//! up to 24 hours. A sweep that finds fewer than `LLM_BATCH_MIN_ITEMS`
-//! incidents also runs synchronously.
+//! **Where it applies.** Three ways in (`config::BatchConfig`):
+//!
+//! - `LLM_MODE=normal` with `LLM_SWEEP_MODE=batch`: only the hourly sweep.
+//!   It is the bulk path: after a model or prompt change (`model_version`)
+//!   it re-extracts every live incident, and nothing waits on it. The
+//!   stream loop (a text change, seconds after it lands) and reclaim (its
+//!   retries) stay synchronous: a batch can take up to 24 hours. A sweep
+//!   that finds fewer than `LLM_BATCH_MIN_ITEMS` incidents runs them
+//!   synchronously.
+//! - `LLM_MODE=batch`: the stream loop and reclaim make no LLM call. They
+//!   run the preflight (skip unchanged text, carry a semantic no-op
+//!   forward) and, where the LLM would be needed, ACK without calling it
+//!   (`enricher_deferred_to_batch_total`), leaving the incident stale. A
+//!   sweep every `LLM_BATCH_SWEEP_INTERVAL_SECS` (120 s) then batches what
+//!   it finds if there are at least `LLM_BATCH_MIN_ITEMS`, and extracts
+//!   them synchronously right away if fewer.
+//! - `LLM_MODE=batch-only`: as `batch`, but the sweep (every 300 s)
+//!   batches whatever it finds, even one incident; nothing ever runs
+//!   synchronously.
+//!
+//! **No double submission.** In `normal`, the sweep skips every incident in
+//! an in-flight batch. In `batch` and `batch-only` it skips only those
+//! whose *current* text is in one: a text that changed since its batch was
+//! submitted is extracted again right away (batched or synchronously), and
+//! the old batch's result for it is dropped by `write_extraction`'s
+//! stale-text guard when it lands (it no longer matches the incident's
+//! text). With the stream loop deferring, waiting for the old batch would
+//! otherwise hold a changed text back for up to a day.
 //!
 //! **Two stages.** One incident is three calls, and the two adversarial
 //! passes need the primary pass's periods. So a sweep submits a *primary*
@@ -43,6 +65,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::config::LlmMode;
 use crate::llm::anthropic::{BatchOutcome, BatchRequest, completion_from_message};
 use crate::llm::{self, LlmCall, LlmCallError, TokenUsage};
 use crate::{Enricher, Preflight, Prepared};
@@ -77,6 +100,21 @@ pub(crate) struct BatchSettings {
     pub min_items: usize,
     pub max_items: usize,
     pub poll_interval: Duration,
+    /// `LLM_MODE`: `normal` here means `LLM_SWEEP_MODE=batch`.
+    pub mode: LlmMode,
+}
+
+impl BatchSettings {
+    /// `LLM_MODE=batch`/`batch-only`: the stream loop and reclaim leave
+    /// extraction to the sweep.
+    pub(crate) fn defers_stream(&self) -> bool {
+        self.mode != LlmMode::Normal
+    }
+
+    /// `LLM_MODE=batch-only`: no synchronous extraction anywhere.
+    pub(crate) fn batch_only(&self) -> bool {
+        self.mode == LlmMode::BatchOnly
+    }
 }
 
 /// A batch's stage (the `stage` column).
@@ -484,15 +522,56 @@ async fn load_batches(pool: &PgPool) -> anyhow::Result<Vec<BatchRow>> {
     Ok(batches)
 }
 
-/// Every incident in an in-flight batch: the sweep skips them.
-async fn in_flight_incident_ids(pool: &PgPool) -> anyhow::Result<HashSet<String>> {
-    let ids: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT item->>'incident_id' FROM enricher_llm_batches, \
+/// `(incident_id, text_hash)` of every item of every in-flight batch: the
+/// sweep skips them (`normal`: by id; `batch`/`batch-only`: by id and
+/// text).
+async fn in_flight_items(pool: &PgPool) -> anyhow::Result<InFlightItems> {
+    let pairs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT item->>'incident_id', item->>'text_hash' FROM enricher_llm_batches, \
          jsonb_array_elements(items) AS item",
     )
     .fetch_all(pool)
     .await?;
-    Ok(ids.into_iter().map(|(id,)| id).collect())
+    Ok(InFlightItems::new(pairs))
+}
+
+/// What is already in an in-flight batch.
+#[derive(Debug, Default)]
+pub(crate) struct InFlightItems {
+    ids: HashSet<String>,
+    texts: HashSet<(String, String)>,
+}
+
+impl InFlightItems {
+    pub(crate) fn new(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        let mut items = Self::default();
+        for (id, hash) in pairs {
+            items.ids.insert(id.clone());
+            items.texts.insert((id, hash));
+        }
+        items
+    }
+
+    /// Some batch holds this incident (whatever its text).
+    pub(crate) fn has_incident(&self, incident_id: &str) -> bool {
+        self.ids.contains(incident_id)
+    }
+
+    /// Some batch holds this incident with exactly this text.
+    pub(crate) fn has_text(&self, incident_id: &str, text_hash: &str) -> bool {
+        self.texts
+            .contains(&(incident_id.to_string(), text_hash.to_string()))
+    }
+}
+
+/// `batch`/`batch-only`: the prepared incidents to extract -- all but those
+/// whose current text is already in a batch. A changed text is extracted
+/// again (see the module doc). Pure, for the tests.
+pub(crate) fn not_in_a_batch(prepared: Vec<Prepared>, in_batch: &InFlightItems) -> Vec<Prepared> {
+    prepared
+        .into_iter()
+        .filter(|p| !in_batch.has_text(&p.incident_id, &p.text_hash))
+        .collect()
 }
 
 async fn insert_batch(
@@ -529,29 +608,57 @@ async fn delete_batch(executor: impl sqlx::PgExecutor<'_>, batch_id: &str) -> an
 // The sweep side: submitting primary batches.
 // ---------------------------------------------------------------------------
 
-/// The sweep's batch step. Drops every id already in a batch; with at
-/// least `min_items` left, runs each through `preflight` and submits the
-/// ones that need the LLM as primary batches of up to `max_items`. Returns
-/// the ids left for the synchronous path: all of them below the threshold,
-/// none otherwise (and none if the in-flight list can't be read, so an
-/// outage never double-submits).
+/// What the sweep's batch step decided.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SweepSplit {
+    /// Submit these as primary batches.
+    Batch(Vec<String>),
+    /// Extract these synchronously, now.
+    Sync(Vec<String>),
+}
+
+/// The threshold rule, pure for the tests: `count` incidents left after
+/// the in-flight skip go to a batch when there are at least `min_items`
+/// (always, in `batch-only`), else to the synchronous path.
+pub(crate) fn split_for_sweep(settings: &BatchSettings, ids: Vec<String>) -> SweepSplit {
+    if settings.batch_only() || ids.len() >= settings.min_items {
+        SweepSplit::Batch(ids)
+    } else {
+        SweepSplit::Sync(ids)
+    }
+}
+
+/// The sweep's batch step. Skips what is already in a batch (`normal`: by
+/// id, up front; `batch`/`batch-only`: by id and current text, after the
+/// preflight); with at least `min_items` left (any, in `batch-only`), runs
+/// each through `preflight` and submits the ones that need the LLM as
+/// primary batches of up to `max_items`. Returns the ids left for the
+/// synchronous path: all of them below the threshold, none otherwise (and
+/// none if the in-flight list can't be read, so an outage never
+/// double-submits). `batch-only` never returns any.
 pub(crate) async fn sweep_with_batches(
     enricher: &Enricher,
     settings: &BatchSettings,
     ids: Vec<String>,
 ) -> Vec<String> {
-    let in_batch = match in_flight_incident_ids(&enricher.pool).await {
-        Ok(ids) => ids,
+    let in_batch = match in_flight_items(&enricher.pool).await {
+        Ok(items) => items,
         Err(err) => {
             tracing::error!(error = ?err, "could not read in-flight batches; skipping this sweep");
             return Vec::new();
         }
     };
-    let ids: Vec<String> = ids
-        .into_iter()
-        .filter(|id| !in_batch.contains(id))
-        .collect();
-    if ids.len() < settings.min_items {
+    let per_text = settings.defers_stream();
+    let ids: Vec<String> = if per_text {
+        ids
+    } else {
+        ids.into_iter()
+            .filter(|id| !in_batch.has_incident(id))
+            .collect()
+    };
+    // `normal` only: below the threshold before the preflight already (the
+    // per-text skip needs the preflight's hash first).
+    if !per_text && let SweepSplit::Sync(ids) = split_for_sweep(settings, ids.clone()) {
         return ids;
     }
     let mut prepared = Vec::new();
@@ -568,8 +675,12 @@ pub(crate) async fn sweep_with_batches(
             prepared.push(ready);
         }
     }
-    if prepared.len() < settings.min_items {
-        return prepared.into_iter().map(|p| p.incident_id).collect();
+    if per_text {
+        prepared = not_in_a_batch(prepared, &in_batch);
+    }
+    let ids = prepared.iter().map(|p| p.incident_id.clone()).collect();
+    if let SweepSplit::Sync(ids) = split_for_sweep(settings, ids) {
+        return ids;
     }
     for chunk in prepared.chunks(settings.max_items) {
         if let Err(err) = submit_primary(enricher, chunk).await {
@@ -1100,5 +1211,82 @@ mod tests {
             Some(Stage::Adversarial)
         );
         assert_eq!(Stage::parse("other"), None);
+    }
+
+    fn prepared(id: &str, hash: &str) -> Prepared {
+        Prepared {
+            incident_id: id.to_string(),
+            text_hash: hash.to_string(),
+            summary: "s".to_string(),
+            description: "d".to_string(),
+            reference_date: "2026-10-01T00:00:00Z".parse().unwrap(),
+            churn_baseline: None,
+            edit_class: None,
+            text_seen_at: None,
+        }
+    }
+
+    /// A stale incident is kept; one whose current text is already in a
+    /// batch is not; one whose text changed since its batch went in is
+    /// extracted again.
+    #[test]
+    fn the_per_text_skip_keeps_every_stale_text_not_already_in_a_batch() {
+        let none = InFlightItems::default();
+        let single = not_in_a_batch(vec![prepared("A", "h1")], &none);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].incident_id, "A");
+
+        let in_batch = InFlightItems::new([
+            ("A".to_string(), "h1".to_string()),
+            ("B".to_string(), "old".to_string()),
+        ]);
+        let ids: Vec<String> = not_in_a_batch(
+            vec![
+                prepared("A", "h1"),
+                prepared("B", "new"),
+                prepared("C", "h3"),
+            ],
+            &in_batch,
+        )
+        .into_iter()
+        .map(|p| p.incident_id)
+        .collect();
+        assert_eq!(ids, ["B", "C"]);
+        // `batch` mode's coarser check: B is in a batch whatever its text.
+        assert!(in_batch.has_incident("B"));
+        assert!(!in_batch.has_text("B", "new"));
+    }
+
+    fn settings(mode: LlmMode) -> BatchSettings {
+        BatchSettings {
+            min_items: if mode == LlmMode::BatchOnly { 1 } else { 20 },
+            max_items: 2000,
+            poll_interval: Duration::from_secs(60),
+            mode,
+        }
+    }
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("I{i}")).collect()
+    }
+
+    /// `batch`: a small set runs synchronously within the period, 20 or
+    /// more are batched. `batch-only`: a single incident is a batch.
+    /// `normal` (`LLM_SWEEP_MODE=batch`): as `batch`.
+    #[test]
+    fn the_sweep_threshold_per_mode() {
+        for mode in [LlmMode::Normal, LlmMode::Batch] {
+            let s = settings(mode);
+            assert_eq!(split_for_sweep(&s, ids(3)), SweepSplit::Sync(ids(3)));
+            assert_eq!(split_for_sweep(&s, ids(19)), SweepSplit::Sync(ids(19)));
+            assert_eq!(split_for_sweep(&s, ids(20)), SweepSplit::Batch(ids(20)));
+            assert_eq!(split_for_sweep(&s, ids(250)), SweepSplit::Batch(ids(250)));
+        }
+        let only = settings(LlmMode::BatchOnly);
+        assert_eq!(split_for_sweep(&only, ids(1)), SweepSplit::Batch(ids(1)));
+        assert_eq!(split_for_sweep(&only, ids(0)), SweepSplit::Batch(ids(0)));
+        assert!(only.defers_stream() && only.batch_only());
+        assert!(settings(LlmMode::Batch).defers_stream());
+        assert!(!settings(LlmMode::Normal).defers_stream());
     }
 }

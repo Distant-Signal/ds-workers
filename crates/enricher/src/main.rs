@@ -89,8 +89,11 @@ async fn run() -> anyhow::Result<()> {
         // Token counters at 0 and the model info series, for the
         // cost-estimate query (docs/enricher-openai.md, "Cost").
         llm::register_usage_metrics(&resolved.model, &resolved.base_url, active.profile);
-        if batch_settings.is_some() {
+        if let Some(settings) = &batch_settings {
             batch::register_metrics();
+            if settings.defers_stream() {
+                register_deferred_metrics();
+            }
         }
         ds_store::pool::register_metrics();
     }
@@ -236,10 +239,18 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
-    tokio::spawn(sweep_loop(
-        Arc::clone(&enricher),
-        config.sweep_interval_secs,
-    ));
+    // `LLM_MODE=batch`/`batch-only` sweep on their own, shorter interval:
+    // the sweep is the only path that extracts.
+    let sweep_interval_secs = config.batch.sweep_interval_secs(config.sweep_interval_secs);
+    if enricher.defers_stream() {
+        tracing::info!(
+            llm_mode = config.batch.llm_mode.as_str(),
+            sweep_interval_secs,
+            "the stream loop and reclaim make no LLM calls; the sweep extracts \
+             (LLM_SWEEP_MODE is ignored)"
+        );
+    }
+    tokio::spawn(sweep_loop(Arc::clone(&enricher), sweep_interval_secs));
     // Batch mode: resume polling every batch a previous process submitted,
     // and keep polling the ones the sweep submits.
     if let Some(settings) = enricher.batch.clone() {
@@ -329,8 +340,8 @@ struct Enricher {
     in_flight: InFlight,
     /// `CARRY_FORWARD_SEMANTIC_NOOPS` (default off).
     carry_forward_noops: bool,
-    /// `LLM_SWEEP_MODE=batch` (default off): the sweep submits Message
-    /// Batches (`batch.rs`).
+    /// `LLM_MODE=batch`/`batch-only`, or `LLM_SWEEP_MODE=batch` (default
+    /// off): the sweep submits Message Batches (`batch.rs`).
     batch: Option<batch::BatchSettings>,
 }
 
@@ -342,6 +353,70 @@ impl Enricher {
     async fn process_exclusive(&self, incident_id: &str, path: latency::Path) -> Option<bool> {
         let _claim = self.in_flight.try_claim(incident_id)?;
         Some(process_incident(self, incident_id, path).await)
+    }
+
+    /// `LLM_MODE=batch`/`batch-only`: the stream loop and reclaim leave
+    /// extraction to the sweep.
+    fn defers_stream(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(batch::BatchSettings::defers_stream)
+    }
+
+    /// The stream loop's and reclaim's entry point: `process_exclusive`,
+    /// or with `LLM_MODE=batch`/`batch-only` [`defer_to_batch`].
+    async fn handle_exclusive(&self, path: latency::Path, incident_id: &str) -> Option<bool> {
+        if self.defers_stream() {
+            let _claim = self.in_flight.try_claim(incident_id)?;
+            Some(defer_to_batch(self, path, incident_id).await)
+        } else {
+            self.process_exclusive(incident_id, path).await
+        }
+    }
+}
+
+/// `enricher_deferred_to_batch_total{path}`: stream entries (`stream`) and
+/// reclaimed entries (`reclaim`) that needed the LLM and were left for the
+/// sweep instead (`LLM_MODE=batch`/`batch-only`). `path` uses the same labels as the
+/// extraction latency histogram's (stream|reclaim|sweep|batch).
+const DEFERRED_METRIC: &str = "enricher_deferred_to_batch_total";
+
+fn register_deferred_metrics() {
+    for path in ["stream", "reclaim"] {
+        metrics::counter!(common::metrics::metric_name(DEFERRED_METRIC), "path" => path)
+            .increment(0);
+    }
+}
+
+/// `LLM_MODE=batch`/`batch-only`: everything `process_incident` does
+/// short of the LLM. The
+/// preflight still skips unchanged text and carries a semantic no-op
+/// forward (no LLM needed); an incident that needs the LLM is ACKed and
+/// left stale, for the batch sweep to find (its stored hash doesn't match).
+/// A preflight that couldn't finish (a DB error, a backed-off text) leaves
+/// the entry pending, as on the synchronous path.
+async fn defer_to_batch(enricher: &Enricher, path: latency::Path, incident_id: &str) -> bool {
+    deferred_outcome(
+        path.label(),
+        incident_id,
+        preflight(enricher, incident_id, path).await,
+    )
+}
+
+/// The decision half of [`defer_to_batch`]: never calls the LLM.
+fn deferred_outcome(path: &'static str, incident_id: &str, preflight: Preflight) -> bool {
+    match preflight {
+        Preflight::Done(ack) => ack,
+        Preflight::Extract(_) => {
+            tracing::info!(
+                incident_id,
+                path,
+                "leaving this text change for the next sweep (LLM_MODE=batch/batch-only)"
+            );
+            metrics::counter!(common::metrics::metric_name(DEFERRED_METRIC), "path" => path)
+                .increment(1);
+            true
+        }
     }
 }
 
@@ -418,7 +493,7 @@ fn record_in_flight_skip(caller: &'static str, incident_id: &str) {
 /// One entry from the stream consumer loop. Returns whether to ack it.
 async fn process_stream_entry(enricher: &Enricher, entry_id: &str, incident_id: &str) -> bool {
     match enricher
-        .process_exclusive(incident_id, latency::Path::Stream)
+        .handle_exclusive(latency::Path::Stream, incident_id)
         .await
     {
         Some(true) => true,
@@ -552,6 +627,8 @@ async fn sweep_loop(enricher: Arc<Enricher>, interval_secs: u64) {
                     // Submits a Message Batch when there are enough; leaves
                     // the rest (or all, below the threshold) for the
                     // synchronous path, minus any already in a batch.
+                    // `batch-only` leaves nothing for it; `batch` leaves
+                    // a set below the minimum, extracted right away.
                     ids = batch::sweep_with_batches(&enricher, settings, ids).await;
                 }
                 let skipped = sweep_ids(&enricher, &ids).await;
@@ -1221,7 +1298,7 @@ async fn process_reclaimed(enricher: &Enricher, entries: Vec<(String, String)>) 
     let mut to_ack = Vec::new();
     for (entry_id, incident_id) in entries {
         match enricher
-            .process_exclusive(&incident_id, latency::Path::Reclaim)
+            .handle_exclusive(latency::Path::Reclaim, &incident_id)
             .await
         {
             Some(true) => to_ack.push(entry_id),
@@ -1859,5 +1936,227 @@ mod tests {
             }
         }
         cleanup_incident(&pool, incident_id).await;
+    }
+
+    // -- Batch-only mode --
+
+    fn batch_mode_enricher(
+        pool: PgPool,
+        server: &MockServer,
+        model_version: &str,
+        mode: config::LlmMode,
+    ) -> Enricher {
+        let mut enricher = test_enricher(pool, server, model_version, false);
+        enricher.llm = LlmClient::new(
+            server.uri(),
+            Some("sk-ant-test".to_string()),
+            "claude-haiku-5-5".to_string(),
+            Duration::from_secs(30),
+        )
+        .with_anthropic(llm::anthropic::AnthropicSettings::default());
+        enricher.batch = Some(batch::BatchSettings {
+            min_items: if mode == config::LlmMode::BatchOnly {
+                1
+            } else {
+                20
+            },
+            max_items: 2000,
+            poll_interval: Duration::from_secs(60),
+            mode,
+        });
+        enricher
+    }
+
+    /// The deferral decision never runs an extraction: a text that needs
+    /// the LLM is ACKed (left stale for the sweep), and a preflight that
+    /// already decided keeps its answer.
+    #[test]
+    fn batch_only_defers_what_needs_the_llm_and_keeps_preflight_answers() {
+        let prepared = Prepared {
+            incident_id: "A".to_string(),
+            text_hash: "h".to_string(),
+            summary: "s".to_string(),
+            description: "d".to_string(),
+            reference_date: chrono::Utc::now(),
+            churn_baseline: None,
+            edit_class: None,
+            text_seen_at: None,
+        };
+        assert!(deferred_outcome(
+            "stream",
+            "A",
+            Preflight::Extract(prepared)
+        ));
+        assert!(deferred_outcome("reclaim", "A", Preflight::Done(true)));
+        assert!(!deferred_outcome("stream", "A", Preflight::Done(false)));
+    }
+
+    /// The in-flight skip still applies in the deferring modes, before any
+    /// DB or LLM work; `normal`'s `LLM_SWEEP_MODE=batch` does not defer.
+    #[tokio::test]
+    async fn deferring_stream_entry_respects_the_in_flight_skip() {
+        let server = MockServer::start().await;
+        for mode in [config::LlmMode::Batch, config::LlmMode::BatchOnly] {
+            let enricher = batch_mode_enricher(unreachable_pool(), &server, "m@v", mode);
+            assert!(enricher.defers_stream());
+            let _claim = enricher.in_flight.try_claim("A").unwrap();
+            assert!(!process_stream_entry(&enricher, "1-0", "A").await);
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let normal =
+            batch_mode_enricher(unreachable_pool(), &server, "m@v", config::LlmMode::Normal);
+        assert!(!normal.defers_stream());
+    }
+
+    /// With a real DB: in batch-only mode the stream loop and reclaim ACK a
+    /// stale incident with no LLM call and leave it stale; the sweep then
+    /// submits it, alone, as a primary Message Batch; a second sweep skips
+    /// it (same text in flight) and a text change is submitted again.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher batch_only -- --ignored --test-threads=1`"]
+    async fn batch_only_defers_stream_work_and_the_sweep_batches_a_single_incident() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-BATCH-ONLY";
+        let cleanup_batches =
+            "DELETE FROM enricher_llm_batches WHERE batch_id LIKE 'msgbatch_test_batch_only_%'";
+        sqlx::query(cleanup_batches).execute(&pool).await.unwrap();
+        seed_incident(&pool, incident_id, "Signal failure", "Lines closed.").await;
+        let server = MockServer::start().await;
+        for n in 1..=2 {
+            Mock::given(method("POST"))
+                .and(path("/messages/batches"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": format!("msgbatch_test_batch_only_{n}"),
+                    "processing_status": "in_progress"
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        let model_version = "claude-haiku-5-5@periods-v2";
+        let enricher = batch_mode_enricher(
+            pool.clone(),
+            &server,
+            model_version,
+            config::LlmMode::BatchOnly,
+        );
+
+        assert!(process_stream_entry(&enricher, "1-0", incident_id).await);
+        assert_eq!(
+            process_reclaimed(
+                &enricher,
+                vec![("2-0".to_string(), incident_id.to_string())]
+            )
+            .await,
+            ["2-0"]
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "batch-only: no LLM call from the stream loop or reclaim"
+        );
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT source_text_hash FROM incidents WHERE incident_id = $1")
+                .bind(incident_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, None, "still stale, for the sweep");
+
+        let settings = enricher.batch.clone().unwrap();
+        let left =
+            batch::sweep_with_batches(&enricher, &settings, vec![incident_id.to_string()]).await;
+        assert!(left.is_empty(), "nothing for the synchronous path");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/messages/batches");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let sent = body["requests"].as_array().unwrap();
+        assert_eq!(sent.len(), 1, "a single stale incident is a batch");
+        assert_eq!(sent[0]["custom_id"], "p-0");
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT batch_id FROM enricher_llm_batches WHERE batch_id LIKE 'msgbatch_test_batch_only_%'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, [("msgbatch_test_batch_only_1".to_string(),)]);
+
+        // Same text, already in flight: not submitted again.
+        batch::sweep_with_batches(&enricher, &settings, vec![incident_id.to_string()]).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        // The text changed while its batch is pending: submitted again now
+        // (the old batch's result will fail the stale-text guard).
+        sqlx::query("UPDATE incidents SET description = 'Lines reopened.' WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        batch::sweep_with_batches(&enricher, &settings, vec![incident_id.to_string()]).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        sqlx::query(cleanup_batches).execute(&pool).await.unwrap();
+        cleanup_incident(&pool, incident_id).await;
+    }
+
+    /// With a real DB, `LLM_MODE=batch`: the stream loop defers (no LLM
+    /// call); a sweep that finds fewer than `LLM_BATCH_MIN_ITEMS` hands them
+    /// to the synchronous path, which extracts them in the same sweep; 20 or
+    /// more are submitted as one batch.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher llm_mode_batch -- --ignored --test-threads=1`"]
+    async fn llm_mode_batch_defers_then_syncs_a_small_set_and_batches_twenty() {
+        let pool = test_pool().await;
+        let prefix = "TEST-ENRICHER-LLM-MODE-BATCH-";
+        let cleanup_batches =
+            "DELETE FROM enricher_llm_batches WHERE batch_id = 'msgbatch_test_llm_mode_batch'";
+        sqlx::query(cleanup_batches).execute(&pool).await.unwrap();
+        let ids: Vec<String> = (0..20).map(|i| format!("{prefix}{i:02}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            seed_incident(&pool, id, &format!("Signal failure {i}"), "Lines closed.").await;
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msgbatch_test_llm_mode_batch",
+                "processing_status": "in_progress"
+            })))
+            .mount(&server)
+            .await;
+        let enricher = batch_mode_enricher(
+            pool.clone(),
+            &server,
+            "claude-haiku-5-5@periods-v2",
+            config::LlmMode::Batch,
+        );
+        let settings = enricher.batch.clone().unwrap();
+
+        // The stream loop defers: ACK, no request.
+        assert!(process_stream_entry(&enricher, "1-0", &ids[0]).await);
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        // A small set (3 < 20) goes back to the synchronous path, unbatched.
+        let small = ids[..3].to_vec();
+        let left = batch::sweep_with_batches(&enricher, &settings, small.clone()).await;
+        assert_eq!(left, small);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "nothing batched below the minimum"
+        );
+
+        // Twenty: one primary batch with twenty requests, none left over.
+        let left = batch::sweep_with_batches(&enricher, &settings, ids.clone()).await;
+        assert!(left.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/messages/batches");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["requests"].as_array().unwrap().len(), 20);
+
+        sqlx::query(cleanup_batches).execute(&pool).await.unwrap();
+        for id in &ids {
+            cleanup_incident(&pool, id).await;
+        }
     }
 }

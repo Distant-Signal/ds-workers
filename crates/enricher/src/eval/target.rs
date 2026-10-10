@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use common::secret::Secret;
 
 use crate::auth::LlmAuthMode;
-use crate::config::{AnthropicConfig, Config, LlmAuthConfig, ProviderPolicyConfig, SweepMode};
+use crate::config::{AnthropicConfig, Config, LlmAuthConfig, ProviderPolicyConfig};
 use crate::eval::pipeline::TargetLabel;
 use crate::llm::anthropic::{AnthropicSettings, PromptCache};
 use crate::llm::{LlmClient, ProviderKind, ProviderPolicy};
@@ -294,7 +294,7 @@ impl Target {
             Some(&self.model),
             self.auth,
             api_key.as_ref(),
-            SweepMode::Sync,
+            None,
         )
         .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
         let auth = self

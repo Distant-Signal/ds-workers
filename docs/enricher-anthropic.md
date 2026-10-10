@@ -43,7 +43,7 @@ errors and their outcome labels, the per-text backoff, and the metrics.
 | `LLM_REASONING_EFFORT` | `reasoning_effort` | `output_config.effort` |
 | `LLM_MAX_TOKENS` | `max_tokens`, omitted when unset | `max_tokens`, 16000 when unset (required by the API) |
 | Thinking | n/a | `LLM_THINKING` → `thinking.type`; unset = model default (adaptive) |
-| Bulk path | none | Message Batches for the sweep (`LLM_SWEEP_MODE=batch`) |
+| Bulk path | none | Message Batches for the sweep (`LLM_SWEEP_MODE=batch`), or for everything ([`LLM_MODE=batch`/`batch-only`](#llm-modes)) |
 
 The code: `crates/enricher/src/llm/anthropic.rs` (request, response,
 errors, batch client), `crates/enricher/src/batch.rs` (batch mode),
@@ -208,11 +208,127 @@ support asks for. Responses also carry `thinking` blocks (adaptive thinking;
 their text is empty by default): they are skipped, and only `text` blocks are
 parsed.
 
+## LLM modes
+
+`LLM_MODE` (chart `enricher.llm.batch.mode`) decides where extractions run.
+`normal` is the default and today's behaviour; `batch` and `batch-only` are
+Claude only (with `openai` the pod refuses to start and the chart refuses
+to render).
+
+| | `normal` (default) | `batch` | `batch-only` |
+| --- | --- | --- | --- |
+| Stream loop and reclaim | extract synchronously, seconds after the text change | no LLM call: ACK, incident left stale | no LLM call: ACK, incident left stale |
+| Sweep | every `SWEEP_INTERVAL_SECS` (1 h); `LLM_SWEEP_MODE` picks sync or batch | every `LLM_BATCH_SWEEP_INTERVAL_SECS` (120 s); ≥ `LLM_BATCH_MIN_ITEMS` (20) stale incidents: a batch; fewer: synchronously, right away | every `LLM_BATCH_SWEEP_INTERVAL_SECS` (300 s); everything batched, even one incident |
+| `LLM_SWEEP_MODE` | used | ignored | ignored |
+| Latency of a text change | the three calls (tens of seconds) | quiet: ≤ 2 min + the three calls; a burst of ≥ 20: two sequential batches (below) | ≤ 5 min + two sequential batches: usually well under 2 h, at worst ~48 h |
+| Cost (Haiku 5.5, [Cost](#cost)) | ~$6-8/month | about the same in steady state; bursts and re-extractions at half price | half of everything: ~$3-4/month |
+| Use it when | users should see an LLM reading within a minute (the default) | you want bursts (a re-extraction, a big disruption day) at half price but quiet periods near-live | cost matters more than freshness |
+
+Both new modes share these rules:
+
+- **The stream loop and reclaim still do everything that needs no LLM.**
+  Unchanged text is skipped and, with `CARRY_FORWARD_SEMANTIC_NOOPS`, a
+  semantic no-op is carried forward. Only a text that needs the LLM is
+  deferred: the entry is ACKed and counted in
+  `distant_signal_enricher_deferred_to_batch_total{path="stream"|"reclaim"}`,
+  and the incident stays stale (its stored `source_text_hash` doesn't match)
+  for the next sweep. A preflight that couldn't finish (database error,
+  backed-off text) leaves the entry pending, as in `normal`.
+- **No double submission.** The sweep skips an incident only when a batch
+  is already in flight for its *current* text. If the text changed after
+  its batch was submitted, the next sweep extracts the new text straight
+  away (batched or, in `batch`, synchronously below the minimum); when the
+  old batch lands, `write_extraction`'s stale-text guard drops its result,
+  because it no longer matches the incident's text. The alternative, waiting
+  for the old batch to end, could hold a changed text back for a day, since
+  nothing else extracts it in these modes. The cost is the superseded
+  request, which is what `normal` pays for every edit anyway. (In `normal`
+  with `LLM_SWEEP_MODE=batch`, the sweep keeps skipping every incident in a
+  batch, as before: there the stream loop extracts the new text.)
+- **Everything else is [batch mode](#batch-mode)**: the two-stage flow,
+  `LLM_BATCH_MAX_ITEMS`, the poll loop, restart resume from
+  `enricher_llm_batches`, the batch metrics and the three batch alerts
+  (rendered for both modes).
+
+**Why 120 s and 300 s.** In `batch`, the interval is the worst-case wait of
+a quiet period's text change, so it is short. It must also be long enough
+for a burst to reach the minimum: 20 text changes in 2 minutes is a real
+disruption day or a re-extraction. Each sweep is one scan of the live
+incidents (a few hundred rows). In `batch-only`, two batches (minutes to an
+hour each) dominate the latency; 5 minutes adds little and keeps the batches
+fewer and larger (better prompt-cache reuse inside each).
+
+### Batch-only mode
+
+`enricher.llm.batch.mode: batch-only` (`LLM_MODE=batch-only`). No
+synchronous LLM call anywhere: every extraction is half price.
+
+**Latency.** A text change waits for the next sweep (up to
+`LLM_BATCH_SWEEP_INTERVAL_SECS`, 300 s), then goes through two batches in
+sequence: the primary batch, then (once it has ended and been polled, up to
+`LLM_BATCH_POLL_SECS`, 60 s, later) the adversarial batch. Anthropic's
+documentation (Message Batches, read 2026-10-09): "most batches completing
+within 1 hour", and "Batches expire if processing does not complete within
+24 hours". So expect minutes to an hour or two per text change, and plan for
+the worst case: a request that expires is dropped and the next sweep
+resubmits it, so a day or two is possible when the API is busy.
+
+**What users see meanwhile.** The incident's previous extraction no longer
+counts: the aggregator only uses an extraction whose `source_text_hash`
+matches the current text (`LoadedIncident::new` in
+`crates/aggregator/src/queries.rs`). Until the batch result is written, the
+incident is shown as if never enriched: severity from the keyword rules,
+without the LLM's periods, impact type or annotations. A brand-new incident
+is shown the same way until its first extraction. That is the real cost of
+this mode.
+
+**Cost.** Half of everything: on Haiku 5.5 about **$3-4 a month** instead
+of $6-8 (the [Cost](#cost) assumptions, all at the batch price). Prompt
+caching still applies inside batches, best effort.
+
+**Retention.** Batch results stay downloadable for 29 days after creation
+(the same page: "Batch results are available for 29 days after creation").
+The enricher reads each batch as soon as it has ended, so this only matters
+for a batch left unread (an enricher down for weeks, or rolled back to
+`normal`, below); such a batch is abandoned with a 404 and its incidents go
+into a later sweep.
+
+**Judging it.** Once the extraction latency histogram
+(`distant_signal_enricher_enrichment_latency_seconds{path}`) is merged, its
+`path="batch"` series against `path="stream"` in `normal` is the answer:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(distant_signal_enricher_enrichment_latency_seconds_bucket{path="batch"}[1d])))
+```
+
+Until then: `distant_signal_enricher_llm_batch_oldest_age_seconds` (how
+long the oldest in-flight batch has been running), the rate of
+`distant_signal_enricher_llm_batches_total{event="ended"}`, and
+`distant_signal_enricher_deferred_to_batch_total` for how many text changes
+went this way. If the p95 is longer than users tolerate, `batch` keeps
+quiet periods near-live and still halves the bursts.
+
+**Rollback.** Set `enricher.llm.batch.mode: normal` (or unset it). The
+stream loop extracts synchronously again at once. Incidents deferred before
+the switch are not re-published to the stream, so the next hourly sweep
+picks them up (or set `SWEEP_INTERVAL_SECS` lower for a while). Batches
+still in flight are not polled with batches off (no `LLM_SWEEP_MODE=batch`):
+their rows stay in `enricher_llm_batches`, unread. Their incidents are
+extracted synchronously anyway, and if batches come back on later, a result
+for a text that has since changed is dropped by the stale-text guard. Delete
+the rows by hand (`DELETE FROM enricher_llm_batches`) once you won't switch
+back; or keep `sweepMode: batch` during the rollback so the poll loop drains
+them.
+
 ## Batch mode
 
 Message Batches run asynchronously at **50% of the synchronous price**, most
 within an hour and all within 24 hours (results stay downloadable for 29
 days).
+
+This section is `LLM_MODE=normal` with `LLM_SWEEP_MODE=batch`; the
+[LLM modes](#llm-modes) `batch` and `batch-only` reuse all of its machinery
+but also take the stream loop's work.
 
 **Where it applies: the sweep only.** The enricher has three loops: the
 stream loop (a text change, seconds after `api` publishes it), reclaim (its
@@ -514,7 +630,12 @@ names the model and `base_url_host` `api.anthropic.com`). Changed or new:
   cache reads, `cache_write` the cache writes, `completion` `output_tokens`
   (thinking included), `reasoning` always 0. OpenAI never sends
   `cache_write`.
-- Batch mode only (registered when `LLM_SWEEP_MODE=batch`):
+- `distant_signal_enricher_deferred_to_batch_total{path}`
+  (`LLM_MODE=batch`/`batch-only` only, registered at 0 then): text changes
+  the stream loop (`path="stream"`) or reclaim (`path="reclaim"`) left for
+  the sweep instead of extracting.
+- Batch mode only (registered when `LLM_SWEEP_MODE=batch` or `LLM_MODE` is
+  `batch`/`batch-only`):
   - `distant_signal_enricher_llm_batch_tokens_total{call, kind}`: the same
     kinds for batch results, kept apart because they are billed at half
     price;
@@ -526,7 +647,7 @@ names the model and `base_url_host` `api.anthropic.com`). Changed or new:
   - `distant_signal_enricher_llm_batch_oldest_age_seconds`: the oldest
     in-flight batch's age.
 
-Batch mode renders three alerts (docs/alerts.md):
+Batch mode (either way) renders three alerts (docs/alerts.md):
 `DistantSignalEnricherBatchFailing` (batches failing to submit or
 abandoned), `DistantSignalEnricherBatchResultsFailing` (a high share of
 errored, expired or canceled results) and `DistantSignalEnricherBatchStuck`
