@@ -391,7 +391,7 @@ fn register_deferred_metrics() {
 /// `LLM_MODE=batch`/`batch-only`: everything `process_incident` does
 /// short of the LLM. The
 /// preflight still skips unchanged text and carries a semantic no-op
-/// forward (no LLM needed); an incident that needs the LLM is ACKed and
+/// forward (no LLM needed); an incident that needs the LLM is acknowledged and
 /// left stale, for the batch sweep to find (its stored hash doesn't match).
 /// A preflight that couldn't finish (a DB error, a backed-off text) leaves
 /// the entry pending, as on the synchronous path.
@@ -399,14 +399,14 @@ async fn defer_to_batch(enricher: &Enricher, path: latency::Path, incident_id: &
     deferred_outcome(
         path.label(),
         incident_id,
-        preflight(enricher, incident_id, path).await,
+        &preflight(enricher, incident_id, path).await,
     )
 }
 
 /// The decision half of [`defer_to_batch`]: never calls the LLM.
-fn deferred_outcome(path: &'static str, incident_id: &str, preflight: Preflight) -> bool {
+fn deferred_outcome(path: &'static str, incident_id: &str, preflight: &Preflight) -> bool {
     match preflight {
-        Preflight::Done(ack) => ack,
+        Preflight::Done(ack) => *ack,
         Preflight::Extract(_) => {
             tracing::info!(
                 incident_id,
@@ -1968,7 +1968,7 @@ mod tests {
     }
 
     /// The deferral decision never runs an extraction: a text that needs
-    /// the LLM is ACKed (left stale for the sweep), and a preflight that
+    /// the LLM is acknowledged (left stale for the sweep), and a preflight that
     /// already decided keeps its answer.
     #[test]
     fn batch_only_defers_what_needs_the_llm_and_keeps_preflight_answers() {
@@ -1985,10 +1985,10 @@ mod tests {
         assert!(deferred_outcome(
             "stream",
             "A",
-            Preflight::Extract(prepared)
+            &Preflight::Extract(prepared)
         ));
-        assert!(deferred_outcome("reclaim", "A", Preflight::Done(true)));
-        assert!(!deferred_outcome("stream", "A", Preflight::Done(false)));
+        assert!(deferred_outcome("reclaim", "A", &Preflight::Done(true)));
+        assert!(!deferred_outcome("stream", "A", &Preflight::Done(false)));
     }
 
     /// The in-flight skip still applies in the deferring modes, before any
