@@ -36,11 +36,16 @@ pub(crate) async fn ensure_group(conn: &mut RedisConn) -> anyhow::Result<()> {
 /// so `enricher`/`enricher-1` on a test's own stream can never collide with
 /// the same names on the real one).
 async fn ensure_group_on(conn: &mut RedisConn, stream: &str) -> anyhow::Result<()> {
-    ensure_group_at(conn, stream, "$").await
+    ensure_group_at(conn, stream, "$").await.map(|_| ())
 }
 
 /// [`ensure_group_on`], the group (if created) starting after `start_id`.
-async fn ensure_group_at(conn: &mut RedisConn, stream: &str, start_id: &str) -> anyhow::Result<()> {
+/// Returns whether it was created (`false`: it already existed).
+async fn ensure_group_at(
+    conn: &mut RedisConn,
+    stream: &str,
+    start_id: &str,
+) -> anyhow::Result<bool> {
     let result: redis::RedisResult<()> = redis::cmd("XGROUP")
         .arg("CREATE")
         .arg(stream)
@@ -51,11 +56,17 @@ async fn ensure_group_at(conn: &mut RedisConn, stream: &str, start_id: &str) -> 
         .await;
 
     match result {
-        Ok(()) => Ok(()),
-        Err(err) if err.to_string().contains("BUSYGROUP") => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if err.to_string().contains("BUSYGROUP") => Ok(false),
         Err(err) => Err(err.into()),
     }
 }
+
+/// `enricher_stream_group_position_restored_total`: times
+/// [`recreate_group`] found the group still there but BEHIND the last entry
+/// `main` read, and moved it forward (`XGROUP SETID`). Registered at 0 by
+/// `main`.
+pub(crate) const GROUP_RESTORED_METRIC: &str = "enricher_stream_group_position_restored_total";
 
 /// The `enricher` group's `last-delivered-id` (`XINFO GROUPS`), or `None`
 /// (logged) when it cannot be read. `main` keeps it, advanced to every
@@ -108,6 +119,11 @@ async fn group_last_delivered_id_on(conn: &mut RedisConn, stream: &str) -> Optio
 /// `main`'s copy of the group's position, refreshed from Redis afterwards.
 /// Entries the lost group had delivered but not `ACKed` are not redelivered
 /// (the sweep still backstops them).
+///
+/// When the group still exists but stands BEHIND `last_delivered` (Redis
+/// restarted and reloaded an older copy of its data; 2026-10-09 redelivery
+/// review), it is moved forward to it, so incidents already extracted are
+/// not handed out again: `common::redis_group::restore_group_position`.
 pub(crate) async fn recreate_group(
     conn: &mut RedisConn,
     last_delivered: &mut Option<String>,
@@ -141,7 +157,22 @@ async fn recreate_group_on(
         None
     };
     let start_id = recreate_start_id(last_delivered.as_deref(), last_generated.as_deref());
-    ensure_group_at(conn, stream, &start_id).await?;
+    let created = ensure_group_at(conn, stream, &start_id).await?;
+    if !created
+        && let Some(remembered) = last_delivered.as_deref()
+        && let common::redis_group::GroupPosition::Restored { was } =
+            common::redis_group::restore_group_position(conn, stream, GROUP, remembered).await?
+    {
+        tracing::warn!(
+            stream,
+            group = GROUP,
+            was,
+            restored_to = remembered,
+            "consumer group went backwards (Redis reloaded an older copy of its data); moved \
+             it forward to the last entry read, so those incidents are not handed out again"
+        );
+        metrics::counter!(common::metrics::metric_name(GROUP_RESTORED_METRIC)).increment(1);
+    }
     if let Some(id) = group_last_delivered_id_on(conn, stream).await {
         *last_delivered = Some(id);
     }
@@ -623,6 +654,41 @@ mod redis_tests {
             .await
             .unwrap();
         assert_eq!(drain(&mut conn, &stream, &mut last).await, vec!["unread"]);
+        cleanup(&stream).await;
+    }
+
+    /// Redis restarted with an older copy of its data: the group exists but
+    /// stands before entries already read. The recreate after the failed
+    /// read moves it forward again, so only the new entry is read.
+    #[tokio::test]
+    #[ignore = "needs REDIS_URL"]
+    async fn a_group_that_went_backwards_is_moved_forward_again() {
+        let stream = unique_stream("rewound");
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        ensure_group_on(&mut conn, &stream).await.unwrap();
+        let mut last = group_last_delivered_id_on(&mut conn, &stream).await;
+        for i in 0..3 {
+            xadd_incident(&mut conn, &stream, &format!("read-{i}")).await;
+        }
+        assert_eq!(drain(&mut conn, &stream, &mut last).await.len(), 3);
+        let read_up_to = last.clone().unwrap();
+
+        let () = redis::cmd("XGROUP")
+            .arg("SETID")
+            .arg(&stream)
+            .arg(GROUP)
+            .arg("0")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        xadd_incident(&mut conn, &stream, "new").await;
+
+        recreate_group_on(&mut conn, &stream, &mut last)
+            .await
+            .unwrap();
+        assert_eq!(last.as_deref(), Some(read_up_to.as_str()));
+        assert_eq!(drain(&mut conn, &stream, &mut last).await, vec!["new"]);
         cleanup(&stream).await;
     }
 }

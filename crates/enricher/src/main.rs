@@ -188,6 +188,7 @@ async fn run() -> anyhow::Result<()> {
     .await;
     // The group's position, kept for `stream::recreate_group`.
     let mut last_delivered = stream::group_last_delivered_id(&mut redis).await;
+    metrics::counter!(common::metrics::metric_name(stream::GROUP_RESTORED_METRIC)).increment(0);
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // `config.llm_model` is the ONLY thing ever sent to the endpoint as the
