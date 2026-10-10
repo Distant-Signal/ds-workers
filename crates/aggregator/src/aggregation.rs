@@ -1457,9 +1457,8 @@ fn compute_sample_availability(
 
 #[expect(
     clippy::cast_precision_loss,
-    clippy::format_push_string,
     clippy::similar_names,
-    reason = "counts stay far below 2^52, so the f64 ratio is exact; short strings off the hot path; format! reads clearer; the similar names are distinct domain terms"
+    reason = "counts stay far below 2^52, so the f64 ratio is exact; the similar names are distinct domain terms"
 )]
 fn infer_from_samples(
     line: &LineDefinition,
