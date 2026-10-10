@@ -1163,7 +1163,7 @@ fn apply_extraction(
                         floors.push(Severity::MinorDelays);
                         annotations.push(scope_qualify(
                             period,
-                            "reported resolved — showing residual impact".to_string(),
+                            "reported resolved, showing residual impact".to_string(),
                         ));
                     }
                     "residual" => {
