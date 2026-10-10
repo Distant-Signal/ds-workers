@@ -20,6 +20,7 @@
 //! No error or log line here ever contains key material.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -98,7 +99,7 @@ impl fmt::Debug for VapidKey {
         f.debug_struct("VapidKey")
             .field("key", &"<redacted>")
             .field("format", &self.format)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -181,7 +182,7 @@ fn canonical_pem(input: &str) -> Option<String> {
         out.push_str(std::str::from_utf8(line).ok()?);
         out.push('\n');
     }
-    out.push_str(&format!("-----END {label}-----\n"));
+    writeln!(out, "-----END {label}-----").ok()?;
     Some(out)
 }
 
