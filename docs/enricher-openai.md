@@ -35,9 +35,10 @@ Service env vars (the chart value that sets each one is in brackets):
 | `LLM_REASONING_EFFORT` | `none` | [`enricher.llm.reasoningEffort`]. Required; see below. |
 | `LLM_MAX_TOKENS` | **unset** | This model reportedly rejects `max_tokens`. Unset means the field is never sent. |
 | `LLM_REQUEST_TIMEOUT_SECS` | `120` | [`enricher.llmRequestTimeoutSecs`]. Effort `none` answers in seconds; confirm with the perf benchmark. |
-| `LLM_MAX_IN_FLIGHT` | `3` | [`enricher.extraEnv`] |
+| `LLM_MAX_IN_FLIGHT` | `3` | [`enricher.extraEnv`]. Caps concurrent requests across the three loops. It is also how many incidents the synchronous sweep extracts at once (one at a time when unset). |
 | `LLM_RATE_LIMIT_RETRIES` | `3` | [`enricher.extraEnv`]. Real rate limits only; a quota 429 is never retried (below). |
 | `LLM_GATEWAY_RETRIES` | `1` | [`enricher.extraEnv`]. One retry on 502/503/504 or a client timeout. |
+| `CARRY_FORWARD_SEMANTIC_NOOPS` | `true` (the default) | [`enricher.llm.carryForwardSemanticNoops`]. A text change that only touches HTML, whitespace, entities, case or in-word punctuation re-stamps the existing extraction instead of making three calls. About 3.6% of calls in the 2026-10 tuning study. `false` re-runs the LLM for every text change. See [docs/enricher-anthropic.md](enricher-anthropic.md#semantic-no-ops); it works the same for both providers. |
 
 These are the same settings as the `openai-gpt-6-luna-none` target in
 `crates/enricher/eval/targets.example.toml`, so the eval measures the

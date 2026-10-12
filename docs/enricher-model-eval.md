@@ -182,9 +182,10 @@ legitimate, but they measure the old prompts, not the current ones.
 | `EVAL_DATASET`, `EVAL_CASES`, `EVAL_OUT_DIR` | as above | Cases do not need labels here |
 
 Choose the concurrency to match the deployment. The service's stream loop
-processes one incident at a time (concurrency 1). The hourly sweep and
-the reclaim loop can overlap with it, so up to 3 documents can be in
-flight, capped across all callers by `max_in_flight` (`LLM_MAX_IN_FLIGHT`).
+processes one incident at a time (concurrency 1). The synchronous sweep
+extracts up to `LLM_MAX_IN_FLIGHT` incidents at once, and it and the
+reclaim loop can overlap with the stream loop; HTTP requests are capped
+across all callers by `max_in_flight` (`LLM_MAX_IN_FLIGHT`, 3 in prod).
 Use 1 for steady-state latency. Use 3 for a burst, such as the full
 re-extraction after a prompt version bump.
 

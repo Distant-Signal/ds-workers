@@ -3,7 +3,7 @@
 //! /home/coder/ds-review/diff-aware-enricher-research.md), so the enricher
 //! can (a) label the churn metrics by edit class
 //! (`enricher_extraction_churn_total{edit_class}` -- measurement, always on)
-//! and (b) behind `CARRY_FORWARD_SEMANTIC_NOOPS` (default off), skip the LLM
+//! and (b) behind `CARRY_FORWARD_SEMANTIC_NOOPS` (default on), skip the LLM
 //! entirely for a *semantic no-op* (HTML/whitespace/entity/case/punctuation-
 //! only change) by carrying the previous extraction forward.
 //!
