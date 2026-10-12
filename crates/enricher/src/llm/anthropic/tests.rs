@@ -625,7 +625,7 @@ async fn message_batch_lifecycle() {
         .map(|i| BatchRequest {
             custom_id: format!("p-{i}"),
             params: client
-                .batch_params(&crate::llm::primary_spec(
+                .batch_params(crate::llm::primary_spec(
                     client.prompts(),
                     "s",
                     &format!("d{i}"),
@@ -665,10 +665,11 @@ async fn message_batch_lifecycle() {
         .await
         .unwrap();
     assert_eq!(outcomes["p-1"], BatchOutcome::Expired);
-    let BatchOutcome::Succeeded(message) = &outcomes["p-0"] else {
+    let BatchOutcome::Succeeded { content, usage } = &outcomes["p-0"] else {
         panic!("{outcomes:?}")
     };
-    assert_eq!(completion_from_message(message).1.unwrap(), primary_text());
+    assert_eq!(content.as_deref(), Ok(primary_text().as_str()));
+    assert_eq!(usage.as_ref().unwrap().completion_tokens, Some(320));
     client.cancel_message_batch("msgbatch_1").await.unwrap();
 
     assert!(matches!(

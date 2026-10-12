@@ -90,7 +90,10 @@ async fn run() -> anyhow::Result<()> {
         // cost-estimate query (docs/enricher-openai.md, "Cost").
         llm::register_usage_metrics(&resolved.model, &resolved.base_url, active.profile);
         if let Some(settings) = &batch_settings {
-            batch::register_metrics();
+            batch::register_metrics(match resolved.provider {
+                llm::ProviderKind::Openai => "openai",
+                llm::ProviderKind::Anthropic => "anthropic",
+            });
             if settings.defers_stream() {
                 register_deferred_metrics();
             }

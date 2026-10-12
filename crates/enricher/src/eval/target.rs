@@ -294,7 +294,6 @@ impl Target {
             Some(&self.model),
             self.auth,
             api_key.as_ref(),
-            None,
         )
         .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
         let auth = self

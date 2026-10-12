@@ -21,6 +21,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod anthropic;
+pub(crate) mod batch_api;
+pub(crate) mod openai_batch;
 
 /// A date range as stated (or inferred) by the primary pass. `None` on
 /// either side is a real, distinct fact -- not "unknown":

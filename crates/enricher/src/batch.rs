@@ -1,7 +1,8 @@
-//! Message Batches (Claude only): extractions sent through the Claude
-//! Message Batches API, at half the synchronous price, instead of one
-//! incident at a time. docs/enricher-anthropic.md, "LLM modes" and "Batch
-//! mode".
+//! Batches: extractions sent through the provider's batch API (the Claude
+//! Message Batches API or the `OpenAI` Batch API, `llm::batch_api`), at
+//! half the synchronous price, instead of one incident at a time.
+//! docs/enricher-anthropic.md, "LLM modes" and "Batch mode", and
+//! docs/enricher-openai.md, "Batch mode".
 //!
 //! **Where it applies.** Three ways in (`config::BatchConfig`):
 //!
@@ -55,9 +56,17 @@
 //! it again (its stored hash still doesn't match). An unusable success (a
 //! refusal, a truncated or unparseable output) also feeds the per-text
 //! backoff, exactly as on the synchronous path. A batch whose
-//! `model_version` is no longer the service's is canceled and dropped.
+//! `model_version` is no longer the service's is canceled and dropped, and
+//! so is one submitted to another provider (`provider` column).
+//!
+//! **Provider files.** An `OpenAI` batch has an input, an output and an
+//! error file; once its results are processed they are deleted (a failure
+//! is logged and counted, `enricher_llm_batch_files_total`, and the files
+//! expire within two days anyway). A batch that failed input validation
+//! (`OpenAI` `failed`) is dropped (`validation_failed`) and its input file
+//! deleted.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,20 +75,26 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::config::LlmMode;
-use crate::llm::anthropic::{BatchOutcome, BatchRequest, completion_from_message};
+use crate::llm::batch_api::{
+    BatchMeta, BatchOutcome, BatchPoll, BatchRequest, BatchResults, CreatedBatch,
+};
 use crate::llm::{self, LlmCall, LlmCallError, TokenUsage};
 use crate::{Enricher, Preflight, Prepared};
 
-/// Ceiling on `LLM_BATCH_MAX_ITEMS`. The API takes up to 100,000 requests
-/// or 256 MB per batch; each request carries a system prompt of up to
-/// ~11 KB, and the adversarial batch has two per incident, so 5,000
-/// incidents stay well under the size limit (~130 MB).
+/// Ceiling on `LLM_BATCH_MAX_ITEMS`. Claude takes up to 100,000 requests
+/// or 256 MB per batch, `OpenAI` 50,000 requests or a 200 MB input file;
+/// each request carries a system prompt of up to ~11 KB, and the
+/// adversarial batch has two per incident, so 5,000 incidents stay well
+/// under both (10,000 requests, ~130 MB).
 pub(crate) const MAX_BATCH_INCIDENTS: usize = 5_000;
 
-/// `enricher_llm_batches_total{stage, event}`: `submitted`,
-/// `submit_failed`, `ended`, `poll_failed`, `abandoned`.
+/// `enricher_llm_batches_total{provider, stage, event}`: `submitted`,
+/// `submit_failed`, `ended`, `poll_failed`, `abandoned`,
+/// `validation_failed` (`OpenAI`: the input file failed validation, so
+/// nothing ran).
 const BATCHES_METRIC: &str = "enricher_llm_batches_total";
-/// `enricher_llm_batch_requests_total{call, result}`: one per request of an
+/// `enricher_llm_batch_requests_total{provider, call, result}`: one per
+/// request of an
 /// ended batch -- `succeeded`, `invalid` (a success the enricher could not
 /// use: a refusal, truncated or unparseable output), `errored`,
 /// `canceled`, `expired`, `missing` (no result line).
@@ -199,28 +214,35 @@ pub(crate) fn custom_id(call: LlmCall, index: usize) -> String {
     format!("{prefix}-{index}")
 }
 
-fn record_batch_event(stage: Stage, event: &'static str) {
+/// Every `event` of [`BATCHES_METRIC`].
+const BATCH_EVENTS: [&str; 6] = [
+    "submitted",
+    "submit_failed",
+    "ended",
+    "poll_failed",
+    "abandoned",
+    "validation_failed",
+];
+
+fn record_batch_event(provider: &'static str, stage: Stage, event: &'static str) {
     metrics::counter!(
         common::metrics::metric_name(BATCHES_METRIC),
+        "provider" => provider,
         "stage" => stage.as_str(),
         "event" => event
     )
     .increment(1);
 }
 
-/// Registers the batch metrics' series at 0 (batch mode only).
-pub(crate) fn register_metrics() {
+/// Registers the batch metrics' series at 0 (batch mode only), labelled
+/// with the configured `provider`.
+pub(crate) fn register_metrics(provider: &'static str) {
     llm::register_token_series(llm::BATCH_TOKENS_METRIC);
     for stage in [Stage::Primary, Stage::Adversarial] {
-        for event in [
-            "submitted",
-            "submit_failed",
-            "ended",
-            "poll_failed",
-            "abandoned",
-        ] {
+        for event in BATCH_EVENTS {
             metrics::counter!(
                 common::metrics::metric_name(BATCHES_METRIC),
+                "provider" => provider,
                 "stage" => stage.as_str(),
                 "event" => event
             )
@@ -238,8 +260,19 @@ pub(crate) fn register_metrics() {
         ] {
             metrics::counter!(
                 common::metrics::metric_name(REQUESTS_METRIC),
+                "provider" => provider,
                 "call" => call.label(),
                 "result" => result
+            )
+            .increment(0);
+        }
+    }
+    if provider == "openai" {
+        for event in ["uploaded", "deleted", "delete_failed"] {
+            metrics::counter!(
+                common::metrics::metric_name(llm::batch_api::FILES_METRIC),
+                "provider" => provider,
+                "event" => event
             )
             .increment(0);
         }
@@ -290,12 +323,16 @@ pub(crate) struct ReadyItem {
 /// missing; already recorded), or `Err(Some(reason))` for an unusable
 /// success (recorded as `invalid`).
 fn take_output(
-    outcomes: &mut HashMap<String, BatchOutcome>,
+    results: &mut BatchResults,
     call: LlmCall,
     index: usize,
     records: &mut Vec<RequestRecord>,
 ) -> Result<String, Option<String>> {
-    let Some(outcome) = outcomes.remove(&custom_id(call, index)) else {
+    let Some(outcome) = results
+        .outcomes
+        .remove(&custom_id(call, index))
+        .or_else(|| results.unanswered.clone())
+    else {
         records.push(RequestRecord {
             call,
             result: "missing",
@@ -303,13 +340,13 @@ fn take_output(
         });
         return Err(None);
     };
-    let BatchOutcome::Succeeded(message) = &outcome else {
+    let BatchOutcome::Succeeded { usage, content } = outcome else {
         if let BatchOutcome::Errored { kind, message } = &outcome {
             tracing::warn!(
                 call = call.label(),
                 error_type = kind.as_deref(),
                 error = message.as_deref(),
-                "Message Batch request errored"
+                "batch request errored"
             );
         }
         records.push(RequestRecord {
@@ -319,7 +356,6 @@ fn take_output(
         });
         return Err(None);
     };
-    let (usage, content) = completion_from_message(message);
     match content {
         Ok(text) => {
             records.push(RequestRecord {
@@ -335,17 +371,14 @@ fn take_output(
                 result: "invalid",
                 usage,
             });
-            Err(Some(err.to_string()))
+            Err(Some(err))
         }
     }
 }
 
 /// Plans an ended primary batch: parse each item's output; the parsed ones
 /// go on to the adversarial stage.
-pub(crate) fn plan_primary(
-    items: Vec<BatchItem>,
-    mut outcomes: HashMap<String, BatchOutcome>,
-) -> StagePlan {
+pub(crate) fn plan_primary(items: Vec<BatchItem>, mut outcomes: BatchResults) -> StagePlan {
     let mut plan = StagePlan::default();
     for mut item in items {
         let parsed = take_output(
@@ -381,10 +414,7 @@ pub(crate) fn plan_primary(
 
 /// Plans an ended adversarial batch: the items whose two verdict lists
 /// both parsed are ready to combine and write.
-pub(crate) fn plan_adversarial(
-    items: Vec<BatchItem>,
-    mut outcomes: HashMap<String, BatchOutcome>,
-) -> StagePlan {
+pub(crate) fn plan_adversarial(items: Vec<BatchItem>, mut outcomes: BatchResults) -> StagePlan {
     let mut plan = StagePlan::default();
     for item in items {
         let Some(primary) = item
@@ -448,6 +478,7 @@ fn apply_records(enricher: &Enricher, plan: &StagePlan) {
     for record in &plan.records {
         metrics::counter!(
             common::metrics::metric_name(REQUESTS_METRIC),
+            "provider" => enricher.llm.provider_label(),
             "call" => record.call.label(),
             "result" => record.result
         )
@@ -476,6 +507,8 @@ fn apply_records(enricher: &Enricher, plan: &StagePlan) {
 #[derive(Debug, Clone)]
 pub(crate) struct BatchRow {
     pub batch_id: String,
+    /// The provider it was submitted to (`LlmClient::provider_label`).
+    pub provider: String,
     pub stage: Stage,
     pub model_version: String,
     pub items: Vec<BatchItem>,
@@ -491,17 +524,25 @@ pub(crate) fn oldest_age_secs(rows: &[BatchRow], now: DateTime<Utc>) -> u32 {
         .map_or(0, |secs| u32::try_from(secs.max(0)).unwrap_or(u32::MAX))
 }
 
-type BatchRecord = (String, String, String, serde_json::Value, DateTime<Utc>);
+type BatchRecord = (
+    String,
+    String,
+    String,
+    String,
+    serde_json::Value,
+    DateTime<Utc>,
+);
 
 async fn load_batches(pool: &PgPool) -> anyhow::Result<Vec<BatchRow>> {
     let rows: Vec<BatchRecord> = sqlx::query_as(
-        "SELECT batch_id, stage, model_version, items, submitted_at FROM enricher_llm_batches \
+        "SELECT batch_id, provider, stage, model_version, items, submitted_at \
+         FROM enricher_llm_batches \
          ORDER BY submitted_at",
     )
     .fetch_all(pool)
     .await?;
     let mut batches = Vec::with_capacity(rows.len());
-    for (batch_id, stage, model_version, items, submitted_at) in rows {
+    for (batch_id, provider, stage, model_version, items, submitted_at) in rows {
         let Some(stage) = Stage::parse(&stage) else {
             tracing::error!(batch_id, stage, "unknown batch stage; skipping the row");
             continue;
@@ -509,6 +550,7 @@ async fn load_batches(pool: &PgPool) -> anyhow::Result<Vec<BatchRow>> {
         match serde_json::from_value(items) {
             Ok(items) => batches.push(BatchRow {
                 batch_id,
+                provider,
                 stage,
                 model_version,
                 items,
@@ -691,6 +733,7 @@ pub(crate) async fn sweep_with_batches(
 }
 
 async fn submit_primary(enricher: &Enricher, prepared: &[Prepared]) -> anyhow::Result<()> {
+    let provider = enricher.llm.provider_label();
     let items: Vec<BatchItem> = prepared
         .iter()
         .enumerate()
@@ -707,37 +750,43 @@ async fn submit_primary(enricher: &Enricher, prepared: &[Prepared]) -> anyhow::R
             );
             Ok(BatchRequest {
                 custom_id: custom_id(LlmCall::Primary, item.index),
-                params: enricher.llm.batch_params(&spec)?,
+                params: enricher.llm.batch_params(spec)?,
             })
         })
         .collect::<Result<Vec<_>, LlmCallError>>()?;
-    let batch = match enricher.llm.create_message_batch(&requests).await {
+    let meta = BatchMeta {
+        stage: Stage::Primary.as_str(),
+        model_version: &enricher.model_version,
+    };
+    let batch = match enricher.llm.create_batch(&requests, meta).await {
         Ok(batch) => batch,
         Err(err) => {
-            record_batch_event(Stage::Primary, "submit_failed");
+            record_batch_event(provider, Stage::Primary, "submit_failed");
             return Err(err.into());
         }
     };
     if let Err(err) = insert_batch(
         &enricher.pool,
         &batch.id,
-        "anthropic",
+        provider,
         Stage::Primary,
         &enricher.model_version,
         &items,
     )
     .await
     {
-        // Unrecorded, nobody would read it: cancel it (best effort).
-        cancel_quietly(enricher, &batch.id).await;
-        record_batch_event(Stage::Primary, "submit_failed");
+        // Unrecorded, nobody would read it: cancel it and drop its files
+        // (best effort).
+        discard_quietly(enricher, &batch).await;
+        record_batch_event(provider, Stage::Primary, "submit_failed");
         return Err(err);
     }
-    record_batch_event(Stage::Primary, "submitted");
+    record_batch_event(provider, Stage::Primary, "submitted");
     tracing::info!(
         batch_id = batch.id,
+        provider,
         count = items.len(),
-        "submitted a primary extraction Message Batch"
+        "submitted a primary extraction batch"
     );
     Ok(())
 }
@@ -752,31 +801,41 @@ pub(crate) async fn poll_loop(enricher: Arc<Enricher>, settings: BatchSettings) 
     let mut interval = crate::ticking_interval(settings.poll_interval.as_secs());
     loop {
         interval.tick().await;
-        match load_batches(&enricher.pool).await {
-            Ok(rows) => {
-                let count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-                metrics::gauge!(common::metrics::metric_name(IN_FLIGHT_METRIC))
-                    .set(f64::from(count));
-                metrics::gauge!(common::metrics::metric_name(OLDEST_AGE_METRIC))
-                    .set(f64::from(oldest_age_secs(&rows, Utc::now())));
-                for row in &rows {
-                    if let Err(err) = poll_batch(&enricher, settings.max_items, row).await {
-                        record_batch_event(row.stage, "poll_failed");
-                        tracing::warn!(error = ?err, batch_id = row.batch_id, "polling a Message Batch failed; retrying next tick");
-                    }
+        poll_once(&enricher, settings.max_items).await;
+    }
+}
+
+/// One tick of [`poll_loop`]: every row of `enricher_llm_batches`.
+pub(crate) async fn poll_once(enricher: &Enricher, max_items: usize) {
+    match load_batches(&enricher.pool).await {
+        Ok(rows) => {
+            let count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+            metrics::gauge!(common::metrics::metric_name(IN_FLIGHT_METRIC)).set(f64::from(count));
+            metrics::gauge!(common::metrics::metric_name(OLDEST_AGE_METRIC))
+                .set(f64::from(oldest_age_secs(&rows, Utc::now())));
+            for row in &rows {
+                if let Err(err) = poll_batch(enricher, max_items, row).await {
+                    record_batch_event(enricher.llm.provider_label(), row.stage, "poll_failed");
+                    tracing::warn!(error = ?err, batch_id = row.batch_id, "polling a batch failed; retrying next tick");
                 }
             }
-            Err(err) => tracing::error!(error = ?err, "could not read in-flight batches"),
         }
+        Err(err) => tracing::error!(error = ?err, "could not read in-flight batches"),
     }
 }
 
 /// Cancels a batch whose results nobody will read; a failure is only
 /// logged (the batch then runs to its end, billed but unread).
 async fn cancel_quietly(enricher: &Enricher, batch_id: &str) {
-    if let Err(err) = enricher.llm.cancel_message_batch(batch_id).await {
-        tracing::warn!(error = %err, batch_id, "could not cancel a Message Batch");
+    if let Err(err) = enricher.llm.cancel_batch(batch_id).await {
+        tracing::warn!(error = %err, batch_id, "could not cancel a batch");
     }
+}
+
+/// Cancels a just-created batch nobody will read and deletes its files.
+async fn discard_quietly(enricher: &Enricher, batch: &CreatedBatch) {
+    cancel_quietly(enricher, &batch.id).await;
+    enricher.llm.delete_batch_files(&batch.files).await;
 }
 
 async fn abandon(enricher: &Enricher, row: &BatchRow, reason: &str) -> anyhow::Result<()> {
@@ -784,63 +843,80 @@ async fn abandon(enricher: &Enricher, row: &BatchRow, reason: &str) -> anyhow::R
         batch_id = row.batch_id,
         stage = row.stage.as_str(),
         reason,
-        "abandoning a Message Batch; its incidents go into a later sweep"
+        "abandoning a batch; its incidents go into a later sweep"
     );
     delete_batch(&enricher.pool, &row.batch_id).await?;
-    record_batch_event(row.stage, "abandoned");
+    record_batch_event(enricher.llm.provider_label(), row.stage, "abandoned");
     Ok(())
 }
 
 async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> anyhow::Result<()> {
+    let provider = enricher.llm.provider_label();
+    if row.provider != provider {
+        // This client can't reach it; it runs out on its own.
+        return abandon(enricher, row, "submitted to another provider").await;
+    }
     if row.model_version != enricher.model_version {
         cancel_quietly(enricher, &row.batch_id).await;
         return abandon(enricher, row, "submitted under another model version").await;
     }
-    let batch = match enricher.llm.get_message_batch(&row.batch_id).await {
-        Ok(batch) => batch,
-        Err(LlmCallError::Status { status: 404 }) => {
+    let ended = match enricher.llm.poll_batch(&row.batch_id).await? {
+        BatchPoll::Pending => return Ok(()),
+        BatchPoll::Gone => {
             return abandon(enricher, row, "the API no longer knows the batch").await;
         }
-        Err(err) => return Err(err.into()),
+        BatchPoll::ResultsGone => {
+            return abandon(enricher, row, "its results can no longer be downloaded").await;
+        }
+        BatchPoll::ValidationFailed { reason, files } => {
+            tracing::error!(
+                batch_id = row.batch_id,
+                stage = row.stage.as_str(),
+                provider,
+                reason,
+                "batch failed input validation; nothing in it ran, its incidents go into a later sweep"
+            );
+            delete_batch(&enricher.pool, &row.batch_id).await?;
+            record_batch_event(provider, row.stage, "validation_failed");
+            enricher.llm.delete_batch_files(&files).await;
+            return Ok(());
+        }
+        BatchPoll::Ended(ended) => ended,
     };
-    if !batch.has_ended() {
-        return Ok(());
-    }
-    let outcomes = match batch.results_url.as_deref() {
-        Some(url) => match enricher.llm.message_batch_results(url).await {
-            Ok(outcomes) => outcomes,
-            Err(LlmCallError::Status { status: 404 }) => {
-                return abandon(enricher, row, "its results are gone (over 29 days old)").await;
-            }
-            Err(err) => return Err(err.into()),
-        },
-        // Ended with no results file (canceled before anything ran).
-        None => HashMap::new(),
-    };
-    record_batch_event(row.stage, "ended");
+    record_batch_event(provider, row.stage, "ended");
     tracing::info!(
         batch_id = row.batch_id,
         stage = row.stage.as_str(),
-        counts = ?batch.request_counts,
-        "Message Batch ended"
+        provider,
+        status = ended.summary,
+        "batch ended"
     );
     match row.stage {
-        Stage::Primary => finish_primary_stage(enricher, max_items, row, outcomes).await,
-        Stage::Adversarial => finish_adversarial_stage(enricher, row, outcomes).await,
+        Stage::Primary => finish_primary_stage(enricher, max_items, row, ended.results).await?,
+        Stage::Adversarial => finish_adversarial_stage(enricher, row, ended.results).await?,
     }
+    // Processed and its row gone: its files have served their purpose.
+    enricher.llm.delete_batch_files(&ended.files).await;
+    Ok(())
 }
 
 /// Submits the adversarial batch(es) for an ended primary batch, then
 /// swaps the rows in one transaction. A failed submission leaves the
-/// primary row for the next tick (its results stay downloadable for 29
-/// days), and nothing is counted until the swap succeeds.
+/// primary row for the next tick (its results stay downloadable: 29 days
+/// on Claude, `FILE_TTL_SECS` on `OpenAI`), and nothing is counted until the
+/// swap succeeds.
 async fn finish_primary_stage(
     enricher: &Enricher,
     max_items: usize,
     row: &BatchRow,
-    outcomes: HashMap<String, BatchOutcome>,
+    results: BatchResults,
 ) -> anyhow::Result<()> {
-    let plan = plan_primary(row.items.clone(), outcomes);
+    let provider = enricher.llm.provider_label();
+    let plan = plan_primary(row.items.clone(), results);
+    let meta = BatchMeta {
+        stage: Stage::Adversarial.as_str(),
+        model_version: &row.model_version,
+    };
     let mut submitted = Vec::new();
     for chunk in plan.next.chunks(max_items) {
         let mut requests = Vec::with_capacity(chunk.len() * 2);
@@ -862,27 +938,27 @@ async fn finish_primary_stage(
             ] {
                 requests.push(BatchRequest {
                     custom_id: custom_id(spec.call, item.index),
-                    params: enricher.llm.batch_params(&spec)?,
+                    params: enricher.llm.batch_params(spec)?,
                 });
             }
         }
-        match enricher.llm.create_message_batch(&requests).await {
-            Ok(batch) => submitted.push((batch.id, chunk.to_vec())),
+        match enricher.llm.create_batch(&requests, meta).await {
+            Ok(batch) => submitted.push((batch, chunk.to_vec())),
             Err(err) => {
-                record_batch_event(Stage::Adversarial, "submit_failed");
-                for (batch_id, _) in &submitted {
-                    cancel_quietly(enricher, batch_id).await;
+                record_batch_event(provider, Stage::Adversarial, "submit_failed");
+                for (batch, _) in &submitted {
+                    discard_quietly(enricher, batch).await;
                 }
                 return Err(err.into());
             }
         }
     }
     let mut tx = enricher.pool.begin().await?;
-    for (batch_id, items) in &submitted {
+    for (batch, items) in &submitted {
         insert_batch(
             &mut *tx,
-            batch_id,
-            "anthropic",
+            &batch.id,
+            provider,
             Stage::Adversarial,
             &row.model_version,
             items,
@@ -892,7 +968,7 @@ async fn finish_primary_stage(
     delete_batch(&mut *tx, &row.batch_id).await?;
     tx.commit().await?;
     for _ in &submitted {
-        record_batch_event(Stage::Adversarial, "submitted");
+        record_batch_event(provider, Stage::Adversarial, "submitted");
     }
     apply_records(enricher, &plan);
     tracing::info!(
@@ -909,9 +985,9 @@ async fn finish_primary_stage(
 async fn finish_adversarial_stage(
     enricher: &Enricher,
     row: &BatchRow,
-    outcomes: HashMap<String, BatchOutcome>,
+    results: BatchResults,
 ) -> anyhow::Result<()> {
-    let plan = plan_adversarial(row.items.clone(), outcomes);
+    let plan = plan_adversarial(row.items.clone(), results);
     let mut written = 0_usize;
     for ready in &plan.ready {
         let prepared = ready.item.prepared();
@@ -1058,7 +1134,7 @@ mod tests {
         let outcomes = parse_results_jsonl(&jsonl);
         assert_eq!(outcomes.len(), 5);
         let items = (0..6).map(|i| item(i, &format!("I{i}"))).collect();
-        let plan = plan_primary(items, outcomes);
+        let plan = plan_primary(items, outcomes.into());
 
         assert_eq!(plan.next.len(), 1);
         assert_eq!(plan.next[0].incident_id, "I2");
@@ -1111,7 +1187,7 @@ mod tests {
                 ..item(i, &format!("I{i}"))
             })
             .collect();
-        let plan = plan_adversarial(items, parse_results_jsonl(&jsonl));
+        let plan = plan_adversarial(items, parse_results_jsonl(&jsonl).into());
         assert_eq!(plan.ready.len(), 1);
         let ready = &plan.ready[0];
         assert_eq!(ready.item.incident_id, "I0");
@@ -1153,7 +1229,7 @@ mod tests {
         .to_string();
         let plan = plan_primary(
             vec![item(0, "A"), item(1, "B")],
-            parse_results_jsonl(&format!("{refused}\n{truncated}")),
+            parse_results_jsonl(&format!("{refused}\n{truncated}")).into(),
         );
         assert!(plan.next.is_empty());
         assert_eq!(plan.text_failures.len(), 2);
@@ -1180,6 +1256,7 @@ mod tests {
         let now: DateTime<Utc> = "2026-10-10T12:00:00Z".parse().unwrap();
         let row = |submitted: &str| BatchRow {
             batch_id: "b".into(),
+            provider: "anthropic".into(),
             stage: Stage::Primary,
             model_version: "m".into(),
             items: Vec::new(),
@@ -1288,5 +1365,132 @@ mod tests {
         assert!(only.defers_stream() && only.batch_only());
         assert!(settings(LlmMode::Batch).defers_stream());
         assert!(!settings(LlmMode::Normal).defers_stream());
+    }
+
+    /// Restart resume against a real database: a primary `OpenAI` batch row
+    /// left by a previous process is polled by a fresh `Enricher` that has
+    /// nothing but the row. Its results are read, the adversarial batch is
+    /// submitted and swapped in, and the primary batch's files are deleted.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher openai_batch_row_resumes -- --ignored --test-threads=1`"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test code: one scenario, mocks then assertions"
+    )]
+    async fn an_openai_batch_row_resumes_after_a_restart() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        sqlx::query("DELETE FROM enricher_llm_batches")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_batch(
+            &pool,
+            "batch_resume",
+            "openai",
+            Stage::Primary,
+            "mv-test",
+            &[item(0, "TEST-OPENAI-BATCH-RESUME")],
+        )
+        .await
+        .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/batches/batch_resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_resume", "status": "completed", "input_file_id": "file-in",
+                "output_file_id": "file-out", "error_file_id": null,
+                "request_counts": { "total": 1, "completed": 1, "failed": 0 }
+            })))
+            .mount(&server)
+            .await;
+        let line = serde_json::json!({
+            "custom_id": "p-0", "error": null,
+            "response": { "status_code": 200, "body": {
+                "choices": [{ "message": { "content": primary_json() }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5 } } }
+        });
+        Mock::given(method("GET"))
+            .and(path("/files/file-out/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(line.to_string()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/files"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": "file-adv" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_adv", "status": "validating", "input_file_id": "file-adv"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let enricher = Enricher {
+            pool: pool.clone(),
+            llm: llm::LlmClient::new(
+                server.uri(),
+                Some("sk-test".into()),
+                "m".into(),
+                Duration::from_secs(30),
+            ),
+            model_version: "mv-test".into(),
+            mismatch_tracker: crate::MismatchTracker::default(),
+            retry_backoff: crate::RetryBackoff::default(),
+            in_flight: crate::InFlight::default(),
+            carry_forward_noops: false,
+            batch: None,
+        };
+        poll_once(&enricher, 100).await;
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT batch_id, provider, stage FROM enricher_llm_batches ORDER BY batch_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [(
+                "batch_adv".to_string(),
+                "openai".to_string(),
+                "adversarial".to_string()
+            )]
+        );
+        let requests = server.received_requests().await.unwrap();
+        let deleted: Vec<&str> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path())
+            .collect();
+        assert_eq!(deleted, ["/files/file-in", "/files/file-out"]);
+        let upload = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path() == "/files")
+            .unwrap();
+        let form = String::from_utf8_lossy(&upload.body);
+        assert!(form.contains("\"custom_id\":\"r-0\""), "{form}");
+        assert!(form.contains("\"custom_id\":\"s-0\""), "{form}");
+
+        sqlx::query("DELETE FROM enricher_llm_batches")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::batch_api::{BatchPoll, EndedBatch};
 use super::{LlmCallError, LlmClient, ProviderPolicy, TokenUsage};
 
 /// `LLM_BASE_URL` when `LLM_PROVIDER=anthropic` and none is set. Like the
@@ -364,14 +365,7 @@ pub(crate) fn classify_error_status(
 // Message Batches API
 // ---------------------------------------------------------------------------
 
-/// One request of a Message Batch. `custom_id` must match
-/// `^[a-zA-Z0-9_-]{1,64}$`; results come back in any order and are matched
-/// by it.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct BatchRequest {
-    pub custom_id: String,
-    pub params: Value,
-}
+pub(crate) use super::batch_api::{BatchOutcome, BatchRequest};
 
 /// A Message Batch object (create and retrieve responses).
 #[derive(Debug, Clone, Deserialize)]
@@ -406,38 +400,10 @@ pub(crate) struct RequestCounts {
     pub expired: u64,
 }
 
-/// One batch request's result.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BatchOutcome {
-    /// The Messages response, to read with [`completion_from_message`].
-    Succeeded(Value),
-    /// No message was created (an invalid request or a server error); not
-    /// billed. `kind` is the error's `type` (e.g. `invalid_request_error`).
-    Errored {
-        kind: Option<String>,
-        message: Option<String>,
-    },
-    /// The batch was canceled before this request ran; not billed.
-    Canceled,
-    /// The batch hit its 24-hour expiry before this request ran; not billed.
-    Expired,
-}
-
-impl BatchOutcome {
-    /// The `result` label of `enricher_llm_batch_requests_total`.
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Succeeded(_) => "succeeded",
-            Self::Errored { .. } => "errored",
-            Self::Canceled => "canceled",
-            Self::Expired => "expired",
-        }
-    }
-}
-
 /// Parses a results file (`results_url`, JSONL: one
 /// `{"custom_id", "result": {"type", ...}}` per line) into outcomes by
-/// `custom_id`. A line that doesn't parse is logged and skipped: its
+/// `custom_id`, each success already read with
+/// [`completion_from_message`]. A line that doesn't parse is logged and skipped: its
 /// request then counts as missing, never as a crash of the whole batch.
 pub(crate) fn parse_results_jsonl(text: &str) -> HashMap<String, BatchOutcome> {
     let mut outcomes = HashMap::new();
@@ -447,7 +413,9 @@ pub(crate) fn parse_results_jsonl(text: &str) -> HashMap<String, BatchOutcome> {
                 let custom_id = value.get("custom_id")?.as_str()?.to_string();
                 let result = value.get("result")?;
                 let outcome = match result.get("type")?.as_str()? {
-                    "succeeded" => BatchOutcome::Succeeded(result.get("message")?.clone()),
+                    "succeeded" => {
+                        BatchOutcome::succeeded(completion_from_message(result.get("message")?))
+                    }
                     "errored" => {
                         // `result.error` is an error response body:
                         // `{"type": "error", "error": {"type", "message"}}`.
@@ -493,20 +461,6 @@ impl LlmClient {
                 "the Message Batches API needs LLM_PROVIDER=anthropic"
             ))),
         }
-    }
-
-    /// The Messages body for `spec`, as a batch request's `params`.
-    pub(crate) fn batch_params(&self, spec: &super::CallSpec) -> Result<Value, LlmCallError> {
-        let settings = self.anthropic()?;
-        Ok(messages_body(
-            &self.model,
-            settings,
-            &self.policy,
-            self.sampling,
-            &spec.system_prompt,
-            &spec.user_content,
-            &spec.schema,
-        ))
     }
 
     /// Sends one batch-API request: the version header and credential, and
@@ -559,12 +513,44 @@ impl LlmClient {
         let request = self
             .http
             .post(format!("{}/messages/batches", self.base_url))
-            .json(&serde_json::json!({ "requests": requests }));
+            .json(&serde_json::json!({ "requests": requests
+                .iter()
+                .map(|r| serde_json::json!({ "custom_id": r.custom_id, "params": r.params }))
+                .collect::<Vec<_>>() }));
         let response = self.batch_api_send(request).await?;
         response
             .json()
             .await
             .map_err(|err| LlmCallError::Other(err.into()))
+    }
+
+    /// One poll (`batch_api::LlmClient::poll_batch`): the batch, and once
+    /// it has ended its results. A batch the API no longer knows is
+    /// [`BatchPoll::Gone`]; ended results that are gone (over 29 days old)
+    /// are [`BatchPoll::ResultsGone`].
+    pub(crate) async fn poll_message_batch(&self, id: &str) -> Result<BatchPoll, LlmCallError> {
+        let batch = match self.get_message_batch(id).await {
+            Ok(batch) => batch,
+            Err(LlmCallError::Status { status: 404 }) => return Ok(BatchPoll::Gone),
+            Err(err) => return Err(err),
+        };
+        if !batch.has_ended() {
+            return Ok(BatchPoll::Pending);
+        }
+        let outcomes = match batch.results_url.as_deref() {
+            Some(url) => match self.message_batch_results(url).await {
+                Ok(outcomes) => outcomes,
+                Err(LlmCallError::Status { status: 404 }) => return Ok(BatchPoll::ResultsGone),
+                Err(err) => return Err(err),
+            },
+            // Ended with no results file (canceled before anything ran).
+            None => HashMap::new(),
+        };
+        Ok(BatchPoll::Ended(EndedBatch {
+            results: outcomes.into(),
+            summary: format!("ended, {:?}", batch.request_counts),
+            files: Vec::new(),
+        }))
     }
 
     /// `GET {base}/messages/batches/{id}`.

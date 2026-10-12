@@ -4,12 +4,14 @@ How to point the enricher (`crates/enricher`) at OpenAI's own platform with
 `gpt-6-luna` at reasoning effort `none`, what that costs, and what to check
 before switching production.
 
-**Status (2026-10-06): not deployed.** The production default is still the
-self-hosted model. Nothing in the chart or the service defaults to OpenAI,
-and [keyless auth](#keyless-auth-workload-identity-federation) is off by
-default too.
-Switch only after the [evaluation checklist](#before-switching-production)
-passes. The Claude API is the other hosted option
+**Status (2026-10-10): deployed.** Production runs `gpt-6-luna` with
+[keyless auth](#keyless-auth-workload-identity-federation)
+(`enricher.llm.auth: openaiWifAuthentik`). The chart's defaults are
+unchanged: nothing in the chart or the service defaults to OpenAI or to
+keyless auth, so other installs need the
+[evaluation checklist](#before-switching-production). Batch mode (the
+Batch API, [below](#batch-mode)) is built but off. The Claude API is the
+other hosted option
 (`enricher.llm.provider: anthropic`): see
 [enricher-anthropic.md](enricher-anthropic.md).
 
@@ -361,7 +363,8 @@ None of these is a secret, but keep real values out of this repo.
      endpoints (`/v1/audio`, `/v1/embeddings`, `/v1/images`,
      `/v1/moderations`, `/v1/realtime`, `/v1/responses`). There is no
      narrower permission; the project's model allowlist and spend limit
-     confine what it can do.
+     confine what it can do. [Batch mode](#batch-mode) also needs
+     `api.batch.write` here and on the service account's project role.
 
 **Fallback mapping (`openaiWifKubernetes`), set up ahead of time:**
 
@@ -662,6 +665,127 @@ if a burst after an outage hits them.
   `carried_forward`. Unchanged-text skips, model-version re-extractions and
   failed attempts record nothing. Details and PromQL:
   [enricher-anthropic.md](enricher-anthropic.md#is-the-latency-acceptable).
+
+## Batch mode
+
+`LLM_SWEEP_MODE=batch` (`enricher.llm.batch.sweepMode: batch`) sends the
+reconciliation sweep's extractions through the OpenAI Batch API at **50% of
+the synchronous price** (cached input is discounted too), results within
+24 hours. It works on any `LLM_AUTH`. It is off by default. The stream loop
+and reclaim stay synchronous, unless `LLM_MODE` is `batch` or `batch-only`
+([enricher-anthropic.md, "LLM modes"](enricher-anthropic.md#llm-modes)),
+which batch the stream loop's work too and work the same on OpenAI. Where it applies, the two stages
+(primary, then adversarial), restarts and the `enricher_llm_batches` table
+are the same as on Claude:
+[enricher-anthropic.md, "Batch mode"](enricher-anthropic.md#batch-mode).
+Only the wire API differs.
+
+OpenAI documentation this relies on (read 2026-10-09):
+
+- Batch guide: <https://developers.openai.com/api/docs/guides/batch>
+- Files: <https://developers.openai.com/api/reference/resources/files>
+- RBAC: <https://developers.openai.com/api/docs/guides/rbac>
+- Your data: <https://developers.openai.com/api/docs/guides/your-data>
+
+### The flow
+
+1. **Input file.** One JSONL line per request:
+   `{custom_id, method: "POST", url: "/v1/chat/completions", body}`. `body`
+   is built by the synchronous path's own request builder, so the model,
+   strict `json_schema`, `temperature`, `reasoning_effort` and prompts are
+   exactly what a synchronous call sends. One model per file, at most
+   50,000 requests and 200 MB (5,000 incidents is 10,000 adversarial
+   requests, about 130 MB).
+2. **Upload.** `POST /v1/files` (multipart, `purpose=batch`,
+   `expires_after` = 2 days from creation).
+3. **Create.** `POST /v1/batches` with the file, `endpoint:
+   /v1/chat/completions`, `completion_window: 24h`, `output_expires_after`
+   = 2 days, and metadata (`source`, `stage`, `model_version`). If the create
+   fails, the uploaded file is deleted at once. The batch id is recorded in
+   `enricher_llm_batches` (`provider` = `openai`).
+4. **Poll.** `GET /v1/batches/{id}` every `LLM_BATCH_POLL_SECS`.
+   `validating`, `in_progress`, `finalizing` and `cancelling` wait.
+   `failed` means the input file failed validation: nothing ran, there are
+   no results. The row is dropped, the input file deleted, and the event
+   counted as `validation_failed` (DistantSignalEnricherBatchInvalid). Its
+   incidents go into the next sweep.
+5. **Results.** On `completed`, `expired` or `cancelled`, the output file
+   (successes) and the error file (everything else) are downloaded from
+   `GET /v1/files/{id}/content` and matched by `custom_id`. Their lines are
+   in no particular order. A line with status 200 is read by the
+   synchronous path's own `chat.completion` parser (refusals and empty
+   content included). Any other status is `errored`. An `error` with code
+   `batch_expired` is `expired` (an `expired` batch's unfinished requests).
+   A request with no line in an `expired` or `cancelled` batch counts as
+   `expired` or `canceled`.
+6. **Cleanup.** Once the results are processed (the adversarial batch
+   submitted, or the extractions written), the input, output and error
+   files are deleted (`DELETE /v1/files/{id}`). A failed delete is logged
+   and counted (`enricher_llm_batch_files_total{event="delete_failed"}`,
+   DistantSignalEnricherBatchFileCleanupFailing) and never fails the run.
+
+**Restarts** need only the batch id: the batch object names its input,
+output and error files, so a restarted pod polls, reads and cleans up
+without any other state (no extra column). A crash between upload and
+create, or between create and recording the row, leaves a file the
+enricher doesn't know about. Its `expires_after` deletes it within 2 days.
+A batch abandoned after a model or provider change (canceled, its row
+dropped) leaves its files to expire the same way.
+
+### Permissions
+
+Batches need **`api.batch.write`** on the project. The RBAC guide lists it
+as covering `/v1/batches` together with file read and write and model
+requests. That is broader than today's `api.model.request`: it also lets
+the credential upload, read and delete any file in the project. Keep the
+enricher in its own project.
+
+- **API key** (`LLM_AUTH=api-key`): a restricted key needs `api.batch.write`
+  added.
+- **Keyless** (`openai-wif-authentik`, production): the bearer token works
+  on the Batch and Files APIs too. The service account mapping
+  (`ds-enricher-wif`, [Setup checklist](#setup-checklist), step 3) and the
+  service account's project role need `api.batch.write` added next to
+  `api.model.request`. That change is made on the OpenAI side
+  (Ranma-Config's OpenAI settings), not in this repo. Without it, every
+  upload is refused with 403 (`submit_failed`, DistantSignalEnricherBatchFailing),
+  and nothing else breaks.
+
+### Retention
+
+Batch input and output files are **not covered by zero data retention**
+([Your data](https://developers.openai.com/api/docs/guides/your-data)).
+They hold the incident text (public Knowledgebase text, no personal data)
+and the extractions. The enricher deletes all three files as soon as it has
+processed a batch, and sets 2-day expiries on the upload (`expires_after`)
+and on the outputs (`output_expires_after`). So a file it loses track of
+lives at most 2 days, not the default 30. The batch objects themselves
+(ids, counts, metadata) stay in the project's batch list.
+
+### Cost
+
+Half price on input, cached input and output. At today's volume (about
+$4.50 a month, [Cost](#cost)), batching *everything* would save about
+**$2.20 a month**. Batch mode only batches the sweep, and in steady state
+the sweep finds fewer incidents than `LLM_BATCH_MIN_ITEMS`, so the routine
+saving is cents. The real gain is the bulk re-extraction after a model or
+prompt change: about **$0.36 per 1,000 incidents** saved (about $0.72 per
+1,000 synchronously). Token counts land in
+`distant_signal_enricher_llm_batch_tokens_total` (same `call` and `kind`
+labels). Price them at half the rates in [Cost](#cost).
+
+### Not verified
+
+The client is tested against mocked Files and Batches endpoints only
+(`crates/enricher/src/llm/openai_batch/tests.rs`). Two points come from the
+docs rather than a live call:
+- the error code of a request that a cancel stopped (`batch_cancelled` is
+  assumed; with no line at all the request counts as `canceled`);
+- the multipart field names for `expires_after` (`expires_after[anchor]`
+  and `expires_after[seconds]`, from the Files reference's curl example).
+
+For a first real run, set `enricher.llm.batch.minItems` low on a quiet
+day, and watch `enricher_llm_batches_total` and the enricher log.
 
 ## Model snapshot
 
