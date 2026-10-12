@@ -626,8 +626,9 @@ names the model and `base_url_host` `api.anthropic.com`). Changed or new:
   `prompt` is every input token (`input_tokens` +
   `cache_creation_input_tokens` + `cache_read_input_tokens`), `cached` the
   cache reads, `cache_write` the cache writes, `completion` `output_tokens`
-  (thinking included), `reasoning` always 0. OpenAI never sends
-  `cache_write`.
+  (thinking included), `reasoning` always 0. OpenAI sends `cache_write`
+  on GPT-5.6 and later
+  ([enricher-openai.md](enricher-openai.md#prompt-caching)).
 - `distant_signal_enricher_deferred_to_batch_total{path}`
   (`LLM_MODE=batch`/`batch-only` only, registered at 0 then): text changes
   the stream loop (`path="stream"`) or reclaim (`path="reclaim"`) left for

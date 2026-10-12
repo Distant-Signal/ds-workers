@@ -27,6 +27,8 @@
 #   prompt_cache          LLM_PROMPT_CACHE (anthropic): "1h" (default), "5m", "off"
 #   thinking              LLM_THINKING (anthropic), e.g. "disabled"
 #   anthropic_version     LLM_ANTHROPIC_VERSION (anthropic)
+#   openai_prompt_cache   LLM_OPENAI_PROMPT_CACHE (openai): "explicit", "off" or
+#                         "omit" (default: the profile's; explicit for gpt-6-luna)
 #   profile               LLM_PROFILE: a built-in profile by name (default:
 #                         picked by provider and model, as the service does)
 #   temperature, top_p    LLM_TEMPERATURE / LLM_TOP_P: a number or "omit"

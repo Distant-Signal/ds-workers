@@ -220,9 +220,7 @@ async fn run() -> anyhow::Result<()> {
         llm = llm.with_anthropic(config.anthropic.settings());
     }
     // The profile's settings and prompts, last (they override the above).
-    let llm = llm
-        .with_generation(&active.generation)
-        .with_prompts(prompts);
+    let llm = llm.with_profile(&active).with_prompts(prompts);
     // `<model>@periods-v2`, plus the prompt version when the prompts are
     // overridden (a prompt change re-extracts).
     let model_version = profile::model_version(&resolved.model, llm.prompts());

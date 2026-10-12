@@ -187,6 +187,51 @@ async fn batch_lines_carry_the_synchronous_request_body() {
     assert!(lines[0]["body"].get("stream").is_none());
 }
 
+/// Under a profile with explicit prompt caching (`openai-gpt-6-luna`), the
+/// batch body still equals the synchronous one, so it carries the same
+/// `prompt_cache_options`, `prompt_cache_key` and system-prompt breakpoint.
+#[tokio::test]
+async fn batch_lines_carry_the_explicit_prompt_cache_fields() {
+    use crate::profile::{Overrides, resolve};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion(&primary_text())))
+        .mount(&server)
+        .await;
+    let active = resolve(
+        crate::llm::ProviderKind::Openai,
+        "gpt-6-luna",
+        None,
+        Overrides::default(),
+    )
+    .unwrap();
+    let client = client(&server).with_profile(&active);
+    client
+        .extract_primary("Signal failure", "Lines blocked 0", reference_date())
+        .await
+        .unwrap();
+    let sync: Value =
+        serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
+
+    let jsonl = batch_jsonl(&requests(&client, 1)).unwrap();
+    let line: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+    let body = &line["body"];
+    assert_eq!(*body, sync);
+    assert_eq!(
+        body["prompt_cache_options"],
+        serde_json::json!({ "mode": "explicit" })
+    );
+    assert_eq!(
+        body["prompt_cache_key"],
+        "ds-enricher:openai-gpt-6-luna:primary"
+    );
+    assert_eq!(
+        body["messages"][0]["content"][0]["prompt_cache_breakpoint"],
+        serde_json::json!({ "mode": "explicit" })
+    );
+}
+
 /// Upload -> create -> poll (in progress, then completed) -> output and
 /// error files, matched by `custom_id` whatever their order -> delete.
 #[tokio::test]

@@ -31,6 +31,7 @@
 use std::path::Path;
 
 use crate::llm::ProviderKind;
+use crate::llm::openai_cache::OpenAiPromptCache;
 
 /// A setting's override: a value, or "don't send" (`omit`).
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +77,9 @@ pub(crate) struct Generation {
     pub reasoning_effort: Option<String>,
     /// Claude only: `thinking.type`.
     pub thinking: Option<String>,
+    /// Chat Completions only: `prompt_cache_options` and a breakpoint
+    /// (`llm::openai_cache`). `None` sends nothing.
+    pub openai_prompt_cache: Option<OpenAiPromptCache>,
 }
 
 /// Explicit overrides from env/values, each `None` when unset.
@@ -86,6 +90,7 @@ pub(crate) struct Overrides {
     pub max_tokens: Option<Setting<u32>>,
     pub reasoning_effort: Option<Setting<String>>,
     pub thinking: Option<Setting<String>>,
+    pub openai_prompt_cache: Option<Setting<OpenAiPromptCache>>,
 }
 
 /// A built-in profile.
@@ -100,6 +105,7 @@ pub(crate) struct Profile {
     max_tokens: Option<u32>,
     reasoning_effort: Option<&'static str>,
     thinking: Option<&'static str>,
+    openai_prompt_cache: Option<OpenAiPromptCache>,
 }
 
 impl Profile {
@@ -110,6 +116,7 @@ impl Profile {
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort.map(str::to_string),
             thinking: self.thinking.map(str::to_string),
+            openai_prompt_cache: self.openai_prompt_cache,
         }
     }
 }
@@ -127,6 +134,9 @@ pub(crate) const PROFILES: &[Profile] = &[
         max_tokens: None,
         reasoning_effort: Some("none"),
         thinking: None,
+        // docs/enricher-openai.md, "Prompt caching": the implicit default
+        // writes the whole prompt (1.25x) on every call and never reads it.
+        openai_prompt_cache: Some(OpenAiPromptCache::Explicit),
     },
     // Every other OpenAI-compatible model: today's requests, temperature 0.
     Profile {
@@ -138,6 +148,7 @@ pub(crate) const PROFILES: &[Profile] = &[
         max_tokens: None,
         reasoning_effort: None,
         thinking: None,
+        openai_prompt_cache: None,
     },
     // Claude: no sampling parameters (the current models reject them), the
     // model's default effort and adaptive thinking.
@@ -150,6 +161,7 @@ pub(crate) const PROFILES: &[Profile] = &[
         max_tokens: None,
         reasoning_effort: None,
         thinking: None,
+        openai_prompt_cache: None,
     },
 ];
 
@@ -315,6 +327,7 @@ pub(crate) fn resolve(
         max_tokens,
         reasoning_effort,
         thinking,
+        openai_prompt_cache,
     } = overrides;
     if let Some(v) = temperature {
         generation.temperature = v.into_option();
@@ -330,6 +343,9 @@ pub(crate) fn resolve(
     }
     if let Some(v) = thinking {
         generation.thinking = v.into_option();
+    }
+    if let Some(v) = openai_prompt_cache {
+        generation.openai_prompt_cache = v.into_option();
     }
     if let Some(cap) = capability(model).filter(|c| c.rejects_sampling) {
         let allowed = cap
@@ -513,12 +529,17 @@ mod tests {
             max_tokens: Some(Setting::Set(4096)),
             reasoning_effort: Some(Setting::Set("low".into())),
             thinking: None,
+            openai_prompt_cache: Some(Setting::Set(OpenAiPromptCache::Off)),
         };
         let r = resolve(ProviderKind::Openai, "m", None, overrides).unwrap();
         assert_eq!(r.generation.temperature, None);
         assert_eq!(r.generation.top_p, Some(0.9));
         assert_eq!(r.generation.max_tokens, Some(4096));
         assert_eq!(r.generation.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            r.generation.openai_prompt_cache,
+            Some(OpenAiPromptCache::Off)
+        );
 
         let r = resolve(
             ProviderKind::Openai,

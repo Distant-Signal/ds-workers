@@ -88,7 +88,8 @@ Since 2026-10 the generation settings and system prompts come from a
 per-provider, per-model profile: `openai-gpt-6-luna` (above) and
 `openai-default` (`temperature: 0`, nothing else: exactly the requests sent
 before profiles) for OpenAI-compatible endpoints. `LLM_TEMPERATURE`,
-`LLM_TOP_P`, `LLM_MAX_TOKENS` and `LLM_REASONING_EFFORT` override a
+`LLM_TOP_P`, `LLM_MAX_TOKENS`, `LLM_REASONING_EFFORT` and
+`LLM_OPENAI_PROMPT_CACHE` ([Prompt caching](#prompt-caching)) override a
 profile (`omit` drops its value), `LLM_PROFILE` names one, and
 `enricher.llm.prompts.configMap` overrides prompts per profile. The details,
 the startup checks, the prompt-version hash in `model_version`, evaluating
@@ -147,7 +148,7 @@ OpenAI support the `request_id` when you report a problem. In the model
 eval, `refused` and `empty_content` count as invalid output, not transport
 failures, and each record keeps the response's token `usage`
 (`prompt_tokens`, `completion_tokens`, `reasoning_tokens`,
-`cached_tokens`) when the provider sends it.
+`cached_tokens`, `cache_write_tokens`) when the provider sends it.
 
 `DistantSignalEnricherErrors` fires on any non-`success` outcome. A
 `quota_exhausted` outcome means "top up the account or raise the budget".
@@ -581,12 +582,15 @@ Assumptions:
 - Output per incident: about 450 tokens (a few hundred for the primary
   pass, under 100 for each verdict list). Effort `none` adds no reasoning
   tokens.
-- No credit taken for prompt caching. The long primary prompt is a stable
-  prefix, so `cached_tokens` may bring the cost down. The eval records show
-  how much.
+- No prompt caching. With the default `explicit` caching
+  ([Prompt caching](#prompt-caching)) the primary call's ~2,700-token
+  prefix is mostly read at the cached price, which cuts input spend by
+  about 40% (about $1.3 a month less). Without it (`omit`, the endpoint's
+  implicit default) every primary call pays the 1.25x cache-write price and
+  input costs about 15% more.
 
 That gives about 1.0M input tokens ($0.10) and 0.09M output tokens
-($0.05) a day: **about $4.50 a month**. Allowing for retries, text-edit
+($0.05) a day: **about $4.50 a month** (about $3.20 with caching). Allowing for retries, text-edit
 re-extractions and longer incidents, budget **$4–8 a month**. Set an
 OpenAI project budget around $15 a month: the hard limit then surfaces as
 `quota_exhausted` instead of an unbounded bill. Switching the model also
@@ -601,9 +605,9 @@ estimated from Prometheus without an OpenAI admin key:
 - `distant_signal_enricher_llm_tokens_total{call, kind}`: `call` is
   `primary`, `resolution_adversarial` or `severity_adversarial` (the same
   labels as `enricher_llm_call_total`); `kind` is `prompt`, `completion`,
-  `reasoning`, `cached` or `cache_write` (the last only from the Claude API,
-  see [enricher-anthropic.md](enricher-anthropic.md#metrics-and-cost); it
-  stays 0 for OpenAI). Every 2xx response that carries `usage` counts,
+  `reasoning`, `cached` or `cache_write` (`prompt_tokens_details.cache_write_tokens`
+  on GPT-5.6 and later, see [Prompt caching](#prompt-caching); the Claude
+  API's are in [enricher-anthropic.md](enricher-anthropic.md#metrics-and-cost)). Every 2xx response that carries `usage` counts,
   refusals and empty or unparseable content included, because OpenAI bills
   them. All 15 series start at 0.
 - `distant_signal_enricher_llm_model_info{model, base_url_host}` is always
@@ -611,18 +615,21 @@ estimated from Prometheus without an OpenAI admin key:
 
 How the kinds add up (OpenAI's billing, checked 2026-10-06 against the
 [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)
-and the [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)):
+and 2026-10-10 against the [prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)):
 
 - `cached` is part of `prompt` (`prompt_tokens_details.cached_tokens` is a
   breakdown of `prompt_tokens`). Cached tokens are billed at the cached
   price **instead of** the input price.
+- `cache_write` is also part of `prompt`, billed at the cache-write price
+  (1.25x input: $0.125 per million for gpt-6-luna) **instead of** the
+  input price.
 - `reasoning` is part of `completion`: reasoning tokens "are billed as
   output tokens" and `completion_tokens_details.reasoning_tokens` is a
   breakdown of `completion_tokens`. **Never add `reasoning` on top.** It is
   there to confirm that effort `none` adds none.
 
-So: cost = (prompt − cached) × input price + cached × cached price +
-completion × output price. With gpt-6-luna's prices, in USD over the last
+So: cost = (prompt − cached − cache_write) × input price + cached × cached
+price + cache_write × cache-write price + completion × output price. With gpt-6-luna's prices, in USD over the last
 day (use `[30d]` for a rolling month):
 
 ```promql
@@ -630,8 +637,10 @@ day (use `[30d]` for a rolling month):
     (
         sum(increase(distant_signal_enricher_llm_tokens_total{kind="prompt"}[1d]))
       - sum(increase(distant_signal_enricher_llm_tokens_total{kind="cached"}[1d]))
+      - sum(increase(distant_signal_enricher_llm_tokens_total{kind="cache_write"}[1d]))
     ) * 0.10
   + sum(increase(distant_signal_enricher_llm_tokens_total{kind="cached"}[1d])) * 0.01
+  + sum(increase(distant_signal_enricher_llm_tokens_total{kind="cache_write"}[1d])) * 0.125
   + sum(increase(distant_signal_enricher_llm_tokens_total{kind="completion"}[1d])) * 0.50
 ) / 1e6
 and on() count(distant_signal_enricher_llm_model_info{model="gpt-6-luna"})
@@ -692,8 +701,9 @@ OpenAI documentation this relies on (read 2026-10-09):
 1. **Input file.** One JSONL line per request:
    `{custom_id, method: "POST", url: "/v1/chat/completions", body}`. `body`
    is built by the synchronous path's own request builder, so the model,
-   strict `json_schema`, `temperature`, `reasoning_effort` and prompts are
-   exactly what a synchronous call sends. One model per file, at most
+   strict `json_schema`, `temperature`, `reasoning_effort`, prompts and the
+   [prompt-caching](#prompt-caching) fields are exactly what a synchronous
+   call sends. One model per file, at most
    50,000 requests and 200 MB (5,000 incidents is 10,000 adversarial
    requests, about 130 MB).
 2. **Upload.** `POST /v1/files` (multipart, `purpose=batch`,
@@ -786,6 +796,127 @@ docs rather than a live call:
 
 For a first real run, set `enricher.llm.batch.minItems` low on a quiet
 day, and watch `enricher_llm_batches_total` and the enricher log.
+
+## Prompt caching
+
+**Verdict: explicit-only caching with one breakpoint at the end of the
+primary system prompt. The default for `openai-gpt-6-luna`
+(`LLM_OPENAI_PROMPT_CACHE=explicit`); saves about $1.3–1.7 a month,
+roughly half the input spend under the implicit default.**
+
+Sources (read 2026-10-10): the
+[prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching),
+the [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+(`prompt_cache_options`, `prompt_cache_breakpoint`, `prompt_cache_key`,
+`usage`) and the [gpt-6-luna model page](https://developers.openai.com/api/docs/models/gpt-6-luna).
+
+### How caching works on GPT-5.6 and later
+
+- Caching is always available and comes in two modes,
+  `prompt_cache_options.mode`:
+  - `implicit` (**the default**): one breakpoint at the end of the latest
+    user message.
+  - `explicit`: only breakpoints the request places, as
+    `prompt_cache_breakpoint: {"mode": "explicit"}` on a system, developer
+    or user text part. With no breakpoint the request neither caches nor
+    pays a cache write.
+- A write costs **1.25x** the input price ($0.125 per million tokens for
+  gpt-6-luna); a read **0.1x** ($0.01). Content after the last breakpoint is
+  billed at the plain input price.
+- The minimum cacheable prefix is 1,024 visible tokens. The `json_schema`
+  (`response_format`) is rendered ahead of the messages, so it is part of
+  the prefix.
+- An entry stays reusable for 30 minutes after its last write or read
+  (`ttl: "30m"`, the only value); a read refreshes it at no charge.
+  (`prompt_cache_retention` is for earlier models.)
+- `prompt_cache_key` only separates cache accounting on these models;
+  routing is automatic.
+- `usage.prompt_tokens_details` reports `cached_tokens` and
+  `cache_write_tokens`; both are parts of `prompt_tokens`.
+
+### Why not the implicit default
+
+Every enricher call is a static system prompt followed by per-incident
+text. The implicit breakpoint sits at the end of that text, so each primary
+call writes its whole ~3,200-token prompt at 1.25x and no later call ever
+has the same prefix to read back. The default therefore costs **more**
+than no caching at all. Explicit mode with one breakpoint after the system
+prompt writes only the shared prefix, and the per-incident text after it is
+billed at the plain input price.
+
+### The prompt sizes
+
+Measured from `llm.rs` at 4 characters per token
+(`llm::openai_cache::tests::prompt_sizes_match_the_openai_caching_analysis`
+fails if an edit moves a prompt across the 1,024-token line):
+
+| Call | Static prefix (system prompt + schema) | Per-incident text | Caches? |
+| --- | --- | --- | --- |
+| Primary | ~2,400 + ~300 tokens | ~500 tokens | yes |
+| Resolution-adversarial | ~250 + ~100 tokens | ~650 tokens | no (below 1,024) |
+| Severity-adversarial | ~240 + ~110 tokens | ~650 tokens | no (below 1,024) |
+
+The adversarial calls get the breakpoint too: below the minimum it is
+ignored (no write, no charge), and it starts working if a prompt grows.
+
+### The numbers
+
+About 200 primary calls a day (~8 an hour, in clusters; see [Cost](#cost)).
+With a 30-minute lifetime refreshed by each read, a miss needs a 30-minute
+gap with no primary call: overnight, and in quiet spells. Take *h*, the
+share of primary calls that read the prefix, as 90–95%. Primary call input
+per day:
+
+| | Prefix (2,700 × 200) | Per-incident text (500 × 200) | Total | Per month |
+| --- | --- | --- | --- | --- |
+| No caching (`off`) | $0.054 | $0.010 | $0.064 | ~$1.90 |
+| Implicit default (`omit`) | $0.068 (all written) | $0.013 (written) | $0.080 | ~$2.40 |
+| Explicit (the default), *h* = 90% | $0.012 | $0.010 | $0.022 | ~$0.65 |
+
+So explicit saves about **$1.3 a month** against no caching and about
+**$1.7** against the implicit default; the adversarial calls (~$1.10 a
+month) are the same in every row. Breaking even needs *h* above
+0.25 / (1.25 − 0.1) ≈ 22%, i.e. a previous primary call in the last 30
+minutes a quarter of the time. If traffic were far sparser, every call would
+pay the write premium on the prefix: about +$0.00007 a call.
+
+### Settings
+
+`LLM_OPENAI_PROMPT_CACHE` (chart: `enricher.llm.openaiPromptCache`), per
+profile:
+
+| Value | Request | When |
+| --- | --- | --- |
+| `explicit` | `prompt_cache_options: {"mode": "explicit"}`, the breakpoint on the system prompt, `prompt_cache_key: ds-enricher:<profile>:<call>` | default for `openai-gpt-6-luna` |
+| `off` | `prompt_cache_options: {"mode": "explicit"}` and no breakpoint: no caching, no writes | debugging, or comparing costs |
+| `omit` | nothing (the endpoint's default: implicit on GPT-5.6+) | |
+| unset | the profile's | `openai-default` sends nothing, so self-hosted and other OpenAI-compatible servers never see the unknown fields |
+
+Set `explicit` only for an endpoint that accepts these fields; an older
+OpenAI model or another server may reject them. The Claude API has its own
+setting, `LLM_PROMPT_CACHE`
+([enricher-anthropic.md](enricher-anthropic.md#prompt-caching)).
+
+### Data handling
+
+Cached prefixes are encrypted key/value tensors kept on OpenAI's GPU
+machines, for 30 minutes after last use and at most 24 hours. The prefix is
+the system prompt and schema, which hold no incident text.
+
+### Watching it
+
+The primary call's read ratio over a day (expect 0.6–0.8 of all its prompt
+tokens, i.e. most of the prefix):
+
+```promql
+sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="cached"}[1d]))
+/
+sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="prompt"}[1d]))
+```
+
+`cache_write` should be a small fraction of `cached`; a `cache_write` close
+to `prompt` means implicit caching is in force (the profile or
+`LLM_OPENAI_PROMPT_CACHE` is not what you think).
 
 ## Model snapshot
 

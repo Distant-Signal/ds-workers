@@ -50,8 +50,9 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 16_000;
 
 /// `LLM_PROMPT_CACHE`: whether, and for how long, the static system prompt
 /// is marked for prompt caching (docs/enricher-anthropic.md, "Prompt
-/// caching"). `OpenAI` caches automatically, so this only affects the Claude
-/// API.
+/// caching"). Claude API only: `OpenAI` has its own setting,
+/// `LLM_OPENAI_PROMPT_CACHE` (`super::openai_cache`; docs/enricher-openai.md,
+/// "Prompt caching").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 pub(crate) enum PromptCache {
     /// No `cache_control` marker.

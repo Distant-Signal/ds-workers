@@ -482,11 +482,18 @@ pub(crate) struct GenerationConfig {
     /// prompts.
     #[arg(long, env)]
     pub llm_prompts_dir: Option<PathBuf>,
+    /// `LLM_OPENAI_PROMPT_CACHE`: `explicit` (cache the static system
+    /// prompt), `off` (no caching, no cache writes) or `omit` (send nothing:
+    /// the endpoint's default); unset keeps the profile's (`explicit` for
+    /// gpt-6-luna, nothing otherwise). Chat Completions only
+    /// (docs/enricher-openai.md, "Prompt caching").
+    #[arg(long, env)]
+    pub llm_openai_prompt_cache: Option<String>,
 }
 
 /// The profile overrides from the service's env: `LLM_TEMPERATURE`,
 /// `LLM_TOP_P`, `LLM_MAX_TOKENS`, `LLM_REASONING_EFFORT` (`omit` drops the
-/// profile's) and `LLM_THINKING` (likewise).
+/// profile's), `LLM_THINKING` and `LLM_OPENAI_PROMPT_CACHE` (likewise).
 pub(crate) fn profile_overrides(
     generation: &GenerationConfig,
     policy: &ProviderPolicyConfig,
@@ -502,6 +509,10 @@ pub(crate) fn profile_overrides(
             policy.llm_reasoning_effort.as_deref(),
         )?,
         thinking: parse_setting("LLM_THINKING", thinking)?,
+        openai_prompt_cache: parse_setting(
+            "LLM_OPENAI_PROMPT_CACHE",
+            generation.llm_openai_prompt_cache.as_deref(),
+        )?,
     })
 }
 

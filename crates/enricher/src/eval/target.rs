@@ -88,6 +88,10 @@ pub(crate) struct Target {
     /// `LLM_THINKING` (`anthropic` only), e.g. `disabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// `LLM_OPENAI_PROMPT_CACHE` (`openai` only): `explicit`, `off` or
+    /// `omit`; unset keeps the profile's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_prompt_cache: Option<String>,
     /// `LLM_ANTHROPIC_VERSION` (`anthropic` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_version: Option<String>,
@@ -315,9 +319,7 @@ impl Target {
             ProviderKind::Openai => client,
             ProviderKind::Anthropic => client.with_anthropic(self.anthropic_settings()),
         };
-        Ok(client
-            .with_generation(&active.generation)
-            .with_prompts(prompts))
+        Ok(client.with_profile(&active).with_prompts(prompts))
     }
 
     /// The target's profile (the service's resolution, with this target's
@@ -333,6 +335,10 @@ impl Target {
             max_tokens: self.max_tokens.map(Setting::Set),
             reasoning_effort: parse_setting("reasoning_effort", self.reasoning_effort.as_deref())?,
             thinking: parse_setting("thinking", self.thinking.as_deref())?,
+            openai_prompt_cache: parse_setting(
+                "openai_prompt_cache",
+                self.openai_prompt_cache.as_deref(),
+            )?,
         };
         let active =
             crate::profile::resolve(self.provider, model, self.profile.as_deref(), overrides)?;
@@ -460,6 +466,7 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
         gateway_retries: policy.llm_gateway_retries,
         prompt_cache: Some(anthropic.llm_prompt_cache),
         thinking: anthropic.llm_thinking,
+        openai_prompt_cache: generation.llm_openai_prompt_cache,
         anthropic_version: Some(anthropic.llm_anthropic_version),
         profile: generation.llm_profile,
         temperature: generation.llm_temperature,
