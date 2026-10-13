@@ -33,7 +33,9 @@
 //! Plus `run.json`: the run's metadata (dataset, prompt fingerprint, every
 //! target's status). The exit code is 0 when every target finished, 2 when
 //! some target failed (the others' outputs are still written), 1 on a setup
-//! error.
+//! error. A target whose *every* record failed in transport (nothing reached
+//! the model: a broken credential, say) counts as failed, and its files are
+//! renamed to `<stem>.failed-<stamp>.*` so that re-running retries it.
 //!
 //! The `EVAL_*` knobs of batch mode apply as documented
 //! (docs/enricher-model-eval.md): `EVAL_MODE`, `EVAL_BATCH_POLL_SECS`,
@@ -331,6 +333,43 @@ fn write_results(
     crate::eval::write_text(path, &out)
 }
 
+/// The first record's failure when *every* record failed in transport:
+/// nothing reached the model (a broken credential, a missing batch
+/// permission, an expired batch), so the target failed as a whole.
+fn all_transport_failed(records: &[PipelineRecord]) -> Option<Failure> {
+    let mut first = None;
+    for record in records {
+        match record.outcome() {
+            Err(failure) if failure.kind == FailureKind::Transport => {
+                first.get_or_insert(failure);
+            }
+            _ => return None,
+        }
+    }
+    first
+}
+
+/// Renames a failed target's files to `<stem>.failed-<stamp>.*`, so a
+/// re-run of the same command (which resumes the directory) retries the
+/// target instead of reusing its failed records. Returns the new stem.
+fn set_aside(dir: &Path, stem: &str) -> anyhow::Result<String> {
+    let moved = format!("{stem}.failed-{}", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
+    for suffix in [
+        "records.jsonl",
+        "results.jsonl",
+        "summary.json",
+        "batch-state.json",
+    ] {
+        let from = dir.join(format!("{stem}.{suffix}"));
+        if from.exists() {
+            let to = dir.join(format!("{moved}.{suffix}"));
+            std::fs::rename(&from, &to)
+                .map_err(|err| anyhow::anyhow!("moving {}: {err}", from.display()))?;
+        }
+    }
+    Ok(moved)
+}
+
 /// One target, start to finish; its status for `run.json`.
 async fn run_target(
     target: &Target,
@@ -385,6 +424,15 @@ async fn run_target(
             .map(|c| format!(", estimated ${:.4}", c.usd))
             .unwrap_or_default()
     );
+    if let Some(failure) = all_transport_failed(&records) {
+        let moved = set_aside(dir, &stem)?;
+        anyhow::bail!(
+            "every record failed in transport (first: {}: {}); its files were moved to {moved}.* \
+             so that re-running the same command retries this target",
+            failure.outcome,
+            failure.message
+        );
+    }
     Ok(TargetStatus {
         name: target.name.clone(),
         model: target.model.clone(),
@@ -575,7 +623,38 @@ mod tests {
         assert_eq!(line["failure"]["kind"], "transport");
         assert_eq!(line["failure"]["outcome"], "batch_expired");
         assert!(line["estimated_usd"].is_null());
-        assert_eq!(Counts::of(&[record, failed]).transport_failures, 1);
+        assert_eq!(
+            Counts::of(&[record.clone(), failed.clone()]).transport_failures,
+            1
+        );
+
+        // Only a target whose every record failed in transport failed.
+        assert!(all_transport_failed(&[record, failed.clone()]).is_none());
+        let first = all_transport_failed(&[failed.clone(), failed]).unwrap();
+        assert_eq!(first.outcome, "batch_expired");
+        assert!(all_transport_failed(&[]).is_none());
+    }
+
+    #[test]
+    fn a_failed_targets_files_are_set_aside_for_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["t.records.jsonl", "t.batch-state.json", "u.records.jsonl"] {
+            std::fs::write(dir.path().join(file), "x").unwrap();
+        }
+        let moved = set_aside(dir.path(), "t").unwrap();
+        assert!(moved.starts_with("t.failed-"), "{moved}");
+        assert!(!dir.path().join("t.records.jsonl").exists());
+        assert!(!dir.path().join("t.batch-state.json").exists());
+        assert!(dir.path().join(format!("{moved}.records.jsonl")).exists());
+        assert!(
+            dir.path()
+                .join(format!("{moved}.batch-state.json"))
+                .exists()
+        );
+        assert!(
+            dir.path().join("u.records.jsonl").exists(),
+            "others untouched"
+        );
     }
 
     /// A whole run over a sync target that can't connect: the target fails

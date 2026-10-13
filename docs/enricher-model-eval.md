@@ -451,7 +451,11 @@ resolved from the workspace root. The dataset needs no `expected` labels.
   others.
 - **Exit code**: 0 when every target finished, 2 when some target failed
   (`run.json` says which and why; the others' files are written), 1 on a
-  setup error (unreadable targets file or dataset, invalid case).
+  setup error (unreadable targets file or dataset, invalid case). A target
+  whose every record failed in transport (nothing reached the model, e.g. a
+  broken credential) counts as failed; its files are renamed to
+  `<stem>.failed-<stamp>.*`, so re-running the command retries it. Batch
+  errors that mention `EVAL_RESUME` mean: re-run with the same `--out`.
 
 Output, per target (`<stem>`: the target name, file-safe):
 
