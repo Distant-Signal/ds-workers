@@ -75,6 +75,16 @@ const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// A token this close to expiry is not handed out even as a fallback.
 const MIN_REMAINING: Duration = Duration::from_secs(5);
 
+/// A federated token creates an `OpenAI` batch only with at least this
+/// share of its lifetime left (`SUBMISSION_FRESH_NUM / _DEN`, 80%); else
+/// [`FederatedTokenSource::bearer_for_submission`] mints a new one. `OpenAI`
+/// authorises a batch with its creator's token some time after the create
+/// call (a batch created with a 900 s token issued ~11 minutes earlier
+/// failed every request with `token_expired`), so a batch must start with
+/// as much token life as there is.
+const SUBMISSION_FRESH_NUM: u32 = 4;
+const SUBMISSION_FRESH_DEN: u32 = 5;
+
 const TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 /// RFC 7523's grant, the Claude API's exchange.
 const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
@@ -243,6 +253,33 @@ impl LlmAuth {
         })
     }
 
+    /// The credential for creating an `OpenAI` batch (its file upload and
+    /// its create call, which must share it): as [`Self::credential`], but
+    /// a federated token comes from
+    /// [`FederatedTokenSource::bearer_for_submission`], so it has at least
+    /// 80% of its lifetime left. `OpenAI` only: Claude batches belong to the
+    /// workspace, not the credential.
+    pub(crate) async fn submission_credential(
+        &self,
+        static_key: StaticKeyHeader,
+    ) -> Result<SubmissionCredential, LlmCallError> {
+        Ok(match self {
+            Self::Federated(source) => {
+                let (token, remaining) = source.bearer_for_submission().await?;
+                SubmissionCredential {
+                    credential: Some(Credential::Bearer(token)),
+                    remaining: Some(remaining),
+                    minted: Instant::now(),
+                }
+            }
+            _ => SubmissionCredential {
+                credential: self.credential(static_key).await?,
+                remaining: None,
+                minted: Instant::now(),
+            },
+        })
+    }
+
     /// The endpoint rejected `rejected` (a 401): forget it, so the next
     /// [`Self::bearer`] exchanges again. A no-op unless it is still the
     /// cached token, so concurrent 401s for one token trigger one refresh.
@@ -250,6 +287,26 @@ impl LlmAuth {
         if let Self::Federated(source) = self {
             source.invalidate(rejected);
         }
+    }
+}
+
+/// The credential one `OpenAI` batch submission uses for both its upload
+/// and its create ([`LlmAuth::submission_credential`]).
+#[derive(Debug, Clone)]
+pub(crate) struct SubmissionCredential {
+    pub credential: Option<Credential>,
+    /// A federated token's remaining life when it was handed out (`None`
+    /// for an API key or no credential).
+    pub remaining: Option<Duration>,
+    /// When it was handed out.
+    pub minted: Instant,
+}
+
+impl SubmissionCredential {
+    /// A federated token's remaining life now.
+    pub(crate) fn remaining_now(&self) -> Option<Duration> {
+        self.remaining
+            .map(|r| r.saturating_sub(self.minted.elapsed()))
     }
 }
 
@@ -347,6 +404,8 @@ impl Clock {
 /// A cached access token and its deadlines.
 struct CachedToken {
     token: Secret,
+    /// When the request that minted it started.
+    issued_at: Instant,
     /// Exchange again from here on.
     refresh_at: Instant,
     /// The token's own expiry, as far as we can tell.
@@ -601,6 +660,59 @@ impl FederatedTokenSource {
                     }
                     None => Err(failure.into_call_error()),
                 }
+            }
+        }
+    }
+
+    /// The cached token if it still has at least 80% of its lifetime left
+    /// (and is before its refresh deadline), with its remaining life.
+    fn submission_token(&self) -> Option<(Secret, Duration)> {
+        let now = self.clock.now();
+        let cached = self.lock_cached();
+        let token = cached.as_ref().filter(|t| now < t.refresh_at)?;
+        let remaining = token.expires_at.saturating_duration_since(now);
+        let lifetime = token.expires_at.saturating_duration_since(token.issued_at);
+        (remaining * SUBMISSION_FRESH_DEN >= lifetime * SUBMISSION_FRESH_NUM)
+            .then(|| (token.token.clone(), remaining))
+    }
+
+    /// A token for creating an `OpenAI` batch: the cached one only if it has
+    /// at least 80% of its lifetime left (in practice: one minted moments
+    /// ago, e.g. by a concurrent submission), else a new exchange with a
+    /// FRESH subject token (in the Authentik modes a new Authentik token
+    /// too: `OpenAI` may cap its token's life at the subject's). Unlike
+    /// [`Self::bearer`] a failed exchange never falls back to the older
+    /// cached token: a batch created with it would fail when `OpenAI`
+    /// authorises it later, so the submission fails now instead and the
+    /// next sweep tries again. Returns the token and its remaining life.
+    pub(crate) async fn bearer_for_submission(&self) -> Result<(Secret, Duration), LlmCallError> {
+        let waiting_since = self.clock.now();
+        let mut state = self.refresh.lock().await;
+        if let Some(token) = self.submission_token() {
+            return Ok(token);
+        }
+        if let Some((at, failure)) = state.last_failure
+            && at >= waiting_since
+        {
+            return Err(failure.into_call_error());
+        }
+        state.authentik = None;
+        match self.refresh_locked(&mut state).await {
+            Ok(token) => {
+                state.last_failure = None;
+                let now = self.clock.now();
+                let remaining = self
+                    .lock_cached()
+                    .as_ref()
+                    .filter(|t| t.token.expose() == token.expose())
+                    .map_or(Duration::ZERO, |t| {
+                        t.expires_at.saturating_duration_since(now)
+                    });
+                Ok((token, remaining))
+            }
+            Err(failure) => {
+                state.last_failure = Some((self.clock.now(), failure));
+                Err(failure.into_call_error())
             }
         }
     }
@@ -871,6 +983,7 @@ impl FederatedTokenSource {
         );
         Ok(CachedToken {
             token: Secret::new(parsed.access_token),
+            issued_at: t0,
             refresh_at,
             expires_at,
         })
@@ -915,7 +1028,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn authentik_config(server: &MockServer, file: &std::path::Path) -> FederationConfig {
+    pub(crate) fn authentik_config(
+        server: &MockServer,
+        file: &std::path::Path,
+    ) -> FederationConfig {
         FederationConfig {
             authentik: Some(AuthentikConfig {
                 token_url: format!("{}/application/o/token/", server.uri()),

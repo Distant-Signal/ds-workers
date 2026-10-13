@@ -51,9 +51,14 @@
 //! billed, but nobody reads it; the incidents go into a later batch).
 //!
 //! **Results.** Matched by `custom_id` (`p-<n>`, `r-<n>`, `s-<n>`, `n` the
-//! item's index), never by position. `errored`, `canceled`, `expired` and
-//! missing entries drop that incident from the batch; the next sweep finds
-//! it again (its stored hash still doesn't match). An unusable success (a
+//! item's index), never by position. `errored`, `canceled`, `expired`,
+//! `auth_expired` and missing entries drop that incident from the batch;
+//! the next sweep finds it again (its stored hash still doesn't match).
+//! `auth_expired` (`OpenAI` `token_expired`: the creator's token had
+//! expired when `OpenAI` authorised the batch, after the create call) is
+//! also counted once per batch (`event="auth_expired"`); the next sweep's
+//! batch is created with a freshly minted token
+//! (`LlmAuth::submission_credential`). An unusable success (a
 //! refusal, a truncated or unparseable output) also feeds the per-text
 //! backoff, exactly as on the synchronous path. A batch whose
 //! `model_version` is no longer the service's is canceled and dropped, and
@@ -63,8 +68,8 @@
 //! error file; once its results are processed they are deleted (a failure
 //! is logged and counted, `enricher_llm_batch_files_total`, and the files
 //! expire within two days anyway). A batch that failed input validation
-//! (`OpenAI` `failed`) is dropped (`validation_failed`) and its input file
-//! deleted.
+//! (`OpenAI` `failed`) is dropped (`validation_failed`, or `auth_expired`
+//! when the failure is `token_expired`) and its input file deleted.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -91,13 +96,17 @@ pub(crate) const MAX_BATCH_INCIDENTS: usize = 5_000;
 /// `enricher_llm_batches_total{provider, stage, event}`: `submitted`,
 /// `submit_failed`, `ended`, `poll_failed`, `abandoned`,
 /// `validation_failed` (`OpenAI`: the input file failed validation, so
-/// nothing ran).
+/// nothing ran), `auth_expired` (`OpenAI`: the batch failed, or some of its
+/// requests did, with `token_expired`, because the creator's token had
+/// expired when `OpenAI` authorised it; once per batch).
 const BATCHES_METRIC: &str = "enricher_llm_batches_total";
 /// `enricher_llm_batch_requests_total{provider, call, result}`: one per
 /// request of an
 /// ended batch -- `succeeded`, `invalid` (a success the enricher could not
 /// use: a refusal, truncated or unparseable output), `errored`,
-/// `canceled`, `expired`, `missing` (no result line).
+/// `canceled`, `expired`, `auth_expired` (`OpenAI` `token_expired`: the
+/// creator's token had expired when the request was authorised), `missing`
+/// (no result line).
 const REQUESTS_METRIC: &str = "enricher_llm_batch_requests_total";
 /// `enricher_llm_batches_in_flight`: rows of `enricher_llm_batches`, as of
 /// the last poll.
@@ -215,13 +224,14 @@ pub(crate) fn custom_id(call: LlmCall, index: usize) -> String {
 }
 
 /// Every `event` of [`BATCHES_METRIC`].
-const BATCH_EVENTS: [&str; 6] = [
+const BATCH_EVENTS: [&str; 7] = [
     "submitted",
     "submit_failed",
     "ended",
     "poll_failed",
     "abandoned",
     "validation_failed",
+    "auth_expired",
 ];
 
 fn record_batch_event(provider: &'static str, stage: Stage, event: &'static str) {
@@ -256,6 +266,7 @@ pub(crate) fn register_metrics(provider: &'static str) {
             "errored",
             "canceled",
             "expired",
+            "auth_expired",
             "missing",
         ] {
             metrics::counter!(
@@ -850,6 +861,23 @@ async fn abandon(enricher: &Enricher, row: &BatchRow, reason: &str) -> anyhow::R
     Ok(())
 }
 
+/// An `OpenAI` batch the creator's token had expired for (whole, or
+/// `requests` of it). Its incidents are dropped like any failed request's
+/// and go into the next sweep's batch, which is created with a freshly
+/// minted token; they are not backed off (nothing is wrong with the text),
+/// and nothing is resubmitted before that sweep, so it cannot spin.
+fn warn_auth_expired(row: &BatchRow, provider: &str, requests: Option<usize>, reason: &str) {
+    tracing::error!(
+        batch_id = row.batch_id,
+        stage = row.stage.as_str(),
+        provider,
+        requests,
+        reason,
+        "batch_auth_expired: OpenAI authorised the batch after its creator's token expired; \
+         those requests did not run and go into the next sweep"
+    );
+}
+
 async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> anyhow::Result<()> {
     let provider = enricher.llm.provider_label();
     if row.provider != provider {
@@ -881,8 +909,21 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
             enricher.llm.delete_batch_files(&files).await;
             return Ok(());
         }
+        BatchPoll::AuthExpired { reason, files } => {
+            warn_auth_expired(row, provider, None, &reason);
+            delete_batch(&enricher.pool, &row.batch_id).await?;
+            record_batch_event(provider, row.stage, "auth_expired");
+            enricher.llm.delete_batch_files(&files).await;
+            return Ok(());
+        }
         BatchPoll::Ended(ended) => ended,
     };
+    let auth_expired = ended
+        .results
+        .outcomes
+        .values()
+        .filter(|o| **o == BatchOutcome::AuthExpired)
+        .count();
     record_batch_event(provider, row.stage, "ended");
     tracing::info!(
         batch_id = row.batch_id,
@@ -894,6 +935,17 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
     match row.stage {
         Stage::Primary => finish_primary_stage(enricher, max_items, row, ended.results).await?,
         Stage::Adversarial => finish_adversarial_stage(enricher, row, ended.results).await?,
+    }
+    // Counted once the row is processed, so a stage retried next tick is
+    // not counted twice.
+    if auth_expired > 0 {
+        warn_auth_expired(
+            row,
+            provider,
+            Some(auth_expired),
+            "token_expired result lines",
+        );
+        record_batch_event(provider, row.stage, "auth_expired");
     }
     // Processed and its row gone: its files have served their purpose.
     enricher.llm.delete_batch_files(&ended.files).await;
@@ -1493,5 +1545,130 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// `token_expired` against a real database: a batch that `failed` with
+    /// it and one whose every request did are both dropped (their
+    /// incidents go to the next sweep), nothing is resubmitted from the
+    /// poll loop (no spin), and the texts are not backed off.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher auth_expired_batches -- --ignored --test-threads=1`"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test code: one scenario, mocks then assertions"
+    )]
+    async fn auth_expired_batches_are_dropped_without_backoff_or_resubmission() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        sqlx::query("DELETE FROM enricher_llm_batches")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (batch_id, incident) in [
+            ("batch_tok_failed", "TEST-AUTH-EXPIRED-FAILED"),
+            ("batch_tok_lines", "TEST-AUTH-EXPIRED-LINES"),
+        ] {
+            insert_batch(
+                &pool,
+                batch_id,
+                "openai",
+                Stage::Primary,
+                "mv-test",
+                &[item(0, incident)],
+            )
+            .await
+            .unwrap();
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/batches/batch_tok_failed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_tok_failed", "status": "failed", "input_file_id": "file-in-1",
+                "errors": { "data": [{ "code": "token_expired",
+                                       "message": "Provided authentication token is expired." }] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/batches/batch_tok_lines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_tok_lines", "status": "completed", "input_file_id": "file-in-2",
+                "output_file_id": null, "error_file_id": "file-err-2",
+                "request_counts": { "total": 1, "completed": 0, "failed": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let line = serde_json::json!({
+            "custom_id": "p-0", "response": null,
+            "error": { "code": "token_expired",
+                       "message": "Provided authentication token is expired." }
+        });
+        Mock::given(method("GET"))
+            .and(path("/files/file-err-2/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(line.to_string()))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let enricher = Enricher {
+            pool: pool.clone(),
+            llm: llm::LlmClient::new(
+                server.uri(),
+                Some("sk-test".into()),
+                "m".into(),
+                Duration::from_secs(30),
+            ),
+            model_version: "mv-test".into(),
+            mismatch_tracker: crate::MismatchTracker::default(),
+            retry_backoff: crate::RetryBackoff::default(),
+            in_flight: crate::InFlight::default(),
+            carry_forward_noops: false,
+            sweep_concurrency: 1,
+            batch: None,
+        };
+        poll_once(&enricher, 100).await;
+        // A second tick finds nothing to do.
+        poll_once(&enricher, 100).await;
+
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT batch_id FROM enricher_llm_batches")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "POST"),
+            "nothing resubmitted from the poll loop"
+        );
+        let mut deleted: Vec<&str> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path())
+            .collect();
+        deleted.sort_unstable();
+        assert_eq!(
+            deleted,
+            ["/files/file-err-2", "/files/file-in-1", "/files/file-in-2"]
+        );
+        // Not backed off: this is each text's first recorded failure.
+        for incident in ["TEST-AUTH-EXPIRED-FAILED", "TEST-AUTH-EXPIRED-LINES"] {
+            assert_eq!(
+                enricher
+                    .retry_backoff
+                    .record_failure(incident, &format!("hash-{incident}")),
+                1
+            );
+        }
     }
 }

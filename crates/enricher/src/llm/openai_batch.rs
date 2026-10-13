@@ -28,6 +28,28 @@ use super::batch_api::{
     record_file_event,
 };
 use super::{LlmCallError, LlmClient};
+use crate::auth::SubmissionCredential;
+
+/// `enricher_llm_batch_submit_token_remaining_seconds`: the federated
+/// token's remaining life when it created the last `OpenAI` batch (keyless
+/// auth only). `OpenAI` authorises a batch with its creator's token after
+/// the create call; a low value here is what preceded every request of a
+/// batch failing with `token_expired`.
+pub(crate) const SUBMIT_TOKEN_REMAINING_METRIC: &str =
+    "enricher_llm_batch_submit_token_remaining_seconds";
+
+/// The error code `OpenAI` gives a batch request (or a failed batch) whose
+/// creator's token had expired by the time it was authorised.
+pub(crate) const TOKEN_EXPIRED_CODE: &str = "token_expired";
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a token lifetime in seconds is far below 2^52"
+)]
+fn record_submit_token_remaining(remaining: std::time::Duration) {
+    metrics::gauge!(common::metrics::metric_name(SUBMIT_TOKEN_REMAINING_METRIC))
+        .set(remaining.as_secs() as f64);
+}
 
 /// The batch's `endpoint` and each line's `url`: the synchronous path's
 /// route.
@@ -101,6 +123,20 @@ pub(crate) fn batch_jsonl(requests: &[BatchRequest]) -> Result<String, LlmCallEr
     Ok(out)
 }
 
+/// Whether a `failed` batch's `errors` name an expired token: the
+/// creator's token had expired when `OpenAI` authorised it.
+fn failed_on_expired_token(batch: &OpenAiBatch) -> bool {
+    batch
+        .errors
+        .as_ref()
+        .and_then(|e| e.get("data"))
+        .and_then(Value::as_array)
+        .is_some_and(|data| {
+            data.iter()
+                .any(|e| e.get("code").and_then(Value::as_str) == Some(TOKEN_EXPIRED_CODE))
+        })
+}
+
 /// The `errors` of a `failed` batch, as one log-friendly line.
 fn validation_reason(batch: &OpenAiBatch) -> String {
     let lines: Vec<String> = batch
@@ -143,6 +179,7 @@ fn parse_line(value: &Value) -> Option<(String, BatchOutcome)> {
         let code = text(Some(error), "code");
         let outcome = match code.as_deref() {
             Some("batch_expired") => BatchOutcome::Expired,
+            Some(TOKEN_EXPIRED_CODE) => BatchOutcome::AuthExpired,
             // The guide names no code for a request a cancel stopped; these
             // are the spellings the API uses for the batch status.
             Some("batch_cancelled" | "batch_canceled") => BatchOutcome::Canceled,
@@ -163,6 +200,9 @@ fn parse_line(value: &Value) -> Option<(String, BatchOutcome)> {
         ));
     }
     let api_error = body.get("error");
+    if text(api_error, "code").as_deref() == Some(TOKEN_EXPIRED_CODE) {
+        return Some((custom_id, BatchOutcome::AuthExpired));
+    }
     Some((
         custom_id,
         BatchOutcome::Errored {
@@ -204,13 +244,30 @@ impl LlmClient {
         what: &'static str,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LlmCallError> {
+        self.openai_api_send_as(what, None, build).await
+    }
+
+    /// [`Self::openai_api_send`], with `pinned` (a submission's credential)
+    /// instead of the cache's when given. A 401 then replaces `pinned` with
+    /// a freshly minted submission credential, so the rest of the
+    /// submission uses the new token too.
+    async fn openai_api_send_as(
+        &self,
+        what: &'static str,
+        mut pinned: Option<&mut SubmissionCredential>,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, LlmCallError> {
         let mut refreshed = false;
         loop {
             let mut request = build();
-            let credential = self
-                .auth
-                .credential(crate::auth::StaticKeyHeader::Bearer)
-                .await?;
+            let credential = match pinned.as_deref() {
+                Some(pinned) => pinned.credential.clone(),
+                None => {
+                    self.auth
+                        .credential(crate::auth::StaticKeyHeader::Bearer)
+                        .await?
+                }
+            };
             if let Some(credential) = &credential {
                 request = credential.apply(request);
             }
@@ -231,6 +288,12 @@ impl LlmClient {
                     return Err(LlmCallError::Unauthorized);
                 }
                 refreshed = true;
+                if let Some(pinned) = pinned.as_deref_mut() {
+                    *pinned = self
+                        .auth
+                        .submission_credential(crate::auth::StaticKeyHeader::Bearer)
+                        .await?;
+                }
                 continue;
             }
             if status.is_success() {
@@ -259,9 +322,10 @@ impl LlmClient {
     async fn openai_json<T: serde::de::DeserializeOwned>(
         &self,
         what: &'static str,
+        pinned: Option<&mut SubmissionCredential>,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<T, LlmCallError> {
-        self.openai_api_send(what, build)
+        self.openai_api_send_as(what, pinned, build)
             .await?
             .json()
             .await
@@ -269,12 +333,17 @@ impl LlmClient {
     }
 
     /// `POST {base}/files` (multipart, `purpose=batch`, expiring after
-    /// [`FILE_TTL_SECS`]). Returns the file id.
-    pub(crate) async fn upload_batch_file(&self, jsonl: String) -> Result<String, LlmCallError> {
+    /// [`FILE_TTL_SECS`]) with the submission's credential. Returns the file
+    /// id.
+    async fn upload_batch_file(
+        &self,
+        jsonl: String,
+        token: &mut SubmissionCredential,
+    ) -> Result<String, LlmCallError> {
         let bytes = jsonl.into_bytes();
         let url = format!("{}/files", self.base_url);
         let file: FileObject = self
-            .openai_json("upload", || {
+            .openai_json("upload", Some(token), || {
                 let part = reqwest::multipart::Part::bytes(bytes.clone())
                     .file_name("enricher-batch.jsonl")
                     .mime_str("application/jsonl")
@@ -293,13 +362,25 @@ impl LlmClient {
 
     /// Uploads the input file and creates a batch on it. A failed create
     /// deletes the file it uploaded (best effort).
+    ///
+    /// Both calls use one credential, minted for this submission right
+    /// before the upload when federated
+    /// ([`crate::auth::LlmAuth::submission_credential`]): `OpenAI`
+    /// authorises the batch with its creator's token after the create call
+    /// returns, so a cached token near the end of its ~900 s life would fail
+    /// every request with `token_expired` (docs/enricher-openai.md, "Batch
+    /// mode").
     pub(crate) async fn create_openai_batch(
         &self,
         requests: &[BatchRequest],
         meta: BatchMeta<'_>,
     ) -> Result<CreatedBatch, LlmCallError> {
         let jsonl = batch_jsonl(requests)?;
-        let file_id = self.upload_batch_file(jsonl).await?;
+        let mut token = self
+            .auth
+            .submission_credential(crate::auth::StaticKeyHeader::Bearer)
+            .await?;
+        let file_id = self.upload_batch_file(jsonl, &mut token).await?;
         let body = serde_json::json!({
             "input_file_id": file_id,
             "endpoint": ENDPOINT,
@@ -316,14 +397,32 @@ impl LlmClient {
             },
         });
         let url = format!("{}/batches", self.base_url);
+        let remaining = token.remaining_now();
         match self
-            .openai_json::<OpenAiBatch>("create", || self.http.post(&url).json(&body))
+            .openai_json::<OpenAiBatch>("create", Some(&mut token), || {
+                self.http.post(&url).json(&body)
+            })
             .await
         {
-            Ok(batch) => Ok(CreatedBatch {
-                id: batch.id,
-                files: vec![file_id],
-            }),
+            Ok(batch) => {
+                // A 401 retry may have replaced the token: report the one
+                // that created the batch.
+                let remaining = token.remaining_now().or(remaining);
+                if let Some(remaining) = remaining {
+                    record_submit_token_remaining(remaining);
+                }
+                tracing::info!(
+                    batch_id = batch.id,
+                    stage = meta.stage,
+                    requests = requests.len(),
+                    token_remaining_secs = remaining.map(|r| r.as_secs()),
+                    "created an OpenAI batch"
+                );
+                Ok(CreatedBatch {
+                    id: batch.id,
+                    files: vec![file_id],
+                })
+            }
             Err(err) => {
                 // Nothing will ever read the file: don't leave it behind.
                 self.delete_batch_files(std::slice::from_ref(&file_id))
@@ -336,7 +435,8 @@ impl LlmClient {
     /// `GET {base}/batches/{id}`.
     pub(crate) async fn get_openai_batch(&self, id: &str) -> Result<OpenAiBatch, LlmCallError> {
         let url = format!("{}/batches/{id}", self.base_url);
-        self.openai_json("retrieve", || self.http.get(&url)).await
+        self.openai_json("retrieve", None, || self.http.get(&url))
+            .await
     }
 
     /// `POST {base}/batches/{id}/cancel`: the batch goes `cancelling` (up
@@ -377,6 +477,12 @@ impl LlmClient {
         let unanswered = match batch.status.as_str() {
             "validating" | "in_progress" | "finalizing" | "cancelling" => {
                 return Ok(BatchPoll::Pending);
+            }
+            "failed" if failed_on_expired_token(&batch) => {
+                return Ok(BatchPoll::AuthExpired {
+                    reason: validation_reason(&batch),
+                    files: batch.input_file_id.into_iter().collect(),
+                });
             }
             "failed" => {
                 return Ok(BatchPoll::ValidationFailed {

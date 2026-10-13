@@ -69,6 +69,11 @@ pub(crate) enum BatchOutcome {
     Canceled,
     /// The batch hit its 24-hour window before this request ran.
     Expired,
+    /// `OpenAI` refused to run the request because the token that created
+    /// the batch had expired by the time it authorised it (error code
+    /// `token_expired`). Nothing ran and nothing is wrong with the request:
+    /// a batch created with a fresh token would run it.
+    AuthExpired,
 }
 
 impl BatchOutcome {
@@ -79,6 +84,7 @@ impl BatchOutcome {
             Self::Errored { .. } => "errored",
             Self::Canceled => "canceled",
             Self::Expired => "expired",
+            Self::AuthExpired => "auth_expired",
         }
     }
 
@@ -144,6 +150,13 @@ pub(crate) enum BatchPoll {
     Gone,
     /// Ended, but its results can no longer be downloaded (404).
     ResultsGone,
+    /// `OpenAI` `failed` with `token_expired`: the creator's token had
+    /// expired when `OpenAI` authorised the batch, so nothing ran. `files`
+    /// is the input file.
+    AuthExpired {
+        reason: String,
+        files: Vec<String>,
+    },
 }
 
 pub(crate) fn record_file_event(provider: &'static str, event: &'static str) {

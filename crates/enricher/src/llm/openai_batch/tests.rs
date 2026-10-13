@@ -603,3 +603,345 @@ async fn a_federated_token_is_refreshed_on_401() {
     let polls = requests_to(&server, "GET", "/batches/batch_1").await;
     assert_eq!(polls.len(), 2);
 }
+
+/// Issues `<prefix>-1`, `<prefix>-2`, ... (a new token per request, from
+/// either token endpoint), each lasting `expires_in`.
+struct Sequential {
+    prefix: &'static str,
+    expires_in: u64,
+    issued: std::sync::atomic::AtomicU64,
+}
+
+impl Sequential {
+    fn new(prefix: &'static str, expires_in: u64) -> Self {
+        Self {
+            prefix,
+            expires_in,
+            issued: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl wiremock::Respond for Sequential {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let n = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        // `expires_in` only: an `expires_at` from the real wall clock would
+        // disagree with the test clock's advances.
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": format!("{}-{n}", self.prefix),
+            "token_type": "Bearer",
+            "expires_in": self.expires_in,
+        }))
+    }
+}
+
+/// A federated client on `server` with a test clock.
+fn federated_client(
+    server: &MockServer,
+    config: crate::auth::FederationConfig,
+) -> (LlmClient, crate::auth::Clock) {
+    let clock = crate::auth::Clock::default();
+    let source = crate::auth::FederatedTokenSource::with_clock(config, clock.clone()).unwrap();
+    let client =
+        client(server).with_auth(crate::auth::LlmAuth::Federated(std::sync::Arc::new(source)));
+    (client, clock)
+}
+
+async fn mount_create(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/batches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch("validating", None, None)))
+        .mount(server)
+        .await;
+}
+
+async fn mount_federated_upload(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "file-in", "object": "file", "purpose": "batch", "bytes": 1
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_in_progress(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/batches/batch_1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch("in_progress", None, None)))
+        .mount(server)
+        .await;
+}
+
+fn bearer(request: &Request) -> String {
+    request.headers["authorization"]
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The 2026-10-13 incident: a 900 s token cached by an ordinary call (or
+/// the previous stage) is still valid, but a batch created with it fails
+/// every request once `OpenAI` authorises it after the token expired. So a
+/// submission mints a fresh token right before the upload, and the upload
+/// and the create both use it. A second submission moments later (the
+/// token still has over 80% of its life) reuses it.
+#[tokio::test]
+async fn a_submission_mints_a_fresh_token_for_upload_and_create() {
+    let server = MockServer::start().await;
+    let file = crate::auth::tests::token_file("k8s.jwt");
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(Sequential::new("oai.tok", 900))
+        .mount(&server)
+        .await;
+    mount_federated_upload(&server).await;
+    mount_create(&server).await;
+    mount_in_progress(&server).await;
+    let (client, clock) = federated_client(
+        &server,
+        crate::auth::tests::kubernetes_config(&server, file.path()),
+    );
+    // A poll (any ordinary call) caches tok-1.
+    client.poll_batch("batch_1").await.unwrap();
+    // 11 minutes on: tok-1 is still valid (refresh at 810 s), 4 minutes left.
+    clock.advance(std::time::Duration::from_secs(660));
+    client.poll_batch("batch_1").await.unwrap();
+    assert_eq!(
+        requests_to(&server, "POST", "/oauth/token").await.len(),
+        1,
+        "ordinary calls keep the cached token"
+    );
+
+    client
+        .create_batch(&requests(&client, 1), META)
+        .await
+        .unwrap();
+    assert_eq!(
+        requests_to(&server, "POST", "/oauth/token").await.len(),
+        2,
+        "the submission minted a new token"
+    );
+    let upload = &requests_to(&server, "POST", "/files").await[0];
+    let create = &requests_to(&server, "POST", "/batches").await[0];
+    assert_eq!(bearer(upload), "Bearer oai.tok-2");
+    assert_eq!(bearer(create), "Bearer oai.tok-2");
+    // The exchange came right before the upload.
+    let order: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p != "/batches/batch_1")
+        .collect();
+    assert_eq!(
+        order,
+        ["/oauth/token", "/oauth/token", "/files", "/batches"]
+    );
+
+    // A minute later, a second submission: tok-2 still has > 80% left.
+    clock.advance(std::time::Duration::from_secs(60));
+    client
+        .create_batch(&requests(&client, 1), META)
+        .await
+        .unwrap();
+    assert_eq!(requests_to(&server, "POST", "/oauth/token").await.len(), 2);
+    let creates = requests_to(&server, "POST", "/batches").await;
+    assert_eq!(bearer(&creates[1]), "Bearer oai.tok-2");
+    // Ordinary calls now use the new token too.
+    client.poll_batch("batch_1").await.unwrap();
+    let polls = requests_to(&server, "GET", "/batches/batch_1").await;
+    assert_eq!(bearer(polls.last().unwrap()), "Bearer oai.tok-2");
+}
+
+/// In `openai-wif-authentik` the submission's exchange presents a FRESH
+/// Authentik token, not the cached one (`OpenAI` may cap its token's life
+/// at the subject's).
+#[tokio::test]
+async fn a_submission_exchanges_a_fresh_authentik_token() {
+    let server = MockServer::start().await;
+    let file = crate::auth::tests::token_file("k8s.jwt");
+    Mock::given(method("POST"))
+        .and(path("/application/o/token/"))
+        .respond_with(Sequential::new("authentik.jwt", 900))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(Sequential::new("oai.tok", 900))
+        .mount(&server)
+        .await;
+    mount_federated_upload(&server).await;
+    mount_create(&server).await;
+    mount_in_progress(&server).await;
+    let (client, clock) = federated_client(
+        &server,
+        crate::auth::tests::authentik_config(&server, file.path()),
+    );
+    client.poll_batch("batch_1").await.unwrap();
+    clock.advance(std::time::Duration::from_secs(300));
+    client
+        .create_batch(&requests(&client, 1), META)
+        .await
+        .unwrap();
+    let subjects: Vec<String> = requests_to(&server, "POST", "/oauth/token")
+        .await
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["subject_token"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(subjects, ["authentik.jwt-1", "authentik.jwt-2"]);
+    let upload = &requests_to(&server, "POST", "/files").await[0];
+    let create = &requests_to(&server, "POST", "/batches").await[0];
+    assert_eq!(bearer(upload), "Bearer oai.tok-2");
+    assert_eq!(bearer(create), "Bearer oai.tok-2");
+}
+
+/// A 401 to the upload mints another submission token, and the create
+/// uses that one too: the two calls never mix tokens.
+#[tokio::test]
+async fn a_401_during_submission_moves_both_calls_to_the_new_token() {
+    let server = MockServer::start().await;
+    let file = crate::auth::tests::token_file("k8s.jwt");
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(Sequential::new("oai.tok", 900))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/files"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_federated_upload(&server).await;
+    mount_create(&server).await;
+    let (client, _) = federated_client(
+        &server,
+        crate::auth::tests::kubernetes_config(&server, file.path()),
+    );
+    client
+        .create_batch(&requests(&client, 1), META)
+        .await
+        .unwrap();
+    let uploads = requests_to(&server, "POST", "/files").await;
+    assert_eq!(bearer(&uploads[0]), "Bearer oai.tok-1");
+    assert_eq!(bearer(&uploads[1]), "Bearer oai.tok-2");
+    let create = &requests_to(&server, "POST", "/batches").await[0];
+    assert_eq!(bearer(create), "Bearer oai.tok-2");
+}
+
+/// An exchange that fails at submission time fails the submission: it
+/// never falls back to the older cached token (a batch created with it
+/// would fail later, all of it, with `token_expired`). Ordinary calls
+/// still fall back to it.
+#[tokio::test]
+async fn a_failed_submission_exchange_does_not_fall_back_to_the_cached_token() {
+    let server = MockServer::start().await;
+    let file = crate::auth::tests::token_file("k8s.jwt");
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(crate::auth::tests::openai_token("oai.tok-1", 900))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    mount_federated_upload(&server).await;
+    mount_create(&server).await;
+    mount_in_progress(&server).await;
+    let (client, clock) = federated_client(
+        &server,
+        crate::auth::tests::kubernetes_config(&server, file.path()),
+    );
+    client.poll_batch("batch_1").await.unwrap();
+    clock.advance(std::time::Duration::from_secs(600));
+    let err = client
+        .create_batch(&requests(&client, 1), META)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, LlmCallError::CredentialUnavailable { .. }),
+        "{err}"
+    );
+    assert!(requests_to(&server, "POST", "/files").await.is_empty());
+    client.poll_batch("batch_1").await.unwrap();
+}
+
+/// `token_expired` result lines (either shape) are their own outcome,
+/// `auth_expired`: dropped like any failed request (the next sweep finds
+/// the incident again), never backed off as the text's fault.
+#[tokio::test]
+async fn token_expired_lines_are_auth_expired() {
+    let server = MockServer::start().await;
+    mount_get(
+        &server,
+        batch("completed", Some("file-out"), Some("file-err")),
+    )
+    .await;
+    mount_content(&server, "file-out", &[ok_line("p-0", &primary_text())]).await;
+    let mut as_response = serde_json::from_str::<Value>(&ok_line("p-2", "")).unwrap();
+    as_response["response"]["status_code"] = 401.into();
+    as_response["response"]["body"] = serde_json::json!({ "error": {
+        "type": "invalid_request_error", "code": "token_expired",
+        "message": "Provided authentication token is expired. Please try signing in again."
+    }});
+    mount_content(
+        &server,
+        "file-err",
+        &[error_line("p-1", "token_expired"), as_response.to_string()],
+    )
+    .await;
+    let done = ended(client(&server).poll_batch("batch_1").await.unwrap());
+    assert_eq!(done.results.outcomes["p-1"], BatchOutcome::AuthExpired);
+    assert_eq!(done.results.outcomes["p-2"], BatchOutcome::AuthExpired);
+    assert_eq!(BatchOutcome::AuthExpired.label(), "auth_expired");
+
+    let items = (0..3)
+        .map(|i| crate::batch::BatchItem {
+            index: i,
+            incident_id: format!("I{i}"),
+            text_hash: "h".into(),
+            summary: "s".into(),
+            description: "d".into(),
+            reference_date: reference_date(),
+            text_seen_at: None,
+            primary_content: None,
+        })
+        .collect();
+    let plan = crate::batch::plan_primary(items, done.results);
+    assert_eq!(plan.next.len(), 1);
+    let results: Vec<&str> = plan.records.iter().map(|r| r.result).collect();
+    assert_eq!(results, ["succeeded", "auth_expired", "auth_expired"]);
+    assert!(plan.text_failures.is_empty(), "not the text's fault");
+}
+
+/// A batch that `failed` with `token_expired` is `AuthExpired`, not a
+/// validation failure.
+#[tokio::test]
+async fn a_batch_failed_on_an_expired_token_is_auth_expired() {
+    let server = MockServer::start().await;
+    let mut failed = batch("failed", None, None);
+    failed["errors"] = serde_json::json!({ "object": "list", "data": [
+        { "code": "token_expired", "message": "Provided authentication token is expired." }
+    ]});
+    mount_get(&server, failed).await;
+    assert_eq!(
+        client(&server).poll_batch("batch_1").await.unwrap(),
+        BatchPoll::AuthExpired {
+            reason: "token_expired Provided authentication token is expired.".into(),
+            files: vec!["file-in".into()],
+        }
+    );
+}

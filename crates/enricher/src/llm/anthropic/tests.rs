@@ -693,7 +693,10 @@ async fn message_batch_lifecycle() {
 }
 
 /// Keyless Claude auth: the minted token goes out as `Authorization:
-/// Bearer`, with no `x-api-key`.
+/// Bearer`, with no `x-api-key`. A Message Batch is created with the
+/// cached token however much of its life is left (Claude batches belong to
+/// the workspace, not the credential): only `OpenAI` submissions mint a
+/// fresh one.
 #[tokio::test]
 async fn a_federated_token_is_a_bearer_with_no_api_key() {
     let server = MockServer::start().await;
@@ -720,23 +723,41 @@ async fn a_federated_token_is_a_bearer_with_no_api_key() {
         )
         .mount(&server)
         .await;
-    let source = crate::auth::FederatedTokenSource::new(crate::auth::FederationConfig {
-        target: crate::auth::ExchangeTarget::Anthropic {
-            federation_rule_id: "fdrl_1".into(),
-            organization_id: "org".into(),
-            service_account_id: "svac_1".into(),
-            workspace_id: None,
+    Mock::given(method("POST"))
+        .and(path("/messages/batches"))
+        .and(header("authorization", "Bearer sk-ant-oat01-minted"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msgbatch_1", "type": "message_batch", "processing_status": "in_progress",
+            "request_counts": { "processing": 1, "succeeded": 0, "errored": 0, "canceled": 0,
+                                "expired": 0 },
+            "ended_at": null, "created_at": "2026-10-09T10:00:00Z",
+            "expires_at": "2026-10-10T10:00:00Z", "cancel_initiated_at": null,
+            "results_url": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let clock = crate::auth::Clock::default();
+    let source = crate::auth::FederatedTokenSource::with_clock(
+        crate::auth::FederationConfig {
+            target: crate::auth::ExchangeTarget::Anthropic {
+                federation_rule_id: "fdrl_1".into(),
+                organization_id: "org".into(),
+                service_account_id: "svac_1".into(),
+                workspace_id: None,
+            },
+            identity_token_file: file.path().to_path_buf(),
+            token_exchange_url: format!("{}/v1/oauth/token", server.uri()),
+            authentik: Some(crate::auth::AuthentikConfig {
+                token_url: format!("{}/application/o/token/", server.uri()),
+                client_id: "ds-enricher-anthropic".into(),
+                scope: None,
+            }),
+            refresh_skew: std::time::Duration::from_secs(60),
+            exchange_timeout: std::time::Duration::from_secs(5),
         },
-        identity_token_file: file.path().to_path_buf(),
-        token_exchange_url: format!("{}/v1/oauth/token", server.uri()),
-        authentik: Some(crate::auth::AuthentikConfig {
-            token_url: format!("{}/application/o/token/", server.uri()),
-            client_id: "ds-enricher-anthropic".into(),
-            scope: None,
-        }),
-        refresh_skew: std::time::Duration::from_secs(60),
-        exchange_timeout: std::time::Duration::from_secs(5),
-    })
+        clock.clone(),
+    )
     .unwrap();
     let client = LlmClient::new(
         server.uri(),
@@ -759,6 +780,31 @@ async fn a_federated_token_is_a_bearer_with_no_api_key() {
         .collect();
     assert_eq!(messages.len(), 1);
     assert!(messages[0].headers.get("x-api-key").is_none());
+
+    // 50 minutes on (under 20% of the hour-long token left, before its
+    // refresh at 54 minutes): the batch still goes out with it.
+    clock.advance(std::time::Duration::from_secs(3000));
+    let requests = vec![BatchRequest {
+        custom_id: "p-0".into(),
+        params: serde_json::json!({ "model": "claude-haiku-5-5", "max_tokens": 1,
+                                    "messages": [] }),
+    }];
+    let meta = crate::llm::batch_api::BatchMeta {
+        stage: "primary",
+        model_version: "v",
+    };
+    assert_eq!(
+        client.create_batch(&requests, meta).await.unwrap().id,
+        "msgbatch_1"
+    );
+    let exchanges = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/oauth/token")
+        .count();
+    assert_eq!(exchanges, 1, "no fresh token for a Claude batch");
 }
 
 /// Profiles on the wire: the resolved sampling is sent or omitted per

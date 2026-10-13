@@ -611,6 +611,54 @@ async fn an_openai_batch_run_scores_like_the_sync_path() {
     );
 }
 
+/// `token_expired` lines (the 2026-10-13 run: a batch created with a token
+/// near its end) are `batch_auth_expired` failed calls, counted in their
+/// own column and called out in the report with what to do.
+#[tokio::test]
+async fn token_expired_requests_are_batch_auth_expired_in_the_report() {
+    let server = MockServer::start().await;
+    mount_openai_routes(&server).await;
+    mount_openai_batch(
+        &server,
+        "batch_file-p0",
+        0,
+        "completed",
+        &[openai_ok("p-0", &primary_text())],
+        &[openai_error("p-1", "token_expired")],
+    )
+    .await;
+    mount_openai_batch(
+        &server,
+        "batch_file-a1",
+        0,
+        "completed",
+        &[],
+        &[
+            openai_error("r-0", "token_expired"),
+            openai_error("s-0", "token_expired"),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = openai_client(&server);
+    let cases = cases(&["a", "b"]);
+    let run = run_batch(&client, &label("gpt-6-luna"), &cases, 1, &opts(dir.path()))
+        .await
+        .unwrap();
+    assert_eq!(run.records[1].calls[0].outcome, "batch_auth_expired");
+    assert_eq!(run.records[0].calls[1].outcome, "batch_auth_expired");
+    let auth_expired: Vec<usize> = run.meta.stages.iter().map(|s| s.auth_expired).collect();
+    assert_eq!(auth_expired, [1, 2]);
+    assert_eq!(run.meta.stages[1].missing, 0);
+    let md = run.meta.markdown();
+    assert!(md.contains("| Auth expired |"), "{md}");
+    assert!(
+        md.contains("batch_auth_expired: 3 request(s) did not run"),
+        "{md}"
+    );
+    assert!(md.contains("mode = \"sync\""), "{md}");
+}
+
 /// An `expired` batch's requests without any result line count as
 /// expired; a canceled one's as canceled; a line-less request of a
 /// completed batch as missing. None of them is dropped.

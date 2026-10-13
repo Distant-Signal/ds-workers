@@ -20,7 +20,11 @@
 //! batch's turnaround, and it carries its `batch_id`. A request that
 //! errored, expired, was canceled or has no result line is recorded as a
 //! failed call (`batch_errored`, `batch_expired`, `batch_canceled`,
-//! `batch_missing`; a transport failure in the scores), never dropped.
+//! `batch_auth_expired`, `batch_missing`; a transport failure in the
+//! scores), never dropped. `batch_auth_expired` is `OpenAI`'s
+//! `token_expired`: the token that created the batch had expired by the
+//! time `OpenAI` authorised it (keyless auth's tokens last ~900 s); the
+//! report calls it out, and sync mode avoids it.
 //! Unlike the sync pipeline, both adversarial passes are always sent
 //! together (the service's batch path does the same); the scoring checks
 //! the resolution pass first either way, so the outcome is the same.
@@ -384,6 +388,12 @@ fn call_record(pass: Pass, result: &RequestResult) -> CallRecord {
             "batch_canceled",
             "the batch was canceled before this request ran".to_string(),
         ),
+        Some(BatchOutcome::AuthExpired) => failed(
+            "batch_auth_expired",
+            "token_expired: the token that created the batch had expired when OpenAI authorised \
+             it; nothing ran"
+                .to_string(),
+        ),
         None => failed(
             "batch_missing",
             "the ended batch has no result for this request".to_string(),
@@ -493,6 +503,14 @@ fn take_results(batch: &mut SubmittedBatch, poll: BatchPoll) -> BatchResults {
             batch.summary = Some(format!("failed validation: {reason}"));
             batch.files.extend(files);
             lost("batch_validation_failed", reason)
+        }
+        BatchPoll::AuthExpired { reason, files } => {
+            batch.summary = Some(format!("failed, creator's token expired: {reason}"));
+            batch.files.extend(files);
+            BatchResults {
+                outcomes: HashMap::new(),
+                unanswered: Some(BatchOutcome::AuthExpired),
+            }
         }
         BatchPoll::Gone => {
             batch.summary = Some("gone (404)".to_string());
@@ -921,6 +939,9 @@ pub(crate) struct StageInfo {
     pub errored: usize,
     pub expired: usize,
     pub canceled: usize,
+    /// `OpenAI` `token_expired` (`batch_auth_expired`): the creator's token
+    /// had expired when the batch was authorised.
+    pub auth_expired: usize,
     /// No result line, or a batch-level loss (gone, results gone, failed
     /// validation).
     pub missing: usize,
@@ -991,6 +1012,7 @@ impl BatchRunMeta {
                     "batch_errored" => info.errored += 1,
                     "batch_expired" => info.expired += 1,
                     "batch_canceled" => info.canceled += 1,
+                    "batch_auth_expired" => info.auth_expired += 1,
                     other if other.starts_with("batch_") => info.missing += 1,
                     _ => info.unusable += 1,
                 }
@@ -1058,6 +1080,7 @@ impl BatchRunMeta {
                     s.errored.to_string(),
                     s.expired.to_string(),
                     s.canceled.to_string(),
+                    s.auth_expired.to_string(),
                     s.missing.to_string(),
                     format!(
                         "{} ({} cached, {} cache write)",
@@ -1078,6 +1101,7 @@ impl BatchRunMeta {
                 "Errored",
                 "Expired",
                 "Canceled",
+                "Auth expired",
                 "Missing",
                 "Prompt tokens",
                 "Completion tokens",
@@ -1086,9 +1110,23 @@ impl BatchRunMeta {
         ));
         md.push_str(
             "\nA batch call's latency is its batch's turnaround (submitted to seen ended, at the \
-             poll interval's resolution), not a request's own time. Errored, expired, canceled and \
-             missing requests are failed calls (transport failures in the scores).\n",
+             poll interval's resolution), not a request's own time. Errored, expired, canceled, \
+             auth-expired and missing requests are failed calls (transport failures in the \
+             scores).\n",
         );
+        let auth_expired: usize = self.stages.iter().map(|s| s.auth_expired).sum();
+        if auth_expired > 0 {
+            let _ = writeln!(
+                md,
+                "\n**batch_auth_expired: {auth_expired} request(s) did not run** because the token \
+                 that created their batch had expired when {} authorised it (`token_expired`). \
+                 Keyless (WIF) tokens last about 900 s and the batch is checked after it is \
+                 created, so a long queue can outlive the token. These are not model failures: \
+                 re-run the target with `mode = \"sync\"` (or `EVAL_BATCH_RETRY_SYNC=1`), or \
+                 resume it later (docs/enricher-model-eval.md, \"Batch mode\").",
+                self.provider
+            );
+        }
         md
     }
 }
