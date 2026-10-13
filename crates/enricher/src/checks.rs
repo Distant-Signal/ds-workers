@@ -15,7 +15,8 @@
 //!   mistake, a stale time. When the extraction has exactly one ETA-shaped
 //!   period it is corrected to the one stated end time, or, with no single
 //!   unambiguous one, its end time is dropped; with several ETA-shaped
-//!   periods (a phased notice) it is only flagged.
+//!   periods (a phased notice), or a time placed only by a bare weekday,
+//!   it is only flagged.
 //!
 //! The third check, that an adversarial pass's verdicts echo the primary
 //! periods, is `combine::echo_mismatch` (and the retry around it).
@@ -79,7 +80,8 @@ pub(crate) enum EndTimeAction {
     Corrected,
     /// No single stated end time: `to_date` cleared.
     Dropped,
-    /// Several ETA-shaped periods: left as it was, only reported.
+    /// Several ETA-shaped periods, or a time placed only by a bare
+    /// weekday: left as it was, only reported.
     Flagged,
 }
 
@@ -248,6 +250,21 @@ pub(crate) struct StatedTimes {
     /// Other "until HH:MM" times ("revised until 15:30 today"): accepted
     /// as a period's end, never used as a correction.
     pub other: Vec<DateTime<Utc>>,
+    /// Some ETA's day came from a bare weekday ("until 18:00 on Sunday"),
+    /// read as the next one; a notice published a week or more ahead
+    /// means a later one, so such a check only flags.
+    pub uncertain: bool,
+}
+
+/// How the day of a stated time was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Day {
+    /// No day named: the reference day (rolled forward when long past).
+    Reference,
+    /// "today", "tomorrow" or a date.
+    Named,
+    /// A bare weekday: its next occurrence.
+    Weekday,
 }
 
 /// The end times `text` (HTML or plain) states, resolved against
@@ -262,8 +279,9 @@ pub(crate) fn stated_end_times(text: &str, reference: DateTime<Utc>) -> StatedTi
             if let Some(whole) = caps.get(0) {
                 eta_spans.push(whole.range());
             }
-            if let Some(at) = place_clock_time(&caps, reference_local) {
+            if let Some((at, day)) = place_clock_time(&caps, reference_local) {
                 push_unique(&mut stated.eta, at);
+                stated.uncertain |= day == Day::Weekday;
             }
         }
     }
@@ -272,7 +290,8 @@ pub(crate) fn stated_end_times(text: &str, reference: DateTime<Utc>) -> StatedTi
             eta_spans.push(whole.range());
         }
         let after = caps.name("after").map_or("", |m| m.as_str());
-        let (day, _) = resolve_day(after, reference_local);
+        let (day, kind) = resolve_day(after, reference_local);
+        stated.uncertain |= kind == Day::Weekday;
         if let Some(at) = day
             .succ_opt()
             .and_then(|next| london_to_utc(next.and_hms_opt(0, 0, 0)?))
@@ -285,7 +304,7 @@ pub(crate) fn stated_end_times(text: &str, reference: DateTime<Utc>) -> StatedTi
         if eta_spans.iter().any(|span| span.contains(&whole.start())) {
             continue;
         }
-        if let Some(at) = place_clock_time(&caps, reference_local)
+        if let Some((at, _)) = place_clock_time(&caps, reference_local)
             && !stated.eta.contains(&at)
         {
             push_unique(&mut stated.other, at);
@@ -300,11 +319,11 @@ fn push_unique(times: &mut Vec<DateTime<Utc>>, at: DateTime<Utc>) {
     }
 }
 
-/// An `hh`/`mm`/`after` capture as a UTC instant.
+/// An `hh`/`mm`/`after` capture as a UTC instant, and how its day was found.
 fn place_clock_time(
     caps: &regex::Captures<'_>,
     reference_local: NaiveDateTime,
-) -> Option<DateTime<Utc>> {
+) -> Option<(DateTime<Utc>, Day)> {
     let mut hour: u32 = caps.name("hh")?.as_str().parse().ok()?;
     match caps.name("ampm").map(|m| m.as_str()) {
         Some("pm") if hour < 12 => hour += 12,
@@ -313,27 +332,26 @@ fn place_clock_time(
     }
     let minute: u32 = caps.name("mm")?.as_str().parse().ok()?;
     let after = caps.name("after").map_or("", |m| m.as_str());
-    let (day, explicit) = resolve_day(after, reference_local);
+    let (day, kind) = resolve_day(after, reference_local);
     let mut local = day.and_hms_opt(hour, minute, 0)?;
-    if !explicit && local < reference_local - ROLL_FORWARD_AFTER {
+    if kind == Day::Reference && local < reference_local - ROLL_FORWARD_AFTER {
         local += Duration::days(1);
     }
-    london_to_utc(local)
+    Some((london_to_utc(local)?, kind))
 }
 
 /// The day the words after a stated time name ("tomorrow", "on Saturday
-/// 19 September", "Tuesday"), and whether they named one; else the
-/// reference day.
-fn resolve_day(after: &str, reference_local: NaiveDateTime) -> (NaiveDate, bool) {
+/// 19 September", "Tuesday"), and how; else the reference day.
+fn resolve_day(after: &str, reference_local: NaiveDateTime) -> (NaiveDate, Day) {
     let today = reference_local.date();
     let Some(caps) = PATTERNS.day_words.captures(after) else {
-        return (today, false);
+        return (today, Day::Reference);
     };
     if caps.name("tomorrow").is_some() {
-        return (today + Duration::days(1), true);
+        return (today + Duration::days(1), Day::Named);
     }
     if caps.name("today").is_some() {
-        return (today, true);
+        return (today, Day::Named);
     }
     if let (Some(dom), Some(month)) = (caps.name("dom"), caps.name("month")) {
         let dom: u32 = dom.as_str().parse().unwrap_or(0);
@@ -349,7 +367,7 @@ fn resolve_day(after: &str, reference_local: NaiveDateTime) -> (NaiveDate, bool)
             .filter_map(|year| NaiveDate::from_ymd_opt(year, month, dom))
             .min_by_key(|date| (*date - today).num_days().abs());
         if let Some(date) = closest {
-            return (date, true);
+            return (date, Day::Named);
         }
     }
     if let Some(weekday) = caps.name("weekday") {
@@ -361,10 +379,10 @@ fn resolve_day(after: &str, reference_local: NaiveDateTime) -> (NaiveDate, bool)
         let ahead = (index + 7 - from) % 7;
         return (
             today + Duration::days(i64::try_from(ahead).unwrap_or(0)),
-            true,
+            Day::Weekday,
         );
     }
-    (today, false)
+    (today, Day::Reference)
 }
 
 const WEEKDAYS: [&str; 7] = [
@@ -410,11 +428,12 @@ fn check_end_times(text: &CheckText<'_>, periods: &mut [ExtractionPeriod]) -> Ve
     // The summary is the headline the operator updates with each new
     // estimate; a different "expected until" left in the description is
     // usually the previous one. So the summary's ETA wins when it has one.
-    let eta = if summary.eta.is_empty() {
-        description.eta.clone()
+    let source = if summary.eta.is_empty() {
+        &description
     } else {
-        summary.eta.clone()
+        &summary
     };
+    let (eta, uncertain) = (source.eta.clone(), source.uncertain);
     if eta.is_empty() {
         return Vec::new();
     }
@@ -447,7 +466,7 @@ fn check_end_times(text: &CheckText<'_>, periods: &mut [ExtractionPeriod]) -> Ve
         {
             continue;
         }
-        let action = if eta_shaped.len() > 1 {
+        let action = if eta_shaped.len() > 1 || uncertain {
             EndTimeAction::Flagged
         } else if let Some(at) = correction {
             range.to_date = Some(at);

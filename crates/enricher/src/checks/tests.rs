@@ -258,6 +258,20 @@ fn a_named_day_or_date_places_the_time() {
     assert_eq!(times.eta, vec![at("2026-09-10T20:30:00Z")]);
 }
 
+/// A time placed only by a bare weekday may mean a later week: flag only.
+#[test]
+fn a_bare_weekday_only_flags() {
+    let (report, kept) = check_one(
+        "No service between Avonmere and Bexcombe",
+        "<p>No trains will run until approximately 18:00 on Sunday.</p>",
+        "2026-09-07T14:30:00Z",
+        "2026-09-20T17:00:00Z",
+    );
+    assert_eq!(report.end_times.len(), 1, "{report:?}");
+    assert_eq!(report.end_times[0].action, EndTimeAction::Flagged);
+    assert_eq!(to_date(&kept), Some(at("2026-09-20T17:00:00Z")));
+}
+
 /// A stale "expected until" left in the description loses to the
 /// summary's: the period on the description's time is corrected.
 #[test]
