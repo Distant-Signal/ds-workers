@@ -473,6 +473,7 @@ mod tests {
             reference_date: Utc::now(),
             extracted_category: Some("signal_failure".to_string()),
             extracted_periods: periods,
+            is_cleared: false,
         }
     }
 

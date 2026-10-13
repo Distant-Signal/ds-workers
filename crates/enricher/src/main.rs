@@ -810,6 +810,13 @@ async fn preflight(enricher: &Enricher, incident_id: &str, path: latency::Path) 
             return Preflight::Done(false);
         }
     };
+    // A cleared incident is never extracted (2026-10-12; see
+    // `IncidentState::is_cleared`): acknowledged, never deferred to a batch,
+    // never backed off. The reopen publish brings it back if RDM uncleared it.
+    if state.is_cleared {
+        tracing::info!(incident_id, "incident is cleared; skipping extraction");
+        return Preflight::Done(true);
+    }
     let text_hash = common::text_hash::text_hash(&state.summary, &state.description);
     // Churn measurement baseline (instrumentation only -- see `churn`'s
     // module doc): `Some` only for a text-change re-run under the current
@@ -2135,6 +2142,77 @@ mod tests {
     }
 
     // -- Batch-only mode --
+
+    /// With a real DB (2026-10-12): a cleared incident is acknowledged with
+    /// no LLM call on every path, deferring modes included, and is left
+    /// unextracted; once reopened, the same entry is extracted.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher cleared -- --ignored --test-threads=1`"]
+    async fn a_cleared_incident_is_acked_without_extraction_until_it_reopens() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-CLEARED";
+        seed_incident(
+            &pool,
+            incident_id,
+            "CLEARED: Disruption between Woking and Guildford",
+            "Disruption between Woking and Guildford has now ended.",
+        )
+        .await;
+        sqlx::query("UPDATE incidents SET is_cleared = true WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(&pool)
+            .await
+            .expect("clear the fixture");
+        let server = MockServer::start().await;
+        mount_flat_extraction(&server).await;
+        let model_version = "test-model@periods-v2";
+
+        let normal = test_enricher(pool.clone(), &server, model_version, false);
+        assert!(matches!(
+            preflight(&normal, incident_id, latency::Path::Stream).await,
+            Preflight::Done(true)
+        ));
+        assert!(process_incident(&normal, incident_id, latency::Path::Stream).await);
+        assert!(process_incident(&normal, incident_id, latency::Path::Reclaim).await);
+        for mode in [config::LlmMode::Batch, config::LlmMode::BatchOnly] {
+            let deferring = batch_mode_enricher(pool.clone(), &server, model_version, mode);
+            assert!(deferring.defers_stream());
+            assert!(
+                process_stream_entry(&deferring, "1-0", incident_id).await,
+                "{mode:?}: acked, not deferred"
+            );
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no LLM call for a cleared incident"
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT source_text_hash FROM incidents WHERE incident_id = $1")
+                .bind(incident_id)
+                .fetch_one(&pool)
+                .await
+                .expect("hash");
+        assert_eq!(stored, None, "nothing written for the cleared text");
+
+        sqlx::query("UPDATE incidents SET is_cleared = false WHERE incident_id = $1")
+            .bind(incident_id)
+            .execute(&pool)
+            .await
+            .expect("reopen the fixture");
+        assert!(process_incident(&normal, incident_id, latency::Path::Stream).await);
+        assert!(
+            !server.received_requests().await.unwrap().is_empty(),
+            "the reopened incident is extracted"
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT source_text_hash FROM incidents WHERE incident_id = $1")
+                .bind(incident_id)
+                .fetch_one(&pool)
+                .await
+                .expect("hash");
+        assert!(stored.is_some(), "the extraction was written");
+        cleanup_incident(&pool, incident_id).await;
+    }
 
     fn batch_mode_enricher(
         pool: PgPool,

@@ -32,6 +32,13 @@ pub(crate) struct IncidentState {
     /// that no longer deserializes can never fail this fetch.
     pub extracted_category: Option<String>,
     pub extracted_periods: Option<serde_json::Value>,
+    /// RDM's `ClearedIncident` flag. A cleared incident is never extracted
+    /// (2026-10-12): its text is the clearing notice ("... has now ended"),
+    /// the aggregator ignores cleared incidents, and a reopen (cleared to
+    /// uncleared) is published to `incident-text-changed` by the snapshot
+    /// writers (`ds_store::incidents::reopened`), so the live text is
+    /// extracted then.
+    pub is_cleared: bool,
 }
 
 /// Fetches the extractable prose for one incident, plus what it was last
@@ -47,6 +54,7 @@ type IncidentStateRow = (
     DateTime<Utc>,
     Option<String>,
     Option<serde_json::Value>,
+    bool,
 );
 
 pub(crate) async fn fetch_incident_state(
@@ -70,7 +78,7 @@ pub(crate) async fn fetch_incident_state(
                                     IS DISTINCT FROM (i.summary, i.description)), \
                             '-infinity'::timestamptz)), \
                     i.first_seen_at) AS reference_date, \
-                i.extracted_category, i.extracted_periods \
+                i.extracted_category, i.extracted_periods, i.is_cleared \
          FROM incidents i WHERE i.incident_id = $1",
     )
     .bind(incident_id)
@@ -85,6 +93,7 @@ pub(crate) async fn fetch_incident_state(
             reference_date,
             extracted_category,
             extracted_periods,
+            is_cleared,
         )| IncidentState {
             summary,
             description,
@@ -93,6 +102,7 @@ pub(crate) async fn fetch_incident_state(
             reference_date,
             extracted_category,
             extracted_periods,
+            is_cleared,
         },
     ))
 }
