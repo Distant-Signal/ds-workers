@@ -42,8 +42,8 @@ pub(crate) const ENDPOINT: &str = "/v1/chat/completions";
 pub(crate) const FILE_TTL_SECS: u64 = 2 * 24 * 3600;
 
 /// The API's per-batch limits: 50,000 requests, a 200 MB input file.
-const MAX_REQUESTS: usize = 50_000;
-const MAX_INPUT_BYTES: usize = 200 * 1024 * 1024;
+pub(crate) const MAX_REQUESTS: usize = 50_000;
+pub(crate) const MAX_INPUT_BYTES: usize = 200 * 1024 * 1024;
 
 /// Longest metadata value the API accepts.
 const MAX_METADATA_CHARS: usize = 512;

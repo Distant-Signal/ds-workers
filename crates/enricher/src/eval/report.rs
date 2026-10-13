@@ -4,7 +4,58 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
+use crate::eval::batch::BatchRunMeta;
+use crate::eval::cost::CostEstimate;
+use crate::eval::pipeline::PipelineRecord;
 use crate::eval::target::Target;
+
+/// How a run's records were produced, and what they cost.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct RunInfo {
+    /// `batch` or `sync` (a re-score: `batch` if any call ran in a batch).
+    pub mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchRunMeta>,
+    pub cost: Option<CostEstimate>,
+}
+
+impl Default for RunInfo {
+    fn default() -> Self {
+        Self {
+            mode: "sync",
+            batch: None,
+            cost: None,
+        }
+    }
+}
+
+impl RunInfo {
+    /// `batch` if any of `records`' calls ran in a provider batch.
+    pub(crate) fn mode_of(records: &[PipelineRecord]) -> &'static str {
+        if records
+            .iter()
+            .flat_map(|r| &r.calls)
+            .any(|c| c.batch_id.is_some())
+        {
+            "batch"
+        } else {
+            "sync"
+        }
+    }
+
+    /// The mode and cost bullet lines.
+    pub(crate) fn lines(&self, md: &mut String) {
+        let _ = writeln!(md, "- Mode: {}", self.mode);
+        md.push_str(&crate::eval::cost::markdown_line(self.cost.as_ref()));
+    }
+
+    /// The "Batch" section, in batch mode.
+    pub(crate) fn batch_section(&self, md: &mut String) {
+        if let Some(batch) = &self.batch {
+            md.push_str(&batch.markdown());
+        }
+    }
+}
 
 /// Who/where a report is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

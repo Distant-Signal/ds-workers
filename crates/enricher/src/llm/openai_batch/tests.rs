@@ -321,7 +321,7 @@ async fn full_lifecycle_with_out_of_order_lines_and_cleanup() {
     assert_eq!(done.results.unanswered, None);
     let outcomes = &done.results.outcomes;
     assert_eq!(outcomes.len(), 3);
-    let BatchOutcome::Succeeded { usage, content } = &outcomes["p-0"] else {
+    let BatchOutcome::Succeeded { usage, content, .. } = &outcomes["p-0"] else {
         panic!("{outcomes:?}")
     };
     assert_eq!(content.as_deref(), Ok(primary_text().as_str()));

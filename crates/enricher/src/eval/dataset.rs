@@ -63,6 +63,25 @@ pub(crate) struct Case {
 }
 
 impl Case {
+    /// An unlabelled case from bare incident text (the churn replay's
+    /// version pairs, `replay_eval`).
+    pub(crate) fn unlabelled(
+        id: String,
+        summary: String,
+        description: String,
+        reference_date: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            summary,
+            description,
+            reference_date,
+            tags: Vec::new(),
+            notes: None,
+            expected: None,
+        }
+    }
+
     /// A short hash of exactly what the model is sent from this case
     /// (`summary`, `description`, `reference_date`), stored on every
     /// record. A replay skips a record whose hash no longer matches: the

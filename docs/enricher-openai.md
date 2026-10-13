@@ -762,6 +762,12 @@ enricher in its own project.
   upload is refused with 403 (`submit_failed`, DistantSignalEnricherBatchFailing),
   and nothing else breaks.
 
+The model-eval harness runs in batch mode by default
+([enricher-model-eval.md, "Batch mode"](enricher-model-eval.md#batch-mode)),
+so the key or service account an eval target uses needs `api.batch.write`
+too. Without it, the eval stops with an error naming the permission and
+the `mode = "sync"` opt-in.
+
 ### Retention
 
 Batch input and output files are **not covered by zero data retention**

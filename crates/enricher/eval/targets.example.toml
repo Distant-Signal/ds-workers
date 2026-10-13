@@ -36,6 +36,23 @@
 #   prompts_dir           LLM_PROMPTS_DIR: prompt overrides, <profile>.<call>.txt
 #                         or <call>.txt (call: primary, adversarial,
 #                         severity_adversarial); relative to the workspace root
+#   mode                  "batch" (default) or "sync". Batch sends the whole
+#                         record set through the provider's batch API (Claude
+#                         Message Batches, OpenAI Batch API) at half price;
+#                         results are scored exactly like sync ones. Sync makes
+#                         one call at a time, like the service's stream loop:
+#                         use it for endpoints without a batch API (Ollama,
+#                         vLLM, most hosted OpenAI-compatible gateways), for a
+#                         quick small run, or to benchmark the synchronous
+#                         path's latency. EVAL_MODE=sync|batch overrides it
+#                         for a run. A batch target whose endpoint has no batch
+#                         API, or whose credential lacks batch permission
+#                         (OpenAI: api.batch.write), fails with an error naming
+#                         this key; it never falls back to sync on its own.
+#   [targets.pricing]     input, output, cache_read, cache_write: synchronous
+#                         USD per million tokens for the cost estimate (built
+#                         in for the Claude API's and OpenAI's models below;
+#                         batch calls are priced at 50% either way)
 #
 # A target is resolved exactly like the service (src/profile.rs), so a
 # setting a model is known to reject fails before any call.
@@ -73,12 +90,15 @@ name = "ollama-gpu-gemma3-12b"
 environment = "Self-hosted Ollama, single consumer GPU, reached over Tailscale"
 base_url = "http://ollama.example.internal:11434/v1"
 model = "gemma3:12b"
+# Ollama has no batch API.
+mode = "sync"
 
 [[targets]]
 name = "ollama-cpu-gemma3-4b"
 environment = "Developer laptop, CPU only (Ollama)"
 base_url = "http://localhost:11434/v1"
 model = "gemma3:4b"
+mode = "sync"
 # A CPU box is slow; match the timeout you would deploy with.
 request_timeout_secs = 600
 
@@ -88,6 +108,8 @@ environment = "Hosted OpenAI-compatible API (gateway cuts requests at ~302 s)"
 base_url = "https://integrate.api.nvidia.com/v1"
 model = "z-ai/glm-5.3"
 api_key_env = "NVIDIA_API_KEY"
+# No batch API on this gateway.
+mode = "sync"
 request_timeout_secs = 320
 max_tokens = 8192
 reasoning_effort = "low"
@@ -108,6 +130,24 @@ request_timeout_secs = 120
 max_in_flight = 3
 rate_limit_retries = 3
 gateway_retries = 1
+# Batch (the default, spelled out): the OpenAI Batch API at half price. The
+# key (or the keyless mode's service account) needs api.batch.write.
+mode = "batch"
+
+# The same model through synchronous calls, for the perf benchmark of the
+# service's own path (or an account without batch access).
+[[targets]]
+name = "openai-gpt-6-luna-none-sync"
+environment = "OpenAI platform (api.openai.com, US processing), Tier 1; see docs/enricher-openai.md"
+base_url = "https://api.openai.com/v1"
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+reasoning_effort = "none"
+request_timeout_secs = 120
+max_in_flight = 3
+rate_limit_retries = 3
+gateway_retries = 1
+mode = "sync"
 
 # The Claude API (docs/enricher-anthropic.md). Haiku 5.5 is the service's
 # default model for LLM_PROVIDER=anthropic; Sonnet 5.5 is the quality
@@ -125,6 +165,22 @@ request_timeout_secs = 120
 max_in_flight = 3
 rate_limit_retries = 3
 gateway_retries = 2
+# Batch (the default, spelled out): Message Batches at half price; the 1-hour
+# prompt cache applies inside batches too.
+mode = "batch"
+
+[[targets]]
+name = "anthropic-claude-haiku-5-5-sync"
+environment = "Claude API (api.anthropic.com), standard tier; see docs/enricher-anthropic.md"
+provider = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+model = "claude-haiku-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+request_timeout_secs = 120
+max_in_flight = 3
+rate_limit_retries = 3
+gateway_retries = 2
+mode = "sync"
 
 [[targets]]
 name = "anthropic-claude-sonnet-5-5"

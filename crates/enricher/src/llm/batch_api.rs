@@ -53,6 +53,11 @@ pub(crate) enum BatchOutcome {
     Succeeded {
         usage: Option<TokenUsage>,
         content: Result<String, String>,
+        /// The synchronous path's `enricher_llm_call_total` outcome label
+        /// for the same response: `success`, or the unusable text's
+        /// (`refused`, `empty_content`, `error`). The model-eval harness
+        /// records it like a synchronous call's.
+        label: &'static str,
     },
     /// No completion was produced (an invalid request or a server error).
     /// `kind` is the error's type or code.
@@ -81,9 +86,13 @@ impl BatchOutcome {
     pub(crate) fn succeeded(
         (usage, content): (Option<TokenUsage>, Result<String, LlmCallError>),
     ) -> Self {
+        let label = content
+            .as_ref()
+            .map_or_else(LlmCallError::outcome_label, |_| "success");
         Self::Succeeded {
             usage,
             content: content.map_err(|err| err.to_string()),
+            label,
         }
     }
 }

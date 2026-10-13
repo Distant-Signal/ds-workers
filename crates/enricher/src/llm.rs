@@ -1398,6 +1398,18 @@ impl LlmClient {
     }
 
     /// The system prompts in use.
+    /// `LLM_BASE_URL` (the model-eval harness names it in errors).
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// `LLM_MODEL`.
+    #[cfg(test)]
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
     pub(crate) fn prompts(&self) -> &crate::profile::PromptSet {
         &self.prompts
     }

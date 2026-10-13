@@ -665,7 +665,7 @@ async fn message_batch_lifecycle() {
         .await
         .unwrap();
     assert_eq!(outcomes["p-1"], BatchOutcome::Expired);
-    let BatchOutcome::Succeeded { content, usage } = &outcomes["p-0"] else {
+    let BatchOutcome::Succeeded { content, usage, .. } = &outcomes["p-0"] else {
         panic!("{outcomes:?}")
     };
     assert_eq!(content.as_deref(), Ok(primary_text().as_str()));

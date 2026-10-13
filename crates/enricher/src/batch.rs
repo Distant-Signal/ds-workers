@@ -340,7 +340,7 @@ fn take_output(
         });
         return Err(None);
     };
-    let BatchOutcome::Succeeded { usage, content } = outcome else {
+    let BatchOutcome::Succeeded { usage, content, .. } = outcome else {
         if let BatchOutcome::Errored { kind, message } = &outcome {
             tracing::warn!(
                 call = call.label(),

@@ -21,6 +21,15 @@ apart:
 Run quality once per model (on any host that can serve it, however slowly),
 and perf once per model *per environment* you might deploy to.
 
+**Batch is the default.** Every run sends its whole record set through the
+provider's batch API (Claude Message Batches or the OpenAI Batch API) unless
+a target sets `mode = "sync"` or the run sets `EVAL_MODE=sync`. Batches cost
+half as much, and the records they produce are scored by exactly the same
+code as synchronous ones: same requests, same parsers, same
+`combine_periods`. Only the transport differs. Endpoints without a batch
+API (Ollama, vLLM, most OpenAI-compatible gateways) need `mode = "sync"`;
+see [Batch mode](#batch-mode).
+
 For OpenAI's own API (`gpt-6-luna` at reasoning effort `none`), see
 [Using the OpenAI API](enricher-openai.md): settings, schema strictness,
 cost, data handling and the checklist to complete before switching
@@ -52,14 +61,19 @@ Code: `crates/enricher/src/eval/`. It is test-only, like the existing
   outcome, time queued for a `max_in_flight` permit, send time, and any 429
   or 502/503/504 back-off slept after it). When the provider reports token
   usage, each call also keeps it (`usage`: `prompt_tokens`,
-  `completion_tokens`, and OpenAI's `reasoning_tokens` and
-  `cached_tokens`). Providers that send none simply have no `usage`.
+  `completion_tokens`, `cached_tokens` and `cache_write_tokens`, and
+  OpenAI's `reasoning_tokens`). Providers that send none simply have no
+  `usage`. A call made in a provider batch also names that batch
+  (`batch_id`).
 - What the service would have written is derived from a record by
   replaying it through the same parsers. Quality scoring is a pure function
   of records, so saved records can be re-scored without the model.
 - `quality.rs` scores records against gold labels. `perf.rs` computes
   latency, outcome and throughput statistics. The two share only the
   pipeline, the dataset loader and the target config.
+- `batch.rs` produces the same records through the providers' batch APIs
+  ([Batch mode](#batch-mode)). `cost.rs` prices every run's token usage
+  ([Cost estimate](#cost-estimate)).
 
 ## Quick start
 
@@ -110,6 +124,11 @@ the deployment as it would really run.
   `quality_timeout_secs` (default 1800) is used by the quality eval. For
   the env-var target, set it with `EVAL_QUALITY_TIMEOUT_SECS`.
 - `EVAL_TARGET=a,b`: runs only the named targets.
+- `mode`: `batch` (the default) or `sync`. `EVAL_MODE` overrides it for a
+  run. See [Batch mode](#batch-mode).
+- `[targets.pricing]`: `input`, `output`, `cache_read` and `cache_write`
+  in USD per million tokens, for the [cost estimate](#cost-estimate) of a
+  model the harness has no built-in price for.
 
 ## Running the quality eval
 
@@ -118,7 +137,7 @@ the deployment as it would really run.
 | `EVAL_DATASET` | `crates/enricher/eval/dataset.jsonl` | Dataset to use |
 | `EVAL_CASES` | all | Comma-separated case ids |
 | `EVAL_REPEATS` | 1 | Repetitions per case. Use 3 or more to measure consistency (the service sends `temperature: 0`, but many backends are still non-deterministic) |
-| `EVAL_CONCURRENCY` | 1 | Documents in flight at once. Only for speed: quality doesn't depend on it |
+| `EVAL_CONCURRENCY` | 1 | Sync mode: documents in flight at once. Only for speed: quality doesn't depend on it |
 | `EVAL_DATE_TOLERANCE_MINS` | 0 | Treat predicted and gold instants this close as equal |
 | `EVAL_OUT_DIR` | `target/enricher-eval` | Report root |
 | `EVAL_QUALITY_TIMEOUT_SECS` | 1800 | Request timeout of the env-var target (no `EVAL_TARGETS`); a targets file uses `quality_timeout_secs` |
@@ -127,7 +146,9 @@ the deployment as it would really run.
 
 Only labelled cases are run. Per target, the run writes
 `<target>.records.jsonl`, `<target>.json` and `<target>.md`, plus a
-`comparison.md` with one row per target.
+`comparison.md` with one row per target. A batch run also keeps
+`<target>.batch-state.json` ([Resume](#resume)). Each report names the
+mode and gives the [cost estimate](#cost-estimate).
 
 **Offline re-scoring** (`replay_quality_score`) groups the records by the
 target and model named on each line, and scores them against the
@@ -178,8 +199,15 @@ legitimate, but they measure the old prompts, not the current ones.
 | --- | --- | --- |
 | `EVAL_PERF_REPEATS` | 3 | Repetitions per case (more gives steadier percentiles) |
 | `EVAL_PERF_CONCURRENCY` | 1 | Documents in flight at once |
-| `EVAL_PERF_WARMUP` | 1 | Untimed runs of the first case first, so a cold model load doesn't skew the numbers |
+| `EVAL_PERF_WARMUP` | 1 | Sync mode: untimed runs of the first case first, so a cold model load doesn't skew the numbers |
 | `EVAL_DATASET`, `EVAL_CASES`, `EVAL_OUT_DIR` | as above | Cases do not need labels here |
+
+The benchmark follows the target's mode too. In batch mode it measures the
+batch path: each call's latency is its batch's turnaround, and concurrency,
+warm-up and the timeout fit don't apply ([Latency](#latency)). To benchmark
+the service's synchronous path against `LLM_REQUEST_TIMEOUT_SECS`, run a
+`mode = "sync"` target (the example file has `openai-gpt-6-luna-none-sync`
+and `anthropic-claude-haiku-5-5-sync`) or set `EVAL_MODE=sync`.
 
 Choose the concurrency to match the deployment. The service's stream loop
 processes one incident at a time (concurrency 1). The synchronous sweep
@@ -202,6 +230,229 @@ its output can't be parsed, the adversarial passes are never sent. A model
 that often produces invalid primary output therefore makes fewer calls per
 document; the report keeps invalid outputs apart from transport failures
 so this doesn't read as an environment problem.
+
+## Batch mode
+
+Batch mode is the default for every target (`mode = "batch"`) and for the
+churn replay (`replay_eval::replay_live_pairs`, `REPLAY_MODE`). Code:
+`crates/enricher/src/eval/batch.rs`.
+
+Why it's the default:
+
+- **Half the price.** Both batch APIs bill every token at 50% of the
+  synchronous price, cache reads and writes included.
+- **Same processing.** Each request body comes from the synchronous path's
+  own builder (`LlmClient::batch_params`: profile, sampling, schema,
+  prompts, and the `prompt_cache` / `openai_prompt_cache` settings). The
+  results go through the same parsers, and the records are scored by the
+  same `PipelineRecord::outcome`. A batch record and a sync record of the
+  same model output score identically
+  (`batch_and_sync_records_score_identically`).
+- **It measures the batch path itself.** The service runs it under
+  `LLM_SWEEP_MODE=batch` and `LLM_MODE=batch` / `batch-only`.
+- **Large evals** go through in one or a few batches, with no rate limits
+  to tune.
+
+Use `mode = "sync"` on a target, or `EVAL_MODE=sync` for a whole run, for
+an endpoint without a batch API, a quick run of a few cases, or a perf
+benchmark of the synchronous path.
+
+```sh
+# Everything synchronously, e.g. a quick check of two cases:
+EVAL_MODE=sync EVAL_CASES=flat-eta-signal-failure,resolved-points-failure EVAL_TARGETS=crates/enricher/eval/targets.toml \
+  cargo test -p enricher --bin enricher eval::quality::live_eval_quality -- --ignored --nocapture
+```
+
+### How it runs
+
+It uses the same two stages as the service's batch mode
+([enricher-anthropic.md, "Batch mode"](enricher-anthropic.md#batch-mode)):
+
+1. **Primary.** One request per (case, repetition), with custom id
+   `p-<n>`, all submitted at once.
+2. **Poll** every `EVAL_BATCH_POLL_SECS` until every batch of the stage has
+   ended.
+3. **Adversarial.** Each record whose primary output parsed gets its two
+   adversarial requests (`r-<n>`, `s-<n>`), built from the parsed periods
+   and submitted. Then poll again.
+4. **Records.** Results are matched by custom id, never by position (they
+   come back in any order). Each record is built as the sync pipeline
+   would build it, then scored as usual.
+
+Both adversarial passes are always sent together, as in the service's
+batch path. The sync pipeline skips the severity pass when the resolution
+pass fails to parse. Scores come out the same either way, because scoring
+checks the resolution pass first; only the token usage differs.
+
+**Limits.** A stage is split into as many batches as the provider needs.
+Claude takes 100,000 requests or 256 MB per batch. OpenAI takes 50,000
+requests or a 200 MB input file, with one model per file. Splitting also
+starts a new batch when the model changes, though a target only has one
+model. `EVAL_BATCH_MAX_REQUESTS` lowers the request cap.
+
+**Failures are kept.** A request that errored, expired (the 24-hour
+window), was canceled or has no result line is recorded as a failed call:
+`batch_errored`, `batch_expired`, `batch_canceled` or `batch_missing`. A
+batch the API lost, whose results are gone, or that failed input
+validation gives `batch_gone`, `batch_results_gone` or
+`batch_validation_failed`. All of these count as transport failures in the
+quality report, like a sync timeout, and none is dropped. An answer the
+model gave that can't be used keeps the sync label (`refused`,
+`empty_content`) and counts as invalid output.
+
+With `EVAL_BATCH_RETRY_SYNC=1`, every record a batch failed is re-run
+synchronously at the end. A failed primary call re-runs the whole pipeline;
+otherwise only the failed adversarial calls are re-run. The report counts
+these re-runs (`retried_in_sync`), and the batch stage's own counts still
+show the failures.
+
+**No batch API, no permission: an error, never a fallback.** If the
+endpoint has no batch API (HTTP 404, 405 or 501 on submit), or the
+credential is refused (401 or 403), the run stops with an error that says
+so and names `mode = "sync"` / `EVAL_MODE=sync`. It never switches to
+synchronous calls on its own.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EVAL_MODE` | the target's `mode`, else `batch` | `batch` or `sync` for every target of the run |
+| `EVAL_BATCH_POLL_SECS` | 30 | Seconds between polls |
+| `EVAL_BATCH_MAX_REQUESTS` | the provider's limit | Lower cap on requests per batch |
+| `EVAL_BATCH_RETRY_SYNC` | 0 | `1` re-runs records a batch failed, synchronously |
+| `EVAL_RESUME` | a new directory | An earlier run's directory to resume ([Resume](#resume)) |
+
+### Auth
+
+Batch mode works with every `auth` a target supports: an API key
+(`api_key_env`) and the keyless workload identity modes. The batch routes
+take the same credential as a synchronous call.
+
+- **OpenAI** batches need the **`api.batch.write`** permission on the
+  project. It covers `/v1/batches` and the Files API. Add it to a
+  restricted API key or, for the keyless modes, to the service account's
+  mapping and project role. Without it the submit is refused with 403, and
+  the error says so. Details:
+  [enricher-openai.md, "Permissions"](enricher-openai.md#permissions).
+- **Claude**: an API key, or `anthropic-wif-authentik` with a workspace
+  that may use the Message Batches API.
+
+OpenAI's batch input and output files aren't covered by zero data
+retention. The harness deletes them once each stage is processed, and they
+expire after 2 days anyway ([enricher-openai.md, "Retention"](enricher-openai.md#retention)).
+
+### Resume
+
+The run keeps `<target>.batch-state.json` next to its records. It rewrites
+the file after every submission and every ended batch, so an interrupted
+run can be picked up where it stopped:
+
+```sh
+EVAL_RESUME=target/enricher-eval/quality/<stamp> EVAL_TARGETS=crates/enricher/eval/targets.toml \
+  cargo test -p enricher --bin enricher eval::quality::live_eval_quality -- --ignored --nocapture
+```
+
+With `EVAL_RESUME`, the run writes into that directory instead of a new
+one:
+
+- A target whose `<target>.records.jsonl` is already there is reused and
+  re-scored.
+- A batch target with a state file polls the batches it lists and submits
+  only the requests no recorded batch holds. It never submits a request
+  twice.
+- A state file from a different run (another target, model, provider,
+  endpoint, prompt fingerprint, case set or repetition count) is refused
+  with an error.
+
+If the process dies between creating a batch and writing the state file,
+that batch is orphaned: it runs and is billed, but nobody reads it. The
+service's batch mode has the same gap.
+
+The state file (JSON, `version` 1):
+
+```json
+{
+  "version": 1,
+  "target": "anthropic-claude-haiku-5-5", "model": "claude-haiku-5-5",
+  "provider": "anthropic", "base_url": "https://api.anthropic.com/v1",
+  "prompt_fingerprint": "3f2a...",
+  "jobs": [{"index": 0, "case_id": "flat-eta-signal-failure", "input_hash": "...", "repetition": 0}],
+  "started_at": "2026-10-12T08:00:00Z",
+  "primary": [{"id": "msgbatch_...", "custom_ids": ["p-0"],
+               "submitted_at": "...", "ended_at": "...", "summary": "ended, ..."}],
+  "primary_calls": {"0": {"pass": "primary", "outcome": "success", "content": "...", "batch_id": "msgbatch_..."}},
+  "adversarial": [{"id": "msgbatch_...", "custom_ids": ["r-0", "s-0"], "submitted_at": "..."}],
+  "done": false
+}
+```
+
+- `primary_calls` is written once the primary stage has ended, so a run
+  resumed in the adversarial stage doesn't need the primary results again.
+- `files` (OpenAI only) lists the input, output and error files. They are
+  deleted once their stage is processed.
+- `done` is set once the records are built.
+
+The churn replay keeps its state at `REPLAY_BATCH_STATE` (default
+`target/enricher-eval/replay/batch-state.json`). A replay re-run with the
+same sample resumes it, and the file is deleted when the replay finishes.
+
+### Latency
+
+A batch call's `elapsed_ms` is its batch's turnaround: from submission to
+the first poll that saw the batch ended. That is not the request's own
+time, and it is only as precise as the poll interval. A record's
+`elapsed_ms` is the primary turnaround plus the adversarial one.
+
+The report's "Batch" section gives, per stage: the batch ids, the request
+count, the turnaround, the succeeded, unusable, errored, expired, canceled
+and missing counts, and the token usage (cache reads and writes included).
+
+Caveats:
+
+- Turnaround depends on the provider's load, not on the model or your
+  network. Most batches end within the hour, but they may take up to 24
+  hours, after which they expire.
+- The two stages run one after the other, so a run takes about two
+  turnarounds.
+- The perf benchmark's timeout fit and send/wait latencies need HTTP
+  attempts. Batch calls have none, so the fit shows `no data`. Use a sync
+  target to judge `LLM_REQUEST_TIMEOUT_SECS`.
+
+## Cost estimate
+
+Each report gives an estimated cost (`cost` in the JSON). It comes from the
+token usage the provider reported on each call, priced the way the
+provider bills it:
+
+```text
+(prompt - cached - cache_write) x input + cached x cache_read
+  + cache_write x cache_write_price + completion x output
+```
+
+`reasoning` is part of `completion` and is never added on top. A call that
+ran in a batch is billed at **50%** of all four rates. `usd` is the
+estimate, and `usd_at_sync_price` prices the same calls at the synchronous
+rate, for comparison. Calls that reported no usage (a transport failure, a
+batch request that never ran) are counted but not priced.
+
+Built-in prices, in USD per million tokens at the synchronous rate. They
+come from [enricher-anthropic.md](enricher-anthropic.md#model) and
+[enricher-openai.md](enricher-openai.md#cost); check them before relying on
+them.
+
+| Model | Input | Cache read | Cache write | Output |
+| --- | --- | --- | --- | --- |
+| `claude-haiku-5-5` | 0.10 | 0.01 | 0.125 (5m TTL) / 0.20 (1h TTL) | 0.50 |
+| `claude-sonnet-5-5` | 2 | 0.10 | 2.50 / 4 | 10 |
+| `claude-opus-5-5` | 4 | 0.20 | 5 / 8 | 20 |
+| `claude-haiku-4-5` | 1 | 0.10 | 1.25 / 2 | 5 |
+| `gpt-6-luna` | 0.10 | 0.01 | 0.125 | 0.50 |
+
+- A Claude target's cache-write price follows its `prompt_cache` (`1h` by
+  default).
+- Built-in prices apply only on the provider's own API (`api.anthropic.com`,
+  `api.openai.com`), so a self-hosted model is never priced as OpenAI's. For
+  anything else, set `[targets.pricing]`.
+- An offline re-score (`replay_quality_score`) has only the model's name,
+  so it prices Claude's cache writes at the 1-hour rate.
 
 ## The dataset
 
@@ -417,7 +668,13 @@ re-run the quality eval for each candidate afterwards.
 
 The scoring, matching, statistics, dataset validation and pipeline logic
 are unit-tested with a scripted fake backend (`pipeline::FakeBackend`).
-They run in the normal `cargo test -p enricher`, with no network. The
+Batch mode is tested against mocked Claude and OpenAI batch endpoints
+(wiremock, `eval/batch/tests.rs`). The tests cover a whole run on each
+provider (submit, poll, out-of-order results, the adversarial stage,
+scoring), partial failures, expiry and cancellation, resuming from a state
+file, the sync retry, the no-batch-API and missing-permission errors, and
+chunking. All of these run in the normal `cargo test -p enricher`, with no
+network. The
 real-model runners are `#[ignore]`d and named `live_eval_*` / `replay_*`,
 the prefixes CI's ignored-tests step already skips
 (`--skip live_eval --skip replay_`).
@@ -439,6 +696,10 @@ the prefixes CI's ignored-tests step already skips
   lists or are left unscored. Review them as the dataset grows.
 - **Small seed set.** 15 cases can separate a broken model from a good one,
   but not two good ones. Grow the set from real incident history first.
+- **Batch mode has only been tested against mocks.** It uses the service's
+  batch clients, which are mock-tested too (see enricher-openai.md, "Not
+  verified"). The first real batch eval will be the first end-to-end
+  check.
 - **Throughput is client-side.** It reflects the endpoint as seen from the
   host running the benchmark, including any other load on a shared
   endpoint. Note that load in the target's `environment`.

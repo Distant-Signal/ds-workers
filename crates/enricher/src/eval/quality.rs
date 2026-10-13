@@ -34,7 +34,7 @@ use serde::Serialize;
 use crate::churn::{self, ChurnField};
 use crate::eval::dataset::{Case, Expected, Gold, GoldPeriod, MAX_GOLD_PERIODS, normalize_label};
 use crate::eval::pipeline::{Extraction, Failure, FailureKind, PipelineRecord};
-use crate::eval::report::{self, TargetInfo, pct, ratio};
+use crate::eval::report::{self, RunInfo, TargetInfo, pct, ratio};
 use crate::llm::{ExtractionPeriod, ScheduleWindow};
 
 /// The scored per-period fields, in report order.
@@ -788,6 +788,9 @@ pub(crate) struct QualityReport {
     pub dataset: String,
     pub repetitions: u32,
     pub date_tolerance_mins: i64,
+    /// Mode, batch metadata and cost estimate.
+    #[serde(flatten)]
+    pub run: RunInfo,
     pub summary: QualitySummary,
     pub cases: Vec<CaseScore>,
 }
@@ -1100,6 +1103,8 @@ pub(crate) fn render_markdown(report: &QualityReport) -> String {
         report.date_tolerance_mins,
         report.generated_at
     );
+    report.run.lines(&mut md);
+    md.push('\n');
     for (n, what) in [
         (
             s.unknown_case_records,
@@ -1140,6 +1145,7 @@ pub(crate) fn render_markdown(report: &QualityReport) -> String {
     summary_section(&mut md, s);
     fields_section(&mut md, s);
     diagnostics_section(&mut md, s);
+    report.run.batch_section(&mut md);
     cases_section(&mut md, &report.cases);
     md
 }
@@ -1378,6 +1384,11 @@ pub(crate) fn comparison_markdown(reports: &[QualityReport]) -> String {
                 s.consistency
                     .as_ref()
                     .map_or("-".to_string(), |c| pct(c.stable_rate)),
+                r.run.mode.to_string(),
+                r.run
+                    .cost
+                    .as_ref()
+                    .map_or("-".to_string(), |c| format!("${:.4}", c.usd)),
             ]
         })
         .collect();
@@ -1397,10 +1408,12 @@ pub(crate) fn comparison_markdown(reports: &[QualityReport]) -> String {
             "From / to date",
             "Schedule window",
             "Stable",
+            "Mode",
+            "Est. cost",
         ],
         &rows,
     ));
-    md.push_str("\n\"Valid output\" and \"Exact\" leave transport failures out of the denominator (\"Exact\" also leaves out unscored cases). Field columns are accuracy over matched periods. See each target's own report for precision/recall, hallucinations and per-case mismatches.\n");
+    md.push_str("\n\"Valid output\" and \"Exact\" leave transport failures out of the denominator (\"Exact\" also leaves out unscored cases). Field columns are accuracy over matched periods. \"Est. cost\" prices the run's token usage, batch calls at half price. See each target's own report for precision/recall, hallucinations and per-case mismatches.\n");
     md
 }
 
@@ -1414,6 +1427,7 @@ fn options_from_env() -> ScoreOptions {
 /// Scores records into a report, printing [`record_warnings`] to stderr.
 fn build_report(
     target: TargetInfo,
+    run: RunInfo,
     dataset_label: &str,
     cases: &[Case],
     records: &[PipelineRecord],
@@ -1431,6 +1445,7 @@ fn build_report(
         // Of the records actually used, not the skipped ones.
         repetitions: summary.repetitions,
         date_tolerance_mins: opts.date_tolerance.num_minutes(),
+        run,
         summary,
         cases: scores,
     }
@@ -1438,16 +1453,21 @@ fn build_report(
 
 /// Scores, writes `<stem>.json` and `<stem>.md` into `dir`, and returns the
 /// report.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test-only runner plumbing; each is one report input"
+)]
 fn score_and_write(
     dir: &std::path::Path,
     stem: &str,
     target: TargetInfo,
+    run: RunInfo,
     dataset_label: &str,
     cases: &[Case],
     records: &[PipelineRecord],
     opts: ScoreOptions,
 ) -> anyhow::Result<QualityReport> {
-    let report = build_report(target, dataset_label, cases, records, opts);
+    let report = build_report(target, run, dataset_label, cases, records, opts);
     crate::eval::write_json(&dir.join(format!("{stem}.json")), &report)?;
     crate::eval::write_text(&dir.join(format!("{stem}.md")), &render_markdown(&report))?;
     Ok(report)
@@ -1464,31 +1484,32 @@ async fn run_live() -> anyhow::Result<()> {
     let repetitions: u32 = crate::eval::env_parse("EVAL_REPEATS", 1);
     let concurrency: usize = crate::eval::env_parse("EVAL_CONCURRENCY", 1);
     let opts = options_from_env();
-    let dir = crate::eval::run_dir("quality", "")?;
+    let dir = crate::eval::live_run_dir("quality")?;
     let mut reports = Vec::new();
     for target in &targets {
         eprintln!(
-            "quality: {} ({}), {} case(s) x {repetitions}, timeout {}s",
+            "quality: {} ({}), {} case(s) x {repetitions}, {} mode, timeout {}s",
             target.name,
             target.model,
             cases.len(),
+            target.mode()?.label(),
             target.quality_timeout_secs
         );
-        let client = std::sync::Arc::new(target.client(target.quality_timeout_secs)?);
-        let records = crate::eval::pipeline::run_jobs(
-            client,
-            &target.label(),
+        let (records, run, _) = crate::eval::run_records(
+            target,
+            target.quality_timeout_secs,
             &cases,
             repetitions,
             concurrency,
+            0,
+            &dir,
         )
-        .await;
-        let stem = target.file_stem();
-        crate::eval::write_records(&dir.join(format!("{stem}.records.jsonl")), &records)?;
+        .await?;
         let report = score_and_write(
             &dir,
-            &stem,
+            &target.file_stem(),
             TargetInfo::from_target(target),
+            run,
             &dataset_path,
             &cases,
             &records,
@@ -1530,7 +1551,24 @@ fn run_replay() -> anyhow::Result<()> {
             base_url: None,
         };
         let stem = crate::eval::target::file_stem(name);
-        let report = score_and_write(&dir, &stem, target, &dataset_path, &cases, records, opts)?;
+        // No target config here: the built-in prices, by the model's name
+        // (Claude's cache writes at the service's default 1-hour TTL).
+        let pricing = crate::eval::cost::builtin_for_model(model);
+        let run = RunInfo {
+            mode: RunInfo::mode_of(records),
+            batch: None,
+            cost: crate::eval::cost::estimate(records, pricing),
+        };
+        let report = score_and_write(
+            &dir,
+            &stem,
+            target,
+            run,
+            &dataset_path,
+            &cases,
+            records,
+            opts,
+        )?;
         println!("{}", render_markdown(&report));
         reports.push(report);
     }
@@ -1815,6 +1853,7 @@ mod tests {
 
         let report = QualityReport {
             kind: "quality",
+            run: RunInfo::default(),
             generated_at: "now".into(),
             target: TargetInfo {
                 name: "t".into(),
@@ -2187,7 +2226,14 @@ mod tests {
             environment: None,
             base_url: None,
         };
-        let report = build_report(target, "d", std::slice::from_ref(&case), &records, opts());
+        let report = build_report(
+            target,
+            RunInfo::default(),
+            "d",
+            std::slice::from_ref(&case),
+            &records,
+            opts(),
+        );
         assert_eq!(report.repetitions, 2);
 
         // One warning line per reason, with counts and examples.
@@ -2364,6 +2410,7 @@ mod tests {
         assert!(
             render_markdown(&QualityReport {
                 kind: "quality",
+                run: RunInfo::default(),
                 generated_at: "now".into(),
                 target: TargetInfo {
                     name: "t".into(),
@@ -2427,6 +2474,7 @@ mod tests {
     fn markdown_renders_every_section() {
         let report = QualityReport {
             kind: "quality",
+            run: RunInfo::default(),
             generated_at: "now".into(),
             target: TargetInfo {
                 name: "t".into(),

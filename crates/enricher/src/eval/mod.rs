@@ -19,7 +19,10 @@
 //!
 //! Both drive the real pipeline (`pipeline`): the service's prompts,
 //! schemas, parsers, provider policy and `combine_periods`, in
-//! `process_incident`'s order.
+//! `process_incident`'s order. By default (`mode = "batch"`) a run sends its
+//! calls through the provider's batch API (`batch`) at half price; `sync`
+//! makes one call at a time. Either way the records, and so the scoring,
+//! are the same (`cost` prices them).
 //!
 //! Commands (the crate is bin-only, hence `--bin enricher`):
 //!
@@ -52,18 +55,29 @@
 //!   request timeout, `quality_timeout_secs` in a targets file).
 //! - Perf: `EVAL_PERF_REPEATS` (3), `EVAL_PERF_CONCURRENCY` (1),
 //!   `EVAL_PERF_WARMUP` (1).
+//! - Mode (`batch`): `EVAL_MODE` (`batch` or `sync`; overrides every
+//!   target's `mode`, which defaults to `batch`), `EVAL_RESUME` (an earlier
+//!   run's directory: resume its batches, reuse its finished targets),
+//!   `EVAL_BATCH_POLL_SECS` (30), `EVAL_BATCH_MAX_REQUESTS` (the
+//!   provider's limit), `EVAL_BATCH_RETRY_SYNC` (0).
 
-mod dataset;
+pub(crate) mod batch;
+mod cost;
+pub(crate) mod dataset;
 mod perf;
-mod pipeline;
+pub(crate) mod pipeline;
 mod quality;
 mod report;
-mod target;
+pub(crate) mod target;
 
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use crate::eval::dataset::Case;
 use crate::eval::pipeline::PipelineRecord;
+use crate::eval::report::RunInfo;
+use crate::eval::target::{EvalMode, Target};
 
 /// The workspace root (two levels above this crate's manifest).
 fn workspace_root() -> PathBuf {
@@ -83,7 +97,7 @@ pub(crate) fn resolve(path: &str) -> PathBuf {
 }
 
 /// `path` relative to the workspace root when it's inside it, for reports.
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     let root = workspace_root().canonicalize().ok();
     let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     root.and_then(|root| full.strip_prefix(root).ok().map(Path::to_path_buf))
@@ -158,6 +172,22 @@ pub(crate) fn run_dir(kind: &str, suffix: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// A live run's directory: `EVAL_RESUME` (an earlier run's directory, to
+/// resume its batch runs and reuse its finished targets' records) when
+/// set, else a fresh [`run_dir`].
+pub(crate) fn live_run_dir(kind: &str) -> anyhow::Result<PathBuf> {
+    match std::env::var("EVAL_RESUME") {
+        Ok(dir) if !dir.trim().is_empty() => {
+            let dir = resolve(dir.trim());
+            if !dir.is_dir() {
+                anyhow::bail!("EVAL_RESUME={} is not a directory", dir.display());
+            }
+            Ok(dir)
+        }
+        _ => run_dir(kind, ""),
+    }
+}
+
 pub(crate) fn write_text(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents)
         .map_err(|err| anyhow::anyhow!("writing {}: {err}", path.display()))
@@ -175,6 +205,68 @@ pub(crate) fn write_records(path: &Path, records: &[PipelineRecord]) -> anyhow::
         out.push('\n');
     }
     write_text(path, &out)
+}
+
+/// One target's records for a live run, in its mode (`Target::mode`),
+/// saved as `<dir>/<stem>.records.jsonl`: synchronously at `concurrency`
+/// after `warmup` untimed runs of the first case, or through the batch API
+/// (`batch::run_batch`, resuming `<stem>.batch-state.json` if present).
+/// When the records file already exists (a resumed run, `EVAL_RESUME`), it
+/// is reused. Returns the records, the run's info (mode, batch metadata,
+/// cost) and its wall time (a batch run's: first submission to last end).
+pub(crate) async fn run_records(
+    target: &Target,
+    timeout_secs: u64,
+    cases: &Arc<[Case]>,
+    repetitions: u32,
+    concurrency: usize,
+    warmup: u32,
+    dir: &Path,
+) -> anyhow::Result<(Vec<PipelineRecord>, RunInfo, u64)> {
+    let mode = target.mode()?;
+    let stem = target.file_stem();
+    let records_path = dir.join(format!("{stem}.records.jsonl"));
+    let state_path = batch::state_path(dir, &stem);
+    let label = target.label();
+    let reused = records_path.is_file();
+    let (records, batch, wall_ms) = if reused {
+        eprintln!("{}: reusing {}", target.name, display_path(&records_path));
+        let records = read_records(&records_path)?;
+        let batch = batch::BatchState::read(&state_path)?
+            .map(|state| batch::BatchRunMeta::new(&state, &records, &state_path, true));
+        let wall_ms = batch.as_ref().and_then(|b| b.turnaround_ms).unwrap_or(0);
+        (records, batch, wall_ms)
+    } else {
+        let client = Arc::new(target.client(timeout_secs)?);
+        match mode {
+            EvalMode::Sync => {
+                for _ in 0..warmup {
+                    let _ = pipeline::run_pipeline(&*client, &label, &cases[0], 0).await;
+                }
+                let start = tokio::time::Instant::now();
+                let records =
+                    pipeline::run_jobs(client, &label, cases, repetitions, concurrency).await;
+                (records, None, pipeline::millis(start.elapsed()))
+            }
+            EvalMode::Batch => {
+                let opts = batch::BatchOptions::from_env(state_path);
+                let run = batch::run_batch(&client, &label, cases, repetitions, &opts).await?;
+                let wall_ms = run.meta.turnaround_ms.unwrap_or(0);
+                (run.records, Some(run.meta), wall_ms)
+            }
+        }
+    };
+    write_records(&records_path, &records)?;
+    let run = RunInfo {
+        mode: if reused {
+            RunInfo::mode_of(&records)
+        } else {
+            mode.label()
+        },
+        cost: cost::estimate(&records, target.pricing()),
+        batch,
+    };
+    Ok((records, run, wall_ms))
 }
 
 pub(crate) fn parse_records(raw: &str) -> anyhow::Result<Vec<PipelineRecord>> {

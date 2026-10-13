@@ -109,6 +109,69 @@ pub(crate) struct Target {
     /// `<call>.txt`), resolved like the targets file's other paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts_dir: Option<std::path::PathBuf>,
+    /// `batch` (the default: the whole record set through the provider's
+    /// batch API, at half price) or `sync` (one call at a time, like the
+    /// service's stream loop). `EVAL_MODE` overrides it for a run. See
+    /// `eval::batch` and docs/enricher-model-eval.md, "Batch mode".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<EvalMode>,
+    /// Synchronous prices (USD per million tokens) for the cost estimate,
+    /// overriding the built-in ones (`eval::cost`); needed for a model or
+    /// endpoint the harness has no price for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::eval::cost::Pricing>,
+}
+
+/// How a run sends its calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EvalMode {
+    /// Every record's calls through the provider's batch API (Claude
+    /// Message Batches, `OpenAI` Batch): half price, results within 24 h.
+    /// The default.
+    #[default]
+    Batch,
+    /// One synchronous call per pass, as the service's stream loop makes
+    /// them. For quick small runs and endpoints without a batch API.
+    Sync,
+}
+
+impl EvalMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Sync => "sync",
+        }
+    }
+
+    /// The run's mode: `EVAL_MODE` (a run option) over the target's `mode`,
+    /// else batch.
+    pub(crate) fn resolve(run: Option<Self>, target: Option<Self>) -> Self {
+        run.or(target).unwrap_or_default()
+    }
+}
+
+impl std::str::FromStr for EvalMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "batch" => Ok(Self::Batch),
+            "sync" => Ok(Self::Sync),
+            other => Err(format!("{other:?} is not a mode (use batch or sync)")),
+        }
+    }
+}
+
+/// `EVAL_MODE` (`batch` or `sync`), when set and not empty.
+pub(crate) fn run_mode() -> anyhow::Result<Option<EvalMode>> {
+    match std::env::var("EVAL_MODE") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .parse()
+            .map(Some)
+            .map_err(|err| anyhow::anyhow!("EVAL_MODE: {err}")),
+        _ => Ok(None),
+    }
 }
 
 /// `[targets.workload_identity]`: the service's WIF env vars, by the same
@@ -350,6 +413,25 @@ impl Target {
         Ok((active, prompts))
     }
 
+    /// This target's mode for this run ([`EvalMode::resolve`]).
+    pub(crate) fn mode(&self) -> anyhow::Result<EvalMode> {
+        Ok(EvalMode::resolve(run_mode()?, self.mode))
+    }
+
+    /// The cost estimate's prices: the target's own, else the built-in ones.
+    pub(crate) fn pricing(&self) -> Option<(crate::eval::cost::Pricing, &'static str)> {
+        if let Some(pricing) = self.pricing {
+            return Some((pricing, "target"));
+        }
+        crate::eval::cost::builtin(
+            self.provider,
+            &self.base_url,
+            &self.model,
+            self.anthropic_settings().prompt_cache,
+        )
+        .map(|pricing| (pricing, "builtin"))
+    }
+
     /// Safe in a file name.
     pub(crate) fn file_stem(&self) -> String {
         file_stem(&self.name)
@@ -472,6 +554,9 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
         temperature: generation.llm_temperature,
         top_p: generation.llm_top_p,
         prompts_dir: generation.llm_prompts_dir,
+        // `EVAL_MODE` decides (default batch).
+        mode: None,
+        pricing: None,
     }])
 }
 
@@ -671,6 +756,92 @@ mod tests {
         assert!(claude.profile_and_prompts("claude-sonnet-5-5").is_err());
         let named = parse("profile = \"nope\"\n");
         assert!(named.profile_and_prompts("m").is_err());
+    }
+
+    /// Batch is the default: a target without `mode`, and the env-var
+    /// target; `EVAL_MODE` (the run option) overrides a target's own.
+    #[test]
+    fn the_mode_defaults_to_batch() {
+        let minimal = &parse_targets(
+            "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\n",
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(minimal.mode, None);
+        assert_eq!(EvalMode::resolve(None, minimal.mode), EvalMode::Batch);
+        assert_eq!(EvalMode::default(), EvalMode::Batch);
+        assert_eq!(
+            EvalMode::resolve(None, Some(EvalMode::Sync)),
+            EvalMode::Sync
+        );
+        assert_eq!(
+            EvalMode::resolve(Some(EvalMode::Sync), None),
+            EvalMode::Sync
+        );
+        assert_eq!(
+            EvalMode::resolve(Some(EvalMode::Batch), Some(EvalMode::Sync)),
+            EvalMode::Batch,
+            "the run option wins"
+        );
+        assert_eq!(" SYNC ".parse::<EvalMode>(), Ok(EvalMode::Sync));
+        assert!("async".parse::<EvalMode>().is_err());
+        let bad = "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\nmode = \"async\"\n";
+        assert!(parse_targets(bad, None).is_err());
+
+        // The example file: endpoints without a batch API opt into sync;
+        // the Claude and OpenAI targets batch, with sync twins.
+        let example = parse_targets(include_str!("../../eval/targets.example.toml"), None).unwrap();
+        let mode = |name: &str| {
+            let target = example.iter().find(|t| t.name == name).unwrap();
+            EvalMode::resolve(None, target.mode)
+        };
+        for name in [
+            "ollama-gpu-gemma3-12b",
+            "ollama-cpu-gemma3-4b",
+            "hosted-glm-low-effort",
+            "openai-gpt-6-luna-none-sync",
+            "anthropic-claude-haiku-5-5-sync",
+        ] {
+            assert_eq!(mode(name), EvalMode::Sync, "{name}");
+        }
+        for name in [
+            "openai-gpt-6-luna-none",
+            "anthropic-claude-haiku-5-5",
+            "anthropic-claude-sonnet-5-5",
+        ] {
+            assert_eq!(mode(name), EvalMode::Batch, "{name}");
+        }
+    }
+
+    /// Built-in prices for the providers' own models, a target's own
+    /// `[targets.pricing]` otherwise.
+    #[test]
+    fn pricing_is_built_in_or_the_targets_own() {
+        let example = parse_targets(include_str!("../../eval/targets.example.toml"), None).unwrap();
+        let price = |name: &str| example.iter().find(|t| t.name == name).unwrap().pricing();
+        let (haiku, source) = price("anthropic-claude-haiku-5-5").unwrap();
+        assert_eq!(source, "builtin");
+        assert!(
+            (haiku.cache_write - 0.20).abs() < 1e-12,
+            "1h cache by default"
+        );
+        assert!(price("openai-gpt-6-luna-none").is_some());
+        assert!(price("ollama-gpu-gemma3-12b").is_none());
+        let own = &parse_targets(
+            "[[targets]]\nname = \"a\"\nbase_url = \"http://l/v1\"\nmodel = \"m\"\n\
+             [targets.pricing]\ninput = 0.2\noutput = 0.8\ncache_read = 0.02\ncache_write = 0.25\n",
+            None,
+        )
+        .unwrap()[0];
+        let (pricing, source) = own.pricing().unwrap();
+        assert_eq!(source, "target");
+        assert!((pricing.output - 0.8).abs() < 1e-12);
+        let typo = "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\n\
+                    [targets.pricing]\ninput = 1.0\noutput = 1.0\ncache_read = 0.1\n";
+        assert!(
+            parse_targets(typo, None).is_err(),
+            "every price is required"
+        );
     }
 
     #[test]

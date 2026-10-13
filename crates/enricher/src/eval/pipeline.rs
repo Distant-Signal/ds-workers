@@ -151,6 +151,12 @@ pub(crate) struct CallRecord {
     /// Absent for providers that omit `usage` and in older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<llm::TokenUsage>,
+    /// The provider batch this call ran in (batch mode, `eval::batch`);
+    /// absent for a synchronous call. A batch call's `elapsed_ms` is its
+    /// batch's turnaround (submitted to seen ended), it has no `attempts`,
+    /// and it is billed at the batch price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 /// One pipeline run of one case: the unit both runners record.
@@ -306,7 +312,7 @@ pub(crate) fn millis(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn timed_call<B: Backend>(
+pub(crate) async fn timed_call<B: Backend>(
     backend: &B,
     pass: Pass,
     case: &Case,
@@ -329,6 +335,7 @@ async fn timed_call<B: Backend>(
         content,
         error,
         usage: raw.usage,
+        batch_id: None,
     }
 }
 

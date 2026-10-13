@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use crate::eval::dataset::Case;
 use crate::eval::pipeline::{self, FailureKind, Pass, PipelineRecord};
-use crate::eval::report::{self, TargetInfo, pct, ratio, ratio_u64, secs};
+use crate::eval::report::{self, RunInfo, TargetInfo, pct, ratio, ratio_u64, secs};
 use crate::eval::target::Target;
 
 /// p95 above this share of the request timeout is "tight".
@@ -399,6 +399,9 @@ pub(crate) struct PerfReport {
     pub policy: PolicyInfo,
     pub dataset: String,
     pub cases: usize,
+    /// Mode, batch metadata and cost estimate.
+    #[serde(flatten)]
+    pub run: RunInfo,
     pub summary: PerfSummary,
 }
 
@@ -453,10 +456,21 @@ pub(crate) fn render_markdown(report: &PerfReport) -> String {
         report.dataset,
         report.generated_at
     );
+    report.run.lines(&mut md);
+    md.push('\n');
+    if report.run.batch.is_some() {
+        md.push_str(
+            "> Batch mode: the provider ran the calls on its own schedule. Call latency is each \
+             call's batch turnaround, concurrency and warm-up don't apply, and the timeout fit \
+             has no attempts to judge. Run with `mode = \"sync\"` to benchmark the service's \
+             synchronous path.\n\n",
+        );
+    }
 
     fit_and_calls_section(&mut md, s);
     outcomes_section(&mut md, s);
     documents_section(&mut md, s);
+    report.run.batch_section(&mut md);
     md
 }
 
@@ -671,26 +685,29 @@ async fn run_target(
     let repetitions: u32 = crate::eval::env_parse("EVAL_PERF_REPEATS", 3);
     let concurrency: usize = crate::eval::env_parse("EVAL_PERF_CONCURRENCY", 1);
     let warmup: u32 = crate::eval::env_parse("EVAL_PERF_WARMUP", 1);
-    let label = target.label();
-    let client = Arc::new(target.client(target.request_timeout_secs)?);
     eprintln!(
-        "perf: {} ({}): {} warm-up run(s), then {} case(s) x {repetitions} at concurrency {concurrency}, timeout {}s",
+        "perf: {} ({}), {} mode: {} warm-up run(s) (sync only), then {} case(s) x {repetitions} at concurrency {concurrency}, timeout {}s",
         target.name,
         target.model,
+        target.mode()?.label(),
         warmup,
         cases.len(),
         target.request_timeout_secs
     );
-    // Untimed: absorbs a cold model load, which would otherwise land in
-    // the first document's latency.
-    for _ in 0..warmup {
-        let _ = pipeline::run_pipeline(&*client, &label, &cases[0], 0).await;
-    }
-    let start = tokio::time::Instant::now();
-    let records = pipeline::run_jobs(client, &label, cases, repetitions, concurrency).await;
-    let wall_ms = pipeline::millis(start.elapsed());
+    // Warm-up runs are untimed: they absorb a cold model load, which would
+    // otherwise land in the first document's latency.
+    let (records, run, wall_ms) = crate::eval::run_records(
+        target,
+        target.request_timeout_secs,
+        cases,
+        repetitions,
+        concurrency,
+        warmup,
+        dir,
+    )
+    .await?;
     let stem = target.file_stem();
-    crate::eval::write_records(&dir.join(format!("{stem}.records.jsonl")), &records)?;
+    let batch = run.batch.is_some();
     let report = PerfReport {
         kind: "perf",
         generated_at: Utc::now().to_rfc3339(),
@@ -698,12 +715,13 @@ async fn run_target(
         policy: PolicyInfo::from_target(target),
         dataset: dataset.to_string(),
         cases: cases.len(),
+        run,
         summary: summarize(
             &records,
             PerfRun {
                 concurrency,
                 repetitions,
-                warmup_runs: warmup,
+                warmup_runs: if batch { 0 } else { warmup },
                 wall_ms,
                 request_timeout_secs: target.request_timeout_secs,
                 reclaim_min_idle_secs: target.reclaim_min_idle_secs,
@@ -722,7 +740,7 @@ async fn run_live() -> anyhow::Result<()> {
     }
     let cases: Arc<[Case]> = cases.into();
     let targets = crate::eval::target::load_targets()?;
-    let dir = crate::eval::run_dir("perf", "")?;
+    let dir = crate::eval::live_run_dir("perf")?;
     let mut reports = Vec::new();
     for target in &targets {
         let report = run_target(target, &cases, &dataset, &dir).await?;
@@ -804,6 +822,7 @@ mod tests {
             content: None,
             error: None,
             usage: None,
+            batch_id: None,
         }
     }
 
@@ -1077,6 +1096,7 @@ mod tests {
             },
             dataset: "d".into(),
             cases: 3,
+            run: RunInfo::default(),
             summary,
         };
         let md = render_markdown(&report);
