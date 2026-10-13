@@ -1455,6 +1455,7 @@ mod tests {
             retry_backoff: crate::RetryBackoff::default(),
             in_flight: crate::InFlight::default(),
             carry_forward_noops: false,
+            sweep_concurrency: 1,
             batch: None,
         };
         poll_once(&enricher, 100).await;
