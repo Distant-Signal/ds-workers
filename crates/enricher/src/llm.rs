@@ -216,7 +216,6 @@ pub(crate) enum ProviderKind {
 impl ProviderKind {
     /// `LLM_PROVIDER` from the environment (default `openai`), for the
     /// model-eval harness and the live evals.
-    #[cfg(test)]
     pub(crate) fn from_env() -> anyhow::Result<Self> {
         match std::env::var("LLM_PROVIDER") {
             Ok(value) if !value.trim().is_empty() => {
@@ -302,25 +301,13 @@ pub(crate) struct LlmClient {
 /// records `retries` and `attempts`.
 pub(crate) struct RawCall {
     pub content: anyhow::Result<String>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read only by the test-only model-eval harness")
-    )]
     pub retries: u32,
     /// Every HTTP attempt `chat_completion` made, in order (empty when the
     /// call failed before sending anything). Only observes the retry loop:
     /// collecting it changes no request, retry decision or metric.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read only by the test-only model-eval harness")
-    )]
     pub attempts: Vec<Attempt>,
     /// The successful attempt's `usage`, when the provider sent one (see
     /// [`TokenUsage`]). Observation only, like `attempts`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read only by the test-only model-eval harness")
-    )]
     pub usage: Option<TokenUsage>,
 }
 
@@ -1260,13 +1247,11 @@ const SEVERITY_ADVERSARIAL_PROMPT: &str = "You are reviewing a UK National Rail 
 /// for the model-eval harness: each record stores it, so a replay can warn
 /// when saved outputs came from different prompts than the current code.
 /// (The user-content wrappers in the `*_raw` methods aren't covered.)
-#[cfg(test)]
 pub(crate) fn prompt_fingerprint() -> String {
     prompt_fingerprint_of(&crate::profile::PromptSet::builtin())
 }
 
 /// [`prompt_fingerprint`] of a given prompt set (a profile's overrides).
-#[cfg(test)]
 pub(crate) fn prompt_fingerprint_of(prompts: &crate::profile::PromptSet) -> String {
     let mut text = String::new();
     for (prompt, schema_name, schema) in [
@@ -1399,7 +1384,6 @@ impl LlmClient {
 
     /// The system prompts in use.
     /// `LLM_BASE_URL` (the model-eval harness names it in errors).
-    #[cfg(test)]
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
     }

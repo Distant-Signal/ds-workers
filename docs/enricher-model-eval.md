@@ -43,9 +43,12 @@ its targets are `anthropic-claude-haiku-5-5` and
 
 ## How it works
 
-Code: `crates/enricher/src/eval/`. It is test-only, like the existing
-`replay_eval` and `llm::tests::live_eval_*` evals. Each runner is an
-`#[ignore]`d test, so neither `cargo test` nor CI ever calls a model.
+Code: `crates/enricher/src/eval/`. Each runner is an `#[ignore]`d test,
+like the existing `replay_eval` and `llm::tests::live_eval_*` evals, so
+neither `cargo test` nor CI ever calls a model. The one exception is the
+`enricher eval` subcommand ([In-cluster run](#in-cluster-run-enricher-eval)),
+which records outputs from inside the cluster, where the keyless
+credentials are.
 
 - `pipeline.rs` runs the service's real pipeline minus the database: the
   primary pass, the resolution-adversarial pass, the severity-adversarial
@@ -415,6 +418,53 @@ Caveats:
 - The perf benchmark's timeout fit and send/wait latencies need HTTP
   attempts. Batch calls have none, so the fit shows `no data`. Use a sync
   target to judge `LLM_REQUEST_TIMEOUT_SECS`.
+
+## In-cluster run (`enricher eval`)
+
+The keyless auth modes (`anthropic-wif-authentik`, `openai-wif-*`) need
+the pod's projected service-account token, so a comparison through them
+has to run in the cluster. For that, the service's own image has an
+`eval` subcommand (`crates/enricher/src/eval/cli.rs`). It runs every
+target over a dataset with the same code as the runners above (batch by
+default, resuming) and **records only**; scoring and comparison happen
+offline on the copied-out files. The service itself never takes
+arguments, so the subcommand is inert unless a container asks for it.
+
+```sh
+enricher eval --targets /eval/targets.toml --dataset /eval/dataset.jsonl \
+  --out /eval/out/run1 [--target a,b] [--cases id1,id2] [--repeats 1] [--label <image tag>]
+```
+
+Every flag also reads an env var (`EVAL_TARGETS`, `EVAL_DATASET`,
+`EVAL_OUT`, `EVAL_TARGET`, `EVAL_CASES`, `EVAL_REPEATS`,
+`EVAL_CONCURRENCY`, `EVAL_RUN_LABEL`), and the batch knobs
+(`EVAL_MODE`, `EVAL_BATCH_POLL_SECS`, `EVAL_BATCH_MAX_REQUESTS`,
+`EVAL_BATCH_RETRY_SYNC`) apply as above. Paths are used as given, not
+resolved from the workspace root. The dataset needs no `expected` labels.
+
+- **Resume.** `--out` is created if absent and resumed if not: a target
+  whose records file is there is reused, and a batch target with a state
+  file polls its recorded batches instead of submitting again. Re-running
+  the same command after a crash never submits a request twice.
+- **Targets run concurrently**, so the run takes about two batch
+  turnarounds of the slowest target. A target that fails doesn't stop the
+  others.
+- **Exit code**: 0 when every target finished, 2 when some target failed
+  (`run.json` says which and why; the others' files are written), 1 on a
+  setup error (unreadable targets file or dataset, invalid case).
+
+Output, per target (`<stem>`: the target name, file-safe):
+
+| File | Contents |
+| --- | --- |
+| `<stem>.records.jsonl` | The harness's records: each call's raw output or error, outcome, token usage, latency, batch id. Re-scorable with `replay_quality_score` |
+| `<stem>.results.jsonl` | One line per record: `status` (`completed` / `failed`), the `extraction` the service would have written (category, combined periods with confidences) or the `failure` (stage, transport or invalid output, label, message), and every call's raw `content`, `usage`, `batch_id`, `elapsed_ms` and `estimated_usd` |
+| `<stem>.batch-state.json` | The batch state ([Resume](#resume)) |
+| `<stem>.summary.json` | The target's config (key env var names and workload identity ids only, never a secret), mode, batch metadata, cost estimate and outcome counts |
+
+Plus `run.json`: the dataset (path, case count, content hash), the
+built-in prompt fingerprint, the label, start and end times, and each
+target's status, counts and estimated cost.
 
 ## Cost estimate
 

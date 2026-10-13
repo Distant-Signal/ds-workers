@@ -1,11 +1,14 @@
 //! Model-comparison harness for the enricher: two separate evaluations of
 //! the LLM behind `LLM_BASE_URL`/`LLM_MODEL`, sharing one model-client
 //! abstraction (`pipeline::Backend`, implemented by the service's own
-//! [`crate::llm::LlmClient`]) and one dataset (`dataset`). Test-only, like
-//! `replay_eval`: every runner is an `#[ignore]`d test, opt-in and named
-//! `live_eval_*` / `replay_*` so the default run and CI's `--ignored` step
-//! (which skips those prefixes) never call a model. Process, report
-//! guide and how to add cases/targets: `docs/enricher-model-eval.md`.
+//! [`crate::llm::LlmClient`]) and one dataset (`dataset`). Every runner is
+//! an `#[ignore]`d test, opt-in and named `live_eval_*` / `replay_*` so the
+//! default run and CI's `--ignored` step (which skips those prefixes) never
+//! call a model. The one part in the release binary is `cli`, the
+//! `enricher eval` subcommand: it records outputs (no scoring) where only
+//! the cluster has the credentials. The scorers (`quality`, `perf`) stay
+//! test-only. Process, report guide and how to add cases/targets:
+//! `docs/enricher-model-eval.md`.
 //!
 //! - **Quality** (`quality`): does the model extract the right structured
 //!   data? Gold-labelled cases, generous timeouts, transport failures kept
@@ -62,10 +65,13 @@
 //!   provider's limit), `EVAL_BATCH_RETRY_SYNC` (0).
 
 pub(crate) mod batch;
+pub(crate) mod cli;
 mod cost;
 pub(crate) mod dataset;
+#[cfg(test)]
 mod perf;
 pub(crate) mod pipeline;
+#[cfg(test)]
 mod quality;
 mod report;
 pub(crate) mod target;
@@ -122,8 +128,9 @@ pub(crate) fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// off. Anything else panics, like [`env_parse`].
 pub(crate) fn env_flag(name: &str) -> bool {
     let raw = std::env::var_os(name).map(|raw| {
-        raw.into_string()
-            .unwrap_or_else(|raw| panic!("{name}={raw:?} is not valid UTF-8 (use 1 or 0)"))
+        raw.into_string().unwrap_or_else(|raw| {
+            panic!("{name}={} is not valid UTF-8 (use 1 or 0)", raw.display())
+        })
     });
     parse_flag(name, raw.as_deref())
 }

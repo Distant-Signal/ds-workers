@@ -372,15 +372,7 @@ pub(crate) use super::batch_api::{BatchOutcome, BatchRequest};
 /// 100,000 requests or 256 MB of request body, whichever comes first.
 /// (The service stays far below them, `batch::MAX_BATCH_INCIDENTS`; the
 /// model-eval harness chunks by them, `eval::batch`.)
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read only by the test-only model-eval harness")
-)]
 pub(crate) const MAX_BATCH_REQUESTS: usize = 100_000;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read only by the test-only model-eval harness")
-)]
 pub(crate) const MAX_BATCH_BYTES: usize = 256 * 1000 * 1000;
 
 /// A Message Batch object (create and retrieve responses).

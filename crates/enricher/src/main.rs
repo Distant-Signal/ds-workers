@@ -9,7 +9,16 @@ mod batch;
 mod churn;
 mod combine;
 mod config;
-#[cfg(test)]
+// The model-eval harness. Its runners are `#[ignore]`d tests; the only
+// part a release build uses is `enricher eval` (`eval::cli`), the in-cluster
+// entry point. Much of the module serves only those tests.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the harness's test runners use what `enricher eval` doesn't"
+    )
+)]
 mod eval;
 mod latency;
 mod llm;
@@ -42,6 +51,12 @@ const LLM_DURATION_METRIC: &str = "enricher_llm_call_duration_seconds";
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // `enricher eval ...`: the one-off model comparison (`eval::cli`,
+    // docs/enricher-model-eval.md, "In-cluster run"). Never reached by the
+    // service, whose container passes no arguments.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "eval") {
+        return eval::cli::main().await;
+    }
     common::logging::exit_code(run().await)
 }
 

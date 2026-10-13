@@ -405,10 +405,8 @@ pub(crate) async fn run_jobs<B: Backend + 'static>(
                 Arc::clone(&limit),
             );
             jobs.spawn(async move {
-                let _permit = limit
-                    .acquire_owned()
-                    .await
-                    .expect("the job semaphore is never closed");
+                // The semaphore is never closed, so this always holds a permit.
+                let _permit = limit.acquire_owned().await.ok();
                 let record = run_pipeline(&*backend, &label, &cases[index], repetition).await;
                 (index, record)
             });
@@ -416,7 +414,12 @@ pub(crate) async fn run_jobs<B: Backend + 'static>(
     }
     let mut records = Vec::new();
     while let Some(joined) = jobs.join_next().await {
-        records.push(joined.expect("an eval job panicked"));
+        match joined {
+            Ok(record) => records.push(record),
+            // A job's panic is the run's (nothing cancels the jobs).
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(_) => {}
+        }
     }
     records.sort_by_key(|(index, record)| (*index, record.repetition));
     records.into_iter().map(|(_, record)| record).collect()

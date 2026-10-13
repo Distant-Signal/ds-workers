@@ -174,20 +174,18 @@ pub(crate) fn chunk_requests(
                 limits.max_bytes
             );
         }
-        let fits = chunks.last().is_some_and(|chunk| {
+        let open = chunks.last_mut().filter(|chunk| {
             chunk.len() < limits.max_requests
                 && bytes + size <= budget
                 && chunk.first().map(model) == Some(model(&request))
         });
-        if !fits {
-            chunks.push(Vec::new());
-            bytes = 0;
+        if let Some(chunk) = open {
+            bytes += size;
+            chunk.push(request);
+        } else {
+            bytes = size;
+            chunks.push(vec![request]);
         }
-        bytes += size;
-        chunks
-            .last_mut()
-            .expect("a chunk was just pushed")
-            .push(request);
     }
     Ok(chunks)
 }
