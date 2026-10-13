@@ -123,6 +123,8 @@ async fn run() -> anyhow::Result<()> {
                 register_deferred_metrics();
             }
         }
+        // The output checks run on every model, in every mode.
+        register_check_metrics();
         ds_store::pool::register_metrics();
     }
     tracing::info!(
@@ -443,6 +445,51 @@ fn register_deferred_metrics() {
     for path in ["stream", "reclaim"] {
         metrics::counter!(common::metrics::metric_name(DEFERRED_METRIC), "path" => path)
             .increment(0);
+    }
+}
+
+/// `enricher_rail_replacement_downgrades_total`: periods whose
+/// `rail_replacement_bus` the output checks cleared ([`record_check_report`]).
+const RAIL_REPLACEMENT_DOWNGRADES_METRIC: &str = "enricher_rail_replacement_downgrades_total";
+/// `enricher_adversarial_echo_mismatches_total{call, kind, result}`
+/// ([`record_echo_mismatch`]).
+const ECHO_MISMATCHES_METRIC: &str = "enricher_adversarial_echo_mismatches_total";
+/// `enricher_end_time_checks_total{action}` ([`record_check_report`]).
+const END_TIME_CHECKS_METRIC: &str = "enricher_end_time_checks_total";
+/// The calls the echo check re-asks.
+const ECHO_CALLS: [llm::LlmCall; 2] = [
+    llm::LlmCall::ResolutionAdversarial,
+    llm::LlmCall::SeverityAdversarial,
+];
+/// [`record_echo_mismatch`]'s `result` labels.
+const ECHO_RESULTS: [&str; 2] = ["recovered", "failed"];
+
+/// The output checks' counters at 0, every label combination, so "no
+/// events" reads as 0 rather than an absent series (`rate()`, `absent()`).
+fn register_check_metrics() {
+    metrics::counter!(common::metrics::metric_name(
+        RAIL_REPLACEMENT_DOWNGRADES_METRIC
+    ))
+    .increment(0);
+    for call in ECHO_CALLS {
+        for kind in combine::EchoMismatch::LABELS {
+            for result in ECHO_RESULTS {
+                metrics::counter!(
+                    common::metrics::metric_name(ECHO_MISMATCHES_METRIC),
+                    "call" => call.label(),
+                    "kind" => kind,
+                    "result" => result
+                )
+                .increment(0);
+            }
+        }
+    }
+    for action in checks::EndTimeAction::ALL {
+        metrics::counter!(
+            common::metrics::metric_name(END_TIME_CHECKS_METRIC),
+            "action" => action.label()
+        )
+        .increment(0);
     }
 }
 
@@ -1370,7 +1417,11 @@ fn record_echo_mismatch(
     mismatch: combine::EchoMismatch,
     recovered: bool,
 ) {
-    let result = if recovered { "recovered" } else { "failed" };
+    let result = if recovered {
+        ECHO_RESULTS[0]
+    } else {
+        ECHO_RESULTS[1]
+    };
     tracing::warn!(
         incident_id,
         call = call.label(),
@@ -1379,7 +1430,7 @@ fn record_echo_mismatch(
         "adversarial verdicts did not echo the primary periods; asked that pass again"
     );
     metrics::counter!(
-        common::metrics::metric_name("enricher_adversarial_echo_mismatches_total"),
+        common::metrics::metric_name(ECHO_MISMATCHES_METRIC),
         "call" => call.label(),
         "kind" => mismatch.label(),
         "result" => result
@@ -1401,7 +1452,7 @@ fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
             "rail_replacement_bus cleared: the text mentions no replacement service"
         );
         metrics::counter!(common::metrics::metric_name(
-            "enricher_rail_replacement_downgrades_total"
+            RAIL_REPLACEMENT_DOWNGRADES_METRIC
         ))
         .increment(u64::try_from(report.rail_replacement_downgraded).unwrap_or(u64::MAX));
     }
@@ -1420,7 +1471,7 @@ fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
             "period end time is an hour or more from every end time the text states"
         );
         metrics::counter!(
-            common::metrics::metric_name("enricher_end_time_checks_total"),
+            common::metrics::metric_name(END_TIME_CHECKS_METRIC),
             "action" => flag.action.label()
         )
         .increment(1);
@@ -2192,6 +2243,50 @@ mod tests {
                 .mount(server)
                 .await;
         }
+    }
+
+    /// The output checks' counters are on `/metrics` at 0 from startup,
+    /// every label combination, before any check has fired.
+    #[test]
+    fn output_check_counters_are_registered_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        register_check_metrics();
+        let rendered = handle.render();
+        let mut want =
+            vec!["distant_signal_enricher_rail_replacement_downgrades_total 0".to_string()];
+        for call in ["resolution_adversarial", "severity_adversarial"] {
+            for kind in ["count", "echo"] {
+                for result in ["recovered", "failed"] {
+                    want.push(format!(
+                        "distant_signal_enricher_adversarial_echo_mismatches_total{{call=\"{call}\",kind=\"{kind}\",result=\"{result}\"}} 0"
+                    ));
+                }
+            }
+        }
+        for action in ["corrected", "dropped", "flagged"] {
+            want.push(format!(
+                "distant_signal_enricher_end_time_checks_total{{action=\"{action}\"}} 0"
+            ));
+        }
+        for line in &want {
+            assert!(rendered.lines().any(|l| l == line), "{line}\n{rendered}");
+        }
+        // The label sets are the code's own.
+        let kinds = [
+            combine::EchoMismatch::Count {
+                periods: 1,
+                verdicts: 2,
+            }
+            .label(),
+            combine::EchoMismatch::Echo { period_index: 0 }.label(),
+        ];
+        assert_eq!(kinds, combine::EchoMismatch::LABELS);
+        assert_eq!(
+            checks::EndTimeAction::ALL.map(checks::EndTimeAction::label),
+            ["corrected", "dropped", "flagged"]
+        );
     }
 
     #[test]

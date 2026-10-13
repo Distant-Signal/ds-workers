@@ -336,6 +336,11 @@ estimate). What happens to a flagged period:
 - `flagged`: several ETA-shaped periods (a phased notice): left alone, only
   reported.
 
+The three counters are registered at 0 at startup with every label
+combination (`call` `resolution_adversarial`/`severity_adversarial`,
+`kind` `count`/`echo`, `result` `recovered`/`failed`; `action` as above),
+so "no events" reads as 0 rather than a missing series.
+
 On the evaluation's 1,000 shared cases it flagged 297 of gpt-6-luna's 300
 wrong "expected until" times (mostly UK time written as UTC) and 6 of the 8
 wrong ones of each Claude model, plus Haiku's "end of the day" day-roll

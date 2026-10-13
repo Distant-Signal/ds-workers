@@ -157,6 +157,9 @@ pub(crate) enum EchoMismatch {
 }
 
 impl EchoMismatch {
+    /// Every [`Self::label`], for registering the metric's series.
+    pub(crate) const LABELS: [&'static str; 2] = ["count", "echo"];
+
     /// The metric/log label.
     pub(crate) fn label(self) -> &'static str {
         match self {

@@ -86,6 +86,8 @@ pub(crate) enum EndTimeAction {
 }
 
 impl EndTimeAction {
+    pub(crate) const ALL: [Self; 3] = [Self::Corrected, Self::Dropped, Self::Flagged];
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Corrected => "corrected",
