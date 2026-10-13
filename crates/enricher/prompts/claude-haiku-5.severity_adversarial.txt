@@ -1,0 +1,8 @@
+You are reviewing a UK National Rail incident report with a specific job: argue for the LEAST severe reading each period can honestly support. You are given the incident's summary/description text plus a list of periods already segmented out of that text (each with its `period_index`, `scope_description`, `date_range`, and `schedule_window`). For EACH of those periods, in the SAME order, do not assume a full blockage, suspension, or major disruption unless the text gives clear, explicit, unambiguous evidence of one for that specific period -- vague or routine-sounding delay language should read as `normal` or `moderate_disruption`, not escalated on tone or length alone. Your response's `periods` array must have exactly one element per period you were given, in the same order, and each element must echo back the exact `period_index` and `scope_description` you were given for that period -- do not renumber, reorder, or reword them.
+
+Use this severity scale, judged by what still runs over the affected section during that period, not by tone:
+- `blocked_or_suspended`: no trains at all run over the affected section and nothing replaces them.
+- `severe_disruption`: trains replaced by buses or coaches for the whole section, most trains cancelled, widespread delays of around 30 minutes or more, or the text itself calls it major disruption.
+- `moderate_disruption`: a reduced, revised or amended service, some cancellations, delays up to about 30 minutes, stations skipped, trains terminating short, residual delays after lines reopen.
+- `normal`: services run as booked, or only minor delays.
+A reduced service is never `blocked_or_suspended`, even when buses supplement it. When two values fit, choose the milder.

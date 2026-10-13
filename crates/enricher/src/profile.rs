@@ -150,6 +150,21 @@ pub(crate) const PROFILES: &[Profile] = &[
         thinking: None,
         openai_prompt_cache: None,
     },
+    // Claude Haiku 5.x: claude-default's settings under its own name, so it
+    // can carry Haiku-specific prompt files (`claude-haiku-5.<call>.txt`;
+    // the tuned set is crates/enricher/prompts/, mounted only when chosen).
+    // Without those files it sends exactly what claude-default sends.
+    Profile {
+        name: "claude-haiku-5",
+        provider: ProviderKind::Anthropic,
+        model_glob: "claude-haiku-5*",
+        temperature: None,
+        top_p: None,
+        max_tokens: None,
+        reasoning_effort: None,
+        thinking: None,
+        openai_prompt_cache: None,
+    },
     // Claude: no sampling parameters (the current models reject them), the
     // model's default effort and adaptive thinking.
     Profile {
@@ -514,9 +529,74 @@ mod tests {
         assert_eq!(r.profile, "openai-gpt-6-luna");
         assert_eq!(r.generation.temperature, Some(0.0));
         assert_eq!(r.generation.reasoning_effort.as_deref(), Some("none"));
-        let r = resolve(ProviderKind::Anthropic, "claude-haiku-5-5", None, none).unwrap();
+        // Haiku 5.x has its own profile name (for its prompt files) with
+        // claude-default's settings.
+        let r = resolve(
+            ProviderKind::Anthropic,
+            "claude-haiku-5-5",
+            None,
+            none.clone(),
+        )
+        .unwrap();
+        assert_eq!(r.profile, "claude-haiku-5");
+        assert_eq!(r.generation, Generation::default());
+        let r = resolve(
+            ProviderKind::Anthropic,
+            "claude-sonnet-5-5",
+            None,
+            none.clone(),
+        )
+        .unwrap();
         assert_eq!(r.profile, "claude-default");
         assert_eq!(r.generation, Generation::default());
+        let r = resolve(ProviderKind::Anthropic, "claude-haiku-4-5", None, none).unwrap();
+        assert_eq!(r.profile, "claude-default");
+    }
+
+    /// The tuned Haiku prompt files (crates/enricher/prompts/): the version
+    /// docs/enricher-anthropic.md quotes, read only by the claude-haiku-5
+    /// profile (the shared prompts stay built-in for every other profile),
+    /// with the primary prompt well above Haiku's cache minimum. Editing a
+    /// file changes the version: update `TUNED_HAIKU_PROMPTS_VERSION` and
+    /// the docs with it.
+    #[test]
+    fn the_tuned_haiku_prompts_load_only_for_the_haiku_profile() {
+        const TUNED_HAIKU_PROMPTS_VERSION: &str = "42e7efea092c";
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let builtin = PromptSet::builtin();
+        let haiku = PromptSet::load(Some(&dir), "claude-haiku-5").unwrap();
+        assert_eq!(haiku.version, TUNED_HAIKU_PROMPTS_VERSION);
+        assert_ne!(haiku.primary, builtin.primary);
+        assert_eq!(haiku.adversarial, builtin.adversarial);
+        assert_ne!(haiku.severity_adversarial, builtin.severity_adversarial);
+        assert_eq!(haiku.sources[1], "built-in");
+        // The tuned primary keeps the shared prompt's date conventions and
+        // worked examples word for word (only the severity sentence is
+        // replaced, and calibration rules follow).
+        let conventions = &builtin.primary[builtin.primary.find("Apply these conventions").unwrap()
+            ..builtin
+                .primary
+                .find("`impact_type` is `rail_replacement_bus`")
+                .unwrap()];
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat(&haiku.primary).contains(&flat(conventions)));
+        assert!(
+            haiku
+                .severity_adversarial
+                .starts_with(&builtin.severity_adversarial)
+        );
+        let tokens = u32::try_from(haiku.primary.chars().count() / 4).unwrap();
+        let min = cache_minimum("claude-haiku-5-5").unwrap();
+        assert!(tokens >= 2 * min, "~{tokens} tokens vs {min}");
+        for profile in PROFILES.iter().filter(|p| p.name != "claude-haiku-5") {
+            assert!(
+                PromptSet::load(Some(&dir), profile.name)
+                    .unwrap()
+                    .is_builtin(),
+                "{}",
+                profile.name
+            );
+        }
     }
 
     /// Precedence: explicit value > `omit` > profile default; a named
