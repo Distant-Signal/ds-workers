@@ -6,6 +6,7 @@
 
 mod auth;
 mod batch;
+mod checks;
 mod churn;
 mod combine;
 mod config;
@@ -1129,14 +1130,15 @@ async fn finish_extraction(
         ..
     } = prepared;
     let incident_id = incident_id.as_str();
-    let Some(periods) = combine_or_record(
+    let Some(periods) = combine_and_check(
         enricher,
-        incident_id,
-        text_hash,
+        prepared,
         primary,
         resolution_adversarial,
         severity_adversarial,
-    ) else {
+    )
+    .await
+    else {
         return false;
     };
 
@@ -1221,6 +1223,183 @@ async fn finish_extraction(
         );
     }
     true
+}
+
+/// The combine and validation step after the three calls: the adversarial
+/// echo check and its retry, `combine_periods` (recorded in the mismatch
+/// tracker and the backoff), then the output checks (`checks.rs`). `None`
+/// when the periods can't be combined.
+async fn combine_and_check(
+    enricher: &Enricher,
+    prepared: &Prepared,
+    primary: &llm::PrimaryExtraction,
+    resolution_adversarial: &[llm::AdversarialPeriodVerdict],
+    severity_adversarial: &[llm::SeverityAdversarialPeriodVerdict],
+) -> Option<Vec<llm::ExtractionPeriod>> {
+    let (resolution_adversarial, severity_adversarial) = realign_adversarial(
+        enricher,
+        prepared,
+        primary,
+        resolution_adversarial,
+        severity_adversarial,
+    )
+    .await;
+    let mut periods = combine_or_record(
+        enricher,
+        &prepared.incident_id,
+        &prepared.text_hash,
+        primary,
+        &resolution_adversarial,
+        &severity_adversarial,
+    )?;
+    let report = checks::apply(
+        &checks::CheckText {
+            summary: &prepared.summary,
+            description: &prepared.description,
+            reference_date: prepared.reference_date,
+        },
+        &mut periods,
+    );
+    record_check_report(&prepared.incident_id, &report);
+    Some(periods)
+}
+
+/// The adversarial echo check (`combine::echo_mismatch`): a verdict list
+/// that doesn't echo the primary periods (wrong count, a placeholder
+/// `scope_description`, a renumbering) is invalid output, and that one pass
+/// is asked again, once, synchronously (on the batch path too). A retry that
+/// still doesn't line up is kept, so `combine_or_record` fails the attempt
+/// as before: nothing is written, the keyword severity stays in force and
+/// the per-text backoff applies. Counted in
+/// `enricher_adversarial_echo_mismatches_total{call, kind, result}`.
+async fn realign_adversarial(
+    enricher: &Enricher,
+    prepared: &Prepared,
+    primary: &llm::PrimaryExtraction,
+    resolution: &[llm::AdversarialPeriodVerdict],
+    severity: &[llm::SeverityAdversarialPeriodVerdict],
+) -> (
+    Vec<llm::AdversarialPeriodVerdict>,
+    Vec<llm::SeverityAdversarialPeriodVerdict>,
+) {
+    let llm = &enricher.llm;
+    let (incident_id, summary, description) = (
+        prepared.incident_id.as_str(),
+        prepared.summary.as_str(),
+        prepared.description.as_str(),
+    );
+    let mut resolution = resolution.to_vec();
+    if let Some(mismatch) = combine::echo_mismatch(&primary.periods, &resolution) {
+        let start = std::time::Instant::now();
+        let retry = llm
+            .extract_adversarial(summary, description, &primary.periods)
+            .await;
+        record_llm_call_metrics(
+            llm::LlmCall::ResolutionAdversarial.label(),
+            start.elapsed(),
+            llm_outcome(&retry),
+        );
+        let recovered = retry
+            .ok()
+            .filter(|v| combine::echo_mismatch(&primary.periods, v).is_none());
+        record_echo_mismatch(
+            incident_id,
+            llm::LlmCall::ResolutionAdversarial,
+            mismatch,
+            recovered.is_some(),
+        );
+        if let Some(verdicts) = recovered {
+            resolution = verdicts;
+        }
+    }
+    let mut severity = severity.to_vec();
+    if let Some(mismatch) = combine::echo_mismatch(&primary.periods, &severity) {
+        let start = std::time::Instant::now();
+        let retry = llm
+            .extract_severity_adversarial(summary, description, &primary.periods)
+            .await;
+        record_llm_call_metrics(
+            llm::LlmCall::SeverityAdversarial.label(),
+            start.elapsed(),
+            llm_outcome(&retry),
+        );
+        let recovered = retry
+            .ok()
+            .filter(|v| combine::echo_mismatch(&primary.periods, v).is_none());
+        record_echo_mismatch(
+            incident_id,
+            llm::LlmCall::SeverityAdversarial,
+            mismatch,
+            recovered.is_some(),
+        );
+        if let Some(verdicts) = recovered {
+            severity = verdicts;
+        }
+    }
+    (resolution, severity)
+}
+
+fn record_echo_mismatch(
+    incident_id: &str,
+    call: llm::LlmCall,
+    mismatch: combine::EchoMismatch,
+    recovered: bool,
+) {
+    let result = if recovered { "recovered" } else { "failed" };
+    tracing::warn!(
+        incident_id,
+        call = call.label(),
+        mismatch = %mismatch,
+        result,
+        "adversarial verdicts did not echo the primary periods; asked that pass again"
+    );
+    metrics::counter!(
+        common::metrics::metric_name("enricher_adversarial_echo_mismatches_total"),
+        "call" => call.label(),
+        "kind" => mismatch.label(),
+        "result" => result
+    )
+    .increment(1);
+}
+
+/// Logs and counts what the output checks (`checks.rs`) changed:
+/// `enricher_rail_replacement_downgrades_total` (periods) and
+/// `enricher_end_time_checks_total{action}` (periods).
+fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
+    if report.is_clean() {
+        return;
+    }
+    if report.rail_replacement_downgraded > 0 {
+        tracing::info!(
+            incident_id,
+            periods = report.rail_replacement_downgraded,
+            "rail_replacement_bus cleared: the text mentions no replacement service"
+        );
+        metrics::counter!(common::metrics::metric_name(
+            "enricher_rail_replacement_downgrades_total"
+        ))
+        .increment(u64::try_from(report.rail_replacement_downgraded).unwrap_or(u64::MAX));
+    }
+    for flag in &report.end_times {
+        let stated: Vec<String> = flag
+            .stated
+            .iter()
+            .map(chrono::DateTime::to_rfc3339)
+            .collect();
+        tracing::warn!(
+            incident_id,
+            period_index = flag.period_index,
+            to_date = %flag.to_date.to_rfc3339(),
+            stated = ?stated,
+            action = flag.action.label(),
+            "period end time is an hour or more from every end time the text states"
+        );
+        metrics::counter!(
+            common::metrics::metric_name("enricher_end_time_checks_total"),
+            "action" => flag.action.label()
+        )
+        .increment(1);
+    }
 }
 
 /// Combines the primary periods with the two verdict lists, recording the
@@ -1600,6 +1779,104 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+    }
+
+    /// The output checks on the service path: a severity verdict list that
+    /// doesn't echo the periods is asked again once (and the aligned retry
+    /// is used), an unsupported `rail_replacement_bus` is cleared and an
+    /// end time written as UTC is corrected to the stated UK time.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher process_incident -- --ignored --test-threads=1`"]
+    async fn process_incident_retries_an_unechoed_verdict_list_and_applies_the_output_checks() {
+        let pool = test_pool().await;
+        let incident_id = "TEST-ENRICHER-CHECKS-1";
+        let summary = "Disruption between Leeds and York expected until 21:00";
+        let description = "<p>Disruption is expected until 21:00.</p>\
+             <p>Your ticket will be accepted on Arriva bus route 7 between Leeds and York.</p>";
+        seed_incident(&pool, incident_id, summary, description).await;
+        // The reference time (when this text appeared): a BST afternoon.
+        for table in ["incidents", "incident_history"] {
+            let column = if table == "incidents" {
+                "first_seen_at"
+            } else {
+                "recorded_at"
+            };
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = '2026-09-20T15:00:00Z' WHERE incident_id = $1"
+            ))
+            .bind(incident_id)
+            .execute(&pool)
+            .await
+            .expect("set the reference time");
+        }
+
+        let server = MockServer::start().await;
+        let primary = serde_json::json!({
+            "category": "signal_failure",
+            "periods": [{
+                "scope_description": null,
+                "date_range": { "from_date": null, "to_date": "2026-09-20T21:00:00Z" },
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "moderate_disruption",
+                "impact_type": "rail_replacement_bus"
+            }]
+        });
+        let reply = |content: serde_json::Value| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "content": content.to_string() } }]
+            }))
+        };
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("incident_extraction"))
+            .respond_with(reply(primary))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("adversarial_resolution_check"))
+            .respond_with(reply(serde_json::json!({ "periods": [
+                { "period_index": 0, "scope_description": null, "resolution_status": "ongoing" }
+            ]})))
+            .mount(&server)
+            .await;
+        // First severity answer: a placeholder echo; the retry is aligned.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("adversarial_severity_check"))
+            .respond_with(reply(serde_json::json!({ "periods": [
+                { "period_index": 0, "scope_description": "x", "apparent_severity": "normal" }
+            ]})))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("adversarial_severity_check"))
+            .respond_with(reply(serde_json::json!({ "periods": [
+                { "period_index": 0, "scope_description": null, "apparent_severity": "moderate_disruption" }
+            ]})))
+            .mount(&server)
+            .await;
+
+        let enricher = test_enricher(pool.clone(), &server, "test-model@periods-v2", false);
+        let ok = process_incident(&enricher, incident_id, latency::Path::Stream).await;
+        assert!(ok, "the aligned retry must let the extraction complete");
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+
+        let (periods,): (Option<serde_json::Value>,) =
+            sqlx::query_as("SELECT extracted_periods FROM incidents WHERE incident_id = $1")
+                .bind(incident_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch written row");
+        let periods = periods.expect("extracted_periods must be written");
+        assert_eq!(periods[0]["impact_type"], serde_json::Value::Null);
+        assert_eq!(periods[0]["date_range"]["to_date"], "2026-09-20T20:00:00Z");
+        assert_eq!(periods[0]["severity_confidence"], "high");
+        cleanup_incident(&pool, incident_id).await;
     }
 
     // `MAX_PERIODS` itself is private to `llm.rs`; this local alias avoids

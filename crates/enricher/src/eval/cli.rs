@@ -41,7 +41,7 @@
 //! (docs/enricher-model-eval.md): `EVAL_MODE`, `EVAL_BATCH_POLL_SECS`,
 //! `EVAL_BATCH_MAX_REQUESTS`, `EVAL_BATCH_RETRY_SYNC`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -50,6 +50,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::Serialize;
 
+use crate::checks::CheckReport;
 use crate::eval::cost::{self, CostEstimate};
 use crate::eval::dataset::{self, Case};
 use crate::eval::pipeline::{CallRecord, Extraction, Failure, FailureKind, PipelineRecord};
@@ -155,6 +156,53 @@ struct Counts {
     invalid_outputs: usize,
     /// Per pass, outcome label to count.
     call_outcomes: BTreeMap<String, BTreeMap<String, usize>>,
+    /// Adversarial passes asked again because their verdicts didn't echo
+    /// the primary periods (`pipeline::retry_echo_mismatches`).
+    echo_retries: usize,
+    /// What the output checks changed in the completed records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checks: Option<CheckCounts>,
+}
+
+/// The output checks (`checks.rs`) over a target's completed records.
+#[derive(Debug, Clone, Default, Serialize)]
+struct CheckCounts {
+    /// Records with a `rail_replacement_bus` cleared.
+    rail_replacement_records: usize,
+    /// Periods with `rail_replacement_bus` cleared.
+    rail_replacement_periods: usize,
+    /// Records with a flagged end time.
+    end_time_records: usize,
+    /// Flagged periods, by action (`corrected`, `dropped`, `flagged`).
+    end_time_periods: BTreeMap<&'static str, usize>,
+}
+
+impl CheckCounts {
+    fn of(records: &[PipelineRecord], cases: &HashMap<&str, &Case>) -> Self {
+        let mut counts = Self::default();
+        for record in records {
+            let Some(case) = cases.get(record.case_id.as_str()) else {
+                continue;
+            };
+            let Ok((_, report)) = record.outcome_checked(case) else {
+                continue;
+            };
+            if report.rail_replacement_downgraded > 0 {
+                counts.rail_replacement_records += 1;
+                counts.rail_replacement_periods += report.rail_replacement_downgraded;
+            }
+            if !report.end_times.is_empty() {
+                counts.end_time_records += 1;
+            }
+            for flag in &report.end_times {
+                *counts
+                    .end_time_periods
+                    .entry(flag.action.label())
+                    .or_default() += 1;
+            }
+        }
+        counts
+    }
 }
 
 impl Counts {
@@ -164,6 +212,7 @@ impl Counts {
             ..Self::default()
         };
         for record in records {
+            counts.echo_retries += record.echo_retries();
             match record.outcome() {
                 Ok(_) => counts.completed += 1,
                 Err(failure) if failure.kind == FailureKind::Transport => {
@@ -208,13 +257,20 @@ struct ResultLine<'a> {
     prompt_fingerprint: &'a str,
     /// `completed` or `failed`.
     status: &'static str,
+    /// What the service would have written: the combined periods with the
+    /// output checks applied (`checks.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     extraction: Option<ExtractionOut>,
+    /// What the output checks changed or flagged in `extraction` (absent
+    /// for a failed record, or when the case text wasn't available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checks: Option<CheckReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<Failure>,
     /// The record's wall time (in batch mode: the batches' turnarounds).
     elapsed_ms: u64,
-    /// Every call made, in order: primary, then the adversarial passes.
+    /// Every call made, in order: primary, then the adversarial passes,
+    /// then any echo retry of an adversarial pass.
     calls: Vec<CallOut<'a>>,
     /// The record's estimated cost (`None` without a price).
     estimated_usd: Option<f64>,
@@ -279,14 +335,29 @@ fn call_out<'a>(call: &'a CallRecord, pricing: Option<&cost::Pricing>) -> CallOu
     }
 }
 
+/// The record's case, when it is the text the record was run on.
+fn case_of<'c>(record: &PipelineRecord, cases: &HashMap<&str, &'c Case>) -> Option<&'c Case> {
+    cases
+        .get(record.case_id.as_str())
+        .copied()
+        .filter(|case| record.input_hash.is_empty() || case.input_hash() == record.input_hash)
+}
+
 fn result_line<'a>(
     target: &'a Target,
     record: &'a PipelineRecord,
+    case: Option<&Case>,
     pricing: Option<&cost::Pricing>,
 ) -> ResultLine<'a> {
-    let (status, extraction, failure) = match record.outcome() {
-        Ok(extraction) => ("completed", Some(extraction.into()), None),
-        Err(failure) => ("failed", None, Some(failure)),
+    let outcome = match case {
+        Some(case) => record
+            .outcome_checked(case)
+            .map(|(extraction, report)| (extraction, Some(report))),
+        None => record.outcome().map(|extraction| (extraction, None)),
+    };
+    let (status, extraction, checks, failure) = match outcome {
+        Ok((extraction, checks)) => ("completed", Some(extraction.into()), checks, None),
+        Err(failure) => ("failed", None, None, Some(failure)),
     };
     let calls: Vec<CallOut<'a>> = record
         .calls
@@ -307,6 +378,7 @@ fn result_line<'a>(
         prompt_fingerprint: &record.prompt_fingerprint,
         status,
         extraction,
+        checks,
         failure,
         elapsed_ms: record.elapsed_ms,
         calls,
@@ -318,6 +390,7 @@ fn write_results(
     path: &Path,
     target: &Target,
     records: &[PipelineRecord],
+    cases: &HashMap<&str, &Case>,
     cost: Option<&CostEstimate>,
 ) -> anyhow::Result<()> {
     let pricing = cost.map(|c| c.pricing);
@@ -326,6 +399,7 @@ fn write_results(
         out.push_str(&serde_json::to_string(&result_line(
             target,
             record,
+            case_of(record, cases),
             pricing.as_ref(),
         ))?);
         out.push('\n');
@@ -395,13 +469,16 @@ async fn run_target(
     )
     .await?;
     let stem = target.file_stem();
+    let by_id: HashMap<&str, &Case> = cases.iter().map(|case| (case.id.as_str(), case)).collect();
     write_results(
         &dir.join(format!("{stem}.results.jsonl")),
         target,
         &records,
+        &by_id,
         run.cost.as_ref(),
     )?;
-    let counts = Counts::of(&records);
+    let mut counts = Counts::of(&records);
+    counts.checks = Some(CheckCounts::of(&records, &by_id));
     crate::eval::write_json(
         &dir.join(format!("{stem}.summary.json")),
         &TargetSummary {
@@ -595,10 +672,17 @@ mod tests {
         }
         let target = target();
         let pricing = target.pricing().unwrap().0;
-        let line = serde_json::to_value(result_line(&target, &record, Some(&pricing))).unwrap();
+        let line = serde_json::to_value(result_line(
+            &target,
+            &record,
+            Some(&case("a")),
+            Some(&pricing),
+        ))
+        .unwrap();
         assert_eq!(line["status"], "completed");
         assert_eq!(line["provider"], "anthropic");
         assert_eq!(line["extraction"]["category"], "signal_failure");
+        assert_eq!(line["checks"]["rail_replacement_downgraded"], 0);
         assert_eq!(
             line["extraction"]["periods"][0]["severity_confidence"],
             "high"
@@ -618,7 +702,7 @@ mod tests {
         };
         failed.calls[0].content = None;
         failed.calls[0].outcome = "batch_expired".to_string();
-        let line = serde_json::to_value(result_line(&target, &failed, None)).unwrap();
+        let line = serde_json::to_value(result_line(&target, &failed, None, None)).unwrap();
         assert_eq!(line["status"], "failed");
         assert_eq!(line["failure"]["kind"], "transport");
         assert_eq!(line["failure"]["outcome"], "batch_expired");

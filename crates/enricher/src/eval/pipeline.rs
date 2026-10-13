@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::checks::{self, CheckReport};
 use crate::combine;
 use crate::eval::dataset::Case;
 use crate::llm::{self, ExtractionPeriod, LlmClient, RawCall};
@@ -268,8 +269,61 @@ impl PipelineRecord {
         })
     }
 
+    /// [`Self::outcome`] with the service's output checks applied
+    /// (`checks::apply`, given the case's text): what the service would
+    /// have written, and what the checks changed.
+    pub(crate) fn outcome_checked(
+        &self,
+        case: &Case,
+    ) -> Result<(Extraction, CheckReport), Failure> {
+        let mut extraction = self.outcome()?;
+        let report = checks::apply(
+            &checks::CheckText {
+                summary: &case.summary,
+                description: &case.description,
+                reference_date: case.reference_date,
+            },
+            &mut extraction.periods,
+        );
+        Ok((extraction, report))
+    }
+
+    /// The adversarial passes whose last call parsed but doesn't echo the
+    /// primary periods (`combine::echo_mismatch`): the ones the service
+    /// asks again.
+    pub(crate) fn echo_mismatches(&self) -> Vec<Pass> {
+        let Ok(primary) = self.parsed(Pass::Primary, llm::parse_primary) else {
+            return Vec::new();
+        };
+        let mut passes = Vec::new();
+        if let Ok(verdicts) = self.parsed(Pass::ResolutionAdversarial, llm::parse_adversarial)
+            && combine::echo_mismatch(&primary.periods, &verdicts).is_some()
+        {
+            passes.push(Pass::ResolutionAdversarial);
+        }
+        if let Ok(verdicts) =
+            self.parsed(Pass::SeverityAdversarial, llm::parse_severity_adversarial)
+            && combine::echo_mismatch(&primary.periods, &verdicts).is_some()
+        {
+            passes.push(Pass::SeverityAdversarial);
+        }
+        passes
+    }
+
+    /// How many echo retries the record holds (calls beyond one per pass).
+    pub(crate) fn echo_retries(&self) -> usize {
+        self.calls.len().saturating_sub(
+            Pass::ALL
+                .iter()
+                .filter(|p| self.calls.iter().any(|c| c.pass == **p))
+                .count(),
+        )
+    }
+
     fn parsed<T>(&self, pass: Pass, parse: fn(&str) -> anyhow::Result<T>) -> Result<T, Failure> {
-        let Some(call) = self.calls.iter().find(|c| c.pass == pass) else {
+        // The last call of the pass: an echo retry follows the call it
+        // replaces (`retry_echo_mismatches`).
+        let Some(call) = self.calls.iter().rev().find(|c| c.pass == pass) else {
             return Err(Failure {
                 stage: pass.into(),
                 kind: FailureKind::InvalidOutput,
@@ -371,15 +425,49 @@ pub(crate) async fn run_pipeline<B: Backend>(
             }
         }
     }
-    PipelineRecord {
+    let mut record = PipelineRecord {
         label: label.clone(),
         case_id: case.id.clone(),
         input_hash: case.input_hash(),
         prompt_fingerprint: backend.prompt_fingerprint(),
         repetition,
-        elapsed_ms: millis(start.elapsed()),
+        elapsed_ms: 0,
         calls,
+    };
+    retry_echo_mismatches(backend, case, &mut record).await;
+    record.elapsed_ms = millis(start.elapsed());
+    record
+}
+
+/// The service's echo retry (`main.rs::realign_adversarial`): each
+/// adversarial pass whose verdicts parsed but don't echo the primary
+/// periods is asked again, once, synchronously; the retry is appended to
+/// the record's calls, and [`PipelineRecord::outcome`] reads the last call
+/// of each pass. Returns how many passes it re-asked.
+pub(crate) async fn retry_echo_mismatches<B: Backend>(
+    backend: &B,
+    case: &Case,
+    record: &mut PipelineRecord,
+) -> usize {
+    let passes = record.echo_mismatches();
+    if passes.is_empty() {
+        return 0;
     }
+    let Some(periods) = record
+        .calls
+        .iter()
+        .find(|c| c.pass == Pass::Primary)
+        .and_then(|c| c.content.as_deref())
+        .and_then(|content| llm::parse_primary(content).ok())
+        .map(|primary| primary.periods)
+    else {
+        return 0;
+    };
+    for pass in &passes {
+        let call = timed_call(backend, *pass, case, &periods).await;
+        record.calls.push(call);
+    }
+    passes.len()
 }
 
 /// Runs every case `repetitions` times, at most `concurrency` documents at
@@ -434,6 +522,8 @@ pub(crate) struct FakeBackend {
     in_flight: std::sync::atomic::AtomicUsize,
     /// Highest number of calls seen in flight at once.
     pub max_in_flight: std::sync::atomic::AtomicUsize,
+    /// Calls so far per (case, pass), for [`FakeReply::FirstThen`].
+    seen: std::sync::Mutex<std::collections::BTreeMap<(String, Pass), usize>>,
 }
 
 /// What a [`FakeBackend`] answers for one (case, pass).
@@ -454,6 +544,11 @@ pub(crate) enum FakeReply {
     /// `then` (whose own attempts follow).
     Retried {
         failed: Vec<fn() -> llm::LlmCallError>,
+        then: Box<FakeReply>,
+    },
+    /// `first` for the first call of this (case, pass), `then` after.
+    FirstThen {
+        first: Box<FakeReply>,
         then: Box<FakeReply>,
     },
 }
@@ -486,7 +581,22 @@ impl Backend for FakeBackend {
             tokio::time::sleep(self.delay).await;
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        let reply = self.replies.get(&(case.id.clone(), pass)).cloned();
+        let key = (case.id.clone(), pass);
+        let seen = {
+            let mut seen = self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let count = seen.entry(key.clone()).or_default();
+            *count += 1;
+            *count
+        };
+        let reply = match self.replies.get(&key).cloned() {
+            Some(FakeReply::FirstThen { first, then }) => {
+                Some(if seen == 1 { *first } else { *then })
+            }
+            other => other,
+        };
         self.reply(reply, pass, case, periods)
     }
 }
@@ -558,6 +668,9 @@ impl FakeBackend {
                 raw.attempts = attempts;
                 raw.retries += u32::try_from(failed.len()).unwrap_or(u32::MAX);
                 raw
+            }
+            Some(FakeReply::FirstThen { first, .. }) => {
+                self.reply(Some(*first), pass, case, periods)
             }
             None => RawCall {
                 content: Err(anyhow::anyhow!(
@@ -674,6 +787,99 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.stage, Stage::Combine);
         assert_eq!(failure.kind, FailureKind::InvalidOutput);
+    }
+
+    /// A severity list that doesn't echo the periods (one placeholder
+    /// verdict for two periods) is asked again once; an aligned retry
+    /// completes the record, a second bad one leaves it failed.
+    #[tokio::test]
+    async fn an_unechoed_verdict_list_is_asked_again_once() {
+        let two_periods = serde_json::json!({
+            "category": "engineering_works",
+            "periods": [
+                {"scope_description": "a", "date_range": null, "schedule_window": null,
+                 "resolution_status": "ongoing", "apparent_severity": "moderate_disruption",
+                 "impact_type": null},
+                {"scope_description": "b", "date_range": null, "schedule_window": null,
+                 "resolution_status": "ongoing", "apparent_severity": "severe_disruption",
+                 "impact_type": null}
+            ]
+        });
+        let placeholder = serde_json::json!({"periods": [{
+            "period_index": 0, "scope_description": "x", "apparent_severity": "moderate_disruption"
+        }]})
+        .to_string();
+        let backend = FakeBackend::default().agreeing("a", &two_periods).with(
+            "a",
+            Pass::SeverityAdversarial,
+            FakeReply::FirstThen {
+                first: Box::new(FakeReply::Content(placeholder.clone())),
+                then: Box::new(FakeReply::Agree),
+            },
+        );
+        let record = run_pipeline(&backend, &label(), &case("a"), 0).await;
+        assert_eq!(
+            record.calls.iter().map(|c| c.pass).collect::<Vec<_>>(),
+            [
+                Pass::Primary,
+                Pass::ResolutionAdversarial,
+                Pass::SeverityAdversarial,
+                Pass::SeverityAdversarial
+            ]
+        );
+        assert_eq!(record.echo_retries(), 1);
+        assert!(record.echo_mismatches().is_empty());
+        assert_eq!(record.outcome().unwrap().periods.len(), 2);
+
+        let backend = FakeBackend::default().agreeing("a", &two_periods).with(
+            "a",
+            Pass::SeverityAdversarial,
+            FakeReply::Content(placeholder),
+        );
+        let record = run_pipeline(&backend, &label(), &case("a"), 0).await;
+        assert_eq!(record.calls.len(), 4);
+        let failure = record.outcome().unwrap_err();
+        assert_eq!(failure.stage, Stage::Combine);
+        assert_eq!(failure.outcome, "combine_mismatch");
+    }
+
+    /// `outcome_checked` applies the output checks with the case's text.
+    #[tokio::test]
+    async fn outcome_checked_applies_the_output_checks() {
+        let tagged = serde_json::json!({
+            "category": "signal_failure",
+            "periods": [{
+                "scope_description": null,
+                "date_range": {"from_date": null, "to_date": "2026-04-01T13:00:00Z"},
+                "schedule_window": null,
+                "resolution_status": "ongoing",
+                "apparent_severity": "moderate_disruption",
+                "impact_type": "rail_replacement_bus"
+            }]
+        });
+        let mut case = case("a");
+        case.summary = "Disruption expected until 13:00".to_string();
+        case.description = "<p>Your ticket will be accepted on local bus route 7.</p>".to_string();
+        let backend = FakeBackend::default().agreeing("a", &tagged);
+        let record = run_pipeline(&backend, &label(), &case, 0).await;
+        let (extraction, report) = record.outcome_checked(&case).unwrap();
+        assert_eq!(report.rail_replacement_downgraded, 1);
+        assert_eq!(extraction.periods[0].impact_type, None);
+        // 13:00 BST on 1 April is 12:00Z.
+        assert_eq!(report.end_times.len(), 1);
+        assert_eq!(
+            extraction.periods[0]
+                .date_range
+                .as_ref()
+                .and_then(|r| r.to_date)
+                .map(|d| d.to_rfc3339()),
+            Some("2026-04-01T12:00:00+00:00".to_string())
+        );
+        // The unchecked outcome is the model's own answer.
+        assert_eq!(
+            record.outcome().unwrap().periods[0].impact_type.as_deref(),
+            Some("rail_replacement_bus")
+        );
     }
 
     #[tokio::test]

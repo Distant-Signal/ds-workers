@@ -120,6 +120,92 @@ impl fmt::Display for CombineError {
 
 impl std::error::Error for CombineError {}
 
+/// One adversarial verdict's echo of the period it answers.
+pub(crate) trait Echo {
+    fn echoed_index(&self) -> usize;
+    fn echoed_scope(&self) -> Option<&str>;
+}
+
+impl Echo for AdversarialPeriodVerdict {
+    fn echoed_index(&self) -> usize {
+        self.period_index
+    }
+    fn echoed_scope(&self) -> Option<&str> {
+        self.scope_description.as_deref()
+    }
+}
+
+impl Echo for SeverityAdversarialPeriodVerdict {
+    fn echoed_index(&self) -> usize {
+        self.period_index
+    }
+    fn echoed_scope(&self) -> Option<&str> {
+        self.scope_description.as_deref()
+    }
+}
+
+/// Why one adversarial pass's verdict list can't be lined up with the
+/// primary periods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EchoMismatch {
+    /// A different number of verdicts than periods (e.g. one placeholder
+    /// verdict for a three-period extraction).
+    Count { periods: usize, verdicts: usize },
+    /// The verdict at `period_index` echoes another index or a different
+    /// `scope_description` (a reordering, or a placeholder such as "x").
+    Echo { period_index: usize },
+}
+
+impl EchoMismatch {
+    /// The metric/log label.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Count { .. } => "count",
+            Self::Echo { .. } => "echo",
+        }
+    }
+}
+
+impl fmt::Display for EchoMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Count { periods, verdicts } => {
+                write!(f, "{verdicts} verdict(s) for {periods} period(s)")
+            }
+            Self::Echo { period_index } => write!(
+                f,
+                "verdict {period_index} does not echo its period's index and scope_description"
+            ),
+        }
+    }
+}
+
+/// The adversarial output check: `None` when `verdicts` line up with
+/// `primary` one for one, each echoing its period's index and exact
+/// `scope_description`. `combine_periods` rejects exactly the lists this
+/// rejects; the service and `enricher eval` call it first, so that they
+/// can re-ask that one pass once before giving up on the extraction.
+pub(crate) fn echo_mismatch<V: Echo>(
+    primary: &[ExtractionPeriod],
+    verdicts: &[V],
+) -> Option<EchoMismatch> {
+    if verdicts.len() != primary.len() {
+        return Some(EchoMismatch::Count {
+            periods: primary.len(),
+            verdicts: verdicts.len(),
+        });
+    }
+    primary
+        .iter()
+        .zip(verdicts)
+        .enumerate()
+        .find(|(index, (period, verdict))| {
+            verdict.echoed_index() != *index
+                || verdict.echoed_scope() != period.scope_description.as_deref()
+        })
+        .map(|(period_index, _)| EchoMismatch::Echo { period_index })
+}
+
 /// Generalizes `combine`/`combine_severity` to operate elementwise over the
 /// primary pass's periods and both adversarial passes' per-period verdict
 /// arrays. A length mismatch between either adversarial array and the
@@ -476,6 +562,52 @@ mod tests {
             ),
             "expected an alignment mismatch, got {err:?}"
         );
+    }
+
+    /// The echo check rejects what `combine_periods` rejects (a short list,
+    /// a placeholder scope, a renumbering) and accepts an aligned list.
+    #[test]
+    fn echo_mismatch_matches_combine_periods() {
+        let primary = vec![
+            period(Some("a"), "ongoing", "normal"),
+            period(Some("b"), "ongoing", "normal"),
+            period(Some("c"), "ongoing", "normal"),
+        ];
+        let aligned: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| severity_verdict(i, Some(s), "normal"))
+            .collect();
+        assert_eq!(echo_mismatch(&primary, &aligned), None);
+        let placeholder = vec![severity_verdict(0, Some("x"), "moderate_disruption")];
+        assert_eq!(
+            echo_mismatch(&primary, &placeholder),
+            Some(EchoMismatch::Count {
+                periods: 3,
+                verdicts: 1
+            })
+        );
+        let mut scoped = aligned.clone();
+        scoped[1].scope_description = Some("x".to_string());
+        assert_eq!(
+            echo_mismatch(&primary, &scoped),
+            Some(EchoMismatch::Echo { period_index: 1 })
+        );
+        let mut renumbered = aligned.clone();
+        renumbered[2].period_index = 3;
+        assert_eq!(
+            echo_mismatch(&primary, &renumbered),
+            Some(EchoMismatch::Echo { period_index: 2 })
+        );
+        let resolution: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| resolution_verdict(i, Some(s), "ongoing"))
+            .collect();
+        for bad in [placeholder, scoped, renumbered] {
+            assert!(combine_periods(&primary, &resolution, &bad).is_err());
+        }
+        assert!(combine_periods(&primary, &resolution, &aligned).is_ok());
     }
 
     #[test]

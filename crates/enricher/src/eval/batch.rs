@@ -894,6 +894,19 @@ pub(crate) async fn run_batch(
         }
     }
 
+    // The service's echo retry (`main.rs::realign_adversarial`): an
+    // adversarial verdict list that doesn't echo the primary periods is
+    // asked again once, synchronously, as the service's batch path does.
+    for (record, (_, case_index)) in records.iter_mut().zip(&jobs) {
+        let retried = pipeline::retry_echo_mismatches(client, &cases[*case_index], record).await;
+        if retried > 0 {
+            eprintln!(
+                "batch: {}: {}: re-asked {retried} adversarial pass(es) whose verdicts didn't echo the periods",
+                label.target, record.case_id
+            );
+        }
+    }
+
     state.done = true;
     state.save(&opts.state_path)?;
     delete_files(client, &state.adversarial).await;

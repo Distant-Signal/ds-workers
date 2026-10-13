@@ -9,12 +9,16 @@ publish.workspace = true
 health-http = { path = "../health-http" }
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
+# Europe/London for the stated-end-time check (`src/checks.rs`).
+chrono-tz = "0.10"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common", features = ["postgres", "redis"] }
 dotenvy = "0.15.7"
 # The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.3).
 ds-store = { path = "../ds-store" }
 metrics = "0.24"
+# The output checks' text patterns (`src/checks.rs`).
+regex = "1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "multipart", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
