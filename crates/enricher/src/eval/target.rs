@@ -756,6 +756,16 @@ mod tests {
         assert!(claude.profile_and_prompts("claude-sonnet-5-5").is_err());
         let named = parse("profile = \"nope\"\n");
         assert!(named.profile_and_prompts("m").is_err());
+        // The tuned-Haiku re-run target: the claude-haiku-5 profile reads
+        // the tuned prompt files.
+        let tuned = parse(
+            "provider = \"anthropic\"\nprofile = \"claude-haiku-5\"\n\
+             prompts_dir = \"crates/enricher/prompts\"\n",
+        );
+        let (active, prompts) = tuned.profile_and_prompts("claude-haiku-5-5").unwrap();
+        assert_eq!(active.profile, "claude-haiku-5");
+        assert!(!prompts.is_builtin());
+        assert!(prompts.sources[0].ends_with("claude-haiku-5.primary.txt"));
     }
 
     /// Batch is the default: a target without `mode`, and the env-var
