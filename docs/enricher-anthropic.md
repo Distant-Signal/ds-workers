@@ -76,6 +76,7 @@ first match wins, or named with `LLM_PROFILE` / `enricher.llm.profile`:
 | --- | --- | --- | --- |
 | `openai-gpt-6-luna` | openai | `gpt-6-luna*` | `temperature: 0`, effort `none` |
 | `openai-default` | openai | `*` | `temperature: 0` (the pre-profile behaviour) |
+| `claude-haiku-5` | anthropic | `claude-haiku-5*` | as `claude-default`; its own name so it can carry Haiku prompt files ([below](#tuned-haiku-prompts)) |
 | `claude-default` | anthropic | `*` | nothing: no `temperature`/`top_p`, the model's effort and adaptive thinking |
 
 On top of the profile, explicit settings win, and `omit` means "don't send
@@ -133,6 +134,145 @@ Compare a tuned target with the untuned one before deploying.
 `topP`, `prompts.configMap`). With the prompts back to built-in,
 `model_version` returns to `<model>@periods-v2` and the sweep re-extracts
 once more.
+
+### Model evaluation, 13 Oct 2026
+
+A blind comparison on real National Rail notices from prod history (3 Sep
+to 13 Oct; the write-up and the data are kept outside the repo, because the
+data is production-derived). Each model ran the real three-call pipeline
+with prod prompts and settings; a separate judge graded 220 cases field by
+field without knowing which model was which.
+
+| Model | Good | Bad | Where it goes wrong |
+| --- | --- | --- | --- |
+| claude-sonnet-5-5 | 95% | 2% | a handful of edge cases; one severity check echoed a single placeholder verdict for three periods |
+| claude-haiku-5-5 (prod) | 70% | 9% | `rail_replacement_bus` from ticket-acceptance bus lists (14 of its 19 bad verdicts); severity inflated (`blocked_or_suspended` for a reduced service); one fact split into several periods; missing day-of-week windows; "end of the day" a day early just after midnight |
+| gpt-6-luna (prod until 10 Oct) | 21% | 54% | UK clock times written as UTC ("expected until 21:00" as 21:00Z, an hour late in summer); dropped end times; day-roll mistakes |
+
+On the 564 cases stating an "expected until" time, Haiku and Sonnet got the
+end time right 98% of the time, gpt-6-luna 36%. Cost per incident with
+normal requests: about $0.0011 on Haiku, $0.013 on Sonnet. The follow-ups
+were the [output checks](#output-checks) for every model, and a
+Haiku-specific prompt set, below, to be re-run on the same 1,000 cases
+before choosing between tuned Haiku and Sonnet.
+
+### Tuned Haiku prompts
+
+`crates/enricher/prompts/` holds a prompt set for the `claude-haiku-5`
+profile (version `42e7efea092c`): `claude-haiku-5.primary.txt` and
+`claude-haiku-5.severity_adversarial.txt`; the resolution check stays the
+shared built-in prompt. The primary prompt is the shared one with its
+severity sentence replaced, plus rules aimed at Haiku's errors in the
+evaluation:
+
+- a severity scale judged by what still runs over the affected section,
+  with short synthetic examples: a reduced service (even with some buses) is
+  `moderate_disruption`, never `blocked_or_suspended`; buses replacing the
+  whole section is `severe_disruption`; when two values fit, the milder one;
+- "lines have reopened ... still delayed" is `residual`;
+- one fact, one period: periods with the same dates, window, impact,
+  severity and status merge, and services running as normal, ticket
+  acceptance or validity, travel advice and individually listed trains are
+  never periods of their own;
+- repeating days and strike dates carry a `schedule_window` (or one period
+  per date), with `start_time`/`end_time` always `HH:MM` ("end of service"
+  is `23:59`);
+- the reference time is converted to UK local time before reading "today"
+  or "the end of the day"; clock times are UK local; the summary's end time
+  wins over a different one in the description;
+- ticket-acceptance bus lists are not `rail_replacement_bus`.
+
+The rules use made-up stations, not cases from the evaluation, and the
+severity check gets the same scale. The primary prompt is about 3,700
+tokens, well above Haiku's cache minimum
+(`the_tuned_haiku_prompts_load_only_for_the_haiku_profile` checks the
+version, the size and that no other profile reads these files).
+
+**Status: not deployed.** The set is used only when its files are mounted.
+To deploy it after the re-run:
+
+```bash
+kubectl create configmap enricher-prompts \
+  --from-file=crates/enricher/prompts/claude-haiku-5.primary.txt \
+  --from-file=crates/enricher/prompts/claude-haiku-5.severity_adversarial.txt
+# then enricher.llm.prompts.configMap: enricher-prompts
+```
+
+`model_version` becomes `claude-haiku-5-5@periods-v2+prompts-42e7efea092c`,
+so the sweep re-extracts every live incident once (a few hundred Haiku
+calls). For the re-run, an eval target names `profile = "claude-haiku-5"`
+and `prompts_dir` pointing at these files.
+
+## Output checks
+
+Three deterministic checks run for every model and provider in the combine
+and validation step after the three calls
+(`main.rs::combine_and_check`, shared by the synchronous and batch paths;
+`crates/enricher/src/checks.rs` and `combine::echo_mismatch`). `enricher
+eval` applies the same ones, so its `results.jsonl` holds what the service
+would write, with a `checks` report per record. They target the errors the
+[evaluation](#model-evaluation-13-oct-2026) found.
+
+**Rail replacement guard.** A period keeps `impact_type:
+rail_replacement_bus` only when the incident text states a replacement
+service: "rail replacement", "replacement bus/coach", "buses replace
+trains", "replaced by buses", "buses will run between", "a bus will be
+provided", "road transport has been arranged/requested", a bus shuttle, and
+similar. A list of local buses that accept rail tickets ("tickets will be
+accepted on ... buses", "use your ticket on the following bus routes")
+doesn't count, nor does the rail-replacement boilerplate ("for helpful
+advice if you need to travel on a rail replacement service ...") or "rail
+replacement buses will not be provided". Otherwise the tag is cleared to
+`null` and counted in `enricher_rail_replacement_downgrades_total`
+(periods). On the evaluation's 1,000 shared cases it cleared 71 of Haiku's
+371 tagged cases (both other models also had no replacement in 66 of them),
+caught 13 of the 14 judged-wrong Haiku tags (the 14th has a real coach
+replacement elsewhere in the text) and cleared none of the 307 judged
+correct or partly correct tags across the three models.
+
+**Adversarial echo check.** Each adversarial pass must return one verdict
+per primary period, echoing its `period_index` and exact
+`scope_description`. A list that doesn't (the wrong count, or a placeholder
+such as `"x"`) is invalid output: that pass is asked again once,
+synchronously (on the batch path too), and an aligned answer is used. A
+second bad answer fails the attempt as before: nothing is written, the
+keyword severity stays in force and the per-text backoff applies.
+`enricher_adversarial_echo_mismatches_total{call, kind="count"|"echo",
+result="recovered"|"failed"}`.
+
+**Stated end time.** When the text gives an end time ("expected until
+21:00", "expected to continue until 17:30", "until approximately 05:30",
+"expected until the end of the day", optionally with "tomorrow", a weekday
+or a date), it is resolved in Europe/London on the reference day: a time
+with no day more than two hours before the reference time rolls to the next
+day ("until approximately 05:30" at 22:50), and "the end of the day" is the
+next local midnight after the reference time (at 00:15 on Tuesday, the end
+of Tuesday). An ETA-shaped period (an end, no weekly window, starting no
+later than an hour after the reference time) whose `to_date` is an hour or
+more from every stated time is flagged, logged and counted in
+`enricher_end_time_checks_total{action}`. A "revised until 15:30 today" in
+the text is an accepted end too. The summary's "expected until" wins over a
+different one in the description (the description's is usually the previous
+estimate). What happens to a flagged period:
+
+- `corrected`: the extraction has one ETA-shaped period and the text one
+  stated end time: `to_date` is set to it;
+- `dropped`: one ETA-shaped period but no single stated time: the end time
+  is cleared (an open-ended period beats a wrong one);
+- `flagged`: several ETA-shaped periods (a phased notice): left alone, only
+  reported.
+
+On the evaluation's 1,000 shared cases it flagged 297 of gpt-6-luna's 300
+wrong "expected until" times (mostly UK time written as UTC) and 6 of the 8
+wrong ones of each Claude model, plus Haiku's "end of the day" day-roll
+and stale-description cases; it flagged 2 of Sonnet's 556 and 6 of Haiku's
+555 times the automated check had judged right. With the corrections
+applied, the share of the 564 "expected until" cases with the right end
+time goes from 36% to 88% for gpt-6-luna (the rest mostly have no end time
+at all, which this check can't add), from 98.4% to 99.5% for Haiku and from
+98.6% to 99.6% for Sonnet, and no end time that was right became wrong. The
+unit tests cover BST, GMT, the clock-change day and the after-midnight
+cases.
 
 ## Setup
 

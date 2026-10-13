@@ -464,6 +464,11 @@ resolved from the workspace root. The dataset needs no `expected` labels.
   whose records file is there is reused, and a batch target with a state
   file polls its recorded batches instead of submitting again. Re-running
   the same command after a crash never submits a request twice.
+- **Re-checking old outputs.** Because a reused records file calls no
+  model, copying an earlier run's `<stem>.records.jsonl` into a fresh
+  `--out` and running a newer `enricher` there rewrites `results.jsonl`
+  with that build's [output checks](enricher-anthropic.md#output-checks),
+  offline (the echo retry, which needs a model call, can't be replayed).
 - **Targets run concurrently**, so the run takes about two batch
   turnarounds of the slowest target. A target that fails doesn't stop the
   others.
@@ -480,9 +485,9 @@ Output, per target (`<stem>`: the target name, file-safe):
 | File | Contents |
 | --- | --- |
 | `<stem>.records.jsonl` | The harness's records: each call's raw output or error, outcome, token usage, latency, batch id. Re-scorable with `replay_quality_score` |
-| `<stem>.results.jsonl` | One line per record: `status` (`completed` / `failed`), the `extraction` the service would have written (category, combined periods with confidences) or the `failure` (stage, transport or invalid output, label, message), and every call's raw `content`, `usage`, `batch_id`, `elapsed_ms` and `estimated_usd` |
+| `<stem>.results.jsonl` | One line per record: `status` (`completed` / `failed`), the `extraction` the service would have written (category, combined periods with confidences, after the [output checks](enricher-anthropic.md#output-checks)) and a `checks` report of what they changed, or the `failure` (stage, transport or invalid output, label, message), and every call's raw `content`, `usage`, `batch_id`, `elapsed_ms` and `estimated_usd` (an adversarial pass re-asked by the echo check appears twice; the last one counts) |
 | `<stem>.batch-state.json` | The batch state ([Resume](#resume)) |
-| `<stem>.summary.json` | The target's config (key env var names and workload identity ids only, never a secret), mode, batch metadata, cost estimate and outcome counts |
+| `<stem>.summary.json` | The target's config (key env var names and workload identity ids only, never a secret), mode, batch metadata, cost estimate and outcome counts (including echo retries and what the output checks changed) |
 
 Plus `run.json`: the dataset (path, case count, content hash), the
 built-in prompt fingerprint, the label, start and end times, and each
