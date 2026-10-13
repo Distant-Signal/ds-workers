@@ -224,6 +224,10 @@ in the fallback, at most what is left of the projected token.
 - It re-reads the token file on every exchange, since the kubelet rotates it.
 - If a refresh fails while the cached token is still valid, it keeps using
   that token until it expires (and logs a warning).
+- Creating a batch is the exception: it mints a fresh token (with a fresh
+  Authentik token in the primary mode) unless the cached one has at least
+  80% of its lifetime left, and never falls back to an older one. See
+  [Batch mode, "Keyless tokens"](#keyless-tokens).
 - A 401 from `/v1/chat/completions` drops the token (only if it is still the
   cached one, so concurrent 401s cause one refresh) and resends once with a
   new one. A second 401 fails the call as `unauthorized`. This happens
@@ -713,13 +717,18 @@ OpenAI documentation this relies on (read 2026-10-09):
    /v1/chat/completions`, `completion_window: 24h`, `output_expires_after`
    = 2 days, and metadata (`source`, `stage`, `model_version`). If the create
    fails, the uploaded file is deleted at once. The batch id is recorded in
-   `enricher_llm_batches` (`provider` = `openai`).
+   `enricher_llm_batches` (`provider` = `openai`). With keyless auth, the
+   upload and the create share one token minted for them right before the
+   upload ([Keyless tokens](#keyless-tokens)); the log line `created an
+   OpenAI batch` carries its `token_remaining_secs`.
 4. **Poll.** `GET /v1/batches/{id}` every `LLM_BATCH_POLL_SECS`.
    `validating`, `in_progress`, `finalizing` and `cancelling` wait.
    `failed` means the input file failed validation: nothing ran, there are
    no results. The row is dropped, the input file deleted, and the event
    counted as `validation_failed` (DistantSignalEnricherBatchInvalid). Its
-   incidents go into the next sweep.
+   incidents go into the next sweep. A `failed` batch whose errors are
+   `token_expired` is counted as `auth_expired` instead
+   ([Keyless tokens](#keyless-tokens)).
 5. **Results.** On `completed`, `expired` or `cancelled`, the output file
    (successes) and the error file (everything else) are downloaded from
    `GET /v1/files/{id}/content` and matched by `custom_id`. Their lines are
@@ -727,6 +736,8 @@ OpenAI documentation this relies on (read 2026-10-09):
    synchronous path's own `chat.completion` parser (refusals and empty
    content included). Any other status is `errored`. An `error` with code
    `batch_expired` is `expired` (an `expired` batch's unfinished requests).
+   Code `token_expired` (as an `error` or in a response body) is
+   `auth_expired` ([Keyless tokens](#keyless-tokens)).
    A request with no line in an `expired` or `cancelled` batch counts as
    `expired` or `canceled`.
 6. **Cleanup.** Once the results are processed (the adversarial batch
@@ -768,6 +779,55 @@ so the key or service account an eval target uses needs `api.batch.write`
 too. Without it, the eval stops with an error naming the permission and
 the `mode = "sync"` opt-in.
 
+### Keyless tokens
+
+A federated OpenAI token lasts about **900 s** (15 minutes; the enricher
+refreshes it at about 810 s). OpenAI does not only check the token when the
+batch is created: it authorises the batch with **its creator's token some
+time after submission**, apparently when it starts validating or running
+it. If that token has expired by then, every request in the batch fails
+with `token_expired: Provided authentication token is expired`. Nothing
+runs and nothing is billed, but the whole batch is lost.
+
+That is what happened in the 2026-10-13 production eval
+(`openai-wif-authentik`). The primary batch (2,000 requests) was created
+with a fresh token and completed after 2,362 s. The adversarial batch
+(3,996 requests) was created about 11 minutes after its token was issued,
+with about 4 minutes left, and every request failed with `token_expired`.
+
+So for every batch submission the enricher (service and eval alike):
+
+- **Mints a fresh token right before the upload**, unless the cached one
+  still has at least 80% of its lifetime (in practice, one minted moments
+  ago by another submission). In `openai-wif-authentik` the exchange
+  presents a fresh Authentik token too, so the OpenAI token isn't capped
+  by an older subject token's remaining life. If that exchange fails, the
+  submission fails (`submit_failed`) rather than fall back to the older
+  token; the next sweep tries again.
+- **Uses that one token for both the upload and the create.** A 401 to
+  either mints another and moves both to it.
+- **Records its remaining life at creation**: `token_remaining_secs` on the
+  `created an OpenAI batch` log line, and the gauge
+  `enricher_llm_batch_submit_token_remaining_seconds`.
+- **Classifies `token_expired` as `auth_expired`**, distinct from
+  `errored`: per request in `enricher_llm_batch_requests_total`, and once
+  per batch as `enricher_llm_batches_total{event="auth_expired"}` (also for
+  a batch that `failed` outright with `token_expired`). That fires
+  [DistantSignalEnricherBatchAuthExpired](alerts.md#distantsignalenricherbatchauthexpired).
+  The incidents are dropped like any failed request and go into the next
+  sweep's batch, created with a new token. They are not backed off (the
+  text isn't at fault), and nothing is resubmitted before that sweep, so
+  this can't loop.
+
+A fresh token gives a batch about 15 minutes to be authorised. That has been
+enough when OpenAI's queue is short, but the enricher can't make it longer:
+OpenAI has no refresh for a batch's token, and the token's lifetime is
+OpenAI's. **Where batch reliability matters, prefer synchronous calls on
+OpenAI with keyless auth** (`enricher.llm.batch.sweepMode: sync`, and
+`mode: normal`), or an API key, whose batches don't depend on a short-lived
+token. Claude batches are not affected: they belong to the workspace, not
+the credential, so the enricher leaves Claude's batch path as it is.
+
 ### Retention
 
 Batch input and output files are **not covered by zero data retention**
@@ -794,12 +854,16 @@ labels). Price them at half the rates in [Cost](#cost).
 ### Not verified
 
 The client is tested against mocked Files and Batches endpoints only
-(`crates/enricher/src/llm/openai_batch/tests.rs`). Two points come from the
-docs rather than a live call:
+(`crates/enricher/src/llm/openai_batch/tests.rs`). Three points come from the
+docs, or from one production run, rather than a verified contract:
 - the error code of a request that a cancel stopped (`batch_cancelled` is
   assumed; with no line at all the request counts as `canceled`);
 - the multipart field names for `expires_after` (`expires_after[anchor]`
-  and `expires_after[seconds]`, from the Files reference's curl example).
+  and `expires_after[seconds]`, from the Files reference's curl example);
+- when OpenAI checks a batch's token, and the exact shape of its
+  `token_expired` failure (the enricher accepts the code as a line's
+  `error`, in a line's response body, or in a `failed` batch's `errors`).
+  The 2026-10-13 run showed the code, not the timing.
 
 For a first real run, set `enricher.llm.batch.minItems` low on a quiet
 day, and watch `enricher_llm_batches_total` and the enricher log.

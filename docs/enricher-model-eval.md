@@ -295,7 +295,8 @@ model. `EVAL_BATCH_MAX_REQUESTS` lowers the request cap.
 
 **Failures are kept.** A request that errored, expired (the 24-hour
 window), was canceled or has no result line is recorded as a failed call:
-`batch_errored`, `batch_expired`, `batch_canceled` or `batch_missing`. A
+`batch_errored`, `batch_expired`, `batch_canceled`, `batch_auth_expired`
+or `batch_missing`. A
 batch the API lost, whose results are gone, or that failed input
 validation gives `batch_gone`, `batch_results_gone` or
 `batch_validation_failed`. All of these count as transport failures in the
@@ -337,6 +338,23 @@ take the same credential as a synchronous call.
   [enricher-openai.md, "Permissions"](enricher-openai.md#permissions).
 - **Claude**: an API key, or `anthropic-wif-authentik` with a workspace
   that may use the Message Batches API.
+
+**OpenAI keyless tokens and batches.** A federated OpenAI token lasts
+about 900 s, and OpenAI authorises a batch with its creator's token some
+time *after* the create call. A batch created with a token near its end
+fails every request with `token_expired`: the 2026-10-13 run's adversarial
+batch (3,996 requests) was created with a token issued 11 minutes earlier
+and lost all of them, while its primary batch, created with a fresh token,
+completed. So each submission mints a fresh token right before its upload
+and uses it for the create too (unless the cached one still has at least
+80% of its life). Requests that still fail this way are recorded as
+`batch_auth_expired`, counted in the report's **Auth expired** column, and
+called out under the batch table; they are failed calls, not model
+failures. Re-run them with `EVAL_BATCH_RETRY_SYNC=1`, or the target with
+`mode = "sync"`. **For an OpenAI target on keyless auth where a complete
+run matters, prefer `mode = "sync"`**: a fresh token gives a batch only
+about 15 minutes to be authorised, and a long queue can outlast it. Details:
+[enricher-openai.md, "Keyless tokens"](enricher-openai.md#keyless-tokens).
 
 OpenAI's batch input and output files aren't covered by zero data
 retention. The harness deletes them once each stage is processed, and they

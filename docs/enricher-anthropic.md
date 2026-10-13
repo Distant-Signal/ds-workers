@@ -688,9 +688,12 @@ names the model and `base_url_host` `api.anthropic.com`). Changed or new:
     kinds for batch results, kept apart because they are billed at half
     price;
   - `distant_signal_enricher_llm_batches_total{stage, event}`: `submitted`,
-    `submit_failed`, `ended`, `poll_failed`, `abandoned`;
+    `submit_failed`, `ended`, `poll_failed`, `abandoned`, and on OpenAI
+    `validation_failed` and `auth_expired`;
   - `distant_signal_enricher_llm_batch_requests_total{call, result}`:
-    `succeeded`, `invalid`, `errored`, `canceled`, `expired`, `missing`;
+    `succeeded`, `invalid`, `errored`, `canceled`, `expired`, `missing`, and
+    on OpenAI `auth_expired`
+    ([enricher-openai.md, "Keyless tokens"](enricher-openai.md#keyless-tokens));
   - `distant_signal_enricher_llm_batches_in_flight`;
   - `distant_signal_enricher_llm_batch_oldest_age_seconds`: the oldest
     in-flight batch's age.
