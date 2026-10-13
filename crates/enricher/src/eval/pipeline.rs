@@ -93,7 +93,12 @@ impl Backend for LlmClient {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TargetLabel {
     pub target: String,
+    /// The primary call's model (every call's, unless `adversarial_model`).
     pub model: String,
+    /// The two adversarial calls' model, when they ran on another one
+    /// (`adversarial_model`); absent otherwise and in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adversarial_model: Option<String>,
 }
 
 /// One HTTP attempt within a call (see [`llm::Attempt`]).
@@ -704,6 +709,7 @@ mod tests {
         TargetLabel {
             target: "fake".to_string(),
             model: "fake-model".to_string(),
+            adversarial_model: None,
         }
     }
 

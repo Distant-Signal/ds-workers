@@ -132,6 +132,14 @@ the deployment as it would really run.
 - `[targets.pricing]`: `input`, `output`, `cache_read` and `cache_write`
   in USD per million tokens, for the [cost estimate](#cost-estimate) of a
   model the harness has no built-in price for.
+- `adversarial_model` (and optionally `adversarial_profile`): runs the two
+  adversarial calls on another model of the same provider, as
+  `LLM_ADVERSARIAL_MODEL` does in the service
+  ([enricher-anthropic.md, "Tuning per model"](enricher-anthropic.md#tuning-per-model)).
+  Records and result lines carry `adversarial_model`, each result call its
+  `model`, and the batch report each stage's model.
+  `[targets.adversarial_pricing]` prices that model when the harness has no
+  built-in price for it.
 
 ## Running the quality eval
 
@@ -530,6 +538,9 @@ them.
   anything else, set `[targets.pricing]`.
 - An offline re-score (`replay_quality_score`) has only the model's name,
   so it prices Claude's cache writes at the 1-hour rate.
+- Each call is priced at its own model's rates: with `adversarial_model`
+  the two adversarial calls are that model's, and `cost.adversarial` gives
+  their model, prices and share of `usd`.
 
 ## The dataset
 

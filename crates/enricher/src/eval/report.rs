@@ -62,6 +62,9 @@ impl RunInfo {
 pub(crate) struct TargetInfo {
     pub name: String,
     pub model: String,
+    /// The adversarial calls' model, when they ran on another one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adversarial_model: Option<String>,
     /// Unknown when re-scoring saved records.
     pub environment: Option<String>,
     pub base_url: Option<String>,
@@ -72,6 +75,7 @@ impl TargetInfo {
         Self {
             name: target.name.clone(),
             model: target.model.clone(),
+            adversarial_model: target.label().adversarial_model,
             environment: target.environment.clone(),
             base_url: Some(target.base_url.clone()),
         }
@@ -125,6 +129,9 @@ pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
 /// The bullet lines naming the target, shared by both report kinds.
 pub(crate) fn target_lines(md: &mut String, target: &TargetInfo) {
     let _ = writeln!(md, "- Model: `{}`", target.model);
+    if let Some(adversarial) = &target.adversarial_model {
+        let _ = writeln!(md, "- Adversarial calls' model: `{adversarial}`");
+    }
     if let Some(url) = &target.base_url {
         let _ = writeln!(md, "- Endpoint: `{url}`");
     }

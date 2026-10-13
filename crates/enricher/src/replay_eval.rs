@@ -284,6 +284,7 @@ async fn extract_all(llm: LlmClient, cases: Vec<Case>) -> BTreeMap<String, Outco
     let label = TargetLabel {
         target: "replay".to_string(),
         model: llm.model().to_string(),
+        adversarial_model: llm.adversarial_model().map(str::to_string),
     };
     let records = match mode {
         EvalMode::Sync => {

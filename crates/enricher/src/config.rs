@@ -491,6 +491,52 @@ pub(crate) struct GenerationConfig {
     /// (docs/enricher-openai.md, "Prompt caching").
     #[arg(long, env)]
     pub llm_openai_prompt_cache: Option<String>,
+    /// `LLM_ADVERSARIAL_MODEL`: the model for the two adversarial calls
+    /// (resolution and severity checks), on the same provider, endpoint
+    /// and credential as `LLM_MODEL`. Unset (the default): `LLM_MODEL`.
+    /// Part of `model_version`, so changing it re-extracts
+    /// (`profile::resolve_adversarial`).
+    #[arg(long, env)]
+    pub llm_adversarial_model: Option<String>,
+    /// `LLM_ADVERSARIAL_PROFILE`: the adversarial calls' profile by name
+    /// (their sampling defaults and prompt files); unset picks it by
+    /// provider and `LLM_ADVERSARIAL_MODEL`. Needs `LLM_ADVERSARIAL_MODEL`.
+    #[arg(long, env)]
+    pub llm_adversarial_profile: Option<String>,
+}
+
+impl GenerationConfig {
+    /// The adversarial calls' own model and profile, or `None`
+    /// (`profile::resolve_adversarial`).
+    pub(crate) fn adversarial(
+        &self,
+        provider: ProviderKind,
+        primary_model: &str,
+    ) -> anyhow::Result<Option<crate::profile::AdversarialModel>> {
+        crate::profile::resolve_adversarial(
+            provider,
+            primary_model,
+            self.llm_adversarial_model.as_deref(),
+            self.llm_adversarial_profile.as_deref(),
+        )
+    }
+}
+
+/// The prompts for the primary profile, with the adversarial calls' from
+/// their own profile when they have one (`LLM_PROMPTS_DIR` either way).
+pub(crate) fn load_prompts(
+    dir: Option<&std::path::Path>,
+    primary_profile: &str,
+    adversarial: Option<&crate::profile::AdversarialModel>,
+) -> anyhow::Result<crate::profile::PromptSet> {
+    let prompts = crate::profile::PromptSet::load(dir, primary_profile)?;
+    Ok(match adversarial {
+        Some(adversarial) => prompts.with_adversarial_prompts(crate::profile::PromptSet::load(
+            dir,
+            adversarial.active.profile,
+        )?),
+        None => prompts,
+    })
 }
 
 /// The profile overrides from the service's env: `LLM_TEMPERATURE`,
@@ -903,6 +949,79 @@ mod tests {
             "redis://x",
         ];
         Config::try_parse_from(base.iter().chain(args.iter()).copied()).unwrap()
+    }
+
+    /// `LLM_ADVERSARIAL_MODEL` / `LLM_ADVERSARIAL_PROFILE`: unset by
+    /// default (no split, prod unchanged); set, the adversarial calls get
+    /// their own model, profile and that profile's prompt files; another
+    /// provider's model fails at startup.
+    #[test]
+    fn adversarial_model_settings() {
+        let anthropic = ["--llm-provider", "anthropic", "--llm-api-key", "k"];
+        let default = config(&anthropic);
+        let resolved = default.resolved_llm().unwrap();
+        assert_eq!(default.generation.llm_adversarial_model, None);
+        assert_eq!(
+            default
+                .generation
+                .adversarial(resolved.provider, &resolved.model)
+                .unwrap(),
+            None
+        );
+
+        let split = config(
+            &[
+                &anthropic[..],
+                &[
+                    "--llm-model",
+                    "claude-sonnet-5-5",
+                    "--llm-adversarial-model",
+                    "claude-haiku-5-5",
+                    "--llm-adversarial-profile",
+                    "claude-haiku-5",
+                ],
+            ]
+            .concat(),
+        );
+        let resolved = split.resolved_llm().unwrap();
+        let adversarial = split
+            .generation
+            .adversarial(resolved.provider, &resolved.model)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adversarial.model, "claude-haiku-5-5");
+        assert_eq!(adversarial.active.profile, "claude-haiku-5");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let prompts = load_prompts(Some(&dir), "claude-default", Some(&adversarial)).unwrap();
+        assert_eq!(prompts.sources[0], "built-in");
+        assert!(prompts.sources[2].ends_with("claude-haiku-5.severity_adversarial.txt"));
+        assert!(
+            load_prompts(None, "claude-default", Some(&adversarial))
+                .unwrap()
+                .is_builtin()
+        );
+
+        let cross = config(&[&anthropic[..], &["--llm-adversarial-model", "gpt-6-luna"]].concat());
+        let resolved = cross.resolved_llm().unwrap();
+        assert!(
+            cross
+                .generation
+                .adversarial(resolved.provider, &resolved.model)
+                .is_err()
+        );
+        let profile_only = config(
+            &[
+                &anthropic[..],
+                &["--llm-adversarial-profile", "claude-haiku-5"],
+            ]
+            .concat(),
+        );
+        assert!(
+            profile_only
+                .generation
+                .adversarial(ProviderKind::Anthropic, "claude-haiku-5-5")
+                .is_err()
+        );
     }
 
     /// `CARRY_FORWARD_SEMANTIC_NOOPS` is on unless set to `false`.

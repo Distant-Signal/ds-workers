@@ -33,7 +33,7 @@ use serde::Serialize;
 
 use crate::churn::{self, ChurnField};
 use crate::eval::dataset::{Case, Expected, Gold, GoldPeriod, MAX_GOLD_PERIODS, normalize_label};
-use crate::eval::pipeline::{Extraction, Failure, FailureKind, PipelineRecord};
+use crate::eval::pipeline::{Extraction, Failure, FailureKind, PipelineRecord, TargetLabel};
 use crate::eval::report::{self, RunInfo, TargetInfo, pct, ratio};
 use crate::llm::{ExtractionPeriod, ScheduleWindow};
 
@@ -1544,16 +1544,24 @@ fn run_replay() -> anyhow::Result<()> {
     let dir = crate::eval::run_dir("quality", "-replay")?;
     let mut reports = Vec::new();
     for ((name, model), records) in &by_target {
+        let adversarial_model = records
+            .first()
+            .and_then(|r| r.label.adversarial_model.clone());
         let target = TargetInfo {
             name: name.clone(),
             model: model.clone(),
+            adversarial_model: adversarial_model.clone(),
             environment: None,
             base_url: None,
         };
         let stem = crate::eval::target::file_stem(name);
-        // No target config here: the built-in prices, by the model's name
+        // No target config here: the built-in prices, by the models' names
         // (Claude's cache writes at the service's default 1-hour TTL).
-        let pricing = crate::eval::cost::builtin_for_model(model);
+        let pricing = crate::eval::cost::Prices::builtin_for_label(&TargetLabel {
+            target: name.clone(),
+            model: model.clone(),
+            adversarial_model,
+        });
         let run = RunInfo {
             mode: RunInfo::mode_of(records),
             batch: None,
@@ -1728,6 +1736,7 @@ mod tests {
         let label = TargetLabel {
             target: "fake".into(),
             model: "m".into(),
+            adversarial_model: None,
         };
         let cases: std::sync::Arc<[Case]> = vec![labelled_case()].into();
         let records = run_jobs(std::sync::Arc::new(backend), &label, &cases, 1, 1).await;
@@ -1817,6 +1826,7 @@ mod tests {
         let label = TargetLabel {
             target: "fake".into(),
             model: "m".into(),
+            adversarial_model: None,
         };
         let cases: std::sync::Arc<[Case]> = vec![
             labelled_case(),
@@ -1858,6 +1868,7 @@ mod tests {
             target: TargetInfo {
                 name: "t".into(),
                 model: "m".into(),
+                adversarial_model: None,
                 environment: None,
                 base_url: None,
             },
@@ -2185,6 +2196,7 @@ mod tests {
             label: TargetLabel {
                 target: "t".into(),
                 model: "m".into(),
+                adversarial_model: None,
             },
             case_id: case_id.into(),
             input_hash: hash,
@@ -2223,6 +2235,7 @@ mod tests {
         let target = TargetInfo {
             name: "t".into(),
             model: "m".into(),
+            adversarial_model: None,
             environment: None,
             base_url: None,
         };
@@ -2364,6 +2377,7 @@ mod tests {
         let label = TargetLabel {
             target: "fake".into(),
             model: "m".into(),
+            adversarial_model: None,
         };
         let cases: std::sync::Arc<[Case]> = vec![labelled_case()].into();
         let records = run_jobs(std::sync::Arc::new(backend), &label, &cases, 2, 1).await;
@@ -2400,6 +2414,7 @@ mod tests {
         let label = TargetLabel {
             target: "fake".into(),
             model: "m".into(),
+            adversarial_model: None,
         };
         let cases: std::sync::Arc<[Case]> = vec![observational].into();
         let records = run_jobs(std::sync::Arc::new(backend), &label, &cases, 1, 1).await;
@@ -2415,6 +2430,7 @@ mod tests {
                 target: TargetInfo {
                     name: "t".into(),
                     model: "m".into(),
+                    adversarial_model: None,
                     environment: None,
                     base_url: None,
                 },
@@ -2479,6 +2495,7 @@ mod tests {
             target: TargetInfo {
                 name: "t".into(),
                 model: "m".into(),
+                adversarial_model: None,
                 environment: Some("laptop".into()),
                 base_url: None,
             },

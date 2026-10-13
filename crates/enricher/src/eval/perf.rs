@@ -1034,6 +1034,7 @@ mod tests {
         let label = TargetLabel {
             target: "t".into(),
             model: "m".into(),
+            adversarial_model: None,
         };
         let records = run_jobs(Arc::new(backend), &label, &cases, 2, 3).await;
         let summary = summarize(
@@ -1082,6 +1083,7 @@ mod tests {
             target: TargetInfo {
                 name: "t".into(),
                 model: "m".into(),
+                adversarial_model: None,
                 environment: None,
                 base_url: None,
             },

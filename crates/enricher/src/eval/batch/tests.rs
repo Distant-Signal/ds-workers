@@ -59,6 +59,7 @@ fn label(model: &str) -> TargetLabel {
     TargetLabel {
         target: "t".to_string(),
         model: model.to_string(),
+        adversarial_model: None,
     }
 }
 
@@ -340,6 +341,103 @@ async fn a_claude_batch_run_scores_like_the_sync_path() {
     assert_eq!(state.primary.len(), 1);
     assert!(state.primary[0].ended_at.is_some());
     assert_eq!(state.adversarial[0].custom_ids.len(), 4);
+}
+
+/// `adversarial_model`: the primary batch is all the primary model's
+/// requests, the adversarial batch all the adversarial model's; the stage
+/// metadata and the state file name each stage's model, and a state file
+/// of the unsplit run is refused.
+#[tokio::test]
+async fn a_split_run_sends_each_stage_to_its_own_model() {
+    let server = MockServer::start().await;
+    mount_claude_create(&server).await;
+    mount_claude_batch(
+        &server,
+        "msgbatch_p0",
+        0,
+        &[claude_ok("p-0", &primary_text())],
+    )
+    .await;
+    mount_claude_batch(
+        &server,
+        "msgbatch_a0",
+        0,
+        &[
+            claude_ok("r-0", &resolution_text()),
+            claude_ok("s-0", &severity_text()),
+        ],
+    )
+    .await;
+    let adversarial = crate::profile::resolve_adversarial(
+        llm::ProviderKind::Anthropic,
+        "claude-sonnet-5-5",
+        Some("claude-haiku-5-5"),
+        None,
+    )
+    .unwrap();
+    let client = LlmClient::new(
+        server.uri(),
+        Some("sk-ant-test".to_string()),
+        "claude-sonnet-5-5".to_string(),
+        Duration::from_secs(10),
+    )
+    .with_anthropic(AnthropicSettings::default())
+    .with_adversarial(adversarial.as_ref());
+    let split_label = TargetLabel {
+        target: "t".to_string(),
+        model: "claude-sonnet-5-5".to_string(),
+        adversarial_model: Some("claude-haiku-5-5".to_string()),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let run = run_batch(&client, &split_label, &cases(&["a"]), 1, &opts(dir.path()))
+        .await
+        .unwrap();
+
+    let creates = requests_to(&server, "POST", "/messages/batches").await;
+    let models = |request: &Request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["params"]["model"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(models(&creates[0]), ["claude-sonnet-5-5"]);
+    assert_eq!(
+        models(&creates[1]),
+        ["claude-haiku-5-5", "claude-haiku-5-5"]
+    );
+    let stages: Vec<(&str, &str)> = run
+        .meta
+        .stages
+        .iter()
+        .map(|s| (s.stage, s.model.as_str()))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            ("primary", "claude-sonnet-5-5"),
+            ("adversarial", "claude-haiku-5-5")
+        ]
+    );
+    assert!(run.meta.markdown().contains("`claude-haiku-5-5`"));
+    assert_eq!(run.records[0].label, split_label);
+    assert!(run.records[0].outcome().is_ok());
+    let state_path = dir.path().join("t.batch-state.json");
+    let mut state = BatchState::read(&state_path).unwrap().unwrap();
+    assert_eq!(state.adversarial_model.as_deref(), Some("claude-haiku-5-5"));
+
+    // An unfinished state file of the same run without the split (or with
+    // another adversarial model) belongs to another run.
+    state.done = false;
+    state.adversarial_model = None;
+    state.save(&state_path).unwrap();
+    let err = run_batch(&client, &split_label, &cases(&["a"]), 1, &opts(dir.path()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("its adversarial model differs"), "{err}");
 }
 
 /// The same model outputs through the sync pipeline (scripted) and the
@@ -742,6 +840,7 @@ async fn a_run_resumes_from_its_state_file_without_resubmitting() {
         version: STATE_VERSION,
         target: "t".into(),
         model: "claude-haiku-5-5".into(),
+        adversarial_model: None,
         provider: "anthropic".into(),
         base_url: server.uri(),
         prompt_fingerprint: Backend::prompt_fingerprint(&client),
@@ -1084,6 +1183,7 @@ fn the_state_file_round_trips() {
         version: STATE_VERSION,
         target: "t".into(),
         model: "m".into(),
+        adversarial_model: None,
         provider: "openai".into(),
         base_url: "https://api.openai.com/v1".into(),
         prompt_fingerprint: "f".into(),

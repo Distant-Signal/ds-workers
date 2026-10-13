@@ -12,12 +12,15 @@
 //! ("Cost", "Prompt caching"); a target can set its own (`[targets.pricing]`).
 //! Only the providers' own APIs are priced: an OpenAI-compatible
 //! self-hosted model is never priced as `OpenAI`'s.
+//!
+//! Each call is priced at its own model's rates ([`Prices`]): with
+//! `adversarial_model` the two adversarial calls are another model's.
 
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
-use crate::eval::pipeline::PipelineRecord;
+use crate::eval::pipeline::{CallRecord, Pass, PipelineRecord, TargetLabel};
 use crate::llm::anthropic::PromptCache;
 use crate::llm::{ProviderKind, TokenUsage};
 
@@ -103,6 +106,73 @@ pub(crate) fn builtin(
     }
 }
 
+/// One model's prices and where they came from.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ModelPricing {
+    pub model: String,
+    /// `builtin` or `target`.
+    pub source: &'static str,
+    pub pricing: Pricing,
+}
+
+/// The prices a run's calls are billed at: each call at its own model's
+/// (the adversarial calls can run on another model, `adversarial_model`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Prices {
+    /// The primary call's model (and every call's, without a split).
+    pub primary: ModelPricing,
+    /// The adversarial calls' model, when it is another one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adversarial: Option<ModelPricing>,
+}
+
+impl Prices {
+    /// The price `pass` is billed at.
+    pub(crate) fn for_pass(&self, pass: Pass) -> &Pricing {
+        match (&self.adversarial, pass) {
+            (Some(adversarial), Pass::ResolutionAdversarial | Pass::SeverityAdversarial) => {
+                &adversarial.pricing
+            }
+            _ => &self.primary.pricing,
+        }
+    }
+
+    /// The built-in prices of a re-score's records, which know only the
+    /// models' names ([`builtin_for_model`]); `None` when either model has
+    /// no price.
+    pub(crate) fn builtin_for_label(label: &TargetLabel) -> Option<Self> {
+        let priced = |model: &str| {
+            builtin_for_model(model).map(|(pricing, source)| ModelPricing {
+                model: model.to_string(),
+                source,
+                pricing,
+            })
+        };
+        Some(Self {
+            primary: priced(&label.model)?,
+            adversarial: match &label.adversarial_model {
+                Some(model) => Some(priced(model)?),
+                None => None,
+            },
+        })
+    }
+}
+
+/// One call's estimated cost at `pricing` (half for a batch call), when
+/// it reported usage.
+pub(crate) fn call_usd(call: &CallRecord, pricing: &Pricing) -> Option<f64> {
+    call.usage.as_ref().map(|usage| {
+        let mut totals = UsageTotals::default();
+        totals.add(usage);
+        let usd = totals.usd(pricing);
+        if call.batch_id.is_some() {
+            usd * BATCH_DISCOUNT
+        } else {
+            usd
+        }
+    })
+}
+
 /// The built-in price for a re-score, which knows only the model's name:
 /// `claude-*` priced as the Claude API (cache writes at the service's
 /// default 1-hour TTL), anything else as the `OpenAI` API.
@@ -161,9 +231,14 @@ impl UsageTotals {
 /// What a run's calls cost.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct CostEstimate {
-    /// `builtin` or `target` (the target's own `[targets.pricing]`).
+    /// `builtin` or `target` (the target's own `[targets.pricing]`): the
+    /// primary model's prices.
     pub source: &'static str,
     pub pricing: Pricing,
+    /// The adversarial calls on their own model (`adversarial_model`):
+    /// its prices and its calls' share of `usd`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adversarial: Option<AdversarialCost>,
     pub batch_discount: f64,
     /// Synchronous calls' usage.
     pub sync_usage: UsageTotals,
@@ -193,21 +268,58 @@ pub(crate) fn usage_totals(records: &[PipelineRecord]) -> (UsageTotals, UsageTot
     (sync, batch, without)
 }
 
-/// Prices `records` (`None` without a price).
-pub(crate) fn estimate(
-    records: &[PipelineRecord],
-    pricing: Option<(Pricing, &'static str)>,
-) -> Option<CostEstimate> {
-    let (pricing, source) = pricing?;
+/// The adversarial calls' part of a [`CostEstimate`] when they ran on
+/// another model.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct AdversarialCost {
+    pub model: String,
+    pub source: &'static str,
+    pub pricing: Pricing,
+    /// The adversarial calls' usage, synchronous and batch together.
+    pub usage: UsageTotals,
+    /// Their estimate (batch calls at the batch price), part of
+    /// `CostEstimate::usd`.
+    pub usd: f64,
+}
+
+/// Prices `records`, each call at its own model's price ([`Prices`];
+/// `None` without a price).
+pub(crate) fn estimate(records: &[PipelineRecord], prices: Option<Prices>) -> Option<CostEstimate> {
+    let prices = prices?;
     let (sync_usage, batch_usage, calls_without_usage) = usage_totals(records);
-    let sync = sync_usage.usd(&pricing);
-    let batch = batch_usage.usd(&pricing);
+    let (mut usd, mut usd_at_sync_price) = (0.0, 0.0);
+    let (mut adversarial_usd, mut adversarial_usage) = (0.0, UsageTotals::default());
+    for call in records.iter().flat_map(|r| &r.calls) {
+        let pricing = prices.for_pass(call.pass);
+        let (Some(billed), Some(usage)) = (call_usd(call, pricing), &call.usage) else {
+            continue;
+        };
+        let mut totals = UsageTotals::default();
+        totals.add(usage);
+        usd += billed;
+        usd_at_sync_price += totals.usd(pricing);
+        if call.pass != Pass::Primary {
+            adversarial_usd += billed;
+            adversarial_usage.add(usage);
+        }
+    }
+    let Prices {
+        primary,
+        adversarial,
+    } = prices;
     Some(CostEstimate {
-        source,
-        pricing,
+        source: primary.source,
+        pricing: primary.pricing,
+        adversarial: adversarial.map(|a| AdversarialCost {
+            model: a.model,
+            source: a.source,
+            pricing: a.pricing,
+            usage: adversarial_usage,
+            usd: adversarial_usd,
+        }),
         batch_discount: BATCH_DISCOUNT,
-        usd: sync + batch * BATCH_DISCOUNT,
-        usd_at_sync_price: sync + batch,
+        usd,
+        usd_at_sync_price,
         sync_usage,
         batch_usage,
         calls_without_usage,
@@ -245,6 +357,20 @@ pub(crate) fn markdown_line(cost: Option<&CostEstimate>) -> String {
         cost.pricing.cache_write,
         cost.pricing.output
     );
+    if let Some(adversarial) = &cost.adversarial {
+        let _ = write!(
+            line,
+            "\n- Adversarial calls on `{}`: ${:.4} of it; {} prices per MTok: input ${}, \
+             cache read ${}, cache write ${}, output ${}",
+            adversarial.model,
+            adversarial.usd,
+            adversarial.source,
+            adversarial.pricing.input,
+            adversarial.pricing.cache_read,
+            adversarial.pricing.cache_write,
+            adversarial.pricing.output
+        );
+    }
     if cost.sync_usage.calls > 0 {
         let _ = write!(line, "\n- Sync tokens: {}", tokens(&cost.sync_usage));
     }
@@ -360,6 +486,7 @@ mod tests {
             label: TargetLabel {
                 target: "t".into(),
                 model: "m".into(),
+                adversarial_model: None,
             },
             case_id: "a".into(),
             input_hash: String::new(),
@@ -376,14 +503,88 @@ mod tests {
         };
         // 100k uncached x 0.10 + 600k x 0.01 + 300k x 0.20 + 100k x 0.50
         // (reasoning is part of completion, never added) = 0.126 per call.
-        let cost = estimate(std::slice::from_ref(&record), Some((pricing, "builtin"))).unwrap();
+        let prices = Prices {
+            primary: ModelPricing {
+                model: "m".into(),
+                source: "builtin",
+                pricing,
+            },
+            adversarial: None,
+        };
+        let cost = estimate(std::slice::from_ref(&record), Some(prices)).unwrap();
         assert!(close(cost.usd_at_sync_price, 0.252), "{cost:?}");
         assert!(close(cost.usd, 0.126 + 0.063), "{cost:?}");
         assert_eq!(cost.calls_without_usage, 1);
         assert_eq!(cost.batch_usage.cache_write_tokens, 300_000);
+        assert_eq!(cost.adversarial, None);
         assert!(estimate(&[record], None).is_none());
         let line = markdown_line(Some(&cost));
         assert!(line.contains("batch calls at 50%"), "{line}");
+        assert!(!line.contains("Adversarial calls"), "{line}");
         assert!(markdown_line(None).contains("[targets.pricing]"));
+    }
+
+    /// A split run: the primary call at Sonnet's prices, the two
+    /// adversarial calls at Haiku's, all at the batch price; a re-score
+    /// prices by the record's two model names.
+    #[test]
+    fn each_call_is_priced_at_its_own_models_rates() {
+        let usage = TokenUsage {
+            prompt_tokens: Some(1_000_000),
+            completion_tokens: Some(100_000),
+            reasoning_tokens: None,
+            cached_tokens: Some(600_000),
+            cache_write_tokens: Some(300_000),
+        };
+        let at = |pass: Pass| CallRecord {
+            pass,
+            ..call(usage.clone(), true)
+        };
+        let label = TargetLabel {
+            target: "sonnet-main-haiku-checks".into(),
+            model: "claude-sonnet-5-5".into(),
+            adversarial_model: Some("claude-haiku-5-5".into()),
+        };
+        let record = PipelineRecord {
+            label: label.clone(),
+            case_id: "a".into(),
+            input_hash: String::new(),
+            prompt_fingerprint: String::new(),
+            repetition: 0,
+            elapsed_ms: 0,
+            calls: vec![
+                at(Pass::Primary),
+                at(Pass::ResolutionAdversarial),
+                at(Pass::SeverityAdversarial),
+            ],
+        };
+        let prices = Prices::builtin_for_label(&label).unwrap();
+        assert!(close(prices.for_pass(Pass::Primary).input, 2.0));
+        assert!(close(
+            prices.for_pass(Pass::SeverityAdversarial).input,
+            0.10
+        ));
+        let cost = estimate(std::slice::from_ref(&record), Some(prices)).unwrap();
+        // Sonnet (1h writes at 2x): 100k x 2 + 600k x 0.10 + 300k x 4 +
+        // 100k x 10 = 2.46; Haiku: 0.126 each (see above). Batch: half.
+        let haiku = 2.0 * 0.126 * BATCH_DISCOUNT;
+        assert!(close(cost.usd, 2.46 * BATCH_DISCOUNT + haiku), "{cost:?}");
+        assert!(close(cost.usd_at_sync_price, 2.46 + 0.252), "{cost:?}");
+        let adversarial = cost.adversarial.as_ref().unwrap();
+        assert_eq!(adversarial.model, "claude-haiku-5-5");
+        assert!(close(adversarial.usd, haiku), "{adversarial:?}");
+        assert_eq!(adversarial.usage.calls, 2);
+        assert!(close(cost.pricing.input, 2.0));
+        let line = markdown_line(Some(&cost));
+        assert!(
+            line.contains("Adversarial calls on `claude-haiku-5-5`"),
+            "{line}"
+        );
+        // A model without a price leaves the whole run unpriced.
+        let unknown = TargetLabel {
+            adversarial_model: Some("claude-unknown-9".into()),
+            ..label
+        };
+        assert_eq!(Prices::builtin_for_label(&unknown), None);
     }
 }

@@ -1547,6 +1547,164 @@ mod tests {
             .unwrap();
     }
 
+    /// `LLM_ADVERSARIAL_MODEL` in the service's batch path, against a real
+    /// database: the primary batch is the primary model's requests, the
+    /// adversarial batch (submitted by the poll loop from the stored
+    /// primary output) the adversarial model's, and both rows carry the
+    /// split `model_version`.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p enricher split_model_batches -- --ignored --test-threads=1`"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test code: one scenario, mocks then assertions"
+    )]
+    async fn split_model_batches_send_each_stage_to_its_own_model() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        sqlx::query("DELETE FROM enricher_llm_batches")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages/batches"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let primary = body["requests"][0]["custom_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("p-");
+                let id = if primary {
+                    "msgbatch_split_p"
+                } else {
+                    "msgbatch_split_a"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "processing_status": "in_progress",
+                    "request_counts": { "processing": 1 }
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/messages/batches/msgbatch_split_p"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msgbatch_split_p", "processing_status": "ended",
+                "results_url": format!("{}/results/msgbatch_split_p", server.uri()),
+                "request_counts": { "succeeded": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let line = serde_json::json!({ "custom_id": "p-0", "result": { "type": "succeeded",
+            "message": { "content": [{ "type": "text", "text": primary_json() }],
+                         "stop_reason": "end_turn",
+                         "usage": { "input_tokens": 10, "output_tokens": 5 } } } });
+        Mock::given(method("GET"))
+            .and(path("/results/msgbatch_split_p"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(line.to_string()))
+            .mount(&server)
+            .await;
+
+        let adversarial = crate::profile::resolve_adversarial(
+            llm::ProviderKind::Anthropic,
+            "claude-sonnet-5-5",
+            Some("claude-haiku-5-5"),
+            None,
+        )
+        .unwrap();
+        let llm = llm::LlmClient::new(
+            server.uri(),
+            Some("sk-ant-test".into()),
+            "claude-sonnet-5-5".into(),
+            Duration::from_secs(30),
+        )
+        .with_anthropic(llm::anthropic::AnthropicSettings::default())
+        .with_adversarial(adversarial.as_ref());
+        let model_version = crate::profile::model_version(
+            "claude-sonnet-5-5",
+            llm.adversarial_model(),
+            llm.prompts(),
+        );
+        assert_eq!(
+            model_version,
+            "claude-sonnet-5-5@periods-v2+adversarial-claude-haiku-5-5"
+        );
+        let enricher = Enricher {
+            pool: pool.clone(),
+            llm,
+            model_version: model_version.clone(),
+            mismatch_tracker: crate::MismatchTracker::default(),
+            retry_backoff: crate::RetryBackoff::default(),
+            in_flight: crate::InFlight::default(),
+            carry_forward_noops: false,
+            sweep_concurrency: 1,
+            batch: None,
+        };
+        submit_primary(&enricher, &[item(0, "TEST-SPLIT-BATCH").prepared()])
+            .await
+            .unwrap();
+        poll_once(&enricher, 100).await;
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT batch_id, stage, model_version FROM enricher_llm_batches ORDER BY batch_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [(
+                "msgbatch_split_a".to_string(),
+                "adversarial".to_string(),
+                model_version
+            )]
+        );
+        let creates: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/messages/batches")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        let models = |body: &serde_json::Value| {
+            body["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["custom_id"].as_str().unwrap().to_string(),
+                        r["params"]["model"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            models(&creates[0]),
+            [("p-0".to_string(), "claude-sonnet-5-5".to_string())]
+        );
+        assert_eq!(
+            models(&creates[1]),
+            [
+                ("r-0".to_string(), "claude-haiku-5-5".to_string()),
+                ("s-0".to_string(), "claude-haiku-5-5".to_string())
+            ]
+        );
+
+        sqlx::query("DELETE FROM enricher_llm_batches")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     /// `token_expired` against a real database: a batch that `failed` with
     /// it and one whose every request did are both dropped (their
     /// incidents go to the next sweep), nothing is resubmitted from the

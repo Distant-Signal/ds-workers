@@ -98,8 +98,11 @@ models reject sampling parameters: Claude Haiku 5.5, Sonnet 5 / 5.5, Opus
 configuration that would send one fails at startup with the setting to
 change, instead of every request answering 400. Models not in the table
 (any self-hosted one, Haiku 4.5) aren't checked. The table also knows each
-Claude model's minimum cacheable prefix: with caching on, a primary prompt
-below it logs a startup warning (caching would silently not apply).
+Claude model's minimum cacheable prefix: with caching on, each call whose
+static prefix (system prompt, schema and the structured-output
+instructions, estimated) is below the minimum of the model *that call* is
+sent to logs a startup warning naming the call and model (caching would
+silently not apply to it).
 
 **Prompts.** The three system prompts (`primary`, `adversarial`,
 `severity_adversarial`) default to the shared built-in ones. To tune them
@@ -134,6 +137,77 @@ Compare a tuned target with the untuned one before deploying.
 `topP`, `prompts.configMap`). With the prompts back to built-in,
 `model_version` returns to `<model>@periods-v2` and the sweep re-extracts
 once more.
+
+### A different model for the adversarial calls
+
+The two adversarial calls (the resolution and severity checks) can run on
+another model than the primary extraction, e.g. Sonnet 5.5 for the primary
+and Haiku 5.5 for the checks:
+
+| Setting | Env | Chart | Eval target |
+| --- | --- | --- | --- |
+| The checks' model | `LLM_ADVERSARIAL_MODEL` | `enricher.llm.adversarialModel` | `adversarial_model` |
+| Their profile (optional) | `LLM_ADVERSARIAL_PROFILE` | `enricher.llm.adversarialProfile` | `adversarial_profile` |
+
+```yaml
+enricher:
+  llm:
+    provider: anthropic
+    anthropic:
+      model: claude-sonnet-5-5
+    adversarialModel: claude-haiku-5-5
+```
+
+- **Unset (the default) changes nothing**: every call uses the primary
+  model, with the same settings, prompts and `model_version` as before.
+- **Same provider only.** The checks share the primary's endpoint,
+  credential, `LLM_PROMPT_CACHE`, provider policy and `LLM_MAX_IN_FLIGHT`
+  budget. A model of the other provider (a non-`claude-` model on
+  `anthropic`, a `claude-` one on `openai`), a profile of the other
+  provider, or a profile without a model fails the render and the pod at
+  startup.
+- **Their own profile.** `LLM_ADVERSARIAL_PROFILE`, else the profile that
+  matches the provider and the checks' model (`claude-haiku-5` for
+  `claude-haiku-5-5`), gives the checks their sampling defaults and their
+  prompt files: `adversarial` and `severity_adversarial` come from
+  `<that profile>.<call>.txt` in the same prompts ConfigMap, the primary
+  prompt from the primary's profile. `LLM_TEMPERATURE`, `LLM_TOP_P`,
+  `LLM_MAX_TOKENS`, `LLM_REASONING_EFFORT` and `LLM_THINKING` apply to the
+  primary call only (the checks' model may reject them). Without a prompts
+  ConfigMap every prompt is the built-in one.
+- **`model_version`** becomes
+  `<model>@periods-v2+adversarial-<checks' model>` (plus `+prompts-<hash>`
+  as above), so setting, changing or clearing it re-extracts every live
+  incident once, like a model change. In-flight batches of the old
+  `model_version` are canceled and dropped by the next poll.
+- **Batches.** The primary and adversarial stages are separate batches,
+  and every request names its own model, so the primary batch is the
+  primary model's and the adversarial batch the checks' (the Message
+  Batches API takes any model per request, and OpenAI's one model per
+  batch file still holds).
+- **Prompt caching** is per model: the checks write and read their own
+  cache entries. Their static prefix is ~650 tokens (prompt ~250, schema
+  and structured-output instructions the rest): above the 512-token
+  minimum of Haiku 5.5, Sonnet 5.5 and Opus 5.5, so they cache as they do
+  today (the 13 Oct runs read ~685 cached tokens per check on both Sonnet
+  and Haiku). On a model with a higher minimum (Haiku 4.5's 4,096) they
+  wouldn't cache: the startup check warns, and those ~650 tokens a call
+  are billed at the full input price instead of the cache-read price
+  (with Haiku 4.5, about $0.0006 a call more).
+- **Metrics.** `enricher_llm_tokens_total` and
+  `enricher_llm_batch_tokens_total` keep their `call` label, and
+  `enricher_llm_call_model_info{call, model, profile} 1` names each call's
+  model, so spend can be priced per call (below, "Metrics and cost").
+  `enricher_llm_model_info` still names the primary model.
+- **Evaluating it.** An eval target takes `adversarial_model` and
+  `adversarial_profile`; its records and results carry
+  `adversarial_model`, and the cost estimate prices each call at its own
+  model's rates (docs/enricher-model-eval.md).
+
+**Rolling back.** Clear `enricher.llm.adversarialModel` (and
+`adversarialProfile`). `model_version` returns to its previous value, the
+sweep re-extracts once more with the one model, and in-flight batches of
+the split are dropped by the next poll.
 
 ### Model evaluation, 13 Oct 2026
 
@@ -818,6 +892,10 @@ names the model and `base_url_host` `api.anthropic.com`). Changed or new:
   (thinking included), `reasoning` always 0. OpenAI sends `cache_write`
   on GPT-5.6 and later
   ([enricher-openai.md](enricher-openai.md#prompt-caching)).
+- `distant_signal_enricher_llm_call_model_info{call, model, profile}`
+  (always 1, one series per call): the model and profile each call is sent
+  to, the primary's for all three unless `LLM_ADVERSARIAL_MODEL` is set
+  ([A different model for the adversarial calls](#a-different-model-for-the-adversarial-calls)).
 - `distant_signal_enricher_deferred_to_batch_total{path}`
   (`LLM_MODE=batch`/`batch-only` only, registered at 0 then): text changes
   the stream loop (`path="stream"`) or reclaim (`path="reclaim"`) left for
@@ -864,6 +942,39 @@ and on() count(distant_signal_enricher_llm_model_info{model="claude-haiku-5-5"})
 
 Add the same expression over `enricher_llm_batch_tokens_total`, times 0.5,
 for batch mode. The Claude Console's usage page stays the source of truth.
+
+With `LLM_ADVERSARIAL_MODEL` the calls are two models' tokens: price each
+`call` at its own model's rates, each part gated on
+`enricher_llm_call_model_info` naming that model for that call. For Sonnet
+5.5 primary and Haiku 5.5 checks (1-hour cache writes):
+
+```promql
+(
+    (
+        sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="prompt"}[1d]))
+      - sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="cached"}[1d]))
+      - sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="cache_write"}[1d]))
+    ) * 2
+  + sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="cached"}[1d])) * 0.10
+  + sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="cache_write"}[1d])) * 4
+  + sum(increase(distant_signal_enricher_llm_tokens_total{call="primary", kind="completion"}[1d])) * 10
+) / 1e6
+and on() count(distant_signal_enricher_llm_call_model_info{call="primary", model="claude-sonnet-5-5"})
+```
+
+```promql
+(
+    (
+        sum(increase(distant_signal_enricher_llm_tokens_total{call=~".+_adversarial", kind="prompt"}[1d]))
+      - sum(increase(distant_signal_enricher_llm_tokens_total{call=~".+_adversarial", kind="cached"}[1d]))
+      - sum(increase(distant_signal_enricher_llm_tokens_total{call=~".+_adversarial", kind="cache_write"}[1d]))
+    ) * 0.10
+  + sum(increase(distant_signal_enricher_llm_tokens_total{call=~".+_adversarial", kind="cached"}[1d])) * 0.01
+  + sum(increase(distant_signal_enricher_llm_tokens_total{call=~".+_adversarial", kind="cache_write"}[1d])) * 0.20
+  + sum(increase(distant_signal_enricher_llm_tokens_total{call=~".+_adversarial", kind="completion"}[1d])) * 0.50
+) / 1e6
+and on() count(distant_signal_enricher_llm_call_model_info{call="severity_adversarial", model="claude-haiku-5-5"})
+```
 
 ### Cost
 

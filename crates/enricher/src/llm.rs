@@ -291,6 +291,31 @@ pub(crate) struct LlmClient {
     /// The active profile's name, for the `prompt_cache_key` (empty unless
     /// set by [`Self::with_profile`]).
     profile: &'static str,
+    /// `LLM_ADVERSARIAL_MODEL`: the two adversarial calls' own model and
+    /// generation settings ([`Self::with_adversarial`]); `None` (the
+    /// default) sends every call as the primary.
+    adversarial: Option<std::sync::Arc<CallModel>>,
+}
+
+/// One call group's model and generation settings, when the adversarial
+/// calls don't run on the primary's (`profile::resolve_adversarial`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CallModel {
+    pub model: String,
+    pub profile: &'static str,
+    pub generation: crate::profile::Generation,
+}
+
+/// What one request is sent with: its call's model and settings.
+struct CallSettings<'a> {
+    model: &'a str,
+    profile: &'static str,
+    sampling: Sampling,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<&'a str>,
+    /// Claude only (`AnthropicSettings::thinking` for the primary).
+    thinking: Option<&'a str>,
+    openai_prompt_cache: Option<openai_cache::OpenAiPromptCache>,
 }
 
 /// One pass's raw chat-completion result: the unparsed `content` (or the
@@ -393,6 +418,13 @@ pub(crate) const BATCH_TOKENS_METRIC: &str = "enricher_llm_batch_tokens_total";
 /// switching model never multiplies the counter's series.
 pub(crate) const MODEL_INFO_METRIC: &str = "enricher_llm_model_info";
 
+/// `enricher_llm_call_model_info{call, model, profile} 1`: the model each
+/// call site is sent to (one series per `call`), for pricing the token
+/// counters per call: with `LLM_ADVERSARIAL_MODEL` the adversarial calls'
+/// tokens are another model's. [`MODEL_INFO_METRIC`] keeps naming the
+/// primary model.
+pub(crate) const CALL_MODEL_INFO_METRIC: &str = "enricher_llm_call_model_info";
+
 /// Every `kind` label of [`TOKENS_METRIC`].
 pub(crate) const TOKEN_KINDS: [&str; 5] =
     ["prompt", "completion", "reasoning", "cached", "cache_write"];
@@ -435,6 +467,19 @@ pub(crate) fn register_usage_metrics(model: &str, base_url: &str, profile: &str)
         "base_url_host" => base_url_host(base_url)
     )
     .set(1.0);
+}
+
+/// Sets [`CALL_MODEL_INFO_METRIC`] for each call site of `llm`.
+pub(crate) fn register_call_model_info(llm: &LlmClient) {
+    for call in LlmCall::ALL {
+        metrics::gauge!(
+            common::metrics::metric_name(CALL_MODEL_INFO_METRIC),
+            "call" => call.label(),
+            "model" => llm.model_for(call).to_string(),
+            "profile" => llm.profile_for(call).to_string()
+        )
+        .set(1.0);
+    }
 }
 
 /// Registers every `{call, kind}` series of `metric` (one of the token
@@ -1328,6 +1373,7 @@ impl LlmClient {
             in_flight: None,
             openai_prompt_cache: None,
             profile: "",
+            adversarial: None,
         }
     }
 
@@ -1380,6 +1426,78 @@ impl LlmClient {
     pub(crate) fn with_prompts(mut self, prompts: crate::profile::PromptSet) -> Self {
         self.prompts = std::sync::Arc::new(prompts);
         self
+    }
+
+    /// Sends the two adversarial calls to `adversarial`'s model with its
+    /// profile's generation settings (`LLM_ADVERSARIAL_MODEL`), on the same
+    /// endpoint, credential, provider policy and `max_in_flight` budget.
+    /// `None` keeps every call on the primary model. The prompts are
+    /// [`Self::with_prompts`]'s (compose them with
+    /// `PromptSet::with_adversarial_prompts`).
+    pub(crate) fn with_adversarial(
+        mut self,
+        adversarial: Option<&crate::profile::AdversarialModel>,
+    ) -> Self {
+        self.adversarial = adversarial.map(|a| {
+            std::sync::Arc::new(CallModel {
+                model: a.model.clone(),
+                profile: a.active.profile,
+                generation: a.active.generation.clone(),
+            })
+        });
+        self
+    }
+
+    /// The model `call` is sent to.
+    pub(crate) fn model_for(&self, call: LlmCall) -> &str {
+        self.call_settings(call).model
+    }
+
+    /// The profile `call`'s settings and prompt files come from.
+    pub(crate) fn profile_for(&self, call: LlmCall) -> &'static str {
+        self.call_settings(call).profile
+    }
+
+    /// The adversarial calls' model, when it isn't the primary's.
+    pub(crate) fn adversarial_model(&self) -> Option<&str> {
+        self.adversarial
+            .as_deref()
+            .map(|a| a.model.as_str())
+            .filter(|model| *model != self.model)
+    }
+
+    /// `call`'s model and settings: the primary's, or the adversarial
+    /// calls' own ([`Self::with_adversarial`]).
+    fn call_settings(&self, call: LlmCall) -> CallSettings<'_> {
+        match self.adversarial.as_deref() {
+            Some(adversarial) if call != LlmCall::Primary => {
+                let generation = &adversarial.generation;
+                CallSettings {
+                    model: &adversarial.model,
+                    profile: adversarial.profile,
+                    sampling: Sampling {
+                        temperature: generation.temperature,
+                        top_p: generation.top_p,
+                    },
+                    max_tokens: generation.max_tokens,
+                    reasoning_effort: generation.reasoning_effort.as_deref(),
+                    thinking: generation.thinking.as_deref(),
+                    openai_prompt_cache: generation.openai_prompt_cache,
+                }
+            }
+            _ => CallSettings {
+                model: &self.model,
+                profile: self.profile,
+                sampling: self.sampling,
+                max_tokens: self.policy.max_tokens,
+                reasoning_effort: self.policy.reasoning_effort.as_deref(),
+                thinking: match &self.provider {
+                    Provider::Anthropic(settings) => settings.thinking.as_deref(),
+                    Provider::OpenAi => None,
+                },
+                openai_prompt_cache: self.openai_prompt_cache,
+            },
+        }
     }
 
     /// The system prompts in use.
@@ -1442,6 +1560,9 @@ impl LlmClient {
     /// The provider's request body for `spec`: an `OpenAI` chat completion
     /// or a Claude Messages API body.
     fn wire_request(&self, spec: CallSpec) -> WireRequest<'_> {
+        // The call's own model and settings (`LLM_ADVERSARIAL_MODEL`), so a
+        // batch request is per call too.
+        let call = self.call_settings(spec.call);
         match &self.provider {
             Provider::OpenAi => {
                 use openai_cache::{MessageContent, OpenAiPromptCache, PromptCacheOptions};
@@ -1449,7 +1570,7 @@ impl LlmClient {
                 // which OpenAI renders ahead of the messages), the
                 // per-incident text last: the breakpoint ends the prefix
                 // every call of this kind shares.
-                let explicit = self.openai_prompt_cache == Some(OpenAiPromptCache::Explicit);
+                let explicit = call.openai_prompt_cache == Some(OpenAiPromptCache::Explicit);
                 let system = if explicit {
                     MessageContent::with_breakpoint(spec.system_prompt)
                 } else {
@@ -1457,7 +1578,7 @@ impl LlmClient {
                 };
                 WireRequest::Chat(ChatCompletionRequest {
                     call: spec.call,
-                    model: &self.model,
+                    model: call.model,
                     messages: vec![
                         ChatMessage {
                             role: "system",
@@ -1476,13 +1597,15 @@ impl LlmClient {
                             schema: spec.schema,
                         },
                     },
-                    temperature: self.sampling.temperature,
-                    top_p: self.sampling.top_p,
-                    max_tokens: self.policy.max_tokens,
-                    reasoning_effort: self.policy.reasoning_effort.as_deref(),
+                    temperature: call.sampling.temperature,
+                    top_p: call.sampling.top_p,
+                    max_tokens: call.max_tokens,
+                    reasoning_effort: call.reasoning_effort,
+                    // Per profile and call, so the adversarial calls on
+                    // their own model have their own key.
                     prompt_cache_key: explicit
-                        .then(|| openai_cache::cache_key(self.profile, spec.call)),
-                    prompt_cache_options: self
+                        .then(|| openai_cache::cache_key(call.profile, spec.call)),
+                    prompt_cache_options: call
                         .openai_prompt_cache
                         .map(|_| PromptCacheOptions::EXPLICIT),
                 })
@@ -1491,10 +1614,8 @@ impl LlmClient {
                 call: spec.call,
                 version: &settings.version,
                 body: anthropic::messages_body(
-                    &self.model,
-                    settings,
-                    &self.policy,
-                    self.sampling,
+                    &call,
+                    settings.prompt_cache,
                     &spec.system_prompt,
                     &spec.user_content,
                     &spec.schema,
@@ -1929,6 +2050,49 @@ pub(crate) fn builtin_prompts() -> [&'static str; 3] {
     ]
 }
 
+/// What structured outputs add to a Claude call's cached prefix beyond the
+/// system prompt and schema text, in tokens, rounded down: the 13 Oct 2026
+/// eval's resolution check read ~685 cached tokens a call (Sonnet 5.5;
+/// ~682 on Haiku 5.5) where [`cacheable_prefix_tokens`]' text estimate
+/// without it is ~354.
+const STRUCTURED_OUTPUT_PREFIX_TOKENS: u32 = 300;
+
+/// A rough size, in tokens (4 characters each), of `call`'s static,
+/// cacheable prefix on the Claude API: its system prompt, its output schema
+/// and the API's structured-output instructions
+/// ([`STRUCTURED_OUTPUT_PREFIX_TOKENS`]), all rendered ahead of the
+/// per-incident message.
+pub(crate) fn cacheable_prefix_tokens(call: LlmCall, prompts: &crate::profile::PromptSet) -> u32 {
+    let (prompt, schema) = match call {
+        LlmCall::Primary => (&prompts.primary, primary_schema()),
+        LlmCall::ResolutionAdversarial => (&prompts.adversarial, adversarial_schema()),
+        LlmCall::SeverityAdversarial => {
+            (&prompts.severity_adversarial, severity_adversarial_schema())
+        }
+    };
+    let chars = prompt.chars().count() + anthropic::claude_schema(&schema).to_string().len();
+    u32::try_from(chars / 4)
+        .unwrap_or(u32::MAX)
+        .saturating_add(STRUCTURED_OUTPUT_PREFIX_TOKENS)
+}
+
+/// The calls whose cacheable prefix ([`cacheable_prefix_tokens`]) is
+/// estimated below their own model's minimum cacheable length
+/// (`profile::cache_minimum`), as `(call, model, estimate, minimum)`:
+/// caching silently doesn't apply to them. Each call is checked against the
+/// model it is sent to (`LLM_ADVERSARIAL_MODEL`).
+pub(crate) fn cache_minimum_shortfalls(llm: &LlmClient) -> Vec<(LlmCall, &str, u32, u32)> {
+    LlmCall::ALL
+        .into_iter()
+        .filter_map(|call| {
+            let model = llm.model_for(call);
+            let minimum = crate::profile::cache_minimum(model)?;
+            let tokens = cacheable_prefix_tokens(call, llm.prompts());
+            (tokens < minimum).then_some((call, model, tokens, minimum))
+        })
+        .collect()
+}
+
 /// Parses (and post-processes) the primary pass's raw `content`: the
 /// non-empty check, the `MAX_PERIODS` cap and the scope-description bound.
 /// Pure, so recorded model output can be re-scored offline exactly as the
@@ -2097,9 +2261,15 @@ pub(crate) fn live_client_from_env() -> LlmClient {
         .expect("LLM_TEMPERATURE/LLM_TOP_P must be numbers or `omit`"),
     )
     .expect("the LLM profile must resolve");
-    let prompts =
-        crate::profile::PromptSet::load(generation.llm_prompts_dir.as_deref(), active.profile)
-            .expect("LLM_PROMPTS_DIR must be readable");
+    let adversarial = generation
+        .adversarial(provider, &model)
+        .expect("LLM_ADVERSARIAL_MODEL/LLM_ADVERSARIAL_PROFILE must resolve");
+    let prompts = crate::config::load_prompts(
+        generation.llm_prompts_dir.as_deref(),
+        active.profile,
+        adversarial.as_ref(),
+    )
+    .expect("LLM_PROMPTS_DIR must be readable");
     let client = LlmClient::new(
         base_url,
         api_key,
@@ -2111,7 +2281,10 @@ pub(crate) fn live_client_from_env() -> LlmClient {
         ProviderKind::Openai => client,
         ProviderKind::Anthropic => client.with_anthropic(anthropic.settings()),
     };
-    client.with_profile(&active).with_prompts(prompts)
+    client
+        .with_profile(&active)
+        .with_prompts(prompts)
+        .with_adversarial(adversarial.as_ref())
 }
 
 #[cfg(test)]
@@ -4226,6 +4399,86 @@ mod tests {
             .map(|v| v.parse().unwrap())
     }
 
+    /// `enricher_llm_call_model_info` names each call's model and profile,
+    /// so the per-call token counters can be priced per model: one model
+    /// for all three without a split, the adversarial model for the two
+    /// checks with one.
+    #[test]
+    fn call_model_info_names_each_calls_model() {
+        let info = |client: &LlmClient| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            register_call_model_info(client);
+            let mut lines: Vec<String> = handle
+                .render()
+                .lines()
+                .filter(|l| l.starts_with("distant_signal_enricher_llm_call_model_info{"))
+                .map(str::to_string)
+                .collect();
+            lines.sort();
+            lines
+        };
+        let sonnet = || {
+            LlmClient::new(
+                "http://unused".into(),
+                None,
+                "claude-sonnet-5-5".into(),
+                DEFAULT_REQUEST_TIMEOUT,
+            )
+            .with_anthropic(anthropic::AnthropicSettings::default())
+            .with_profile(
+                &crate::profile::resolve(
+                    ProviderKind::Anthropic,
+                    "claude-sonnet-5-5",
+                    None,
+                    crate::profile::Overrides::default(),
+                )
+                .unwrap(),
+            )
+        };
+        let line = |call: &str, model: &str, profile: &str| {
+            format!(
+                "distant_signal_enricher_llm_call_model_info{{call=\"{call}\",model=\"{model}\",profile=\"{profile}\"}} 1"
+            )
+        };
+        assert_eq!(
+            info(&sonnet()),
+            [
+                line("primary", "claude-sonnet-5-5", "claude-default"),
+                line(
+                    "resolution_adversarial",
+                    "claude-sonnet-5-5",
+                    "claude-default"
+                ),
+                line(
+                    "severity_adversarial",
+                    "claude-sonnet-5-5",
+                    "claude-default"
+                ),
+            ]
+        );
+        let adversarial = crate::profile::resolve_adversarial(
+            ProviderKind::Anthropic,
+            "claude-sonnet-5-5",
+            Some("claude-haiku-5-5"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            info(&sonnet().with_adversarial(adversarial.as_ref())),
+            [
+                line("primary", "claude-sonnet-5-5", "claude-default"),
+                line(
+                    "resolution_adversarial",
+                    "claude-haiku-5-5",
+                    "claude-haiku-5"
+                ),
+                line("severity_adversarial", "claude-haiku-5-5", "claude-haiku-5"),
+            ]
+        );
+    }
+
     /// Reported usage is added to the token counter under the call's label,
     /// kind by kind; a response without `usage` adds nothing; a kind the
     /// provider left out is not incremented; and the label never reaches
@@ -4483,6 +4736,60 @@ mod tests {
             assert_eq!(
                 body["prompt_cache_key"],
                 "ds-enricher:openai-gpt-6-luna:severity_adversarial"
+            );
+        }
+    }
+
+    /// `LLM_ADVERSARIAL_MODEL` on Chat Completions: the adversarial calls
+    /// name their model and send their own profile's settings and prompt
+    /// cache key (`gpt-6-luna`: effort none, explicit caching); the primary
+    /// keeps its own (here `openai-default`: temperature 0, no caching).
+    #[tokio::test]
+    async fn openai_adversarial_calls_use_their_own_model_and_cache_key() {
+        use crate::profile::{Overrides, resolve, resolve_adversarial};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(flat_primary_body()))
+            .mount(&server)
+            .await;
+        let primary = resolve(ProviderKind::Openai, "big", None, Overrides::default()).unwrap();
+        let adversarial =
+            resolve_adversarial(ProviderKind::Openai, "big", Some("gpt-6-luna"), None).unwrap();
+        let client = LlmClient::new(server.uri(), None, "big".into(), DEFAULT_REQUEST_TIMEOUT)
+            .with_profile(&primary)
+            .with_adversarial(adversarial.as_ref());
+        let periods = parse_primary(
+            flat_primary_body()["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .periods;
+        let _ = client.primary_raw("s", "d", reference_date()).await;
+        let _ = client.adversarial_raw("s", "d", &periods).await;
+        let _ = client.severity_adversarial_raw("s", "d", &periods).await;
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["model"], "big");
+        assert_eq!(bodies[0]["temperature"], 0.0);
+        assert!(bodies[0].get("prompt_cache_key").is_none());
+        assert!(bodies[0].get("reasoning_effort").is_none());
+        for (body, call) in bodies[1..]
+            .iter()
+            .zip(["resolution_adversarial", "severity_adversarial"])
+        {
+            assert_eq!(body["model"], "gpt-6-luna");
+            assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(
+                body["prompt_cache_key"],
+                format!("ds-enricher:openai-gpt-6-luna:{call}")
             );
         }
     }

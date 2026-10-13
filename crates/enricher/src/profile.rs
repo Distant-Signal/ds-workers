@@ -27,6 +27,14 @@
 //! active prompt set's short hash is its `version`: logged, and part of
 //! `model_version` when it isn't the built-in set (so an edited prompt
 //! re-extracts, like a model change).
+//!
+//! **Per-call model.** `LLM_ADVERSARIAL_MODEL` (with an optional
+//! `LLM_ADVERSARIAL_PROFILE`) runs the two adversarial calls on another
+//! model of the same provider, with that model's profile: its generation
+//! defaults (the env overrides above apply to the primary call only) and
+//! its prompt files for `adversarial` and `severity_adversarial`. Unset (the
+//! default), every call uses `LLM_MODEL` as before. The adversarial model is
+//! part of `model_version`, so switching it re-extracts.
 
 use std::path::Path;
 
@@ -392,6 +400,68 @@ pub(crate) fn resolve(
     })
 }
 
+/// The adversarial calls' own model and profile ([`resolve_adversarial`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AdversarialModel {
+    pub model: String,
+    pub active: Resolved,
+}
+
+/// `LLM_ADVERSARIAL_MODEL` / `LLM_ADVERSARIAL_PROFILE`: the adversarial
+/// calls' model and profile, or `None` when they run on the primary's
+/// (unset, or the primary model with no profile named).
+///
+/// - Same provider only: the calls share the endpoint and credential, so a
+///   model of the other provider is refused (a Claude model needs
+///   `LLM_PROVIDER=anthropic`, and nothing else runs there), as is a named
+///   profile of the other provider.
+/// - The profile is picked like the primary's (`profile`, else provider
+///   plus model glob) with no overrides: `LLM_TEMPERATURE` and friends are
+///   for the primary model, which may take settings this one rejects.
+/// - A profile without a model is refused, so the setting is never a
+///   silent no-op.
+pub(crate) fn resolve_adversarial(
+    provider: ProviderKind,
+    primary_model: &str,
+    model: Option<&str>,
+    profile: Option<&str>,
+) -> anyhow::Result<Option<AdversarialModel>> {
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let profile = profile.map(str::trim).filter(|p| !p.is_empty());
+    let Some(model) = model else {
+        if let Some(profile) = profile {
+            anyhow::bail!(
+                "LLM_ADVERSARIAL_PROFILE={profile:?} needs LLM_ADVERSARIAL_MODEL (the \
+                 adversarial calls' model)"
+            );
+        }
+        return Ok(None);
+    };
+    if model == primary_model && profile.is_none() {
+        return Ok(None);
+    }
+    let claude = model.starts_with("claude-");
+    match provider {
+        ProviderKind::Anthropic if !claude => anyhow::bail!(
+            "LLM_ADVERSARIAL_MODEL={model:?} is not a Claude model, but LLM_PROVIDER is \
+             anthropic: the adversarial calls use the primary's provider, endpoint and \
+             credential (docs/enricher-anthropic.md, \"Tuning per model\")"
+        ),
+        ProviderKind::Openai if claude => anyhow::bail!(
+            "LLM_ADVERSARIAL_MODEL={model:?} is a Claude model, but LLM_PROVIDER is openai: \
+             the adversarial calls use the primary's provider, endpoint and credential; \
+             mixing providers isn't supported"
+        ),
+        _ => {}
+    }
+    let active = resolve(provider, model, profile, Overrides::default())
+        .map_err(|err| anyhow::anyhow!("LLM_ADVERSARIAL_MODEL={model:?}: {err}"))?;
+    Ok(Some(AdversarialModel {
+        model: model.to_string(),
+        active,
+    }))
+}
+
 /// One call's system prompt file name stem.
 pub(crate) const PROMPT_CALLS: [&str; 3] = ["primary", "adversarial", "severity_adversarial"];
 
@@ -433,6 +503,28 @@ impl PromptSet {
                 "built-in".to_string(),
             ],
             version: prompt_version(prompts),
+        }
+    }
+
+    /// This set's primary prompt with `adversarial`'s two adversarial
+    /// prompts: the prompts in use when the adversarial calls run on their
+    /// own profile ([`resolve_adversarial`]). Its version covers all three,
+    /// so it is the built-in version exactly when all three are built-in.
+    #[must_use]
+    pub(crate) fn with_adversarial_prompts(self, adversarial: Self) -> Self {
+        let [primary_source, ..] = self.sources;
+        let [_, adversarial_source, severity_source] = adversarial.sources;
+        let version = prompt_version([
+            &self.primary,
+            &adversarial.adversarial,
+            &adversarial.severity_adversarial,
+        ]);
+        Self {
+            primary: self.primary,
+            adversarial: adversarial.adversarial,
+            severity_adversarial: adversarial.severity_adversarial,
+            sources: [primary_source, adversarial_source, severity_source],
+            version,
         }
     }
 
@@ -488,15 +580,25 @@ impl PromptSet {
 }
 
 /// `model_version` for the extraction columns: `<model>@periods-v2`, plus
-/// `+prompts-<version>` when the prompts aren't the built-in ones, so a
-/// prompt change re-extracts like a model change (and switching back to the
-/// built-in prompts restores the old value).
-pub(crate) fn model_version(model: &str, prompts: &PromptSet) -> String {
-    if prompts.is_builtin() {
-        format!("{model}@periods-v2")
-    } else {
-        format!("{model}@periods-v2+prompts-{}", prompts.version)
+/// `+adversarial-<model>` when the adversarial calls run on another model
+/// (`LLM_ADVERSARIAL_MODEL`), plus `+prompts-<version>` when the prompts
+/// aren't the built-in ones. So a model or prompt change on any call
+/// re-extracts, and switching back restores the old value.
+pub(crate) fn model_version(
+    model: &str,
+    adversarial_model: Option<&str>,
+    prompts: &PromptSet,
+) -> String {
+    let mut version = format!("{model}@periods-v2");
+    if let Some(adversarial) = adversarial_model.filter(|a| *a != model) {
+        version.push_str("+adversarial-");
+        version.push_str(adversarial);
     }
+    if !prompts.is_builtin() {
+        version.push_str("+prompts-");
+        version.push_str(&prompts.version);
+    }
+    version
 }
 
 #[cfg(test)]
@@ -719,7 +821,7 @@ mod tests {
     fn prompt_overrides_load_and_fall_back() {
         let builtin = PromptSet::builtin();
         assert!(builtin.is_builtin());
-        assert_eq!(model_version("m", &builtin), "m@periods-v2");
+        assert_eq!(model_version("m", None, &builtin), "m@periods-v2");
         assert_eq!(PromptSet::load(None, "claude-default").unwrap(), builtin);
 
         let dir = tempfile::tempdir().unwrap();
@@ -745,7 +847,7 @@ mod tests {
         assert!(!claude.is_builtin());
         assert_eq!(claude.version.len(), 12);
         assert_eq!(
-            model_version("m", &claude),
+            model_version("m", None, &claude),
             format!("m@periods-v2+prompts-{}", claude.version)
         );
         let openai = PromptSet::load(Some(dir.path()), "openai-default").unwrap();
@@ -788,5 +890,140 @@ mod tests {
         }
         assert_eq!(cache_minimum("claude-haiku-4-5-20251001"), Some(4096));
         assert_eq!(cache_minimum("gpt-6-luna"), None);
+    }
+
+    /// `LLM_ADVERSARIAL_MODEL`: unset or the primary model is no split; a
+    /// split resolves its own profile without the primary's overrides;
+    /// another provider's model or profile, or a profile alone, is refused.
+    #[test]
+    fn the_adversarial_model_resolves_its_own_profile_on_the_same_provider() {
+        let anthropic = ProviderKind::Anthropic;
+        let sonnet = "claude-sonnet-5-5";
+        assert_eq!(
+            resolve_adversarial(anthropic, sonnet, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_adversarial(anthropic, sonnet, Some(" "), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_adversarial(anthropic, sonnet, Some(sonnet), None).unwrap(),
+            None,
+            "the primary model again is no split"
+        );
+        let split = resolve_adversarial(anthropic, sonnet, Some("claude-haiku-5-5"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(split.model, "claude-haiku-5-5");
+        assert_eq!(split.active.profile, "claude-haiku-5");
+        assert_eq!(split.active.generation, Generation::default());
+        let named = resolve_adversarial(
+            anthropic,
+            sonnet,
+            Some("claude-haiku-5-5"),
+            Some("claude-default"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(named.active.profile, "claude-default");
+        // The same model with a profile named is a split (its own prompts).
+        assert!(
+            resolve_adversarial(anthropic, sonnet, Some(sonnet), Some("claude-haiku-5"))
+                .unwrap()
+                .is_some()
+        );
+
+        for (provider, model, profile, want) in [
+            (anthropic, Some("gpt-6-luna"), None, "is not a Claude model"),
+            (
+                ProviderKind::Openai,
+                Some("claude-haiku-5-5"),
+                None,
+                "is a Claude model",
+            ),
+            (
+                anthropic,
+                Some("claude-haiku-5-5"),
+                Some("openai-default"),
+                "is for LLM_PROVIDER",
+            ),
+            (
+                anthropic,
+                None,
+                Some("claude-haiku-5"),
+                "needs LLM_ADVERSARIAL_MODEL",
+            ),
+            (anthropic, Some("claude-haiku-5-5"), Some("nope"), "nope"),
+        ] {
+            let err = resolve_adversarial(provider, sonnet, model, profile)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{model:?} {profile:?}: {err}");
+        }
+        // OpenAI-compatible endpoints: any non-Claude name.
+        let local = resolve_adversarial(ProviderKind::Openai, "big", Some("small"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.active.profile, "openai-default");
+        assert_eq!(local.active.generation.temperature, Some(0.0));
+    }
+
+    /// The adversarial calls' prompts come from their own profile's files;
+    /// with built-in prompts everywhere the set is still the built-in one.
+    #[test]
+    fn adversarial_prompts_come_from_the_adversarial_profile() {
+        let builtin = PromptSet::builtin();
+        let both = builtin.clone().with_adversarial_prompts(builtin.clone());
+        assert_eq!(both, builtin);
+        assert!(both.is_builtin());
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let primary = PromptSet::load(Some(&dir), "claude-default").unwrap();
+        let haiku = PromptSet::load(Some(&dir), "claude-haiku-5").unwrap();
+        let split = primary.with_adversarial_prompts(haiku.clone());
+        assert_eq!(split.primary, builtin.primary);
+        assert_eq!(split.adversarial, builtin.adversarial);
+        assert_eq!(split.severity_adversarial, haiku.severity_adversarial);
+        assert_eq!(split.sources[0], "built-in");
+        assert!(split.sources[2].ends_with("claude-haiku-5.severity_adversarial.txt"));
+        assert!(!split.is_builtin());
+        assert_ne!(split.version, haiku.version);
+    }
+
+    /// `model_version` names the adversarial model when it differs, so a
+    /// switch (either way) re-extracts; the prompt suffix stays last.
+    #[test]
+    fn model_version_encodes_the_adversarial_model() {
+        let builtin = PromptSet::builtin();
+        let sonnet = "claude-sonnet-5-5";
+        assert_eq!(
+            model_version(sonnet, None, &builtin),
+            "claude-sonnet-5-5@periods-v2"
+        );
+        assert_eq!(
+            model_version(sonnet, Some(sonnet), &builtin),
+            "claude-sonnet-5-5@periods-v2",
+            "the same model is no split"
+        );
+        let split = model_version(sonnet, Some("claude-haiku-5-5"), &builtin);
+        assert_eq!(
+            split,
+            "claude-sonnet-5-5@periods-v2+adversarial-claude-haiku-5-5"
+        );
+        assert_ne!(split, model_version("claude-haiku-5-5", None, &builtin));
+        assert_ne!(
+            split,
+            model_version("claude-haiku-5-5", Some(sonnet), &builtin)
+        );
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let tuned = PromptSet::load(Some(&dir), "claude-haiku-5").unwrap();
+        assert_eq!(
+            model_version(sonnet, Some("claude-haiku-5-5"), &tuned),
+            format!(
+                "claude-sonnet-5-5@periods-v2+adversarial-claude-haiku-5-5+prompts-{}",
+                tuned.version
+            )
+        );
     }
 }

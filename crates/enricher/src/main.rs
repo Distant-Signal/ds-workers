@@ -88,8 +88,17 @@ async fn run() -> anyhow::Result<()> {
             config.anthropic.llm_thinking.as_deref(),
         )?,
     )?;
-    let prompts =
-        profile::PromptSet::load(config.generation.llm_prompts_dir.as_deref(), active.profile)?;
+    // `LLM_ADVERSARIAL_MODEL`: the adversarial calls' own model and
+    // profile (unset: the primary's), refused here when it is another
+    // provider's. Their prompts come from their own profile.
+    let adversarial = config
+        .generation
+        .adversarial(resolved.provider, &resolved.model)?;
+    let prompts = config::load_prompts(
+        config.generation.llm_prompts_dir.as_deref(),
+        active.profile,
+        adversarial.as_ref(),
+    )?;
     if config.metrics_enabled {
         let buckets = llm_duration_buckets(config.llm_request_timeout_secs);
         common::metrics::install_with_buckets(
@@ -126,20 +135,13 @@ async fn run() -> anyhow::Result<()> {
         sweep_mode = ?config.batch.llm_sweep_mode,
         "LLM provider configured"
     );
-    // Caching silently does nothing below the model's minimum prefix.
-    if resolved.provider == llm::ProviderKind::Anthropic
-        && config.anthropic.llm_prompt_cache != llm::anthropic::PromptCache::Off
-        && let Some(minimum) = profile::cache_minimum(&resolved.model)
-    {
-        let tokens = prompts.primary.chars().count() / 4;
-        if u32::try_from(tokens).unwrap_or(u32::MAX) < minimum {
-            tracing::warn!(
-                model = %resolved.model,
-                minimum,
-                prompt_tokens = tokens,
-                "the primary system prompt is below the model's cache minimum; prompt caching won't apply"
-            );
-        }
+    if let Some(adversarial) = &adversarial {
+        tracing::info!(
+            model = %adversarial.model,
+            profile = adversarial.active.profile,
+            generation = ?adversarial.active.generation,
+            "adversarial calls on their own model (LLM_ADVERSARIAL_MODEL)"
+        );
     }
 
     // The LLM credential, validated before anything else connects: a
@@ -236,10 +238,33 @@ async fn run() -> anyhow::Result<()> {
         llm = llm.with_anthropic(config.anthropic.settings());
     }
     // The profile's settings and prompts, last (they override the above).
-    let llm = llm.with_profile(&active).with_prompts(prompts);
-    // `<model>@periods-v2`, plus the prompt version when the prompts are
-    // overridden (a prompt change re-extracts).
-    let model_version = profile::model_version(&resolved.model, llm.prompts());
+    let llm = llm
+        .with_profile(&active)
+        .with_prompts(prompts)
+        .with_adversarial(adversarial.as_ref());
+    if config.metrics_enabled {
+        llm::register_call_model_info(&llm);
+    }
+    // Caching silently does nothing below a model's minimum prefix; each
+    // call against the model it is sent to.
+    if resolved.provider == llm::ProviderKind::Anthropic
+        && config.anthropic.llm_prompt_cache != llm::anthropic::PromptCache::Off
+    {
+        for (call, model, tokens, minimum) in llm::cache_minimum_shortfalls(&llm) {
+            tracing::warn!(
+                call = call.label(),
+                model,
+                minimum,
+                prompt_tokens = tokens,
+                "a system prompt is below its model's cache minimum; prompt caching won't apply to this call"
+            );
+        }
+    }
+    // `<model>@periods-v2`, plus the adversarial model when it is another
+    // one, plus the prompt version when the prompts are overridden (a
+    // model or prompt change re-extracts).
+    let model_version =
+        profile::model_version(&resolved.model, llm.adversarial_model(), llm.prompts());
     let enricher = Arc::new(Enricher {
         pool,
         llm,

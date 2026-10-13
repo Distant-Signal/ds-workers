@@ -53,7 +53,7 @@ use serde::Serialize;
 use crate::checks::CheckReport;
 use crate::eval::cost::{self, CostEstimate};
 use crate::eval::dataset::{self, Case};
-use crate::eval::pipeline::{CallRecord, Extraction, Failure, FailureKind, PipelineRecord};
+use crate::eval::pipeline::{CallRecord, Extraction, Failure, FailureKind, Pass, PipelineRecord};
 use crate::eval::report::{RunInfo, TargetInfo};
 use crate::eval::target::{self, Target};
 use crate::llm::{ExtractionPeriod, TokenUsage};
@@ -132,6 +132,9 @@ struct DatasetMeta {
 struct TargetStatus {
     name: String,
     model: String,
+    /// The adversarial calls' model, when they run on another one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adversarial_model: Option<String>,
     /// `pending`, `ok` or `error`.
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,6 +253,9 @@ struct TargetSummary<'a> {
 struct ResultLine<'a> {
     target: &'a str,
     model: &'a str,
+    /// The adversarial calls' model, when they ran on another one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adversarial_model: Option<&'a str>,
     provider: &'static str,
     case_id: &'a str,
     repetition: u32,
@@ -297,6 +303,9 @@ impl From<Extraction> for ExtractionOut {
 #[derive(Debug, Serialize)]
 struct CallOut<'a> {
     pass: &'static str,
+    /// The model this call ran on (the adversarial calls can run on their
+    /// own, `adversarial_model`).
+    model: &'a str,
     outcome: &'a str,
     elapsed_ms: u64,
     retries: u32,
@@ -312,9 +321,20 @@ struct CallOut<'a> {
     estimated_usd: Option<f64>,
 }
 
-fn call_out<'a>(call: &'a CallRecord, pricing: Option<&cost::Pricing>) -> CallOut<'a> {
+fn call_out<'a>(
+    record: &'a PipelineRecord,
+    call: &'a CallRecord,
+    prices: Option<&cost::Prices>,
+) -> CallOut<'a> {
+    let adversarial = call.pass != Pass::Primary;
     CallOut {
         pass: call.pass.label(),
+        model: record
+            .label
+            .adversarial_model
+            .as_deref()
+            .filter(|_| adversarial)
+            .unwrap_or(&record.label.model),
         outcome: &call.outcome,
         elapsed_ms: call.elapsed_ms,
         retries: call.retries,
@@ -322,16 +342,8 @@ fn call_out<'a>(call: &'a CallRecord, pricing: Option<&cost::Pricing>) -> CallOu
         content: call.content.as_deref(),
         error: call.error.as_deref(),
         usage: call.usage.as_ref(),
-        estimated_usd: pricing.zip(call.usage.as_ref()).map(|(pricing, usage)| {
-            let mut totals = cost::UsageTotals::default();
-            totals.add(usage);
-            let usd = totals.usd(pricing);
-            if call.batch_id.is_some() {
-                usd * cost::BATCH_DISCOUNT
-            } else {
-                usd
-            }
-        }),
+        // At the price of the model this call ran on.
+        estimated_usd: prices.and_then(|prices| cost::call_usd(call, prices.for_pass(call.pass))),
     }
 }
 
@@ -347,7 +359,7 @@ fn result_line<'a>(
     target: &'a Target,
     record: &'a PipelineRecord,
     case: Option<&Case>,
-    pricing: Option<&cost::Pricing>,
+    prices: Option<&cost::Prices>,
 ) -> ResultLine<'a> {
     let outcome = match case {
         Some(case) => record
@@ -362,12 +374,13 @@ fn result_line<'a>(
     let calls: Vec<CallOut<'a>> = record
         .calls
         .iter()
-        .map(|call| call_out(call, pricing))
+        .map(|call| call_out(record, call, prices))
         .collect();
-    let estimated_usd = pricing.map(|_| calls.iter().filter_map(|c| c.estimated_usd).sum());
+    let estimated_usd = prices.map(|_| calls.iter().filter_map(|c| c.estimated_usd).sum());
     ResultLine {
         target: &record.label.target,
         model: &record.label.model,
+        adversarial_model: record.label.adversarial_model.as_deref(),
         provider: match target.provider {
             crate::llm::ProviderKind::Openai => "openai",
             crate::llm::ProviderKind::Anthropic => "anthropic",
@@ -393,14 +406,15 @@ fn write_results(
     cases: &HashMap<&str, &Case>,
     cost: Option<&CostEstimate>,
 ) -> anyhow::Result<()> {
-    let pricing = cost.map(|c| c.pricing);
+    // The run's prices (each call at its own model's), when it was priced.
+    let prices = cost.and_then(|_| target.pricing());
     let mut out = String::new();
     for record in records {
         out.push_str(&serde_json::to_string(&result_line(
             target,
             record,
             case_of(record, cases),
-            pricing.as_ref(),
+            prices.as_ref(),
         ))?);
         out.push('\n');
     }
@@ -513,6 +527,7 @@ async fn run_target(
     Ok(TargetStatus {
         name: target.name.clone(),
         model: target.model.clone(),
+        adversarial_model: target.label().adversarial_model,
         status: "ok",
         error: None,
         counts: Some(counts),
@@ -566,6 +581,7 @@ async fn run(args: &Args) -> anyhow::Result<bool> {
             .map(|t| TargetStatus {
                 name: t.name.clone(),
                 model: t.model.clone(),
+                adversarial_model: t.label().adversarial_model,
                 status: "pending",
                 error: None,
                 counts: None,
@@ -658,6 +674,7 @@ mod tests {
         let label = TargetLabel {
             target: "haiku".to_string(),
             model: "claude-haiku-5-5".to_string(),
+            adversarial_model: None,
         };
         let mut record = run_pipeline(&backend, &label, &case("a"), 0).await;
         for call in &mut record.calls {
@@ -671,14 +688,16 @@ mod tests {
             });
         }
         let target = target();
-        let pricing = target.pricing().unwrap().0;
+        let prices = target.pricing().unwrap();
         let line = serde_json::to_value(result_line(
             &target,
             &record,
             Some(&case("a")),
-            Some(&pricing),
+            Some(&prices),
         ))
         .unwrap();
+        assert!(line.get("adversarial_model").is_none());
+        assert_eq!(line["calls"][2]["model"], "claude-haiku-5-5");
         assert_eq!(line["status"], "completed");
         assert_eq!(line["provider"], "anthropic");
         assert_eq!(line["extraction"]["category"], "signal_failure");

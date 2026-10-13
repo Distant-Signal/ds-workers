@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::batch_api::{BatchPoll, EndedBatch};
-use super::{LlmCallError, LlmClient, ProviderPolicy, TokenUsage};
+use super::{LlmCallError, LlmClient, TokenUsage};
 
 /// `LLM_BASE_URL` when `LLM_PROVIDER=anthropic` and none is set. Like the
 /// `OpenAI` convention it includes `/v1`: requests go to `{base}/messages`
@@ -207,41 +207,43 @@ pub(crate) fn claude_schema(schema: &Value) -> Value {
 /// - `output_config.format` carries the JSON schema ([`claude_schema`]);
 ///   `output_config.effort` is `LLM_REASONING_EFFORT` when set.
 /// - `max_tokens` is `LLM_MAX_TOKENS`, else [`DEFAULT_MAX_TOKENS`].
-pub(crate) fn messages_body(
-    model: &str,
-    settings: &AnthropicSettings,
-    policy: &ProviderPolicy,
-    sampling: super::Sampling,
+/// - `model` and the generation settings are the call's own
+///   (`LlmClient::call_settings`: the adversarial calls can run on
+///   `LLM_ADVERSARIAL_MODEL`). The cache marker is the same for every call;
+///   the cache itself is per model, so each model writes and reads its own.
+pub(super) fn messages_body(
+    call: &super::CallSettings<'_>,
+    prompt_cache: PromptCache,
     system_prompt: &str,
     user_content: &str,
     schema: &Value,
 ) -> Value {
     let mut system = serde_json::json!({ "type": "text", "text": system_prompt });
-    if let Some(marker) = settings.prompt_cache.marker() {
+    if let Some(marker) = prompt_cache.marker() {
         system["cache_control"] = marker;
     }
     let mut output_config = serde_json::json!({
         "format": { "type": "json_schema", "schema": claude_schema(schema) }
     });
-    if let Some(effort) = &policy.reasoning_effort {
-        output_config["effort"] = Value::String(effort.clone());
+    if let Some(effort) = call.reasoning_effort {
+        output_config["effort"] = Value::String(effort.to_string());
     }
     let mut body = serde_json::json!({
-        "model": model,
-        "max_tokens": policy.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "model": call.model,
+        "max_tokens": call.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "system": [system],
         "messages": [{ "role": "user", "content": user_content }],
         "output_config": output_config,
     });
-    if let Some(thinking) = &settings.thinking {
+    if let Some(thinking) = call.thinking {
         body["thinking"] = serde_json::json!({ "type": thinking });
     }
     // Only when a profile sets them (none of the built-in Claude profiles
     // does; `profile::resolve` refuses them for models that reject them).
-    if let Some(temperature) = sampling.temperature {
+    if let Some(temperature) = call.sampling.temperature {
         body["temperature"] = serde_json::json!(temperature);
     }
-    if let Some(top_p) = sampling.top_p {
+    if let Some(top_p) = call.sampling.top_p {
         body["top_p"] = serde_json::json!(top_p);
     }
     body

@@ -36,6 +36,11 @@
 #   prompts_dir           LLM_PROMPTS_DIR: prompt overrides, <profile>.<call>.txt
 #                         or <call>.txt (call: primary, adversarial,
 #                         severity_adversarial); relative to the workspace root
+#   adversarial_model     LLM_ADVERSARIAL_MODEL: the two adversarial calls'
+#                         model, same provider and endpoint (default: model)
+#   adversarial_profile   LLM_ADVERSARIAL_PROFILE: their profile by name
+#                         (default: picked by provider and adversarial_model);
+#                         its prompt files come from prompts_dir
 #   mode                  "batch" (default) or "sync". Batch sends the whole
 #                         record set through the provider's batch API (Claude
 #                         Message Batches, OpenAI Batch API) at half price;
@@ -53,6 +58,8 @@
 #                         USD per million tokens for the cost estimate (built
 #                         in for the Claude API's and OpenAI's models below;
 #                         batch calls are priced at 50% either way)
+#   [targets.adversarial_pricing]  the same for adversarial_model; each call is
+#                         priced at its own model's rates
 #
 # A target is resolved exactly like the service (src/profile.rs), so a
 # setting a model is known to reject fails before any call.
@@ -188,6 +195,22 @@ environment = "Claude API (api.anthropic.com), standard tier; see docs/enricher-
 provider = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 model = "claude-sonnet-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+request_timeout_secs = 180
+max_in_flight = 3
+rate_limit_retries = 3
+gateway_retries = 2
+
+# Sonnet for the primary extraction, Haiku for the two adversarial checks
+# (LLM_ADVERSARIAL_MODEL), each with its own default profile and the
+# built-in prompts; each call is priced at its own model's rates.
+[[targets]]
+name = "anthropic-sonnet-main-haiku-checks"
+environment = "Claude API (api.anthropic.com), standard tier; see docs/enricher-anthropic.md"
+provider = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+model = "claude-sonnet-5-5"
+adversarial_model = "claude-haiku-5-5"
 api_key_env = "ANTHROPIC_API_KEY"
 request_timeout_secs = 180
 max_in_flight = 3

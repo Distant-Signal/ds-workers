@@ -243,6 +243,10 @@ pub(crate) struct BatchState {
     pub version: u32,
     pub target: String,
     pub model: String,
+    /// The adversarial stage's model when it isn't `model`
+    /// (`adversarial_model`); absent in older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adversarial_model: Option<String>,
     /// `openai` or `anthropic`.
     pub provider: String,
     pub base_url: String,
@@ -285,6 +289,10 @@ impl BatchState {
         [
             (self.target == fresh.target, "target"),
             (self.model == fresh.model, "model"),
+            (
+                self.adversarial_model == fresh.adversarial_model,
+                "adversarial model",
+            ),
             (self.provider == fresh.provider, "provider"),
             (self.base_url == fresh.base_url, "base_url"),
             (
@@ -572,12 +580,19 @@ async fn submit_stage(
             stage: stage.label(),
             model_version: &model_version,
         };
+        // One model per batch (`chunk_requests`): the stage's call model.
+        let model = chunk
+            .first()
+            .and_then(|r| r.params.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string();
         let created = client
             .create_batch(&chunk, meta)
             .await
             .map_err(|err| submit_error(client, stage, &opts.state_path, &err))?;
         eprintln!(
-            "batch: {target} {} batch {} submitted ({} request(s))",
+            "batch: {target} {} batch {} submitted ({} request(s), model {model})",
             stage.label(),
             created.id,
             chunk.len()
@@ -723,6 +738,7 @@ pub(crate) async fn run_batch(
         version: STATE_VERSION,
         target: label.target.clone(),
         model: label.model.clone(),
+        adversarial_model: client.adversarial_model().map(str::to_string),
         provider: client.provider_label().to_string(),
         base_url: client.base_url().to_string(),
         prompt_fingerprint: fingerprint.clone(),
@@ -940,6 +956,10 @@ pub(crate) struct BatchInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct StageInfo {
     pub stage: &'static str,
+    /// The model the stage's requests went to: the primary model, or the
+    /// adversarial calls' own (`adversarial_model`). Its `usage` is that
+    /// model's tokens.
+    pub model: String,
     pub batches: Vec<BatchInfo>,
     pub requests: usize,
     /// First submission to the last batch seen ended.
@@ -992,8 +1012,13 @@ impl BatchRunMeta {
             (Stage::Primary, &state.primary),
             (Stage::Adversarial, &state.adversarial),
         ] {
+            let model = match stage {
+                Stage::Primary => &state.model,
+                Stage::Adversarial => state.adversarial_model.as_ref().unwrap_or(&state.model),
+            };
             let mut info = StageInfo {
                 stage: stage.label(),
+                model: model.clone(),
                 ..StageInfo::default()
             };
             for batch in batches {
@@ -1081,6 +1106,7 @@ impl BatchRunMeta {
             .map(|s| {
                 vec![
                     s.stage.to_string(),
+                    format!("`{}`", s.model),
                     s.batches
                         .iter()
                         .map(|b| format!("`{}`", b.id))
@@ -1106,6 +1132,7 @@ impl BatchRunMeta {
         md.push_str(&report::table(
             &[
                 "Stage",
+                "Model",
                 "Batches",
                 "Requests",
                 "Turnaround",

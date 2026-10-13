@@ -109,6 +109,15 @@ pub(crate) struct Target {
     /// `<call>.txt`), resolved like the targets file's other paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts_dir: Option<std::path::PathBuf>,
+    /// `LLM_ADVERSARIAL_MODEL`: the two adversarial calls' model (same
+    /// provider and endpoint); unset runs them on `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adversarial_model: Option<String>,
+    /// `LLM_ADVERSARIAL_PROFILE`: the adversarial calls' profile by name;
+    /// unset picks it by provider and `adversarial_model`. Its prompt files
+    /// come from `prompts_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adversarial_profile: Option<String>,
     /// `batch` (the default: the whole record set through the provider's
     /// batch API, at half price) or `sync` (one call at a time, like the
     /// service's stream loop). `EVAL_MODE` overrides it for a run. See
@@ -120,6 +129,10 @@ pub(crate) struct Target {
     /// endpoint the harness has no price for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::eval::cost::Pricing>,
+    /// `pricing` for the adversarial calls' model, when it is another one
+    /// (`adversarial_model`) the harness has no price for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adversarial_pricing: Option<crate::eval::cost::Pricing>,
 }
 
 /// How a run sends its calls.
@@ -290,7 +303,27 @@ impl Target {
         TargetLabel {
             target: self.name.clone(),
             model: self.model.clone(),
+            adversarial_model: self
+                .adversarial_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && *m != self.model)
+                .map(str::to_string),
         }
+    }
+
+    /// `adversarial_model` / `adversarial_profile`, resolved as the service
+    /// resolves `LLM_ADVERSARIAL_*`.
+    pub(crate) fn adversarial(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<Option<crate::profile::AdversarialModel>> {
+        crate::profile::resolve_adversarial(
+            self.provider,
+            model,
+            self.adversarial_model.as_deref(),
+            self.adversarial_profile.as_deref(),
+        )
     }
 
     pub(crate) fn policy(&self) -> ProviderPolicy {
@@ -367,7 +400,7 @@ impl Target {
             .auth_config()
             .auth(api_key.as_ref())
             .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
-        let (active, prompts) = self
+        let (active, prompts, adversarial) = self
             .profile_and_prompts(&resolved.model)
             .map_err(|err| anyhow::anyhow!("target {:?}: {err}", self.name))?;
         let client = LlmClient::new(
@@ -382,15 +415,24 @@ impl Target {
             ProviderKind::Openai => client,
             ProviderKind::Anthropic => client.with_anthropic(self.anthropic_settings()),
         };
-        Ok(client.with_profile(&active).with_prompts(prompts))
+        Ok(client
+            .with_profile(&active)
+            .with_prompts(prompts)
+            .with_adversarial(adversarial.as_ref()))
     }
 
     /// The target's profile (the service's resolution, with this target's
-    /// settings as the overrides) and its prompts.
+    /// settings as the overrides), its prompts (the adversarial calls' from
+    /// their own profile when they have one) and the adversarial calls'
+    /// model.
     pub(crate) fn profile_and_prompts(
         &self,
         model: &str,
-    ) -> anyhow::Result<(crate::profile::Resolved, crate::profile::PromptSet)> {
+    ) -> anyhow::Result<(
+        crate::profile::Resolved,
+        crate::profile::PromptSet,
+        Option<crate::profile::AdversarialModel>,
+    )> {
         use crate::profile::{Overrides, Setting, parse_setting};
         let overrides = Overrides {
             temperature: parse_setting("temperature", self.temperature.as_deref())?,
@@ -409,8 +451,10 @@ impl Target {
             .prompts_dir
             .as_deref()
             .map(|p| crate::eval::resolve(&p.to_string_lossy()));
-        let prompts = crate::profile::PromptSet::load(dir.as_deref(), active.profile)?;
-        Ok((active, prompts))
+        let adversarial = self.adversarial(model)?;
+        let prompts =
+            crate::config::load_prompts(dir.as_deref(), active.profile, adversarial.as_ref())?;
+        Ok((active, prompts, adversarial))
     }
 
     /// This target's mode for this run ([`EvalMode::resolve`]).
@@ -418,18 +462,37 @@ impl Target {
         Ok(EvalMode::resolve(run_mode()?, self.mode))
     }
 
-    /// The cost estimate's prices: the target's own, else the built-in ones.
-    pub(crate) fn pricing(&self) -> Option<(crate::eval::cost::Pricing, &'static str)> {
-        if let Some(pricing) = self.pricing {
-            return Some((pricing, "target"));
-        }
-        crate::eval::cost::builtin(
-            self.provider,
-            &self.base_url,
-            &self.model,
-            self.anthropic_settings().prompt_cache,
-        )
-        .map(|pricing| (pricing, "builtin"))
+    /// The cost estimate's prices, per call model: the target's own
+    /// (`pricing`, `adversarial_pricing`), else the built-in ones. `None`
+    /// when a model the run calls has no price.
+    pub(crate) fn pricing(&self) -> Option<crate::eval::cost::Prices> {
+        use crate::eval::cost::{ModelPricing, Prices};
+        let priced = |model: &str, own: Option<crate::eval::cost::Pricing>| {
+            let (pricing, source) = match own {
+                Some(pricing) => (pricing, "target"),
+                None => (
+                    crate::eval::cost::builtin(
+                        self.provider,
+                        &self.base_url,
+                        model,
+                        self.anthropic_settings().prompt_cache,
+                    )?,
+                    "builtin",
+                ),
+            };
+            Some(ModelPricing {
+                model: model.to_string(),
+                source,
+                pricing,
+            })
+        };
+        Some(Prices {
+            primary: priced(&self.model, self.pricing)?,
+            adversarial: match &self.label().adversarial_model {
+                Some(model) => Some(priced(model, self.adversarial_pricing)?),
+                None => None,
+            },
+        })
     }
 
     /// Safe in a file name.
@@ -554,6 +617,9 @@ pub(crate) fn load_targets() -> anyhow::Result<Vec<Target>> {
         temperature: generation.llm_temperature,
         top_p: generation.llm_top_p,
         prompts_dir: generation.llm_prompts_dir,
+        adversarial_model: generation.llm_adversarial_model,
+        adversarial_profile: generation.llm_adversarial_profile,
+        adversarial_pricing: None,
         // `EVAL_MODE` decides (default batch).
         mode: None,
         pricing: None,
@@ -743,11 +809,12 @@ mod tests {
             .unwrap()
             .remove(0)
         };
-        let (active, prompts) = parse("").profile_and_prompts("m").unwrap();
+        let (active, prompts, adversarial) = parse("").profile_and_prompts("m").unwrap();
         assert_eq!(active.profile, "openai-default");
         assert_eq!(active.generation.temperature, Some(0.0));
         assert!(prompts.is_builtin());
-        let (active, _) = parse("temperature = \"omit\"\ntop_p = \"0.8\"\n")
+        assert_eq!(adversarial, None);
+        let (active, _, _) = parse("temperature = \"omit\"\ntop_p = \"0.8\"\n")
             .profile_and_prompts("m")
             .unwrap();
         assert_eq!(active.generation.temperature, None);
@@ -762,10 +829,83 @@ mod tests {
             "provider = \"anthropic\"\nprofile = \"claude-haiku-5\"\n\
              prompts_dir = \"crates/enricher/prompts\"\n",
         );
-        let (active, prompts) = tuned.profile_and_prompts("claude-haiku-5-5").unwrap();
+        let (active, prompts, _) = tuned.profile_and_prompts("claude-haiku-5-5").unwrap();
         assert_eq!(active.profile, "claude-haiku-5");
         assert!(!prompts.is_builtin());
         assert!(prompts.sources[0].ends_with("claude-haiku-5.primary.txt"));
+    }
+
+    /// The split target (`targets-split.toml`'s shape): Sonnet primary on
+    /// its default profile, the adversarial calls on Haiku with the
+    /// claude-haiku-5 profile and, with no `prompts_dir`, the prod
+    /// (built-in) prompts; each call priced at its own model's rates.
+    #[test]
+    fn a_split_target_runs_the_adversarial_calls_on_their_own_model() {
+        let split = &parse_targets(
+            "[[targets]]\nname = \"sonnet-main-haiku-checks\"\nprovider = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com/v1\"\nmodel = \"claude-sonnet-5-5\"\n\
+             api_key_env = \"PATH\"\n\
+             adversarial_model = \"claude-haiku-5-5\"\nadversarial_profile = \"claude-haiku-5\"\n",
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(
+            split.label().adversarial_model.as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        let (active, prompts, adversarial) =
+            split.profile_and_prompts("claude-sonnet-5-5").unwrap();
+        assert_eq!(active.profile, "claude-default");
+        assert!(prompts.is_builtin(), "the prod prompts, not the tuned ones");
+        let adversarial = adversarial.unwrap();
+        assert_eq!(adversarial.model, "claude-haiku-5-5");
+        assert_eq!(adversarial.active.profile, "claude-haiku-5");
+
+        let prices = split.pricing().unwrap();
+        assert_eq!(prices.primary.model, "claude-sonnet-5-5");
+        assert!((prices.for_pass(crate::eval::pipeline::Pass::Primary).input - 2.0).abs() < 1e-12);
+        let haiku = prices.adversarial.as_ref().unwrap();
+        assert_eq!(
+            (haiku.model.as_str(), haiku.source),
+            ("claude-haiku-5-5", "builtin")
+        );
+        assert!((haiku.pricing.cache_write - 0.20).abs() < 1e-12);
+
+        // `api_key_env` is PATH, a variable that is always set: the client
+        // is built, never used to send.
+        let client = split.client(1).unwrap();
+        assert_eq!(
+            client.model_for(crate::llm::LlmCall::Primary),
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(
+            client.model_for(crate::llm::LlmCall::SeverityAdversarial),
+            "claude-haiku-5-5"
+        );
+        assert_eq!(client.adversarial_model(), Some("claude-haiku-5-5"));
+
+        // Another provider's model is refused, as by the service.
+        let cross = &parse_targets(
+            "[[targets]]\nname = \"x\"\nprovider = \"anthropic\"\nbase_url = \"u\"\n\
+             model = \"claude-sonnet-5-5\"\nadversarial_model = \"gpt-6-luna\"\n",
+            None,
+        )
+        .unwrap()[0];
+        let err = cross
+            .profile_and_prompts("claude-sonnet-5-5")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a Claude model"), "{err}");
+        // An adversarial model the harness has no price for, without
+        // `adversarial_pricing`, leaves the run unpriced.
+        let unpriced = &parse_targets(
+            "[[targets]]\nname = \"x\"\nprovider = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com/v1\"\nmodel = \"claude-sonnet-5-5\"\n\
+             adversarial_model = \"claude-new-9\"\n",
+            None,
+        )
+        .unwrap()[0];
+        assert!(unpriced.pricing().is_none());
     }
 
     /// Batch is the default: a target without `mode`, and the env-var
@@ -818,9 +958,19 @@ mod tests {
             "openai-gpt-6-luna-none",
             "anthropic-claude-haiku-5-5",
             "anthropic-claude-sonnet-5-5",
+            "anthropic-sonnet-main-haiku-checks",
         ] {
             assert_eq!(mode(name), EvalMode::Batch, "{name}");
         }
+        let split = example
+            .iter()
+            .find(|t| t.name == "anthropic-sonnet-main-haiku-checks")
+            .unwrap();
+        assert_eq!(
+            split.label().adversarial_model.as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert!(split.pricing().unwrap().adversarial.is_some());
     }
 
     /// Built-in prices for the providers' own models, a target's own
@@ -829,10 +979,11 @@ mod tests {
     fn pricing_is_built_in_or_the_targets_own() {
         let example = parse_targets(include_str!("../../eval/targets.example.toml"), None).unwrap();
         let price = |name: &str| example.iter().find(|t| t.name == name).unwrap().pricing();
-        let (haiku, source) = price("anthropic-claude-haiku-5-5").unwrap();
-        assert_eq!(source, "builtin");
+        let haiku = price("anthropic-claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.primary.source, "builtin");
+        assert_eq!(haiku.adversarial, None);
         assert!(
-            (haiku.cache_write - 0.20).abs() < 1e-12,
+            (haiku.primary.pricing.cache_write - 0.20).abs() < 1e-12,
             "1h cache by default"
         );
         assert!(price("openai-gpt-6-luna-none").is_some());
@@ -843,9 +994,9 @@ mod tests {
             None,
         )
         .unwrap()[0];
-        let (pricing, source) = own.pricing().unwrap();
-        assert_eq!(source, "target");
-        assert!((pricing.output - 0.8).abs() < 1e-12);
+        let own = own.pricing().unwrap().primary;
+        assert_eq!(own.source, "target");
+        assert!((own.pricing.output - 0.8).abs() < 1e-12);
         let typo = "[[targets]]\nname = \"a\"\nbase_url = \"u\"\nmodel = \"m\"\n\
                     [targets.pricing]\ninput = 1.0\noutput = 1.0\ncache_read = 0.1\n";
         assert!(

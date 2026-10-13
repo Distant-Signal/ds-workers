@@ -1,5 +1,5 @@
 use super::*;
-use crate::llm::PrimaryExtraction;
+use crate::llm::{PrimaryExtraction, ProviderPolicy};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -898,4 +898,202 @@ async fn profiles_decide_sampling_and_prompts_on_the_wire() {
     assert!(bodies[2].get("top_p").is_none());
     assert_eq!(bodies[3]["temperature"], 0.0);
     assert_eq!(bodies[3]["system"][0]["text"], "Custom primary prompt.");
+}
+
+/// The sonnet-main/haiku-checks split as the service and the eval build
+/// it: Sonnet with the primary's overrides (effort, thinking, `max_tokens`),
+/// Haiku with its own profile's defaults and prompt files.
+fn split_client(server: &MockServer, prompts_dir: Option<&std::path::Path>) -> LlmClient {
+    use crate::llm::ProviderKind;
+    use crate::profile::{Overrides, Setting, resolve, resolve_adversarial};
+    let primary = resolve(
+        ProviderKind::Anthropic,
+        "claude-sonnet-5-5",
+        None,
+        Overrides {
+            reasoning_effort: Some(Setting::Set("medium".into())),
+            thinking: Some(Setting::Set("between_tools".into())),
+            max_tokens: Some(Setting::Set(8000)),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let adversarial = resolve_adversarial(
+        ProviderKind::Anthropic,
+        "claude-sonnet-5-5",
+        Some("claude-haiku-5-5"),
+        None,
+    )
+    .unwrap();
+    let prompts =
+        crate::config::load_prompts(prompts_dir, primary.profile, adversarial.as_ref()).unwrap();
+    LlmClient::new(
+        server.uri(),
+        Some(KEY.to_string()),
+        "claude-sonnet-5-5".to_string(),
+        std::time::Duration::from_secs(30),
+    )
+    .with_anthropic(AnthropicSettings::default())
+    .with_profile(&primary)
+    .with_prompts(prompts)
+    .with_adversarial(adversarial.as_ref())
+}
+
+/// `LLM_ADVERSARIAL_MODEL`: each call's request names its own model and
+/// carries its own settings (the primary's overrides never reach the
+/// adversarial model), on the synchronous path and in batch `params`
+/// alike; the cache marker is on every call.
+#[tokio::test]
+async fn the_adversarial_calls_are_sent_to_their_own_model() {
+    use crate::llm::LlmCall;
+    let server = MockServer::start().await;
+    mount_success(&server).await;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let client = split_client(&server, Some(&dir));
+    assert_eq!(client.model_for(LlmCall::Primary), "claude-sonnet-5-5");
+    assert_eq!(
+        client.model_for(LlmCall::ResolutionAdversarial),
+        "claude-haiku-5-5"
+    );
+    assert_eq!(client.profile_for(LlmCall::Primary), "claude-default");
+    assert_eq!(
+        client.profile_for(LlmCall::SeverityAdversarial),
+        "claude-haiku-5"
+    );
+    assert_eq!(client.adversarial_model(), Some("claude-haiku-5-5"));
+    let periods = crate::llm::parse_primary(&primary_text()).unwrap().periods;
+    let _ = client.primary_raw("s", "d", reference_date()).await;
+    let _ = client.adversarial_raw("s", "d", &periods).await;
+    let _ = client.severity_adversarial_raw("s", "d", &periods).await;
+    let sync = sent_bodies(&server).await;
+    let batch: Vec<Value> = [
+        crate::llm::primary_spec(client.prompts(), "s", "d", reference_date()),
+        crate::llm::adversarial_spec(client.prompts(), "s", "d", &periods).unwrap(),
+        crate::llm::severity_adversarial_spec(client.prompts(), "s", "d", &periods).unwrap(),
+    ]
+    .into_iter()
+    .map(|spec| client.batch_params(spec).unwrap())
+    .collect();
+    let haiku_tuned = crate::profile::PromptSet::load(Some(&dir), "claude-haiku-5").unwrap();
+    for bodies in [&sync, &batch] {
+        let [primary, resolution, severity] = &bodies[..] else {
+            panic!("{bodies:?}")
+        };
+        assert_eq!(primary["model"], "claude-sonnet-5-5");
+        assert_eq!(primary["max_tokens"], 8000);
+        assert_eq!(primary["thinking"]["type"], "between_tools");
+        assert_eq!(primary["output_config"]["effort"], "medium");
+        assert_eq!(
+            primary["system"][0]["text"],
+            crate::llm::builtin_prompts()[0],
+            "claude-default has no prompt files: the built-in primary"
+        );
+        for adversarial in [resolution, severity] {
+            assert_eq!(adversarial["model"], "claude-haiku-5-5");
+            assert_eq!(adversarial["max_tokens"], DEFAULT_MAX_TOKENS);
+            assert!(adversarial.get("thinking").is_none(), "{adversarial}");
+            assert!(adversarial["output_config"].get("effort").is_none());
+            assert!(adversarial.get("temperature").is_none());
+            assert_eq!(adversarial["system"][0]["cache_control"]["ttl"], "1h");
+        }
+        assert_eq!(
+            severity["system"][0]["text"], haiku_tuned.severity_adversarial,
+            "the adversarial profile's own prompt file"
+        );
+    }
+
+    // Without a prompts directory every prompt is built-in, as in prod.
+    let plain = split_client(&server, None);
+    assert!(plain.prompts().is_builtin());
+    assert_eq!(
+        crate::profile::model_version(
+            "claude-sonnet-5-5",
+            plain.adversarial_model(),
+            plain.prompts()
+        ),
+        "claude-sonnet-5-5@periods-v2+adversarial-claude-haiku-5-5"
+    );
+}
+
+/// Unset (prod's configuration) changes nothing: every call goes to the
+/// one model, and `model_version` keeps its value.
+#[tokio::test]
+async fn without_an_adversarial_model_every_call_is_the_primary_model() {
+    let server = MockServer::start().await;
+    let client = client(&server, AnthropicSettings::default()).with_adversarial(None);
+    assert_eq!(client.adversarial_model(), None);
+    let periods = crate::llm::parse_primary(&primary_text()).unwrap().periods;
+    for spec in [
+        crate::llm::primary_spec(client.prompts(), "s", "d", reference_date()),
+        crate::llm::adversarial_spec(client.prompts(), "s", "d", &periods).unwrap(),
+        crate::llm::severity_adversarial_spec(client.prompts(), "s", "d", &periods).unwrap(),
+    ] {
+        let call = spec.call;
+        assert_eq!(
+            client.batch_params(spec).unwrap()["model"],
+            "claude-haiku-5-5"
+        );
+        assert_eq!(client.model_for(call), "claude-haiku-5-5");
+    }
+    assert_eq!(
+        crate::profile::model_version(
+            "claude-haiku-5-5",
+            client.adversarial_model(),
+            client.prompts()
+        ),
+        "claude-haiku-5-5@periods-v2"
+    );
+}
+
+/// The cache-minimum check is per call, against the model each call is
+/// sent to: the built-in prompts clear the 512-token minimum of Sonnet 5.5
+/// and Haiku 5.5 on all three calls, and a Haiku 4.5 adversarial model
+/// (4,096) is flagged for its two calls only.
+#[test]
+fn the_cache_minimum_is_checked_per_call_and_model() {
+    use crate::llm::{LlmCall, cache_minimum_shortfalls, cacheable_prefix_tokens};
+    let builtin = crate::profile::PromptSet::builtin();
+    for call in LlmCall::ALL {
+        let tokens = cacheable_prefix_tokens(call, &builtin);
+        assert!(tokens >= 512, "{}: ~{tokens} tokens", call.label());
+    }
+    let sonnet = |adversarial: Option<&str>| {
+        let adversarial = crate::profile::resolve_adversarial(
+            crate::llm::ProviderKind::Anthropic,
+            "claude-sonnet-5-5",
+            adversarial,
+            None,
+        )
+        .unwrap();
+        LlmClient::new(
+            "http://unused".into(),
+            None,
+            "claude-sonnet-5-5".into(),
+            std::time::Duration::from_secs(1),
+        )
+        .with_anthropic(AnthropicSettings::default())
+        .with_adversarial(adversarial.as_ref())
+    };
+    assert!(cache_minimum_shortfalls(&sonnet(None)).is_empty());
+    assert!(cache_minimum_shortfalls(&sonnet(Some("claude-haiku-5-5"))).is_empty());
+    let old = sonnet(Some("claude-haiku-4-5"));
+    let flagged: Vec<_> = cache_minimum_shortfalls(&old)
+        .into_iter()
+        .map(|(call, model, _, minimum)| (call, model.to_string(), minimum))
+        .collect();
+    assert_eq!(
+        flagged,
+        [
+            (
+                LlmCall::ResolutionAdversarial,
+                "claude-haiku-4-5".to_string(),
+                4096
+            ),
+            (
+                LlmCall::SeverityAdversarial,
+                "claude-haiku-4-5".to_string(),
+                4096
+            ),
+        ]
+    );
 }
