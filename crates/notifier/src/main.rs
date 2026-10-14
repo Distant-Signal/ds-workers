@@ -279,6 +279,16 @@ async fn shutdown_signal() {
     }
 }
 
+/// A line push's deep link: a transit line (`metrolink:blue`) opens its
+/// tram line page, `/transit/metrolink/lines/blue` (transit spec §12.2);
+/// every other line its National Rail or `TfL` line page.
+fn line_url(line_id: &str) -> String {
+    match common::transit::QualifiedLineId::parse(line_id) {
+        Ok(id) => format!("/transit/{}/lines/{}", id.network(), id.line()),
+        Err(_) => format!("/lines/{line_id}"),
+    }
+}
+
 /// Hands one decided notification to the push queue. Never blocks; see
 /// `push_queue`'s module doc for what happens when the queue refuses it.
 fn enqueue_push(
@@ -354,7 +364,7 @@ async fn run_cycle(
             let payload = NotificationPayload {
                 title: "Line status changed".to_string(),
                 body: format!("{} has a new status.", candidate.line_id),
-                url: format!("/lines/{}", candidate.line_id),
+                url: line_url(&candidate.line_id),
                 tag: format!("line-{}", candidate.line_id),
             };
             enqueue_push(
@@ -1046,6 +1056,13 @@ mod poll_interval_tests {
 #[cfg(test)]
 mod copy_tests {
     use super::*;
+
+    #[test]
+    fn a_transit_line_links_to_its_tram_line_page() {
+        assert_eq!(line_url("metrolink:blue"), "/transit/metrolink/lines/blue");
+        assert_eq!(line_url("northern"), "/lines/northern");
+        assert_eq!(line_url("tfl-victoria"), "/lines/tfl-victoria");
+    }
 
     fn ctx(total_legs: i64, journey_name: Option<&str>) -> queries::JourneyLegContext {
         queries::JourneyLegContext {

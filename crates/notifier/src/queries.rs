@@ -297,6 +297,28 @@ fn worst_rank(statuses: &[LineStatus]) -> u8 {
         .unwrap_or(0)
 }
 
+/// A transit line's rank (transit spec §12.2): its headline, the first
+/// status (`common::transit::status::derive` lists the worst first, and
+/// "No reported disruption" ahead of any Information). Information never
+/// counts, so a change that only adds, drops or swaps Information
+/// situations is not a transition and is never pushed.
+fn transit_rank(statuses: &[LineStatus]) -> u8 {
+    statuses
+        .first()
+        .filter(|s| s.severity != common::Severity::Information)
+        .map_or(0, |s| severity_rank(s.severity))
+}
+
+/// The rank a line's history row is compared on: [`transit_rank`] for a
+/// transit line (`<network>:<line>`), [`worst_rank`] for every other.
+fn line_rank(line_id: &str, statuses: &[LineStatus]) -> u8 {
+    if common::transit::QualifiedLineId::parse(line_id).is_ok() {
+        transit_rank(statuses)
+    } else {
+        worst_rank(statuses)
+    }
+}
+
 /// Decodes one polled `line_status_history` row into a candidate, or
 /// `None` for "this row is not a candidate" -- which now deliberately
 /// covers BOTH "no severity transition here" and "this row's own JSON does
@@ -337,12 +359,12 @@ fn line_candidate_from_row(row: LineHistoryRow) -> Option<LineCandidate> {
             return None;
         }
     };
-    let new_rank = worst_rank(&statuses);
+    let new_rank = line_rank(&row.line_id, &statuses);
 
     let previous_rank = match row.previous_statuses {
         None => None,
         Some(previous_json) => match serde_json::from_value::<Vec<LineStatus>>(previous_json) {
-            Ok(previous_statuses) => Some(worst_rank(&previous_statuses)),
+            Ok(previous_statuses) => Some(line_rank(&row.line_id, &previous_statuses)),
             Err(err) => {
                 tracing::error!(
                     error = ?err,
@@ -2379,6 +2401,82 @@ mod tests {
             .collect();
         assert_eq!(all_ours, ids[1..].to_vec());
 
+        cleanup_line_history(&pool, line_id).await;
+    }
+
+    /// Transit plan 4.7 (spec §12.2): a transit line's history row compares
+    /// on its headline. Minor delays to "No reported disruption" is a
+    /// transition; one that only adds, drops or swaps Information
+    /// situations behind the headline is not; a stale row is skipped and
+    /// counted.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `cargo test -p notifier \
+                transit_line_history -- --ignored --test-threads=1`"]
+    async fn transit_line_history_compares_on_the_headline_without_information() {
+        use common::Severity::{Information, MinorDelays, NoReportedDisruption};
+
+        let pool = connect().await;
+        let line_id = "test-notifier:blue";
+        cleanup_line_history(&pool, line_id).await;
+        let since: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM line_status_history")
+            .fetch_one(&pool)
+            .await
+            .expect("read the head id");
+        let mut ids = Vec::new();
+        for (severities, age_minutes) in [
+            (vec![MinorDelays], 0),
+            (vec![NoReportedDisruption], 0),
+            (vec![NoReportedDisruption, Information], 0),
+            (vec![NoReportedDisruption, Information, Information], 0),
+            (vec![MinorDelays, Information], 30),
+            (vec![NoReportedDisruption], 0),
+        ] {
+            let statuses: Vec<serde_json::Value> =
+                severities.into_iter().map(status_json).collect();
+            let statuses = serde_json::Value::Array(
+                statuses
+                    .into_iter()
+                    .flat_map(|s| s.as_array().cloned().unwrap_or_default())
+                    .collect(),
+            );
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO line_status_history (line_id, statuses, computed_at) \
+                 VALUES ($1, $2, now() - make_interval(mins => $3::int)) RETURNING id",
+            )
+            .bind(line_id)
+            .bind(statuses)
+            .bind(age_minutes)
+            .fetch_one(&pool)
+            .await
+            .expect("seed transit history row");
+            ids.push(id);
+        }
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (candidates, _) = {
+            let _local = metrics::set_default_local_recorder(&recorder);
+            poll_line_candidates_with_max_age(
+                &pool,
+                since,
+                TEST_POLL_BATCH_ROWS,
+                Some(chrono::Duration::minutes(15)),
+            )
+            .await
+            .expect("poll")
+        };
+        let ours: Vec<(i64, u8, u8)> = candidates
+            .iter()
+            .filter(|c| c.line_id == line_id)
+            .map(|c| (c.id, c.previous_rank, c.new_rank))
+            .collect();
+        let minor = severity_rank(MinorDelays);
+        // Row 1: Minor delays to No reported disruption, pushed. Rows 2 and
+        // 3: Information only, nothing. Row 4 is stale (skipped and
+        // counted); row 5 compares with it, Minor delays to No reported
+        // disruption again.
+        assert_eq!(ours, [(ids[1], minor, 0), (ids[5], minor, 0)]);
+        assert_eq!(stale_skips(&handle.render()), 1);
         cleanup_line_history(&pool, line_id).await;
     }
 
