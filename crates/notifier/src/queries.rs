@@ -289,11 +289,18 @@ pub(crate) fn register_line_history_metrics() {
     .increment(0);
 }
 
+/// A non-transit line's rank: its single worst concurrent status (spec
+/// Decision 2), so `.max()` -- `severity_rank` is higher-is-worse. The same
+/// "worst" as `LineStatusReport::worst_severity`, the api's operator rollup
+/// and the frontend's `worstStatus`. No statuses rank as good (0).
+///
+/// History stores statuses, not ranks, and both sides of a comparison are
+/// ranked here at poll time, so changing this never re-ranks one side only.
 fn worst_rank(statuses: &[LineStatus]) -> u8 {
     statuses
         .iter()
         .map(|s| severity_rank(s.severity))
-        .min()
+        .max()
         .unwrap_or(0)
 }
 
@@ -5899,5 +5906,204 @@ mod sweep_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+}
+
+/// Pure (no-DB) tests for how a history row's statuses become a rank and a
+/// candidate. `worst_rank` once took `.min()` of `severity_rank` (higher is
+/// worse), so a line's rank was its MILDEST status: escalations on an
+/// already-disrupted line were never pushed, and adding a milder status to
+/// one looked like an improvement.
+#[cfg(test)]
+mod line_rank_tests {
+    use super::*;
+    use common::Severity::{
+        GoodService, Information, MinorDelays, NoReportedDisruption, PartClosure, PlannedClosure,
+        SevereDelays,
+    };
+
+    const TFL_LINE: &str = "central";
+    const TRANSIT_LINE: &str = "test-notifier:blue";
+
+    fn status(severity: common::Severity) -> LineStatus {
+        LineStatus {
+            severity,
+            reason: String::new(),
+            validity: common::ValidityPeriod {
+                from_date: Utc::now(),
+                to_date: None,
+                is_now: true,
+            },
+            disruption: None,
+            data_quality: common::DataQuality::default(),
+            sample_stats: None,
+            sample_availability: common::SampleAvailability::NoCoverage,
+            full_coverage_stats: None,
+            full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
+        }
+    }
+
+    fn statuses(severities: &[common::Severity]) -> Vec<LineStatus> {
+        severities.iter().copied().map(status).collect()
+    }
+
+    fn json(severities: &[common::Severity]) -> serde_json::Value {
+        serde_json::to_value(statuses(severities)).expect("serialize fixture statuses")
+    }
+
+    /// `(previous_rank, new_rank)` of the candidate a row becomes, or `None`
+    /// when it is no transition.
+    fn transition(
+        line_id: &str,
+        previous: &[common::Severity],
+        new: &[common::Severity],
+    ) -> Option<(u8, u8)> {
+        line_candidate_from_row(LineHistoryRow {
+            id: 1,
+            line_id: line_id.to_owned(),
+            statuses: json(new),
+            previous_statuses: Some(json(previous)),
+            stale: false,
+        })
+        .map(|c| (c.previous_rank, c.new_rank))
+    }
+
+    #[test]
+    fn a_mixed_severity_line_ranks_as_its_worst_status() {
+        let severe = severity_rank(SevereDelays);
+        assert_eq!(worst_rank(&statuses(&[GoodService, SevereDelays])), severe);
+        // Order must not matter.
+        assert_eq!(worst_rank(&statuses(&[SevereDelays, GoodService])), severe);
+        assert_eq!(
+            worst_rank(&statuses(&[PartClosure, MinorDelays, Information])),
+            severity_rank(MinorDelays)
+        );
+    }
+
+    #[test]
+    fn a_single_status_ranks_as_itself() {
+        for severity in [
+            GoodService,
+            Information,
+            PlannedClosure,
+            MinorDelays,
+            SevereDelays,
+        ] {
+            assert_eq!(worst_rank(&statuses(&[severity])), severity_rank(severity));
+        }
+    }
+
+    #[test]
+    fn no_statuses_rank_as_good() {
+        assert_eq!(worst_rank(&[]), 0);
+        assert_eq!(transit_rank(&[]), 0);
+        assert_eq!(line_rank(TFL_LINE, &[]), 0);
+        assert_eq!(line_rank(TRANSIT_LINE, &[]), 0);
+    }
+
+    /// The case `.min()` missed outright: a line already partly closed
+    /// gains severe delays elsewhere. Its mildest status never changed, so
+    /// no candidate was produced and nobody was told.
+    #[test]
+    fn an_escalation_alongside_an_unchanged_milder_status_is_a_transition() {
+        let planned = severity_rank(PartClosure);
+        let severe = severity_rank(SevereDelays);
+        assert_eq!(
+            transition(TFL_LINE, &[PartClosure], &[PartClosure, SevereDelays]),
+            Some((planned, severe))
+        );
+        assert_eq!(
+            transition(TFL_LINE, &[GoodService], &[GoodService, SevereDelays]),
+            Some((0, severe))
+        );
+    }
+
+    /// The reverse: severe delays clearing while a milder status stays is a
+    /// real de-escalation the old ranking also never saw.
+    #[test]
+    fn a_de_escalation_alongside_an_unchanged_milder_status_is_a_transition() {
+        assert_eq!(
+            transition(TFL_LINE, &[MinorDelays, SevereDelays], &[MinorDelays]),
+            Some((severity_rank(SevereDelays), severity_rank(MinorDelays)))
+        );
+    }
+
+    /// Adding or dropping a milder status beside an unchanged worst one is
+    /// no transition. `.min()` read the first as a de-escalation and the
+    /// second as an escalation (pushed past the cooldown).
+    #[test]
+    fn a_milder_status_coming_or_going_beside_the_worst_is_no_transition() {
+        assert_eq!(
+            transition(TFL_LINE, &[SevereDelays], &[SevereDelays, PlannedClosure]),
+            None
+        );
+        assert_eq!(
+            transition(TFL_LINE, &[SevereDelays, PlannedClosure], &[SevereDelays]),
+            None
+        );
+        assert_eq!(
+            transition(
+                TFL_LINE,
+                &[MinorDelays, Information],
+                &[Information, MinorDelays, PartClosure]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn single_status_transitions_are_unchanged() {
+        assert_eq!(
+            transition(TFL_LINE, &[GoodService], &[MinorDelays]),
+            Some((0, severity_rank(MinorDelays)))
+        );
+        assert_eq!(
+            transition(TFL_LINE, &[SevereDelays], &[GoodService]),
+            Some((severity_rank(SevereDelays), 0))
+        );
+        assert_eq!(transition(TFL_LINE, &[MinorDelays], &[MinorDelays]), None);
+    }
+
+    #[test]
+    fn a_row_with_no_previous_row_is_never_a_candidate() {
+        let row = LineHistoryRow {
+            id: 1,
+            line_id: TFL_LINE.to_owned(),
+            statuses: json(&[SevereDelays]),
+            previous_statuses: None,
+            stale: false,
+        };
+        assert!(line_candidate_from_row(row).is_none());
+    }
+
+    /// Transit lines still rank on their headline (the first status) and
+    /// never on Information, as `transit_rank` documents.
+    #[test]
+    fn transit_lines_rank_on_the_headline_without_information() {
+        let minor = severity_rank(MinorDelays);
+        assert_eq!(
+            line_rank(TRANSIT_LINE, &statuses(&[MinorDelays, Information])),
+            minor
+        );
+        assert_eq!(
+            line_rank(
+                TRANSIT_LINE,
+                &statuses(&[NoReportedDisruption, Information])
+            ),
+            0
+        );
+        assert_eq!(line_rank(TRANSIT_LINE, &statuses(&[Information])), 0);
+        assert_eq!(
+            transition(
+                TRANSIT_LINE,
+                &[NoReportedDisruption],
+                &[NoReportedDisruption, Information]
+            ),
+            None
+        );
+        assert_eq!(
+            transition(TRANSIT_LINE, &[MinorDelays], &[NoReportedDisruption]),
+            Some((minor, 0))
+        );
     }
 }
