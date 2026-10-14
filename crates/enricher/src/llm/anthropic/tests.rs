@@ -784,11 +784,14 @@ async fn a_federated_token_is_a_bearer_with_no_api_key() {
     // 50 minutes on (under 20% of the hour-long token left, before its
     // refresh at 54 minutes): the batch still goes out with it.
     clock.advance(std::time::Duration::from_secs(3000));
-    let requests = vec![BatchRequest {
-        custom_id: "p-0".into(),
-        params: serde_json::json!({ "model": "claude-haiku-5-5", "max_tokens": 1,
-                                    "messages": [] }),
-    }];
+    let requests = vec![
+        BatchRequest::new(
+            "p-0".into(),
+            &serde_json::json!({ "model": "claude-haiku-5-5", "max_tokens": 1,
+                                 "messages": [] }),
+        )
+        .unwrap(),
+    ];
     let meta = crate::llm::batch_api::BatchMeta {
         stage: "primary",
         model_version: "v",
@@ -972,7 +975,7 @@ async fn the_adversarial_calls_are_sent_to_their_own_model() {
         crate::llm::severity_adversarial_spec(client.prompts(), "s", "d", &periods).unwrap(),
     ]
     .into_iter()
-    .map(|spec| client.batch_params(spec).unwrap())
+    .map(|spec| BatchRequest::params_value(&client.batch_params(spec).unwrap()))
     .collect();
     let haiku_tuned = crate::profile::PromptSet::load(Some(&dir), "claude-haiku-5").unwrap();
     for bodies in [&sync, &batch] {
@@ -1030,7 +1033,7 @@ async fn without_an_adversarial_model_every_call_is_the_primary_model() {
     ] {
         let call = spec.call;
         assert_eq!(
-            client.batch_params(spec).unwrap()["model"],
+            BatchRequest::params_value(&client.batch_params(spec).unwrap())["model"],
             "claude-haiku-5-5"
         );
         assert_eq!(client.model_for(call), "claude-haiku-5-5");

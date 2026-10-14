@@ -267,7 +267,7 @@ async fn a_claude_batch_run_scores_like_the_sync_path() {
     assert_eq!(primary["requests"][1]["custom_id"], "p-1");
     assert_eq!(
         primary["requests"][1]["params"],
-        client.batch_params(spec).unwrap()
+        BatchRequest::params_value(&client.batch_params(spec).unwrap())
     );
     assert_eq!(
         primary["requests"][0]["params"]["system"][0]["cache_control"]["ttl"], "1h",
@@ -673,7 +673,10 @@ async fn an_openai_batch_run_scores_like_the_sync_path() {
         &cases[0].description,
         cases[0].reference_date,
     );
-    assert_eq!(line["body"], client.batch_params(spec).unwrap());
+    assert_eq!(
+        line["body"],
+        BatchRequest::params_value(&client.batch_params(spec).unwrap())
+    );
     assert_eq!(line["url"], "/v1/chat/completions");
 
     let records = &run.records;
@@ -1055,10 +1058,11 @@ async fn a_stage_is_split_into_batches_within_the_limits() {
 }
 
 fn request(custom_id: &str, model: &str, filler: usize) -> BatchRequest {
-    BatchRequest {
-        custom_id: custom_id.to_string(),
-        params: json!({ "model": model, "text": "x".repeat(filler) }),
-    }
+    BatchRequest::new(
+        custom_id.to_string(),
+        &json!({ "model": model, "text": "x".repeat(filler) }),
+    )
+    .unwrap()
 }
 
 #[test]

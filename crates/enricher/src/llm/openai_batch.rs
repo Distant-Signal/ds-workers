@@ -95,30 +95,47 @@ struct FileObject {
     id: String,
 }
 
-/// The input file: one line per request.
-pub(crate) fn batch_jsonl(requests: &[BatchRequest]) -> Result<String, LlmCallError> {
+/// One line of the input file.
+#[derive(serde::Serialize)]
+struct InputLine<'a> {
+    custom_id: &'a str,
+    method: &'static str,
+    url: &'static str,
+    body: &'a serde_json::value::RawValue,
+}
+
+/// The input file: one line per request, written straight from each
+/// request's text into one buffer allocated at its final size
+/// (`batch_api`, "Memory").
+pub(crate) fn batch_jsonl(requests: &[BatchRequest]) -> Result<Vec<u8>, LlmCallError> {
+    // Exact: a custom id (`[a-zA-Z0-9_-]`) and the endpoint need no escaping.
+    const LINE_OVERHEAD: usize =
+        r#"{"custom_id":"","method":"POST","url":"","body":}"#.len() + ENDPOINT.len() + 1;
     if requests.len() > MAX_REQUESTS {
         return Err(LlmCallError::Other(anyhow::anyhow!(
             "{} requests is over the Batch API's {MAX_REQUESTS} per batch",
             requests.len()
         )));
     }
-    let mut out = String::new();
-    for request in requests {
-        let line = serde_json::json!({
-            "custom_id": request.custom_id,
-            "method": "POST",
-            "url": ENDPOINT,
-            "body": request.params,
-        });
-        out.push_str(&line.to_string());
-        out.push('\n');
-    }
-    if out.len() > MAX_INPUT_BYTES {
+    let size: usize = requests
+        .iter()
+        .map(|r| r.custom_id.len() + r.params.get().len() + LINE_OVERHEAD)
+        .sum();
+    if size > MAX_INPUT_BYTES {
         return Err(LlmCallError::Other(anyhow::anyhow!(
-            "batch input file is {} bytes, over the Batch API's 200 MB; lower LLM_BATCH_MAX_ITEMS",
-            out.len()
+            "batch input file is {size} bytes, over the Batch API's 200 MB; lower LLM_BATCH_MAX_ITEMS"
         )));
+    }
+    let mut out = Vec::with_capacity(size);
+    for request in requests {
+        let line = InputLine {
+            custom_id: &request.custom_id,
+            method: "POST",
+            url: ENDPOINT,
+            body: &request.params,
+        };
+        serde_json::to_writer(&mut out, &line).map_err(|err| LlmCallError::Other(err.into()))?;
+        out.push(b'\n');
     }
     Ok(out)
 }
@@ -214,23 +231,36 @@ fn parse_line(value: &Value) -> Option<(String, BatchOutcome)> {
     ))
 }
 
-/// Parses an output or error file into outcomes by `custom_id`. A line that
-/// doesn't parse is logged and skipped: its request then counts as
-/// unanswered, never as a crash of the whole batch.
+/// Parses a whole output or error file into outcomes by `custom_id`. (The
+/// service streams the files instead: [`add_result_line`] per line.)
+#[cfg(test)]
 pub(crate) fn parse_results_jsonl(text: &str, into: &mut HashMap<String, BatchOutcome>) {
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let parsed = serde_json::from_str::<Value>(line)
+        add_result_line(into, Ok(line));
+    }
+}
+
+/// Parses one line of an output or error file into `into`. A line that
+/// doesn't parse is logged and skipped: its request then counts as
+/// unanswered, never as a crash of the whole batch.
+pub(crate) fn add_result_line(into: &mut HashMap<String, BatchOutcome>, line: Result<&str, &str>) {
+    let parsed = line.ok().and_then(|line| {
+        serde_json::from_str::<Value>(line)
             .ok()
             .as_ref()
-            .and_then(parse_line);
-        if let Some((custom_id, outcome)) = parsed {
-            into.insert(custom_id, outcome);
-        } else {
-            tracing::warn!(
-                line = %line.chars().take(200).collect::<String>(),
-                "unparseable OpenAI batch result line; skipping it"
-            );
-        }
+            .and_then(parse_line)
+    });
+    if let Some((custom_id, outcome)) = parsed {
+        into.insert(custom_id, outcome);
+    } else {
+        let shown = match line {
+            Ok(line) => line.chars().take(200).collect::<String>(),
+            Err(lossy) => lossy.to_string(),
+        };
+        tracing::warn!(
+            line = %shown,
+            "unparseable OpenAI batch result line; skipping it"
+        );
     }
 }
 
@@ -337,17 +367,21 @@ impl LlmClient {
     /// id.
     async fn upload_batch_file(
         &self,
-        jsonl: String,
+        jsonl: Vec<u8>,
         token: &mut SubmissionCredential,
     ) -> Result<String, LlmCallError> {
-        let bytes = jsonl.into_bytes();
+        // Shared, not copied, by the 401 retry's second request.
+        let bytes = bytes::Bytes::from(jsonl);
         let url = format!("{}/files", self.base_url);
         let file: FileObject = self
             .openai_json("upload", Some(token), || {
-                let part = reqwest::multipart::Part::bytes(bytes.clone())
+                let length = bytes.len() as u64;
+                let part = reqwest::multipart::Part::stream_with_length(bytes.clone(), length)
                     .file_name("enricher-batch.jsonl")
                     .mime_str("application/jsonl")
-                    .unwrap_or_else(|_| reqwest::multipart::Part::bytes(bytes.clone()));
+                    .unwrap_or_else(|_| {
+                        reqwest::multipart::Part::stream_with_length(bytes.clone(), length)
+                    });
                 let form = reqwest::multipart::Form::new()
                     .text("purpose", "batch")
                     .text("expires_after[anchor]", "created_at")
@@ -448,14 +482,18 @@ impl LlmClient {
             .map(|_| ())
     }
 
-    /// `GET {base}/files/{id}/content`.
-    pub(crate) async fn openai_file_content(&self, id: &str) -> Result<String, LlmCallError> {
+    /// `GET {base}/files/{id}/content`, parsed into `into` line by line as
+    /// it arrives (`batch_api`, "Memory").
+    pub(crate) async fn read_openai_results_file(
+        &self,
+        id: &str,
+        into: &mut HashMap<String, BatchOutcome>,
+    ) -> Result<(), LlmCallError> {
         let url = format!("{}/files/{id}/content", self.base_url);
-        self.openai_api_send("download", || self.http.get(&url))
-            .await?
-            .text()
-            .await
-            .map_err(|err| LlmCallError::Other(err.into()))
+        let response = self
+            .openai_api_send("download", || self.http.get(&url))
+            .await?;
+        super::batch_api::read_jsonl_lines(response, |line| add_result_line(into, line)).await
     }
 
     /// `DELETE {base}/files/{id}`.
@@ -507,8 +545,8 @@ impl LlmClient {
             .into_iter()
             .flatten()
         {
-            match self.openai_file_content(file).await {
-                Ok(text) => parse_results_jsonl(&text, &mut outcomes),
+            match self.read_openai_results_file(file, &mut outcomes).await {
+                Ok(()) => {}
                 Err(LlmCallError::Status { status: 404 }) => return Ok(BatchPoll::ResultsGone),
                 Err(err) => return Err(err),
             }

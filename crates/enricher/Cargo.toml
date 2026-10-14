@@ -8,6 +8,9 @@ publish.workspace = true
 [dependencies]
 health-http = { path = "../health-http" }
 anyhow = "1.0.102"
+# Already in the tree through reqwest: the `OpenAI` batch upload's body, so
+# its 401 retry shares the bytes instead of copying the whole input file.
+bytes = "1"
 chrono = { version = "0.4.44", features = ["serde"] }
 # Europe/London for the stated-end-time check (`src/checks.rs`).
 chrono-tz = "0.10"
@@ -22,7 +25,9 @@ regex = "1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "multipart", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+# `raw_value`: a batch request is held as its serialised body
+# (`llm::batch_api::BatchRequest`), not a `Value` tree three times its size.
+serde_json = { version = "1.0.149", features = ["raw_value"] }
 sqlx = { version = "0.8.6", features = ["chrono", "json", "macros", "postgres", "runtime-tokio", "tls-native-tls"] }
 futures-util = "0.3"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -30,6 +35,11 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "
 # `enricher eval` and its tests. Already in the image through `common`.
 toml = { version = "1.1.2", features = ["serde"] }
 tracing = "0.1.44"
+
+# `malloc_trim` after a batch stage (`batch::release_freed_memory`): glibc
+# keeps a stage's freed heap otherwise. Already in the tree via tokio/std.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"

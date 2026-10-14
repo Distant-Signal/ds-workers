@@ -8,10 +8,23 @@
 //! Every request body comes from the synchronous path's own builder
 //! (`LlmClient::wire_request`), so a batch request carries exactly the
 //! profile, schema, sampling and reasoning effort a synchronous call would.
+//!
+//! **Memory.** A batch is up to `LLM_BATCH_MAX_ITEMS` (2,000) incidents,
+//! and every request carries its whole system prompt (~11 KB primary), so
+//! a batch is tens of MB of JSON. Each request is therefore held as its
+//! serialised text ([`BatchRequest::params`], a `RawValue`), never as a
+//! `serde_json::Value` tree (about three times the text), and the upload
+//! body is written straight from those texts into one buffer sized up
+//! front ([`message_batches_body`], [`openai_batch::batch_jsonl`]). Results
+//! are read off the response as it arrives and parsed line by line
+//! ([`read_jsonl_lines`]); the raw file is never held whole.
+//!
+//! [`openai_batch::batch_jsonl`]: super::openai_batch::batch_jsonl
 
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::value::RawValue;
 
 use super::{CallSpec, LlmCallError, LlmClient, Provider, TokenUsage, WireRequest};
 
@@ -24,8 +37,135 @@ pub(crate) const FILES_METRIC: &str = "enricher_llm_batch_files_total";
 #[derive(Debug, Clone)]
 pub(crate) struct BatchRequest {
     pub custom_id: String,
-    /// The provider's request body ([`LlmClient::batch_params`]).
-    pub params: Value,
+    /// The provider's request body ([`LlmClient::batch_params`]), as the
+    /// compact JSON text that goes on the wire.
+    pub params: Box<RawValue>,
+}
+
+impl BatchRequest {
+    /// A request whose body is `params` serialised.
+    #[cfg(test)]
+    pub(crate) fn new(
+        custom_id: String,
+        params: &impl Serialize,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            custom_id,
+            params: serde_json::value::to_raw_value(params)?,
+        })
+    }
+
+    /// The body as a `Value`, for the tests.
+    #[cfg(test)]
+    pub(crate) fn params_value(params: &RawValue) -> serde_json::Value {
+        serde_json::from_str(params.get()).expect("a RawValue is valid JSON")
+    }
+
+    /// The body's `model` (the model-eval harness batches by model).
+    pub(crate) fn model(&self) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct Model {
+            model: Option<String>,
+        }
+        serde_json::from_str::<Model>(self.params.get())
+            .ok()
+            .and_then(|m| m.model)
+    }
+}
+
+/// One entry of a Message Batches create body.
+#[derive(Serialize)]
+pub(crate) struct MessageBatchEntry<'a> {
+    pub custom_id: &'a str,
+    pub params: &'a RawValue,
+}
+
+/// `{"requests": [{"custom_id", "params"}, ...]}`, the Message Batches
+/// create body, written into one buffer allocated at its final size.
+pub(crate) fn message_batches_body(requests: &[BatchRequest]) -> Result<Vec<u8>, LlmCallError> {
+    const ENTRY_OVERHEAD: usize = r#"{"custom_id":"","params":},"#.len();
+    let capacity = requests
+        .iter()
+        .map(|r| r.custom_id.len() + r.params.get().len() + ENTRY_OVERHEAD)
+        .sum::<usize>()
+        + r#"{"requests":[]}"#.len();
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(br#"{"requests":["#);
+    for (i, request) in requests.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        let entry = MessageBatchEntry {
+            custom_id: &request.custom_id,
+            params: &request.params,
+        };
+        serde_json::to_writer(&mut out, &entry).map_err(|err| LlmCallError::Other(err.into()))?;
+    }
+    out.extend_from_slice(b"]}");
+    Ok(out)
+}
+
+/// Splits a byte stream into lines as its chunks arrive, holding only the
+/// current partial line between chunks. Pure, for the tests.
+#[derive(Debug, Default)]
+pub(crate) struct LineSplitter {
+    partial: Vec<u8>,
+}
+
+impl LineSplitter {
+    /// Calls `line` with every line `chunk` completes (without its `\n`).
+    pub(crate) fn push(&mut self, chunk: &[u8], line: &mut impl FnMut(&[u8])) {
+        let mut rest = chunk;
+        while let Some(end) = rest.iter().position(|b| *b == b'\n') {
+            if self.partial.is_empty() {
+                line(&rest[..end]);
+            } else {
+                self.partial.extend_from_slice(&rest[..end]);
+                line(&self.partial);
+                self.partial.clear();
+            }
+            rest = &rest[end + 1..];
+        }
+        self.partial.extend_from_slice(rest);
+    }
+
+    /// Calls `line` with the last line if the stream did not end in `\n`.
+    pub(crate) fn finish(self, line: &mut impl FnMut(&[u8])) {
+        if !self.partial.is_empty() {
+            line(&self.partial);
+        }
+    }
+}
+
+/// Reads a JSONL response body as it arrives and calls `line` with each
+/// non-blank line, so a results file is never held whole: only the chunk
+/// in hand and one partial line. A line that is not UTF-8 is passed as
+/// `Err` with its first bytes, for the caller to log and skip.
+pub(crate) async fn read_jsonl_lines(
+    mut response: reqwest::Response,
+    mut line: impl FnMut(Result<&str, &str>),
+) -> Result<(), LlmCallError> {
+    let mut splitter = LineSplitter::default();
+    let mut emit = |bytes: &[u8]| {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(text) => line(Ok(text)),
+            Err(_) => line(Err(&String::from_utf8_lossy(
+                &bytes[..bytes.len().min(200)],
+            ))),
+        }
+    };
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| LlmCallError::Other(err.into()))?
+    {
+        splitter.push(&chunk, &mut emit);
+    }
+    splitter.finish(&mut emit);
+    Ok(())
 }
 
 /// What `batch.rs` tells the provider about a batch (`OpenAI` metadata).
@@ -180,14 +320,13 @@ impl LlmClient {
 
     /// The provider's request body for `spec`, exactly as the synchronous
     /// path would send it: a Chat Completions body (`OpenAI`) or a Messages
-    /// body (Claude).
-    pub(crate) fn batch_params(&self, spec: CallSpec) -> Result<Value, LlmCallError> {
+    /// body (Claude), serialised.
+    pub(crate) fn batch_params(&self, spec: CallSpec) -> Result<Box<RawValue>, LlmCallError> {
         match self.wire_request(spec) {
-            WireRequest::Chat(request) => {
-                serde_json::to_value(&request).map_err(|err| LlmCallError::Other(err.into()))
-            }
-            WireRequest::Messages { body, .. } => Ok(body),
+            WireRequest::Chat(request) => serde_json::value::to_raw_value(&request),
+            WireRequest::Messages { body, .. } => serde_json::value::to_raw_value(&body),
         }
+        .map_err(|err| LlmCallError::Other(err.into()))
     }
 
     /// Submits `requests` as one batch.
@@ -253,3 +392,7 @@ impl LlmClient {
         failed
     }
 }
+
+/// The batch path's memory bounds, and the line splitter.
+#[cfg(test)]
+mod tests;

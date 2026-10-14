@@ -4,6 +4,8 @@
 //! docs/superpowers/specs/2026-08-20-incident-nlp-extraction-design.md and
 //! docs/superpowers/specs/2026-08-21-multi-period-extraction-design.md.
 
+#[cfg(test)]
+mod alloc_meter;
 mod auth;
 mod batch;
 mod checks;
@@ -21,6 +23,7 @@ mod config;
     )
 )]
 mod eval;
+mod heap;
 mod latency;
 mod llm;
 mod profile;
@@ -69,6 +72,9 @@ async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     common::logging::init("enricher");
+    // Before any batch work: the batch path's freed peaks go back to the
+    // kernel (`heap`).
+    heap::pin_mmap_threshold();
 
     let config = Config::parse();
     // `LLM_PROVIDER` with its defaults (`anthropic` fills in the base URL

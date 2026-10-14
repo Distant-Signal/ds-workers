@@ -168,7 +168,7 @@ async fn batch_lines_carry_the_synchronous_request_body() {
     let sync: Value =
         serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
 
-    let jsonl = batch_jsonl(&requests(&client, 2)).unwrap();
+    let jsonl = String::from_utf8(batch_jsonl(&requests(&client, 2)).unwrap()).unwrap();
     let lines: Vec<Value> = jsonl
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -214,7 +214,7 @@ async fn batch_lines_carry_the_explicit_prompt_cache_fields() {
     let sync: Value =
         serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
 
-    let jsonl = batch_jsonl(&requests(&client, 1)).unwrap();
+    let jsonl = String::from_utf8(batch_jsonl(&requests(&client, 1)).unwrap()).unwrap();
     let line: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
     let body = &line["body"];
     assert_eq!(*body, sync);
@@ -528,10 +528,7 @@ async fn a_fresh_client_resumes_from_the_batch_id_alone() {
 /// The limits are checked before anything is uploaded.
 #[test]
 fn oversized_input_is_refused_before_upload() {
-    let request = BatchRequest {
-        custom_id: "p-0".into(),
-        params: Value::Null,
-    };
+    let request = BatchRequest::new("p-0".into(), &Value::Null).unwrap();
     let too_many = vec![request; MAX_REQUESTS + 1];
     assert!(batch_jsonl(&too_many).is_err());
 }

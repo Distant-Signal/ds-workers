@@ -649,6 +649,21 @@ transaction, after the new batch exists. Known gaps, all bounded:
   ids stay valid across a key rotation (or a switch to [keyless auth](#keyless-auth))
   in the same workspace.
 
+**Memory.** A batch of `LLM_BATCH_MAX_ITEMS` (2,000) incidents is tens of
+MB of JSON: each primary request carries the whole ~11 KB system prompt.
+The enricher holds each request once, as its serialised text (`RawValue`),
+writes the upload body straight from those texts into one buffer of its
+final size, parses results line by line as the file downloads, reads a
+row's `items` only once its batch has ended, and combines and writes an
+adversarial stage 100 incidents at a time. glibc would keep the freed peak
+resident, so the binary pins malloc's mmap threshold at startup and runs
+`malloc_trim` after each batch step (`crates/enricher/src/heap.rs`).
+Measured at 2,000 incidents: a primary submission peaks at ~50 MiB of
+allocations (it was ~215 MiB) and an adversarial one at ~25 MiB (~160 MiB),
+and the process returns to its baseline afterwards (it used to stay at the
+peak: ~230 MiB after a 929-incident run on 14 Oct 2026). The chart's 256Mi
+limit covers 2,000; raise it by ~25Mi per extra 1,000 items.
+
 **OpenAI batch.** `LLM_SWEEP_MODE=batch` and the `batch`/`batch-only`
 [LLM modes](#llm-modes) work with `openai` too, through
 the OpenAI Batch API. `batch.rs` and its table, stages, metrics and alerts

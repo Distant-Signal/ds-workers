@@ -140,17 +140,17 @@ impl ChunkLimits {
 /// Bytes one request adds to its batch's upload: its `OpenAI` JSONL line,
 /// or its entry in the Message Batches body (plus a separator).
 pub(crate) fn request_bytes(provider: &str, request: &BatchRequest) -> usize {
-    let value = if provider == "openai" {
-        serde_json::json!({
-            "custom_id": request.custom_id,
-            "method": "POST",
-            "url": llm::openai_batch::ENDPOINT,
-            "body": request.params,
-        })
+    let line = if provider == "openai" {
+        llm::openai_batch::batch_jsonl(std::slice::from_ref(request)).map(|line| line.len() - 1)
     } else {
-        serde_json::json!({ "custom_id": request.custom_id, "params": request.params })
+        serde_json::to_vec(&llm::batch_api::MessageBatchEntry {
+            custom_id: &request.custom_id,
+            params: &request.params,
+        })
+        .map(|entry| entry.len())
+        .map_err(|err| LlmCallError::Other(err.into()))
     };
-    value.to_string().len() + 1
+    line.map_or(usize::MAX, |len| len + 1)
 }
 
 /// Splits `requests` into batches within `limits`, and one model per batch
@@ -161,12 +161,7 @@ pub(crate) fn chunk_requests(
     limits: ChunkLimits,
 ) -> anyhow::Result<Vec<Vec<BatchRequest>>> {
     let budget = limits.max_bytes.saturating_sub(ENVELOPE_BYTES);
-    let model = |r: &BatchRequest| {
-        r.params
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    };
+    let model = BatchRequest::model;
     let mut chunks: Vec<Vec<BatchRequest>> = Vec::new();
     let mut bytes = 0;
     for request in requests {
@@ -583,10 +578,8 @@ async fn submit_stage(
         // One model per batch (`chunk_requests`): the stage's call model.
         let model = chunk
             .first()
-            .and_then(|r| r.params.get("model"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-")
-            .to_string();
+            .and_then(BatchRequest::model)
+            .unwrap_or_else(|| "-".to_string());
         let created = client
             .create_batch(&chunk, meta)
             .await

@@ -410,54 +410,69 @@ pub(crate) struct RequestCounts {
     pub expired: u64,
 }
 
-/// Parses a results file (`results_url`, JSONL: one
+/// Parses a whole results file (`results_url`, JSONL: one
 /// `{"custom_id", "result": {"type", ...}}` per line) into outcomes by
 /// `custom_id`, each success already read with
 /// [`completion_from_message`]. A line that doesn't parse is logged and skipped: its
 /// request then counts as missing, never as a crash of the whole batch.
+/// (The service streams the file instead: [`add_result_line`] per line.)
+#[cfg(test)]
 pub(crate) fn parse_results_jsonl(text: &str) -> HashMap<String, BatchOutcome> {
     let mut outcomes = HashMap::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let parsed: Option<(String, BatchOutcome)> =
-            serde_json::from_str::<Value>(line).ok().and_then(|value| {
-                let custom_id = value.get("custom_id")?.as_str()?.to_string();
-                let result = value.get("result")?;
-                let outcome = match result.get("type")?.as_str()? {
-                    "succeeded" => {
-                        BatchOutcome::succeeded(completion_from_message(result.get("message")?))
-                    }
-                    "errored" => {
-                        // `result.error` is an error response body:
-                        // `{"type": "error", "error": {"type", "message"}}`.
-                        let error = result.get("error");
-                        let inner = error.and_then(|e| e.get("error")).or(error);
-                        let text = |key: &str| {
-                            inner
-                                .and_then(|e| e.get(key))
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        };
-                        BatchOutcome::Errored {
-                            kind: text("type"),
-                            message: text("message"),
-                        }
-                    }
-                    "canceled" => BatchOutcome::Canceled,
-                    "expired" => BatchOutcome::Expired,
-                    _ => return None,
-                };
-                Some((custom_id, outcome))
-            });
-        if let Some((custom_id, outcome)) = parsed {
-            outcomes.insert(custom_id, outcome);
-        } else {
-            tracing::warn!(
-                line = %line.chars().take(200).collect::<String>(),
-                "unparseable Message Batch result line; skipping it"
-            );
-        }
+        add_result_line(&mut outcomes, Ok(line));
     }
     outcomes
+}
+
+/// Parses one results line into `outcomes` ([`parse_results_jsonl`]); the
+/// line's JSON tree is dropped as soon as its outcome is read.
+pub(crate) fn add_result_line(
+    outcomes: &mut HashMap<String, BatchOutcome>,
+    line: Result<&str, &str>,
+) {
+    let parsed = line.ok().and_then(parse_result_line);
+    if let Some((custom_id, outcome)) = parsed {
+        outcomes.insert(custom_id, outcome);
+    } else {
+        let shown = match line {
+            Ok(line) => line.chars().take(200).collect::<String>(),
+            Err(lossy) => lossy.to_string(),
+        };
+        tracing::warn!(
+            line = %shown,
+            "unparseable Message Batch result line; skipping it"
+        );
+    }
+}
+
+fn parse_result_line(line: &str) -> Option<(String, BatchOutcome)> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let custom_id = value.get("custom_id")?.as_str()?.to_string();
+    let result = value.get("result")?;
+    let outcome = match result.get("type")?.as_str()? {
+        "succeeded" => BatchOutcome::succeeded(completion_from_message(result.get("message")?)),
+        "errored" => {
+            // `result.error` is an error response body:
+            // `{"type": "error", "error": {"type", "message"}}`.
+            let error = result.get("error");
+            let inner = error.and_then(|e| e.get("error")).or(error);
+            let text = |key: &str| {
+                inner
+                    .and_then(|e| e.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            BatchOutcome::Errored {
+                kind: text("type"),
+                message: text("message"),
+            }
+        }
+        "canceled" => BatchOutcome::Canceled,
+        "expired" => BatchOutcome::Expired,
+        _ => return None,
+    };
+    Some((custom_id, outcome))
 }
 
 impl LlmClient {
@@ -520,13 +535,14 @@ impl LlmClient {
         &self,
         requests: &[BatchRequest],
     ) -> Result<MessageBatch, LlmCallError> {
+        // Written straight from each request's text: no `Value` copy of
+        // the whole batch (`batch_api`, "Memory").
+        let body = super::batch_api::message_batches_body(requests)?;
         let request = self
             .http
             .post(format!("{}/messages/batches", self.base_url))
-            .json(&serde_json::json!({ "requests": requests
-                .iter()
-                .map(|r| serde_json::json!({ "custom_id": r.custom_id, "params": r.params }))
-                .collect::<Vec<_>>() }));
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
         let response = self.batch_api_send(request).await?;
         response
             .json()
@@ -584,8 +600,8 @@ impl LlmClient {
         self.batch_api_send(request).await.map(|_| ())
     }
 
-    /// Downloads an ended batch's `results_url` and parses it
-    /// ([`parse_results_jsonl`]). The URL comes from the API's response and
+    /// Downloads an ended batch's `results_url` and parses it line by line
+    /// as it arrives ([`add_result_line`]). The URL comes from the API's response and
     /// the request carries the credential, so a URL on any other host than
     /// `LLM_BASE_URL`'s is refused rather than sent the key.
     pub(crate) async fn message_batch_results(
@@ -608,11 +624,13 @@ impl LlmClient {
             )));
         }
         let response = self.batch_api_send(self.http.get(results_url)).await?;
-        let text = response
-            .text()
-            .await
-            .map_err(|err| LlmCallError::Other(err.into()))?;
-        Ok(parse_results_jsonl(&text))
+        // Parsed line by line as it arrives (`batch_api`, "Memory").
+        let mut outcomes = HashMap::new();
+        super::batch_api::read_jsonl_lines(response, |line| {
+            add_result_line(&mut outcomes, line);
+        })
+        .await?;
+        Ok(outcomes)
     }
 }
 

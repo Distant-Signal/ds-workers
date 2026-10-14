@@ -50,6 +50,18 @@
 //! creating a batch and recording it orphans that batch (it runs and is
 //! billed, but nobody reads it; the incidents go into a later batch).
 //!
+//! **Memory.** A batch is up to `LLM_BATCH_MAX_ITEMS` (2,000) incidents;
+//! its requests and results are tens of MB, so nothing holds a whole batch
+//! more than once. The requests are held as serialised text and written
+//! into the upload body without a `Value` copy, and the results file is
+//! parsed line by line as it downloads (`llm::batch_api`, "Memory"). The
+//! poll loop reads only each row's id, stage and model version every tick;
+//! a row's `items` are loaded once its batch has ended, decoded straight
+//! into [`BatchItem`]s, and moved (never cloned) through the stage. An
+//! adversarial stage is combined and written [`WRITE_CHUNK`] incidents at
+//! a time, each result dropped once used. Afterwards
+//! `heap::release_freed_memory` hands the freed heap back to the kernel.
+//!
 //! **Results.** Matched by `custom_id` (`p-<n>`, `r-<n>`, `s-<n>`, `n` the
 //! item's index), never by position. `errored`, `canceled`, `expired`,
 //! `auth_expired` and missing entries drop that incident from the batch;
@@ -425,7 +437,7 @@ pub(crate) fn plan_primary(items: Vec<BatchItem>, mut outcomes: BatchResults) ->
 
 /// Plans an ended adversarial batch: the items whose two verdict lists
 /// both parsed are ready to combine and write.
-pub(crate) fn plan_adversarial(items: Vec<BatchItem>, mut outcomes: BatchResults) -> StagePlan {
+pub(crate) fn plan_adversarial(items: Vec<BatchItem>, outcomes: &mut BatchResults) -> StagePlan {
     let mut plan = StagePlan::default();
     for item in items {
         let Some(primary) = item
@@ -440,7 +452,7 @@ pub(crate) fn plan_adversarial(items: Vec<BatchItem>, mut outcomes: BatchResults
             continue;
         };
         let resolution = take_output(
-            &mut outcomes,
+            outcomes,
             LlmCall::ResolutionAdversarial,
             item.index,
             &mut plan.records,
@@ -454,7 +466,7 @@ pub(crate) fn plan_adversarial(items: Vec<BatchItem>, mut outcomes: BatchResults
             })
         });
         let severity = take_output(
-            &mut outcomes,
+            outcomes,
             LlmCall::SeverityAdversarial,
             item.index,
             &mut plan.records,
@@ -522,7 +534,6 @@ pub(crate) struct BatchRow {
     pub provider: String,
     pub stage: Stage,
     pub model_version: String,
-    pub items: Vec<BatchItem>,
     pub submitted_at: DateTime<Utc>,
 }
 
@@ -535,44 +546,48 @@ pub(crate) fn oldest_age_secs(rows: &[BatchRow], now: DateTime<Utc>) -> u32 {
         .map_or(0, |secs| u32::try_from(secs.max(0)).unwrap_or(u32::MAX))
 }
 
-type BatchRecord = (
-    String,
-    String,
-    String,
-    String,
-    serde_json::Value,
-    DateTime<Utc>,
-);
+type BatchRecord = (String, String, String, String, DateTime<Utc>);
 
+/// Every row, without its `items` (read once the batch has ended,
+/// [`load_items`]): a tick that finds every batch still running reads a
+/// few bytes per row, not every incident's text.
 async fn load_batches(pool: &PgPool) -> anyhow::Result<Vec<BatchRow>> {
     let rows: Vec<BatchRecord> = sqlx::query_as(
-        "SELECT batch_id, provider, stage, model_version, items, submitted_at \
+        "SELECT batch_id, provider, stage, model_version, submitted_at \
          FROM enricher_llm_batches \
          ORDER BY submitted_at",
     )
     .fetch_all(pool)
     .await?;
     let mut batches = Vec::with_capacity(rows.len());
-    for (batch_id, provider, stage, model_version, items, submitted_at) in rows {
+    for (batch_id, provider, stage, model_version, submitted_at) in rows {
         let Some(stage) = Stage::parse(&stage) else {
             tracing::error!(batch_id, stage, "unknown batch stage; skipping the row");
             continue;
         };
-        match serde_json::from_value(items) {
-            Ok(items) => batches.push(BatchRow {
-                batch_id,
-                provider,
-                stage,
-                model_version,
-                items,
-                submitted_at,
-            }),
-            Err(err) => {
-                tracing::error!(batch_id, error = %err, "unreadable batch items; skipping the row");
-            }
-        }
+        batches.push(BatchRow {
+            batch_id,
+            provider,
+            stage,
+            model_version,
+            submitted_at,
+        });
     }
     Ok(batches)
+}
+
+/// An ended batch's `items`, decoded straight from the column's JSON (no
+/// `Value` tree in between). `None` if the row is gone. Unreadable items
+/// are an error: the row stays, and `enricher_llm_batch_oldest_age_seconds`
+/// shows it stuck.
+async fn load_items(pool: &PgPool, batch_id: &str) -> anyhow::Result<Option<Vec<BatchItem>>> {
+    let row: Option<(sqlx::types::Json<Vec<BatchItem>>,)> =
+        sqlx::query_as("SELECT items FROM enricher_llm_batches WHERE batch_id = $1")
+            .bind(batch_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| anyhow::anyhow!("reading batch {batch_id}'s items: {err}"))?;
+    Ok(row.map(|(items,)| items.0))
 }
 
 /// `(incident_id, text_hash)` of every item of every in-flight batch: the
@@ -643,7 +658,7 @@ async fn insert_batch(
     .bind(provider)
     .bind(stage.as_str())
     .bind(model_version)
-    .bind(serde_json::to_value(items)?)
+    .bind(sqlx::types::Json(items))
     .execute(executor)
     .await?;
     Ok(())
@@ -740,6 +755,8 @@ pub(crate) async fn sweep_with_batches(
             tracing::error!(error = ?err, count = chunk.len(), "could not submit a primary batch; the next sweep retries");
         }
     }
+    drop(prepared);
+    crate::heap::release_freed_memory();
     Vec::new()
 }
 
@@ -918,6 +935,13 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
         }
         BatchPoll::Ended(ended) => ended,
     };
+    let Some(items) = load_items(&enricher.pool, &row.batch_id).await? else {
+        tracing::warn!(
+            batch_id = row.batch_id,
+            "batch row went away before its results were processed; skipping it"
+        );
+        return Ok(());
+    };
     let auth_expired = ended
         .results
         .outcomes
@@ -932,10 +956,16 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
         status = ended.summary,
         "batch ended"
     );
-    match row.stage {
-        Stage::Primary => finish_primary_stage(enricher, max_items, row, ended.results).await?,
-        Stage::Adversarial => finish_adversarial_stage(enricher, row, ended.results).await?,
-    }
+    let finished = match row.stage {
+        Stage::Primary => {
+            finish_primary_stage(enricher, max_items, row, items, ended.results).await
+        }
+        Stage::Adversarial => finish_adversarial_stage(enricher, row, items, ended.results).await,
+    };
+    // A stage's items, results and request bodies are freed by now,
+    // whether it succeeded or not.
+    crate::heap::release_freed_memory();
+    finished?;
     // Counted once the row is processed, so a stage retried next tick is
     // not counted twice.
     if auth_expired > 0 {
@@ -957,45 +987,29 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
 /// primary row for the next tick (its results stay downloadable: 29 days
 /// on Claude, `FILE_TTL_SECS` on `OpenAI`), and nothing is counted until the
 /// swap succeeds.
+///
+/// `items` and `results` are moved through: each chunk's items go into its
+/// row as they are (no copy), and only one chunk's requests exist at a time.
 async fn finish_primary_stage(
     enricher: &Enricher,
     max_items: usize,
     row: &BatchRow,
+    items: Vec<BatchItem>,
     results: BatchResults,
 ) -> anyhow::Result<()> {
     let provider = enricher.llm.provider_label();
-    let plan = plan_primary(row.items.clone(), results);
+    let of = items.len();
+    let mut plan = plan_primary(items, results);
+    let next = plan.next.len();
     let meta = BatchMeta {
         stage: Stage::Adversarial.as_str(),
         model_version: &row.model_version,
     };
     let mut submitted = Vec::new();
-    for chunk in plan.next.chunks(max_items) {
-        let mut requests = Vec::with_capacity(chunk.len() * 2);
-        for item in chunk {
-            let primary = llm::parse_primary(item.primary_content.as_deref().unwrap_or_default())?;
-            for spec in [
-                llm::adversarial_spec(
-                    enricher.llm.prompts(),
-                    &item.summary,
-                    &item.description,
-                    &primary.periods,
-                )?,
-                llm::severity_adversarial_spec(
-                    enricher.llm.prompts(),
-                    &item.summary,
-                    &item.description,
-                    &primary.periods,
-                )?,
-            ] {
-                requests.push(BatchRequest {
-                    custom_id: custom_id(spec.call, item.index),
-                    params: enricher.llm.batch_params(spec)?,
-                });
-            }
-        }
+    for chunk in into_chunks(std::mem::take(&mut plan.next), max_items) {
+        let requests = adversarial_requests(enricher, &chunk)?;
         match enricher.llm.create_batch(&requests, meta).await {
-            Ok(batch) => submitted.push((batch, chunk.to_vec())),
+            Ok(batch) => submitted.push((batch, chunk)),
             Err(err) => {
                 record_batch_event(provider, Stage::Adversarial, "submit_failed");
                 for (batch, _) in &submitted {
@@ -1025,49 +1039,111 @@ async fn finish_primary_stage(
     apply_records(enricher, &plan);
     tracing::info!(
         batch_id = row.batch_id,
-        next = plan.next.len(),
-        of = row.items.len(),
+        next,
+        of,
         "primary batch done; adversarial batch submitted"
     );
     Ok(())
 }
 
+/// `items` in consecutive chunks of at most `size` (at least 1), moved
+/// rather than copied.
+pub(crate) fn into_chunks(items: Vec<BatchItem>, size: usize) -> Vec<Vec<BatchItem>> {
+    let size = size.max(1);
+    let mut chunks = Vec::with_capacity(items.len().div_ceil(size));
+    let mut items = items.into_iter();
+    loop {
+        let chunk: Vec<BatchItem> = items.by_ref().take(size).collect();
+        if chunk.is_empty() {
+            return chunks;
+        }
+        chunks.push(chunk);
+    }
+}
+
+/// The two adversarial requests of every item of `chunk`.
+fn adversarial_requests(
+    enricher: &Enricher,
+    chunk: &[BatchItem],
+) -> anyhow::Result<Vec<BatchRequest>> {
+    let mut requests = Vec::with_capacity(chunk.len() * 2);
+    for item in chunk {
+        let primary = llm::parse_primary(item.primary_content.as_deref().unwrap_or_default())?;
+        for spec in [
+            llm::adversarial_spec(
+                enricher.llm.prompts(),
+                &item.summary,
+                &item.description,
+                &primary.periods,
+            )?,
+            llm::severity_adversarial_spec(
+                enricher.llm.prompts(),
+                &item.summary,
+                &item.description,
+                &primary.periods,
+            )?,
+        ] {
+            requests.push(BatchRequest {
+                custom_id: custom_id(spec.call, item.index),
+                params: enricher.llm.batch_params(spec)?,
+            });
+        }
+    }
+    Ok(requests)
+}
+
+/// How many incidents of an adversarial batch are combined and written at
+/// a time: their parsed outputs are all that is held besides the
+/// remaining results.
+pub(crate) const WRITE_CHUNK: usize = 100;
+
 /// Combines and writes every incident of an ended adversarial batch whose
-/// passes all succeeded, then deletes the row.
+/// passes all succeeded, [`WRITE_CHUNK`] at a time (each result is dropped
+/// once used), then deletes the row. As before, each incident's write
+/// stands on its own; the row is deleted, and the requests counted, only
+/// once every incident has been through.
 async fn finish_adversarial_stage(
     enricher: &Enricher,
     row: &BatchRow,
-    results: BatchResults,
+    items: Vec<BatchItem>,
+    mut results: BatchResults,
 ) -> anyhow::Result<()> {
-    let plan = plan_adversarial(row.items.clone(), results);
+    let of = items.len();
+    let mut done = StagePlan::default();
     let mut written = 0_usize;
-    for ready in &plan.ready {
-        let prepared = ready.item.prepared();
-        // Another loop extracting it right now wins; its own write is fresh.
-        let Some(_claim) = enricher.in_flight.try_claim(&prepared.incident_id) else {
-            crate::record_in_flight_skip("batch", &prepared.incident_id);
-            continue;
-        };
-        crate::note_truncation(&prepared.incident_id, &ready.primary);
-        if crate::finish_extraction(
-            enricher,
-            &prepared,
-            &ready.primary,
-            &ready.resolution,
-            &ready.severity,
-            crate::latency::Path::Batch,
-        )
-        .await
-        {
-            written += 1;
+    for chunk in into_chunks(items, WRITE_CHUNK) {
+        let plan = plan_adversarial(chunk, &mut results);
+        for ready in plan.ready {
+            let prepared = ready.item.prepared();
+            // Another loop extracting it right now wins; its own write is fresh.
+            let Some(_claim) = enricher.in_flight.try_claim(&prepared.incident_id) else {
+                crate::record_in_flight_skip("batch", &prepared.incident_id);
+                continue;
+            };
+            crate::note_truncation(&prepared.incident_id, &ready.primary);
+            if crate::finish_extraction(
+                enricher,
+                &prepared,
+                &ready.primary,
+                &ready.resolution,
+                &ready.severity,
+                crate::latency::Path::Batch,
+            )
+            .await
+            {
+                written += 1;
+            }
         }
+        done.records.extend(plan.records);
+        done.text_failures.extend(plan.text_failures);
     }
+    drop(results);
     delete_batch(&enricher.pool, &row.batch_id).await?;
-    apply_records(enricher, &plan);
+    apply_records(enricher, &done);
     tracing::info!(
         batch_id = row.batch_id,
         written,
-        of = row.items.len(),
+        of,
         "adversarial batch done; extractions written"
     );
     Ok(())
@@ -1239,7 +1315,7 @@ mod tests {
                 ..item(i, &format!("I{i}"))
             })
             .collect();
-        let plan = plan_adversarial(items, parse_results_jsonl(&jsonl).into());
+        let plan = plan_adversarial(items, &mut parse_results_jsonl(&jsonl).into());
         assert_eq!(plan.ready.len(), 1);
         let ready = &plan.ready[0];
         assert_eq!(ready.item.incident_id, "I0");
@@ -1266,6 +1342,71 @@ mod tests {
                 ("severity_adversarial", "succeeded"),
             ]
         );
+    }
+
+    /// `finish_adversarial_stage` plans [`WRITE_CHUNK`] items at a time
+    /// against one shared set of results: the same plan as all at once,
+    /// with every used result taken out of the set as it goes.
+    #[test]
+    fn planning_in_chunks_matches_planning_at_once_and_drains_the_results() {
+        let resolution = serde_json::json!({"periods": [{
+            "period_index": 0, "scope_description": null, "resolution_status": "ongoing"
+        }]})
+        .to_string();
+        let severity = serde_json::json!({"periods": [{
+            "period_index": 0, "scope_description": null,
+            "apparent_severity": "moderate_disruption"
+        }]})
+        .to_string();
+        let n = 2 * WRITE_CHUNK + 7;
+        let jsonl: Vec<String> = (0..n)
+            .flat_map(|i| {
+                // Every fifth item's severity is missing: dropped quietly.
+                let severity = (i % 5 != 0).then(|| succeeded(&format!("s-{i}"), &severity));
+                [Some(succeeded(&format!("r-{i}"), &resolution)), severity]
+            })
+            .flatten()
+            .collect();
+        let jsonl = jsonl.join("\n");
+        let items = || -> Vec<BatchItem> {
+            (0..n)
+                .map(|i| BatchItem {
+                    primary_content: Some(primary_json()),
+                    ..item(i, &format!("I{i}"))
+                })
+                .collect()
+        };
+        let summary = |plan: &StagePlan| {
+            (
+                plan.ready
+                    .iter()
+                    .map(|r| r.item.incident_id.clone())
+                    .collect::<Vec<_>>(),
+                plan.records
+                    .iter()
+                    .map(|r| (r.call, r.result))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let whole = plan_adversarial(items(), &mut parse_results_jsonl(&jsonl).into());
+
+        let mut results: BatchResults = parse_results_jsonl(&jsonl).into();
+        let chunks = into_chunks(items(), WRITE_CHUNK);
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [WRITE_CHUNK, WRITE_CHUNK, 7]
+        );
+        let mut chunked = StagePlan::default();
+        for chunk in chunks {
+            let plan = plan_adversarial(chunk, &mut results);
+            chunked.ready.extend(plan.ready);
+            chunked.records.extend(plan.records);
+        }
+        assert_eq!(summary(&chunked), summary(&whole));
+        assert_eq!(whole.ready.len(), n - n.div_ceil(5));
+        assert!(results.outcomes.is_empty(), "{:?}", results.outcomes.keys());
+        assert!(into_chunks(Vec::new(), 0).is_empty());
+        assert_eq!(into_chunks(items(), 0).len(), n, "a size of 0 counts as 1");
     }
 
     #[test]
@@ -1311,7 +1452,6 @@ mod tests {
             provider: "anthropic".into(),
             stage: Stage::Primary,
             model_version: "m".into(),
-            items: Vec::new(),
             submitted_at: submitted.parse().unwrap(),
         };
         assert_eq!(oldest_age_secs(&[], now), 0);
