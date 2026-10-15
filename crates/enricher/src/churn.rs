@@ -86,7 +86,12 @@ pub(crate) fn baseline_for_text_change_rerun(
     let raw_periods = state.extracted_periods.as_ref()?;
     match serde_json::from_value::<Vec<ExtractionPeriod>>(raw_periods.clone()) {
         Ok(periods) => Some(Baseline {
-            category: state.extracted_category.clone(),
+            // Normalised, so a row stored before `category` had a fixed
+            // vocabulary isn't counted as category churn for that alone.
+            category: state
+                .extracted_category
+                .as_deref()
+                .map(|raw| crate::category::normalise(raw).category.to_owned()),
             periods,
         }),
         Err(err) => {
@@ -488,6 +493,23 @@ mod tests {
             .expect("a same-version text change must be measured");
         assert_eq!(baseline.category.as_deref(), Some("signal_failure"));
         assert_eq!(baseline.periods, vec![period("a", "normal")]);
+    }
+
+    /// A row stored before the fixed vocabulary is compared in it, so the
+    /// first re-extraction doesn't count its spelling as category churn.
+    #[test]
+    fn a_stored_free_text_category_is_compared_normalised() {
+        let mut s = state(Some("old-hash"), Some("m@v2"), Some(stored_periods()));
+        s.extracted_category = Some("Signalling Fault".to_string());
+        let baseline = baseline_for_text_change_rerun("I1", &s, "new-hash", "m@v2").unwrap();
+        assert_eq!(baseline.category.as_deref(), Some("signal_failure"));
+        let report = compare(
+            baseline.category.as_deref(),
+            &baseline.periods,
+            "signal_failure",
+            &baseline.periods,
+        );
+        assert!(fields(&report).is_empty(), "{:?}", fields(&report));
     }
 
     #[test]

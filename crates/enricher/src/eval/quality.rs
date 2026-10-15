@@ -21,7 +21,7 @@
 //!   non-null value as a positive, so `hallucinated` (non-null where gold
 //!   is null) costs precision and `missed` (null where gold is not) costs
 //!   recall. `wrong` (non-null, wrong value) costs both.
-//! - **Category** (free text in the schema) against `category_any_of`.
+//! - **Category** (normalised to `category::CATEGORIES`) against `category_any_of`.
 //! - **Consistency** (repetitions > 1): whether repeats of the same case
 //!   agree, via `churn::compare` (`scope_description` wording excluded).
 

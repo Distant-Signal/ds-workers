@@ -1048,7 +1048,7 @@ fn primary_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "category": { "type": "string" },
+            "category": { "type": "string", "enum": crate::category::CATEGORIES },
             "periods": {
                 "type": "array",
                 "items": {
@@ -1120,6 +1120,9 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     even when the text presents them as neighboring clauses -- do not merge them, and do not let the shared \
     date range alone suggest they are one period. `periods` must always \
     contain at least one element. \
+    `category` is the incident's cause, for the whole incident, as exactly one of the schema's values: \
+    use `engineering_works` for planned or overrunning works (including when buses replace trains for \
+    them), and `other` when the text states no cause or none of the values fits. \
     For each period: `scope_description` is short, display-only text distinguishing what's different about \
     that period from the incident's other periods (e.g. \"platform 2 closed, calls at platform 1\"), or \
     null if there's only one period. `resolution_status` is `resolved` only if the text explicitly says the \
@@ -2124,6 +2127,18 @@ pub(crate) fn parse_primary(content: &str) -> anyhow::Result<PrimaryExtraction> 
         extraction.periods = select_periods_within_cap(extraction.periods);
     }
     extraction.dropped_period_count = original_count.saturating_sub(MAX_PERIODS);
+    // A fixed vocabulary whatever the backend sent (see `category`'s
+    // module doc): an unrecognised value is stored as the fallback, never
+    // dropped.
+    let normalised = crate::category::normalise(&extraction.category);
+    if !normalised.recognised {
+        tracing::info!(
+            raw_category = %extraction.category,
+            stored_as = normalised.category,
+            "primary extraction returned an unrecognised category"
+        );
+    }
+    normalised.category.clone_into(&mut extraction.category);
     // Before the adversarial passes, which echo each period's scope back
     // and are checked against exactly what was sent.
     for period in &mut extraction.periods {
@@ -2603,8 +2618,12 @@ mod strict_schema_tests {
                     windows += 1;
                 }
             }
-            let category =
+            // The schema's `category` is an enum; the dataset's accepted
+            // lists hold synonyms, so send the canonical one.
+            let accepted =
                 first_accepted(case["expected"].get("category_any_of"), "unknown".into());
+            let category =
+                crate::category::normalise(accepted.as_str().unwrap_or_default()).category;
             let primary = serde_json::json!({ "category": category, "periods": periods });
             validate(&primary_schema(), &primary, &case["id"].to_string())
                 .unwrap_or_else(|e| panic!("primary: {e}"));
@@ -2666,11 +2685,11 @@ mod strict_schema_tests {
             "schedule_window": null, "resolution_status": "ongoing",
             "apparent_severity": "normal", "impact_type": null
         });
-        let extra = serde_json::json!({ "category": "c", "periods": [period] });
+        let extra = serde_json::json!({ "category": "other", "periods": [period] });
         assert!(validate(&primary_schema(), &extra, "extra").is_err());
         let missing = serde_json::json!({ "periods": [] });
         assert!(validate(&primary_schema(), &missing, "missing").is_err());
-        let bad_day = serde_json::json!({ "category": "c", "periods": [{
+        let bad_day = serde_json::json!({ "category": "other", "periods": [{
             "scope_description": null, "date_range": null,
             "schedule_window": {"days_of_week": [8], "start_time": "00:00", "end_time": "23:59"},
             "resolution_status": "ongoing", "apparent_severity": "normal", "impact_type": null

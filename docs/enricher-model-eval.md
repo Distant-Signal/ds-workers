@@ -564,7 +564,7 @@ them.
 | `reference_date` | What `process_incident` passes as `first_seen_at`. The model resolves year-less dates and bare times against it |
 | `tags`, `notes` | Optional. Tags slice the report (a "By tag" table). Notes record why the case exists and how it was labelled |
 | `expected` | Optional. Without it, the case is perf-only |
-| `expected.category_any_of` | Accepted categories. `category` is free text in the schema, so list synonyms. They're compared lowercased, with punctuation runs folded to `_` |
+| `expected.category_any_of` | Accepted categories. The enricher normalises `category` to a fixed set (`crates/enricher/src/category.rs`; unknown values become `other`), so list the canonical value; synonyms are fine as long as every one maps to the same category (a unit test checks). They're compared lowercased, with punctuation runs folded to `_` |
 | `expected.periods` | Gold periods in text order, at most 12. Leave it out to leave segmentation unlabelled |
 | Per period: `date_range`, or `from_date` / `to_date` on their own | Full range, or just one side when the other is a judgment call |
 | `schedule_window` | `{days_of_week (ISO 1-7), start_time, end_time ("HH:MM")}` or `null`. Day order doesn't matter |
@@ -769,8 +769,11 @@ the prefixes CI's ignored-tests step already skips
 
 ## Limitations and open questions
 
-- **Category is free text** (the schema has no enum), so category accuracy
-  is only as good as each case's synonym list.
+- **Category is a fixed set** (a schema `enum`, plus normalisation after
+  parsing that maps synonyms and maps anything unknown to `other`), so a
+  model that picks the wrong cause scores wrong, but one that only spells
+  it differently no longer does. The set is a judgment call; grow it (and
+  `category.rs`'s rules) from real incident history.
 - **Period matching** maximises the number of pairs, then field
   agreement, so with two near-identical periods the pairing it picks may
   not be the one a human would. It is deterministic, and the per-case

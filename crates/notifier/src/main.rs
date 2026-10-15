@@ -116,24 +116,11 @@ async fn run() -> anyhow::Result<()> {
     // INF-5: wait for Postgres (e.g. still in crash recovery after a node
     // reboot) instead of exiting into CrashLoopBackOff. `/healthz` stays
     // 503 until this returns; `/livez` stays 200 while it retries.
-    common::startup::retry_until_ready(
-        "Postgres",
-        common::startup::CONNECT_BACKOFF,
-        Some(&progress),
-        || async {
-            use sqlx::Connection;
-            sqlx::PgConnection::connect(config.database_url.expose())
-                .await?
-                .close()
-                .await
-        },
-    )
-    .await;
     // application_name, statement/idle-in-transaction timeouts and a short
     // acquire_timeout; see `common::pg`. ds_store's wrapper adds the
     // db_pool_* metrics.
     let pool = ds_store::pool::PoolSettings::from_env("distant-signal-notifier", 5)?
-        .connect(config.database_url.expose())
+        .connect_until_ready(config.database_url.expose(), Some(&progress))
         .await?;
     // The schema gate (spec §12.2): no loop and no readiness until the
     // schema and grants this build needs are there; exits after 15 minutes.
