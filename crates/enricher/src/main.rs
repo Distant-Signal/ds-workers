@@ -2163,7 +2163,7 @@ mod tests {
              VALUES ($1, $2, $3, '{}', '{}', 3) \
              ON CONFLICT (incident_id) DO UPDATE SET summary = EXCLUDED.summary, description = EXCLUDED.description, \
                  source_text_hash = NULL, extraction_model_version = NULL, extracted_periods = NULL, \
-                 extracted_category = NULL",
+                 extracted_category = NULL, is_cleared = false",
         )
         .bind(incident_id)
         .bind(summary)
