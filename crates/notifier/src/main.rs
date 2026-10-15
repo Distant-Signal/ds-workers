@@ -59,7 +59,7 @@ const TEMPLATE_SWEEP_CYCLE: &str = "template_sweep";
 /// The "an app was connected" notices (delegated-access spec 2026-10-14
 /// §5.3), run on the skip-check interval right after that cycle.
 const GRANT_NOTICE_CYCLE: &str = "grant_notice";
-/// Grant notices read per cycle.
+/// Users given a grant notice per cycle (one notice each).
 const GRANT_NOTICE_BATCH: i64 = 100;
 
 #[tokio::main]
@@ -632,16 +632,17 @@ fn grant_notice_payload(grant: &queries::NewGrantRow) -> NotificationPayload {
     }
 }
 
-/// Enqueues the notice for every grant made recently whose notice has not
-/// gone out. A worker records `push_notified_at` once it is delivered, so
-/// a failed or dropped send is decided again next cycle (up to
-/// `GRANT_NOTICE_MAX_AGE_HOURS`).
+/// Enqueues one notice per user for the oldest active grant whose notice
+/// has not gone out, whatever its age. A worker records `push_notified_at`
+/// once it is delivered (or the user has no push subscription), so each
+/// grant gets exactly one notice; a failed or dropped send is decided again
+/// next cycle, and a user's next grant waits for the next cycle.
 async fn run_grant_notice_cycle(
     pool: &PgPool,
     queue: &Queue,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    for grant in queries::poll_new_grants(pool, now, GRANT_NOTICE_BATCH).await? {
+    for grant in queries::poll_new_grants(pool, GRANT_NOTICE_BATCH).await? {
         enqueue_push(
             queue,
             &grant.user_id,

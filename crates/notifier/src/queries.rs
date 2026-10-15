@@ -1133,26 +1133,20 @@ pub(crate) struct NewGrantRow {
     pub scopes: Vec<String>,
 }
 
-/// How far back an unsent grant notice is still worth sending: a notifier
-/// that was down longer than this skips it (the banner and the Connected
-/// apps page still show the grant).
-pub(crate) const GRANT_NOTICE_MAX_AGE_HOURS: i32 = 24;
-
-/// Active grants made in the last [`GRANT_NOTICE_MAX_AGE_HOURS`] whose
-/// notice has not been sent, oldest first, at most `limit`.
-pub(crate) async fn poll_new_grants(
-    pool: &PgPool,
-    now: DateTime<Utc>,
-    limit: i64,
-) -> anyhow::Result<Vec<NewGrantRow>> {
+/// Active grants whose notice has not been sent, at most one per user
+/// (that user's oldest), oldest first, at most `limit` users. No age
+/// cutoff: a notifier that was down for days still sends each grant's one
+/// notice. One per user per cycle keeps a backlog from flooding a user;
+/// the next grant is due once the first is marked sent.
+pub(crate) async fn poll_new_grants(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<NewGrantRow>> {
     Ok(sqlx::query_as::<_, NewGrantRow>(
-        "SELECT id, user_id, client_display_name, scopes FROM delegated_grants \
-         WHERE revoked_at IS NULL AND push_notified_at IS NULL \
-           AND created_at > $1 - make_interval(hours => $2) \
-         ORDER BY created_at, id LIMIT $3",
+        "SELECT id, user_id, client_display_name, scopes FROM ( \
+             SELECT DISTINCT ON (user_id) id, user_id, client_display_name, scopes, created_at \
+             FROM delegated_grants \
+             WHERE revoked_at IS NULL AND push_notified_at IS NULL \
+             ORDER BY user_id, created_at, id \
+         ) due ORDER BY created_at, id LIMIT $1",
     )
-    .bind(now)
-    .bind(GRANT_NOTICE_MAX_AGE_HOURS)
     .bind(limit)
     .fetch_all(pool)
     .await?)
@@ -6016,27 +6010,31 @@ mod grant_notice_tests {
         }
         let (fresh, revoked, stale) = (ids[0], ids[1], ids[2]);
         let due = |pool: PgPool| async move {
-            poll_new_grants(&pool, Utc::now(), 1000)
+            poll_new_grants(&pool, 10_000)
                 .await
                 .expect("poll")
                 .into_iter()
+                .filter(|grant| grant.user_id == user)
                 .map(|grant| grant.id)
                 .collect::<Vec<i64>>()
         };
-        let first = due(pool.clone()).await;
-        assert!(first.contains(&fresh), "a new grant is due");
-        assert!(!first.contains(&revoked), "a revoked grant gets no notice");
-        assert!(
-            !first.contains(&stale),
-            "a grant older than the window gets no notice"
+        // No age cutoff, but one notice per user per cycle: the oldest.
+        assert_eq!(
+            due(pool.clone()).await,
+            vec![stale],
+            "a two-day-old grant is still due, and only one of the user's grants is"
         );
+        mark_grant_notified(&pool, stale, Utc::now())
+            .await
+            .expect("mark");
+        assert_eq!(due(pool.clone()).await, vec![fresh], "then the next one");
         mark_grant_notified(&pool, fresh, Utc::now())
             .await
             .expect("mark");
-        assert!(
-            !due(pool.clone()).await.contains(&fresh),
-            "a sent notice is not sent again"
-        );
+        // Each grant gets exactly one notice; a revoked grant gets none.
+        let after = due(pool.clone()).await;
+        assert!(after.is_empty(), "{after:?}");
+        assert!(!after.contains(&revoked));
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user)
             .execute(&pool)
