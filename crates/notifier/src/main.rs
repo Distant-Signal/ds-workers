@@ -56,6 +56,11 @@ const FORWARD_QUEUE_CYCLE: &str = "forward_queue";
 const SKIP_CHECK_CYCLE: &str = "skip_check";
 /// Hourly by default, so the chart's 15-minute alert leaves it out.
 const TEMPLATE_SWEEP_CYCLE: &str = "template_sweep";
+/// The "an app was connected" notices (delegated-access spec 2026-10-14
+/// §5.3), run on the skip-check interval right after that cycle.
+const GRANT_NOTICE_CYCLE: &str = "grant_notice";
+/// Grant notices read per cycle.
+const GRANT_NOTICE_BATCH: i64 = 100;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -146,6 +151,7 @@ async fn run() -> anyhow::Result<()> {
         FORWARD_QUEUE_CYCLE,
         SKIP_CHECK_CYCLE,
         TEMPLATE_SWEEP_CYCLE,
+        GRANT_NOTICE_CYCLE,
     ] {
         common::metrics::register_cycle("notifier", cycle);
     }
@@ -211,6 +217,11 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
                 }
                 common::metrics::record_cycle("notifier", SKIP_CHECK_CYCLE, result.is_ok());
+                let result = run_grant_notice_cycle(&pool, &queue, Utc::now()).await;
+                if let Err(err) = &result {
+                    tracing::error!(error = ?err, "notifier grant-notice cycle failed; will retry next interval");
+                }
+                common::metrics::record_cycle("notifier", GRANT_NOTICE_CYCLE, result.is_ok());
             }
             _ = progress.idle(template_sweep_interval.tick()) => {
                 let result = run_template_sweep_cycle(
@@ -593,6 +604,55 @@ async fn sample_forward_queue(pool: &PgPool, now: DateTime<Utc>) {
 /// doc comment), needed here for the same reason: which day's committed
 /// legs this cycle checks is now a direct function of `now`'s London-local
 /// date (see below), so that has to be controllable from a test.
+/// The push a new delegated-access grant sends to each of the user's
+/// devices: who can now do what, and where to disconnect it.
+fn grant_notice_payload(grant: &queries::NewGrantRow) -> NotificationPayload {
+    let abilities: Vec<&str> = [
+        ("journeys:write", "save"),
+        ("journeys:read", "read"),
+        ("journeys:delete", "delete"),
+    ]
+    .into_iter()
+    .filter(|(scope, _)| grant.scopes.iter().any(|s| s == scope))
+    .map(|(_, verb)| verb)
+    .collect();
+    let what = match abilities.as_slice() {
+        [] => "use".to_string(),
+        [only] => (*only).to_string(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    };
+    NotificationPayload {
+        title: format!("{} connected", grant.client_display_name),
+        body: format!(
+            "{} can now {what} your journeys. Not you? Disconnect it in Connected apps.",
+            grant.client_display_name
+        ),
+        url: "/account/connected-apps".to_string(),
+        tag: format!("grant-created-{}", grant.id),
+    }
+}
+
+/// Enqueues the notice for every grant made recently whose notice has not
+/// gone out. A worker records `push_notified_at` once it is delivered, so
+/// a failed or dropped send is decided again next cycle (up to
+/// `GRANT_NOTICE_MAX_AGE_HOURS`).
+async fn run_grant_notice_cycle(
+    pool: &PgPool,
+    queue: &Queue,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for grant in queries::poll_new_grants(pool, now, GRANT_NOTICE_BATCH).await? {
+        enqueue_push(
+            queue,
+            &grant.user_id,
+            grant_notice_payload(&grant),
+            Delivered::GrantCreated { grant_id: grant.id },
+            now,
+        );
+    }
+    Ok(())
+}
+
 async fn run_skip_check_cycle(
     pool: &PgPool,
     queue: &Queue,
@@ -2706,5 +2766,41 @@ mod sweep_cycle_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+}
+
+#[cfg(test)]
+mod grant_notice_tests {
+    use super::*;
+
+    fn grant(scopes: &[&str]) -> queries::NewGrantRow {
+        queries::NewGrantRow {
+            id: 7,
+            user_id: "u".to_string(),
+            client_display_name: "Distant Signal assistant".to_string(),
+            scopes: scopes.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn the_notice_names_the_app_and_what_it_can_do() {
+        let payload = grant_notice_payload(&grant(&["journeys:read", "journeys:write"]));
+        assert_eq!(payload.title, "Distant Signal assistant connected");
+        assert_eq!(
+            payload.body,
+            "Distant Signal assistant can now save and read your journeys. Not you? Disconnect \
+             it in Connected apps."
+        );
+        assert_eq!(payload.url, "/account/connected-apps");
+        assert_eq!(payload.tag, "grant-created-7");
+        let all = grant_notice_payload(&grant(&[
+            "journeys:delete",
+            "journeys:read",
+            "journeys:write",
+        ]));
+        assert!(
+            all.body
+                .contains("can now save, read and delete your journeys.")
+        );
     }
 }

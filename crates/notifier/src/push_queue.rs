@@ -151,6 +151,9 @@ pub(crate) enum Delivered {
     SkippedStop { journey_leg_id: i64 },
     /// `journey_leg_notification_state.last_notified_unmatched = TRUE`.
     Unmatched { journey_leg_id: i64 },
+    /// `delegated_grants.push_notified_at`: the "an app was connected"
+    /// notice (delegated-access spec 2026-10-14 §5.3).
+    GrantCreated { grant_id: i64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -159,6 +162,7 @@ enum Target {
     Train(i64),
     SkippedStop(i64),
     Unmatched(i64),
+    GrantCreated(i64),
 }
 
 impl Delivered {
@@ -170,6 +174,7 @@ impl Delivered {
             } => Target::Train(*tracked_train_id),
             Delivered::SkippedStop { journey_leg_id } => Target::SkippedStop(*journey_leg_id),
             Delivered::Unmatched { journey_leg_id } => Target::Unmatched(*journey_leg_id),
+            Delivered::GrantCreated { grant_id } => Target::GrantCreated(*grant_id),
         }
     }
 }
@@ -328,6 +333,9 @@ impl PushBackend for PgBackend {
                     at,
                 )
                 .await
+            }
+            Delivered::GrantCreated { grant_id } => {
+                queries::mark_grant_notified(&self.pool, *grant_id, at).await
             }
         }
     }

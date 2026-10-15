@@ -1123,6 +1123,59 @@ pub(crate) struct PushSubscriptionRow {
     pub auth: String,
 }
 
+/// A delegated-access grant whose "an app was connected" push has not gone
+/// out yet (delegated-access spec 2026-10-14 §5.3, compensating control 2).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct NewGrantRow {
+    pub id: i64,
+    pub user_id: String,
+    pub client_display_name: String,
+    pub scopes: Vec<String>,
+}
+
+/// How far back an unsent grant notice is still worth sending: a notifier
+/// that was down longer than this skips it (the banner and the Connected
+/// apps page still show the grant).
+pub(crate) const GRANT_NOTICE_MAX_AGE_HOURS: i32 = 24;
+
+/// Active grants made in the last [`GRANT_NOTICE_MAX_AGE_HOURS`] whose
+/// notice has not been sent, oldest first, at most `limit`.
+pub(crate) async fn poll_new_grants(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> anyhow::Result<Vec<NewGrantRow>> {
+    Ok(sqlx::query_as::<_, NewGrantRow>(
+        "SELECT id, user_id, client_display_name, scopes FROM delegated_grants \
+         WHERE revoked_at IS NULL AND push_notified_at IS NULL \
+           AND created_at > $1 - make_interval(hours => $2) \
+         ORDER BY created_at, id LIMIT $3",
+    )
+    .bind(now)
+    .bind(GRANT_NOTICE_MAX_AGE_HOURS)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Records that a grant's notice was delivered (or that the user has no
+/// push subscription, which counts as handled).
+pub(crate) async fn mark_grant_notified(
+    pool: &PgPool,
+    grant_id: i64,
+    at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE delegated_grants SET push_notified_at = $2 \
+         WHERE id = $1 AND push_notified_at IS NULL",
+    )
+    .bind(grant_id)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn push_subscriptions_for_user(
     pool: &PgPool,
     user_id: &str,
@@ -5906,6 +5959,89 @@ mod sweep_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+}
+
+/// The "an app was connected" notice's queries (delegated-access spec
+/// 2026-10-14 §5.3): which grants are due, and marking one sent. Run as the
+/// notifier's own role in the per-service CI step, which proves its column
+/// grants on `delegated_grants`.
+#[cfg(test)]
+mod grant_notice_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                -- --ignored --test-threads=1`"]
+    async fn due_grants_are_polled_until_marked() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        let user = "TEST-GRANT-NOTICE-USER";
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $1, $1)")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        // One grant per client (one active grant per user and client).
+        let mut ids = Vec::new();
+        for (client, created_at, revoked) in [
+            ("notice-fresh", "now()", false),
+            ("notice-revoked", "now()", true),
+            ("notice-stale", "now() - INTERVAL '2 days'", false),
+        ] {
+            let id: i64 = sqlx::query_scalar(&format!(
+                "INSERT INTO delegated_grants \
+                     (user_id, client, client_display_name, scopes, created_at, revoked_at, \
+                      revoked_reason) \
+                 VALUES ($1, $2, 'Assistant', '{{journeys:read}}', {created_at}, {}, {}) \
+                 RETURNING id",
+                if revoked { "now()" } else { "NULL" },
+                if revoked { "'user'" } else { "NULL" },
+            ))
+            .bind(user)
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("seed grant");
+            ids.push(id);
+        }
+        let (fresh, revoked, stale) = (ids[0], ids[1], ids[2]);
+        let due = |pool: PgPool| async move {
+            poll_new_grants(&pool, Utc::now(), 1000)
+                .await
+                .expect("poll")
+                .into_iter()
+                .map(|grant| grant.id)
+                .collect::<Vec<i64>>()
+        };
+        let first = due(pool.clone()).await;
+        assert!(first.contains(&fresh), "a new grant is due");
+        assert!(!first.contains(&revoked), "a revoked grant gets no notice");
+        assert!(
+            !first.contains(&stale),
+            "a grant older than the window gets no notice"
+        );
+        mark_grant_notified(&pool, fresh, Utc::now())
+            .await
+            .expect("mark");
+        assert!(
+            !due(pool.clone()).await.contains(&fresh),
+            "a sent notice is not sent again"
+        );
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }
 
