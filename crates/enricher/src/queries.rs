@@ -261,17 +261,10 @@ pub(crate) async fn carry_forward_extraction(
     reason = "test code: scenario tests read top to bottom"
 )]
 mod tests {
-    use sqlx::postgres::PgPoolOptions;
-
     use super::*;
 
     async fn test_pool() -> PgPool {
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        PgPoolOptions::new()
-            .connect(&database_url)
-            .await
-            .expect("connect to postgres")
+        crate::test_db::pool().await
     }
 
     fn one_period() -> ExtractionPeriod {

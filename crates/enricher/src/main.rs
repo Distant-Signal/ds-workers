@@ -33,6 +33,8 @@ mod replay_eval;
 mod retry_backoff;
 mod stream;
 mod sweep;
+#[cfg(test)]
+mod test_db;
 mod text_delta;
 
 use std::collections::{HashMap, HashSet};
@@ -1684,12 +1686,7 @@ mod tests {
     }
 
     async fn test_pool() -> PgPool {
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        PgPoolOptions::new()
-            .connect(&database_url)
-            .await
-            .expect("connect to postgres")
+        test_db::pool().await
     }
 
     fn test_enricher(

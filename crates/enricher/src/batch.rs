@@ -1573,12 +1573,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect(&database_url)
-            .await
-            .expect("connect to postgres");
+        let pool = crate::test_db::pool().await;
         sqlx::query("DELETE FROM enricher_llm_batches")
             .execute(&pool)
             .await
@@ -1702,12 +1697,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect(&database_url)
-            .await
-            .expect("connect to postgres");
+        let pool = crate::test_db::pool().await;
         sqlx::query("DELETE FROM enricher_llm_batches")
             .execute(&pool)
             .await
@@ -1859,12 +1849,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect(&database_url)
-            .await
-            .expect("connect to postgres");
+        let pool = crate::test_db::pool().await;
         sqlx::query("DELETE FROM enricher_llm_batches")
             .execute(&pool)
             .await
