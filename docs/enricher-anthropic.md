@@ -657,7 +657,7 @@ final size, parses results line by line as the file downloads, reads a
 row's `items` only once its batch has ended, and combines and writes an
 adversarial stage 100 incidents at a time. glibc would keep the freed peak
 resident, so the binary pins malloc's mmap threshold at startup and runs
-`malloc_trim` after each batch step (`crates/enricher/src/heap.rs`).
+`malloc_trim` after each batch step (`crates/common/src/heap.rs`).
 Measured at 2,000 incidents: a primary submission peaks at ~50 MiB of
 allocations (it was ~215 MiB) and an adversarial one at ~25 MiB (~160 MiB),
 and the process returns to its baseline afterwards (it used to stay at the

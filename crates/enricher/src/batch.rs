@@ -60,7 +60,7 @@
 //! into [`BatchItem`]s, and moved (never cloned) through the stage. An
 //! adversarial stage is combined and written [`WRITE_CHUNK`] incidents at
 //! a time, each result dropped once used. Afterwards
-//! `heap::release_freed_memory` hands the freed heap back to the kernel.
+//! `common::heap::release_freed_memory` hands the freed heap back to the kernel.
 //!
 //! **Results.** Matched by `custom_id` (`p-<n>`, `r-<n>`, `s-<n>`, `n` the
 //! item's index), never by position. `errored`, `canceled`, `expired`,
@@ -756,7 +756,7 @@ pub(crate) async fn sweep_with_batches(
         }
     }
     drop(prepared);
-    crate::heap::release_freed_memory();
+    common::heap::release_freed_memory();
     Vec::new()
 }
 
@@ -964,7 +964,7 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
     };
     // A stage's items, results and request bodies are freed by now,
     // whether it succeeded or not.
-    crate::heap::release_freed_memory();
+    common::heap::release_freed_memory();
     finished?;
     // Counted once the row is processed, so a stage retried next tick is
     // not counted twice.

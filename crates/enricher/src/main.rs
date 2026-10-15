@@ -24,7 +24,6 @@ mod config;
     )
 )]
 mod eval;
-mod heap;
 mod latency;
 mod llm;
 mod profile;
@@ -74,8 +73,8 @@ async fn run() -> anyhow::Result<()> {
 
     common::logging::init("enricher");
     // Before any batch work: the batch path's freed peaks go back to the
-    // kernel (`heap`).
-    heap::pin_mmap_threshold();
+    // kernel (`common::heap`).
+    common::heap::pin_mmap_threshold();
 
     let config = Config::parse();
     // `LLM_PROVIDER` with its defaults (`anthropic` fills in the base URL
