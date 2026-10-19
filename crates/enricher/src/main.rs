@@ -9,6 +9,7 @@ mod alloc_meter;
 mod auth;
 mod batch;
 mod category;
+mod category_backfill;
 mod checks;
 mod churn;
 mod combine;
@@ -60,8 +61,13 @@ async fn main() -> std::process::ExitCode {
     // `enricher eval ...`: the one-off model comparison (`eval::cli`,
     // docs/enricher-model-eval.md, "In-cluster run"). Never reached by the
     // service, whose container passes no arguments.
-    if std::env::args_os().nth(1).is_some_and(|arg| arg == "eval") {
-        return eval::cli::main().await;
+    match std::env::args_os().nth(1) {
+        Some(arg) if arg == "eval" => return eval::cli::main().await,
+        // `enricher normalise-categories ...`: the one-off backfill of
+        // categories stored before the fixed set (`category_backfill`,
+        // docs/enricher-category-backfill.md).
+        Some(arg) if arg == "normalise-categories" => return category_backfill::main().await,
+        _ => {}
     }
     common::logging::exit_code(run().await)
 }

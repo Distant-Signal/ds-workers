@@ -10,7 +10,9 @@
 //! batch and eval paths all store the same vocabulary. The primary schema
 //! also lists [`CATEGORIES`] as an `enum`, so a backend that enforces the
 //! schema already sends one of them; [`normalise`] is the net for one that
-//! does not.
+//! does not. Rows stored before the fixed set are mapped through the same
+//! [`normalise`] by `enricher normalise-categories` (`category_backfill.rs`,
+//! docs/enricher-category-backfill.md).
 //!
 //! The category is the incident's *cause*, whole-incident. The *effect* of
 //! each period is `impact_type`. Nothing outside the enricher reads
