@@ -470,6 +470,58 @@ async fn notify_train_candidates(
     Ok(())
 }
 
+/// A station in push copy: its name, else its code. Push text is short, so
+/// "Name" rather than the site's "Name (CODE)"; see docs/style-guide.md,
+/// "Journey names".
+fn push_station(crs: &str, name: Option<&str>) -> String {
+    name.filter(|name| !name.trim().is_empty())
+        .unwrap_or(crs)
+        .to_string()
+}
+
+/// "York to Newcastle", or `None` without both ends. Like the site's
+/// `routeLabel`, both ends degrade to codes together ("YRK to NCL") rather
+/// than mixing a name with a bare code.
+fn push_route(
+    origin_crs: Option<&str>,
+    origin_name: Option<&str>,
+    destination_crs: Option<&str>,
+    destination_name: Option<&str>,
+) -> Option<String> {
+    let (origin_crs, destination_crs) = (origin_crs?, destination_crs?);
+    let named = |name: Option<&str>| name.is_some_and(|name| !name.trim().is_empty());
+    Some(if named(origin_name) && named(destination_name) {
+        format!(
+            "{} to {}",
+            push_station(origin_crs, origin_name),
+            push_station(destination_crs, destination_name)
+        )
+    } else {
+        format!("{origin_crs} to {destination_crs}")
+    })
+}
+
+/// How a push names a whole journey: its custom name in quotes, else
+/// "your journey to <where it ends>" (the LAST leg's destination, the
+/// site's naming rule), else "your journey".
+fn push_journey_label(ctx: &queries::JourneyLegContext) -> String {
+    if let Some(name) = ctx
+        .journey_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        return format!("'{name}'");
+    }
+    match ctx.journey_destination_crs.as_deref() {
+        Some(crs) => format!(
+            "your journey to {}",
+            push_station(crs, ctx.journey_destination_name.as_deref())
+        ),
+        None => "your journey".to_string(),
+    }
+}
+
 /// Builds the delay/cancellation `NotificationPayload` -- journey/leg-aware
 /// when `journey_context` names a genuine multi-leg journey (`total_legs >
 /// 1`), otherwise byte-for-byte today's plain copy (Judgment Call 5). CRS
@@ -506,19 +558,18 @@ fn build_train_notification_payload(
         };
     };
 
-    let journey_label = match &ctx.journey_name {
-        Some(name) => format!("'{name}'"),
-        None => "your journey".to_string(),
-    };
-    let route = match (&ctx.origin_crs, &ctx.destination_crs) {
-        (Some(origin), Some(destination)) => Some(format!("{origin} to {destination}")),
-        _ => None,
-    };
+    let journey_label = push_journey_label(ctx);
+    let route = push_route(
+        ctx.origin_crs.as_deref(),
+        ctx.origin_name.as_deref(),
+        ctx.destination_crs.as_deref(),
+        ctx.destination_name.as_deref(),
+    );
 
     let title = if is_cancelled {
-        format!("Leg {} of {journey_label} was cancelled", ctx.leg_order)
+        format!("Leg {} of {journey_label} was cancelled", ctx.leg_position)
     } else {
-        format!("Leg {} of {journey_label} is delayed", ctx.leg_order)
+        format!("Leg {} of {journey_label} is delayed", ctx.leg_position)
     };
     let body = match (is_cancelled, delay_minutes, &route) {
         (true, _, Some(route)) => format!("The {route} service was cancelled."),
@@ -703,7 +754,8 @@ async fn run_skip_check_cycle(
             title: "A stop on your journey is being skipped".to_string(),
             body: format!(
                 "Your service between {} and {} is no longer calling at one of those stops today.",
-                leg.origin_crs, leg.destination_crs
+                push_station(&leg.origin_crs, leg.origin_name.as_deref()),
+                push_station(&leg.destination_crs, leg.destination_name.as_deref())
             ),
             url: format!("/journeys/{}", leg.journey_id),
             tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
@@ -850,8 +902,14 @@ async fn run_template_sweep_cycle(
             let payload = NotificationPayload {
                 title: "Your recurring journey needs attention".to_string(),
                 body: format!(
-                    "No {} to {} service was found for today within your usual window.",
-                    leg.origin_crs, leg.destination_crs
+                    "No {} service was found for today within your usual window.",
+                    push_route(
+                        Some(&leg.origin_crs),
+                        leg.origin_name.as_deref(),
+                        Some(&leg.destination_crs),
+                        leg.destination_name.as_deref(),
+                    )
+                    .unwrap_or_default()
                 ),
                 url: format!("/journeys/{}", leg.journey_id),
                 tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
@@ -1116,10 +1174,14 @@ mod copy_tests {
         queries::JourneyLegContext {
             journey_id: 42,
             journey_name: journey_name.map(str::to_string),
-            leg_order: 2,
+            leg_position: 2,
             total_legs,
             origin_crs: Some("WAV".to_string()),
+            origin_name: Some("Wakefield Westgate".to_string()),
             destination_crs: Some("KGX".to_string()),
+            destination_name: Some("London Kings Cross".to_string()),
+            journey_destination_crs: Some("BTN".to_string()),
+            journey_destination_name: Some("Brighton".to_string()),
         }
     }
 
@@ -1147,7 +1209,7 @@ mod copy_tests {
         assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' is delayed");
         assert_eq!(
             payload.body,
-            "WAV to KGX, now running about 18 minutes late."
+            "Wakefield Westgate to London Kings Cross, now running about 18 minutes late."
         );
         assert_eq!(payload.url, "/journeys/42");
         assert_eq!(payload.tag, "train-7");
@@ -1157,7 +1219,38 @@ mod copy_tests {
     fn an_unnamed_multi_leg_journey_falls_back_to_a_generic_journey_label() {
         let context = ctx(2, None);
         let payload = build_train_notification_payload(7, "en_route", Some(5), Some(&context));
+        assert_eq!(
+            payload.title,
+            "Leg 2 of your journey to Brighton is delayed"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_journey_with_no_known_end_says_your_journey() {
+        let mut context = ctx(2, None);
+        context.journey_destination_crs = None;
+        context.journey_destination_name = None;
+        let payload = build_train_notification_payload(7, "en_route", Some(5), Some(&context));
         assert_eq!(payload.title, "Leg 2 of your journey is delayed");
+    }
+
+    #[test]
+    fn an_unnamed_journey_whose_end_has_no_name_uses_its_code() {
+        let mut context = ctx(2, Some("   "));
+        context.journey_destination_name = None;
+        let payload = build_train_notification_payload(7, "cancelled", None, Some(&context));
+        assert_eq!(payload.title, "Leg 2 of your journey to BTN was cancelled");
+    }
+
+    #[test]
+    fn a_leg_route_with_one_unresolved_name_uses_codes_on_both_ends() {
+        let mut context = ctx(2, None);
+        context.destination_name = None;
+        let payload = build_train_notification_payload(7, "en_route", Some(5), Some(&context));
+        assert_eq!(
+            payload.body,
+            "WAV to KGX, now running about 5 minutes late."
+        );
     }
 
     #[test]
@@ -1168,7 +1261,10 @@ mod copy_tests {
             payload.title,
             "Leg 2 of 'Weekend in Edinburgh' was cancelled"
         );
-        assert_eq!(payload.body, "The WAV to KGX service was cancelled.");
+        assert_eq!(
+            payload.body,
+            "The Wakefield Westgate to London Kings Cross service was cancelled."
+        );
     }
 
     #[test]

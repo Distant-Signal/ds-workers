@@ -1070,10 +1070,20 @@ pub(crate) async fn upsert_train_notification_state(
 pub(crate) struct JourneyLegContext {
     pub journey_id: i64,
     pub journey_name: Option<String>,
-    pub leg_order: i32,
+    /// The leg's 1-based position among the journey's legs. Not
+    /// `leg_order`, which is never renumbered after a leg is deleted, so a
+    /// two-leg journey could otherwise say "Leg 3".
+    pub leg_position: i64,
     pub total_legs: i64,
     pub origin_crs: Option<String>,
+    pub origin_name: Option<String>,
     pub destination_crs: Option<String>,
+    pub destination_name: Option<String>,
+    /// The LAST leg's destination: where the whole journey ends, which is
+    /// what names a journey with no custom name ("your journey to
+    /// Edinburgh"), the same rule the site uses.
+    pub journey_destination_crs: Option<String>,
+    pub journey_destination_name: Option<String>,
 }
 
 /// Finds the journey/leg context for a `train_subscriptions.id`, if one
@@ -1101,11 +1111,22 @@ pub(crate) async fn journey_leg_for_train_subscription(
     tracked_train_id: i64,
 ) -> anyhow::Result<Option<JourneyLegContext>> {
     let row = sqlx::query_as::<_, JourneyLegContext>(
-        "SELECT j.id AS journey_id, j.custom_name AS journey_name, jl.leg_order, \
+        "SELECT j.id AS journey_id, j.custom_name AS journey_name, \
+                (SELECT COUNT(*) FROM journey_legs jl2 \
+                 WHERE jl2.journey_id = jl.journey_id AND jl2.leg_order <= jl.leg_order) AS leg_position, \
                 (SELECT COUNT(*) FROM journey_legs jl2 WHERE jl2.journey_id = jl.journey_id) AS total_legs, \
-                jl.origin_crs, jl.destination_crs \
+                jl.origin_crs, so.name AS origin_name, jl.destination_crs, sd.name AS destination_name, \
+                last_leg.destination_crs AS journey_destination_crs, \
+                sj.name AS journey_destination_name \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
+         CROSS JOIN LATERAL ( \
+             SELECT jl3.destination_crs FROM journey_legs jl3 WHERE jl3.journey_id = jl.journey_id \
+             ORDER BY jl3.leg_order DESC LIMIT 1 \
+         ) last_leg \
+         LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
+         LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
+         LEFT JOIN stations sj ON sj.crs = UPPER(last_leg.destination_crs)::bpchar \
          WHERE jl.train_subscription_id = $1 \
          ORDER BY jl.id LIMIT 1",
     )
@@ -1230,6 +1251,10 @@ pub(crate) struct CommittedLeg {
     pub user_id: String,
     pub origin_crs: String,
     pub destination_crs: String,
+    /// Display names for the two codes above (`stations`), for the push
+    /// copy only; `None` when no reference row exists.
+    pub origin_name: Option<String>,
+    pub destination_name: Option<String>,
     pub trains_id: i64,
     pub pin_destination_crs: Option<String>,
     pub next_calling_point: Option<String>,
@@ -1256,11 +1281,13 @@ pub(crate) async fn list_committed_legs_for_today(
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
-                jl.origin_crs, jl.destination_crs, ts.trains_id, \
-                ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
+                jl.origin_crs, jl.destination_crs, so.name AS origin_name, sd.name AS destination_name, \
+                ts.trains_id, ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+         LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
+         LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
          LEFT JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
          LEFT JOIN trains tr ON tr.id = ts.trains_id \
          WHERE jl.train_subscription_id IS NOT NULL \
@@ -1285,6 +1312,8 @@ pub(crate) async fn list_committed_legs_for_today(
                 user_id: row.try_get("user_id")?,
                 origin_crs: row.try_get("origin_crs")?,
                 destination_crs: row.try_get("destination_crs")?,
+                origin_name: row.try_get("origin_name")?,
+                destination_name: row.try_get("destination_name")?,
                 trains_id: row.try_get("trains_id")?,
                 pin_destination_crs: row.try_get("pin_destination_crs")?,
                 next_calling_point: row.try_get("next_calling_point")?,
@@ -1595,6 +1624,9 @@ pub(crate) struct CommitCheckLeg {
     pub user_id: String,
     pub origin_crs: String,
     pub destination_crs: String,
+    /// Display names for the two codes above, for the push copy only.
+    pub origin_name: Option<String>,
+    pub destination_name: Option<String>,
     pub service_date: chrono::NaiveDate,
     pub depart_after: Option<chrono::NaiveTime>,
     pub depart_before: Option<chrono::NaiveTime>,
@@ -1608,11 +1640,13 @@ pub(crate) async fn unmatched_auto_legs_for_commit_check(
 ) -> anyhow::Result<Vec<CommitCheckLeg>> {
     let rows = sqlx::query_as::<_, CommitCheckLeg>(
         "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
-                jl.origin_crs, jl.destination_crs, jl.service_date, \
-                jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before \
+                jl.origin_crs, jl.destination_crs, so.name AS origin_name, sd.name AS destination_name, \
+                jl.service_date, jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN journey_templates jt ON jt.id = j.source_template_id \
+         LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
+         LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
          WHERE jl.match_mode = 'unmatched' \
            AND jl.service_date = $1 \
            AND jt.default_match_mode = 'auto' \
@@ -3905,6 +3939,97 @@ mod tests {
             .await
             .ok();
         cleanup_user_skip(&pool, "TEST-SKIP-STATE-USER").await;
+    }
+
+    /// The push copy's journey context: the leg's POSITION (not its
+    /// `leg_order`, which has gaps after a delete), station names for the
+    /// leg, and the LAST leg's destination for "your journey to ...".
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                journey_leg_context_names_the_leg_and_the_journey_end -- --ignored --test-threads=1`"]
+    async fn journey_leg_context_names_the_leg_and_the_journey_end() {
+        let pool = connect().await;
+        let user_id = "TEST-JOURNEY-LEG-CONTEXT-USER";
+        seed_user(&pool, user_id).await;
+        sqlx::query(
+            "INSERT INTO stations (crs, name) VALUES ('ZZB', 'Test Change'), ('ZZD', 'Test End') \
+             ON CONFLICT (crs) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed stations");
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-JLC-UID', DATE '2026-09-22') \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+        let subscription_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, trains_id, service_date) \
+             VALUES ($1, $2, DATE '2026-09-22') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed subscription");
+        let journey_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journeys (user_id, custom_name) VALUES ($1, NULL) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey");
+        sqlx::query(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode, \
+                 train_subscription_id) \
+             VALUES ($1, 2, 'ZZA', 'ZZB', DATE '2026-09-22', 'unmatched', NULL), \
+                    ($1, 5, 'zzb', 'ZZC', DATE '2026-09-22', 'manual', $2), \
+                    ($1, 7, 'ZZC', 'ZZD', DATE '2026-09-22', 'unmatched', NULL)",
+        )
+        .bind(journey_id)
+        .bind(subscription_id)
+        .execute(&pool)
+        .await
+        .expect("seed legs");
+
+        let context = journey_leg_for_train_subscription(&pool, subscription_id)
+            .await
+            .expect("query")
+            .expect("a journey leg");
+        assert_eq!(context.journey_id, journey_id);
+        assert_eq!(context.leg_position, 2);
+        assert_eq!(context.total_legs, 3);
+        assert_eq!(context.origin_name.as_deref(), Some("Test Change"));
+        assert_eq!(context.destination_name, None);
+        assert_eq!(context.journey_destination_crs.as_deref(), Some("ZZD"));
+        assert_eq!(
+            context.journey_destination_name.as_deref(),
+            Some("Test End")
+        );
+
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
+            .bind(subscription_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM stations WHERE crs IN ('ZZB', 'ZZD')")
+            .execute(&pool)
+            .await
+            .ok();
+        cleanup_user_skip(&pool, user_id).await;
     }
 
     #[tokio::test]
