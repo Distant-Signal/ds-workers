@@ -1617,6 +1617,10 @@ pub(crate) async fn due_templates_for(
 /// This struct and `unmatched_auto_legs_for_commit_check` below are called
 /// from `main.rs`'s `run_template_sweep_cycle` (Task 5, stage 2) -- also
 /// exercised directly by this module's own `sweep_tests`.
+///
+/// Train legs only (`jl.kind = 'train'`, 2026-10-20): an untracked Tube or
+/// walk leg has no train to commit. One is never `'unmatched'` and never
+/// comes from a template anyway; the filter says so explicitly.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct CommitCheckLeg {
     pub journey_leg_id: i64,
@@ -1648,6 +1652,7 @@ pub(crate) async fn unmatched_auto_legs_for_commit_check(
          LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
          LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
          WHERE jl.match_mode = 'unmatched' \
+           AND jl.kind = 'train' \
            AND jl.service_date = $1 \
            AND jt.default_match_mode = 'auto' \
            AND jt.active \
