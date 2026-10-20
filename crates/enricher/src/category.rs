@@ -55,7 +55,8 @@ pub(crate) struct Normalised {
     /// One of [`CATEGORIES`].
     pub category: &'static str,
     /// Whether the raw value was recognised: `false` means it fell back to
-    /// [`FALLBACK`] (a raw `other`/`unknown` counts as recognised).
+    /// [`FALLBACK`] (a raw `other`/`unknown`, or a [`GENERIC`] value, counts
+    /// as recognised).
     pub recognised: bool,
 }
 
@@ -368,6 +369,39 @@ const RULES: &[(&str, &[&[&str]])] = &[
             "earlier",
         ]],
     ),
+    // A station closure or station facilities fault, with no cause named
+    // (e.g. "Station closure: trains not calling at Worthing"). Last, so
+    // any named cause ("station closed due to fire") wins.
+    (
+        "other",
+        &[
+            &["station"],
+            &["closure", "closures", "closed", "facilities", "lighting"],
+        ],
+    ),
+];
+
+/// Folded values that name no cause (a generic word, or the effect rather
+/// than the cause): deliberately [`FALLBACK`], so recognised. Matched only
+/// as the whole value, so "fault" or "incident" never overrides a specific
+/// cause such as "signal fault".
+const GENERIC: &[&str] = &[
+    "incident",
+    "incidents",
+    "incident_resolved",
+    "fault",
+    "faults",
+    "disturbance",
+    "residual",
+    "resolved",
+    "service_alteration",
+    "service_alterations",
+    "no_service",
+    "cancellation",
+    "cancellations",
+    "station_facilities",
+    "station_closure",
+    "station_lighting_fault",
 ];
 
 /// Maps a raw model `category` to one of [`CATEGORIES`].
@@ -376,6 +410,12 @@ pub(crate) fn normalise(raw: &str) -> Normalised {
     if let Some(&category) = CATEGORIES.iter().find(|&&c| c == folded) {
         return Normalised {
             category,
+            recognised: true,
+        };
+    }
+    if GENERIC.contains(&folded.as_str()) {
+        return Normalised {
+            category: FALLBACK,
             recognised: true,
         };
     }
@@ -593,6 +633,57 @@ mod tests {
         assert_maps("telecoms cable theft", "vandalism");
         // Without a failure word it isn't a cause.
         assert!(!normalise("customer communications").recognised);
+    }
+
+    /// Generic or effect-only values from the production dry-run are a
+    /// deliberate `other`, not a miss.
+    #[test]
+    fn generic_and_effect_only_values_are_a_recognised_other() {
+        for raw in [
+            "incident",
+            "Incident",
+            "fault",
+            "disturbance",
+            "station_facilities",
+            "service_alteration",
+            "no_service",
+            "residual",
+            "resolved",
+            "Incident resolved",
+            "cancellation",
+            "Cancellations",
+            "Station closure: trains not calling at Worthing",
+            "Station lighting fault causing reduced Thameslink service at Herne Hill",
+            "station closure",
+            "station lighting fault",
+        ] {
+            assert_maps(raw, "other");
+        }
+    }
+
+    /// "fault" and "incident" only count as generic on their own, and a
+    /// station closure with a named cause keeps that cause.
+    #[test]
+    fn a_generic_word_never_overrides_a_specific_cause() {
+        assert_maps("signal fault", "signal_failure");
+        assert_maps("points fault", "points_failure");
+        assert_maps("train fault", "train_fault");
+        assert_maps("trespass incident", "trespass");
+        assert_maps("police incident", "emergency_services_incident");
+        assert_maps("station closed due to fire", "fire");
+        assert_maps("station closure due to flooding", "flooding");
+        // Titles stored as the category stay unrecognised.
+        for raw in [
+            "Amended 22:51 Leicester to Nottingham service",
+            "No trains between Leeds and York",
+            "Reduced service",
+            "Lines reopened",
+            "Timetable change",
+        ] {
+            let got = normalise(raw);
+            assert_eq!(got.category, FALLBACK, "{raw:?}");
+            assert!(!got.recognised, "{raw:?}");
+        }
     }
 
     fn primary_response(category: &str) -> String {

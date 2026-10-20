@@ -105,7 +105,10 @@ complete`):
   the enricher is running. If `updated` is 0 while `examined` isn't, the
   writes are being lost: stop and investigate.
 - **unrecognised:** rows becoming `other` because no rule matched. These are
-  the `mapping` lines with `recognised=false`.
+  the `mapping` lines with `recognised=false`. A generic or effect-only
+  value ("incident", "fault", "cancellation", "station closure", ...) is a
+  deliberate `other` and counts as recognised; an incident title stored as
+  the category ("Reduced service", "Lines reopened") stays unrecognised.
 
 **Review the dry run's `mapping` lines before the real run.** An
 unrecognised value that names a real cause is a missing rule in
