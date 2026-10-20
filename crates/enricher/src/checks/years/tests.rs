@@ -362,6 +362,49 @@ fn ends_that_disagree_are_only_flagged() {
     assert_eq!(periods[0], stored);
 }
 
+/// Incident 7F2EA7F43BED48428BD2BEF249F53EA4 (first seen Monday 12 October
+/// 2026): the feed cut its summary off before the month ("from Monday 4 to
+/// Friday "), and its text says nothing about "this week". The only Monday
+/// the 4th within the window is 4 January 2027, which is also the feed's
+/// validity period (4-8 January 2027). With no stated month there is
+/// nothing to correct against: the stored weekly-window periods (no
+/// `date_range`) and a 4-8 January 2027 range stay as they are. A range
+/// on Monday 4 October 2027, a year out, is only flagged.
+#[test]
+fn a_summary_cut_off_before_its_month_is_not_corrected() {
+    let summary =
+        "Amended late night / early morning South Western Railway service from Monday 4 to Friday ";
+    let description = "<p>Engineering work is taking place overnight in the Eastleigh area, \
+                       closing some lines.</p><p><strong>Monday to Thursday:</strong></p>\
+                       <ul><li>23:05 London Waterloo to Southampton service terminates at \
+                       Basingstoke.</li></ul><p><strong>Tuesday to Friday:</strong></p>\
+                       <p>Repalcement buses will run between Basingstoke and Southampton \
+                       Central.</p>";
+    let reference = "2026-10-12T10:23:09Z";
+    assert!(stated_dates(summary).is_empty());
+
+    let undated = ExtractionPeriod {
+        date_range: None,
+        ..period(None, None)
+    };
+    let mut periods = [undated.clone()];
+    assert!(check(summary, description, reference, &mut periods).is_empty());
+    assert_eq!(periods[0], undated);
+
+    let mut periods = [period(
+        Some("2027-01-04T00:00:00Z"),
+        Some("2027-01-09T00:00:00Z"),
+    )];
+    assert!(check(summary, description, reference, &mut periods).is_empty());
+
+    let october = period(Some("2027-10-03T23:00:00Z"), Some("2027-10-08T23:00:00Z"));
+    let mut periods = [october.clone()];
+    let flags = check(summary, description, reference, &mut periods);
+    assert_eq!(flags.len(), 1);
+    assert_eq!(flags[0].action, YearAction::Flagged);
+    assert_eq!(periods[0], october);
+}
+
 /// Undated periods and periods in the right year are untouched, and
 /// `apply` reports nothing for them.
 #[test]
