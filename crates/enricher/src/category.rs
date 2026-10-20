@@ -299,6 +299,34 @@ const RULES: &[(&str, &[&[&str]])] = &[
         ],
     ),
     ("train_fault", &[&["breakdown", "brokendown"]]),
+    // Lineside telecoms are part of signalling. Needs a failure word, and
+    // comes after the train and vandalism rules, so a train's own
+    // communications fault is `train_fault` and telecoms cable theft is
+    // `vandalism`.
+    (
+        "signal_failure",
+        &[
+            &[
+                "communications",
+                "communication",
+                "comms",
+                "telecoms",
+                "telecom",
+                "telecommunications",
+            ],
+            &[
+                "fault",
+                "faults",
+                "failure",
+                "failures",
+                "failed",
+                "defect",
+                "defective",
+                "equipment",
+                "outage",
+            ],
+        ],
+    ),
     (
         "track_fault",
         &[
@@ -546,6 +574,25 @@ mod tests {
         assert_maps("signal fault", "signal_failure");
         assert_maps("points failure", "points_failure");
         assert_maps("broken rail", "track_fault");
+    }
+
+    #[test]
+    fn telecoms_faults_map_to_signal_failure() {
+        for raw in [
+            "communications equipment fault",
+            "Communications Equipment Fault",
+            "telecoms failure",
+            "comms fault",
+            "telecommunications equipment",
+        ] {
+            assert_maps(raw, "signal_failure");
+        }
+        // A train's own communications, or telecoms cable theft, keep
+        // their more specific cause.
+        assert_maps("train communications fault", "train_fault");
+        assert_maps("telecoms cable theft", "vandalism");
+        // Without a failure word it isn't a cause.
+        assert!(!normalise("customer communications").recognised);
     }
 
     fn primary_response(category: &str) -> String {
