@@ -79,7 +79,9 @@ fn fold(raw: &str) -> String {
 /// of alternatives. Order matters where a token is shared (`bridge_strike`
 /// before `industrial_action`; `signal_failure` and `points_failure` before
 /// `train_fault`; `engineering_works` before `emergency_services_incident`,
-/// for "emergency engineering works").
+/// for "emergency engineering works"; the emergency speed restriction rule
+/// before `emergency_services_incident`; the generic infrastructure and
+/// speed restriction rules after every specific cause).
 const RULES: &[(&str, &[&[&str]])] = &[
     (
         "other",
@@ -227,6 +229,13 @@ const RULES: &[(&str, &[&[&str]])] = &[
         ]],
     ),
     ("fire", &[&["fire", "fires", "smoke"]]),
+    // An emergency speed restriction is a track fault, not an emergency
+    // services incident; a more specific cause above (flooding, a fallen
+    // tree, fire, ...) still wins.
+    (
+        "track_fault",
+        &[&["emergency"], &["speed"], &["restriction", "restrictions"]],
+    ),
     (
         "emergency_services_incident",
         &[&[
@@ -302,6 +311,22 @@ const RULES: &[(&str, &[&[&str]])] = &[
                 "broken",
                 "buckled",
             ],
+        ],
+    ),
+    // Infrastructure faults with no more specific cause. These come after
+    // every cause rule, so "speed restriction due to flooding" is still
+    // `flooding` and "power infrastructure failure" is still
+    // `power_supply_failure`.
+    ("track_fault", &[&["infrastructure"]]),
+    (
+        "track_fault",
+        &[&["speed"], &["restriction", "restrictions"]],
+    ),
+    (
+        "track_fault",
+        &[
+            &["track", "line", "infrastructure"],
+            &["inspection", "inspections"],
         ],
     ),
     (
@@ -475,6 +500,52 @@ mod tests {
         assert_maps("lineside fire", "fire");
         assert_maps("animals on the line", "animal_on_line");
         assert_maps("unknown", "other");
+    }
+
+    /// Infrastructure causes the production dry-run left unrecognised.
+    #[test]
+    fn infrastructure_faults_map_to_track_fault() {
+        for raw in [
+            "infrastructure failure",
+            "Infrastructure failure",
+            "infrastructure",
+            "Infrastructure",
+            "Track safety inspection",
+            "track safety inspection",
+            "speed restriction",
+            "Speed Restriction",
+            "speed restriction following track safety inspection",
+            "infrastructure_safety_inspection",
+            "emergency speed restriction",
+            "Emergency speed restrictions",
+        ] {
+            assert_maps(raw, "track_fault");
+        }
+    }
+
+    /// The generic infrastructure and speed restriction rules come after
+    /// every specific cause, so a named cause still wins.
+    #[test]
+    fn a_specific_cause_beats_a_speed_restriction() {
+        assert_maps("speed restriction due to flooding", "flooding");
+        assert_maps("emergency speed restriction due to flooding", "flooding");
+        assert_maps("speed restriction due to signal fault", "signal_failure");
+        assert_maps("speed restriction due to landslip", "landslip");
+        assert_maps(
+            "speed restriction due to high temperatures",
+            "severe_weather",
+        );
+        assert_maps(
+            "speed restriction after a fallen tree",
+            "obstruction_on_line",
+        );
+        assert_maps("power infrastructure failure", "power_supply_failure");
+        assert_maps("emergency engineering works", "engineering_works");
+        assert_maps("police incident", "emergency_services_incident");
+        assert_maps("emergency services", "emergency_services_incident");
+        assert_maps("signal fault", "signal_failure");
+        assert_maps("points failure", "points_failure");
+        assert_maps("broken rail", "track_fault");
     }
 
     fn primary_response(category: &str) -> String {
