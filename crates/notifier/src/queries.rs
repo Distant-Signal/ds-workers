@@ -671,7 +671,8 @@ async fn subscriber_stop_delays(
 /// already had, extracted so Task 18's forward-queue cycle can reuse it
 /// without a second, divergent copy of the cooldown/escalation lookup. One
 /// `trains_id` can have MANY independent subscribers (`tracked_trains`
-/// rows); this fans out to every one of them, each judged by its OWN
+/// rows); this fans out to every one of them -- one per user, see the
+/// subscriber query -- each judged by its OWN
 /// cooldown/escalation state in `train_notification_state` (still keyed by
 /// `(user_id, tracked_train_id)` -- unchanged, since that's still each
 /// user's own private escalation history for their own subscription row).
@@ -711,14 +712,24 @@ pub(crate) async fn candidates_for_trains_id(
     let service_date: Option<chrono::NaiveDate> = current.try_get("service_date")?;
     let train = train_uid.zip(service_date);
 
+    // One subscriber per USER, not per subscription: a user can hold two
+    // live subscriptions on one physical train (a pin tracked on its own
+    // that resolved to the same train as one of their journey legs), and
+    // one train's delay must reach them once. The journey leg's
+    // subscription wins, as `GET /Train/mine` folds the other into the
+    // journey too (`TrackedTrainListItem::journey_ids`); then the oldest,
+    // so the choice, and the cooldown state it reads, stays put.
     let subscribers: Vec<Subscriber> = sqlx::query_as(
-        "SELECT ts.id, ts.user_id, \
+        "SELECT DISTINCT ON (ts.user_id) ts.id, ts.user_id, \
                 COALESCE((SELECT jl.destination_crs FROM journey_legs jl \
                           WHERE jl.train_subscription_id = ts.id \
                           ORDER BY jl.id LIMIT 1), \
                          ts.pin_destination_crs) AS stop_crs \
          FROM train_subscriptions ts \
-         WHERE ts.trains_id = $1 AND ts.notifications_enabled",
+         WHERE ts.trains_id = $1 AND ts.notifications_enabled \
+         ORDER BY ts.user_id, \
+                  EXISTS (SELECT 1 FROM journey_legs jl WHERE jl.train_subscription_id = ts.id) DESC, \
+                  ts.id",
     )
     .bind(trains_id)
     .fetch_all(pool)
@@ -4239,6 +4250,113 @@ mod tests {
                 .await
                 .ok();
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                candidates_for_trains_id_notifies_a_user_once_per_train \
+                -- --ignored --test-threads=1`"]
+    async fn candidates_for_trains_id_notifies_a_user_once_per_train() {
+        // A pin tracked on its own that resolved to the same train as one
+        // of the user's journey legs: two live subscriptions, one push, on
+        // the journey leg's subscription.
+        let pool = connect().await;
+        let service_date: chrono::NaiveDate = "2026-09-06".parse().unwrap();
+        let user_id = "TEST-ONCE-PER-TRAIN-USER";
+        let trains_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-ONCE-PER-TRAIN-UID', $1) \
+             RETURNING id",
+        )
+        .bind(service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+        sqlx::query(
+            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@example.com"))
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("seed fixture user");
+        let mut subscription_ids = Vec::new();
+        for _ in 0..2 {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO train_subscriptions \
+                    (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
+                 VALUES ($1, $2, 'EUS', $3, $4, 'resolved') RETURNING id",
+            )
+            .bind(user_id)
+            .bind(service_date)
+            .bind(service_date.and_hms_opt(19, 15, 0).unwrap().and_utc())
+            .bind(trains_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seed a subscription on the shared train");
+            subscription_ids.push(id);
+        }
+        // The NEWER subscription is the journey leg's, so the pick is by
+        // the leg, not by age.
+        let journey_leg_subscription = subscription_ids[1];
+        let (journey_id,): (i64,) =
+            sqlx::query_as("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("seed journey");
+        sqlx::query(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, destination_crs, service_date, \
+                 train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'EUS', 'MAN', $2, $3, 'manual')",
+        )
+        .bind(journey_id)
+        .bind(service_date)
+        .bind(journey_leg_subscription)
+        .execute(&pool)
+        .await
+        .expect("seed journey leg");
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status, delay_minutes) VALUES ($1, 'en_route', 20)",
+        )
+        .bind(trains_id)
+        .execute(&pool)
+        .await
+        .expect("seed current state showing a real delay");
+
+        let candidates = candidates_for_trains_id(&pool, trains_id, 15)
+            .await
+            .expect("candidates_for_trains_id");
+
+        sqlx::query("DELETE FROM journeys WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_current_state WHERE trains_id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE trains_id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(candidates.len(), 1, "one push per user per train");
+        assert_eq!(candidates[0].tracked_train_id, journey_leg_subscription);
     }
 
     #[tokio::test]
