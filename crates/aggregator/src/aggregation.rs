@@ -395,10 +395,11 @@ fn validity_for_output(periods: &[ValidityPeriod]) -> ValidityPeriod {
 
 /// Whether `period` covers the instant `now`. Shared by `validity_for_output`
 /// (picks which period to *display*) and `is_active` (decides whether an
-/// incident is included at all) so the "is this period active" condition
-/// has one definition, not two.
+/// incident is included at all), and with the api's incident state through
+/// `common::incident_validity`, so the "is this period active" condition
+/// has one definition, not three.
 fn period_covers_now(period: &ValidityPeriod, now: DateTime<Utc>) -> bool {
-    period.from_date <= now && period.to_date.is_none_or(|to| to > now)
+    common::incident_validity::period_covers(period, now)
 }
 
 /// Whether `status` is in effect at `now`, so live data (LDBWS samples, a
@@ -462,9 +463,12 @@ enum Keep {
 ///    [`Keep::Undated`]).
 fn keep_reason(loaded: &LoadedIncident, now: DateTime<Utc>) -> Option<Keep> {
     let incident = &loaded.message;
-    let validity_ok =
-        incident.validity.is_empty() || incident.validity.iter().any(|p| period_covers_now(p, now));
-    if !validity_ok {
+    // The same rule as the incident's own "Active" state on its page
+    // (`common::incident_validity`): an incident whose windows are all
+    // still to come, or all over, contributes nothing to a line.
+    if common::incident_validity::ValidityPhase::of(&incident.validity, now)
+        != common::incident_validity::ValidityPhase::Active
+    {
         return None;
     }
     if incident.is_planned {
