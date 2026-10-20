@@ -233,7 +233,7 @@ before choosing between tuned Haiku and Sonnet.
 ### Tuned Haiku prompts
 
 `crates/enricher/prompts/` holds a prompt set for the `claude-haiku-5`
-profile (version `42e7efea092c`): `claude-haiku-5.primary.txt` and
+profile (version `0f5df4652b2c`): `claude-haiku-5.primary.txt` and
 `claude-haiku-5.severity_adversarial.txt`; the resolution check stays the
 shared built-in prompt. The primary prompt is the shared one with its
 severity sentence replaced, plus rules aimed at Haiku's errors in the
@@ -272,14 +272,14 @@ kubectl create configmap enricher-prompts \
 # then enricher.llm.prompts.configMap: enricher-prompts
 ```
 
-`model_version` becomes `claude-haiku-5-5@periods-v2+prompts-42e7efea092c`,
+`model_version` becomes `claude-haiku-5-5@periods-v2+prompts-0f5df4652b2c`,
 so the sweep re-extracts every live incident once (a few hundred Haiku
 calls). For the re-run, an eval target names `profile = "claude-haiku-5"`
 and `prompts_dir` pointing at these files.
 
 ## Output checks
 
-Three deterministic checks run for every model and provider in the combine
+Four deterministic checks run for every model and provider in the combine
 and validation step after the three calls
 (`main.rs::combine_and_check`, shared by the synchronous and batch paths;
 `crates/enricher/src/checks.rs` and `combine::echo_mismatch`). `enricher
@@ -336,7 +336,7 @@ estimate). What happens to a flagged period:
 - `flagged`: several ETA-shaped periods (a phased notice): left alone, only
   reported.
 
-The three counters are registered at 0 at startup with every label
+The four counters are registered at 0 at startup with every label
 combination (`call` `resolution_adversarial`/`severity_adversarial`,
 `kind` `count`/`echo`, `result` `recovered`/`failed`; `action` as above),
 so "no events" reads as 0 rather than a missing series.
@@ -352,6 +352,35 @@ at all, which this check can't add), from 98.4% to 99.5% for Haiku and from
 98.6% to 99.6% for Sonnet, and no end time that was right became wrong. The
 unit tests cover BST, GMT, the clock-change day and the after-midnight
 cases.
+
+**Stated year.** National Rail notices give days without a year ("Sunday
+3 January", "from Monday 4 to Thursday 7 January"). Each day and month the
+text states is resolved on the reference date's Europe/London day: a stated
+year wins; otherwise the occurrence from 92 days before the reference day to
+274 days (about nine months) after it, since notices announce work ahead.
+When two occurrences fall in that window (or none does), one on the named
+weekday wins, then the nearer. The window comes first because notices get
+weekdays wrong: a "Thursday 1 January" notice of October 2026 is for Friday
+1 January 2027, as the feed's own validity period says. A period date on a
+stated day and month (a `to_date` at local midnight also counts as the
+inclusive end of the day before) in another year moves there, with the
+period's other date, keeping local times across BST and GMT. It runs before
+the stated end time check. Counted per period in
+`enricher_period_year_checks_total{action}`:
+
+- `corrected`: both dates moved by the difference;
+- `flagged`: the period's dates disagree about the difference, or, in a text
+  that states no year at all, a date that matches no stated day is more than
+  a year before the reference time or more than 274 days after it. Left
+  alone, only reported.
+
+It came from production in October 2026: three January 2027 notices
+(DA8E46F4..., 0D58CC8E..., 7EAD2B82...) were extracted into January 2026.
+Run over all 2,541 stored extractions on 20 October 2026, it corrected
+exactly those three and flagged nothing. The stated end time check uses the
+same year rule; it used to take the nearest occurrence, which from June put
+"Friday 1 January" in the January just gone. The four counters above
+include this one's (`action` `corrected`/`flagged`).
 
 ## Setup
 

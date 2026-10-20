@@ -1144,8 +1144,12 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     from 18:00\") is expressed as a period whose `date_range.to_date` is that time, with `from_date: null` \
     -- do not add a separate field for it. Apply these conventions when resolving a stated date into that \
     timestamp: (1) Year inference -- the text is given together with a reference date this incident was \
-    first reported around; if a date has no stated year, resolve it to whichever occurrence of that \
-    month/day falls closest to the reference date -- do NOT invent an unrelated year. (2) Inclusivity -- a \
+    first reported around, and that date's Europe/London day and weekday. A year the text states always \
+    wins. If a date has no stated year, resolve it to the occurrence of that month/day from about three \
+    months before the reference date to about nine months after it: notices announce work ahead, so a \
+    January date in a notice first reported in October is the NEXT January, never the one already gone. \
+    Only if two occurrences fit, take the one on the weekday the text names. Do NOT invent an unrelated \
+    year. (2) Inclusivity -- a \
     stated end day (e.g. \"to Sunday 26 July\") means *through* that day, so its resolved `to_date` must be \
     the *following* day's 00:00 in Europe/London local time, converted to UTC -- not that day's own 00:00. \
     (3) Timezone -- a bare date with no stated time-of-day is a Europe/London calendar-day boundary; convert \
@@ -1158,8 +1162,8 @@ const PRIMARY_PROMPT: &str = "You extract structured facts from UK National Rail
     at Clapham Junction is closed, trains call at platform 4. Saturday 16 May to Sunday 14 June: Platform 5 \
     is closed, trains call at platform 6.\" segments into exactly two periods -- period 1: \
     `scope_description` \"platform 3 closed, calls at platform 4\", `date_range` `{\"from_date\": \
-    \"2026-04-05T23:00:00Z\", \"to_date\": \"2026-05-15T23:00:00Z\"}` (2026 because that's the closest \
-    occurrence to the March 2026 reference date; `to_date` is the day AFTER the stated 15 May end; both \
+    \"2026-04-05T23:00:00Z\", \"to_date\": \"2026-05-15T23:00:00Z\"}` (2026 because that's the \
+    occurrence within nine months after the March 2026 reference date; `to_date` is the day AFTER the stated 15 May end; both \
     dates fall in BST, UTC+1, so each Europe/London midnight is 23:00Z on the previous UTC day -- in GMT \
     it would be 00:00Z), \
     `schedule_window: null`, `resolution_status: \"ongoing\"` (no statement that it has ended); period 2: \
@@ -2000,9 +2004,13 @@ pub(crate) fn primary_spec(
         call: LlmCall::Primary,
         system_prompt: prompts.primary.clone(),
         user_content: format!(
-            "This incident was first reported around {}. Resolve any year-less date in the text below \
-             relative to that reference date.\nSummary: {summary}\nDescription: {description}",
-            reference_date.to_rfc3339()
+            "This incident was first reported around {} ({} in Europe/London). Resolve any year-less \
+             date in the text below relative to that reference date.\nSummary: {summary}\n\
+             Description: {description}",
+            reference_date.to_rfc3339(),
+            reference_date
+                .with_timezone(&chrono_tz::Europe::London)
+                .format("%A %-d %B %Y")
         ),
         schema_name: PRIMARY_SCHEMA_NAME,
         schema: primary_schema(),
@@ -3166,6 +3174,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_string_contains("2026-04-10T09:00:00+00:00"))
+            .and(body_string_contains(
+                "(Friday 10 April 2026 in Europe/London)",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{
                     "message": {

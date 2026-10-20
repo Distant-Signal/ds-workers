@@ -663,7 +663,7 @@ mod tests {
     /// the docs with it.
     #[test]
     fn the_tuned_haiku_prompts_load_only_for_the_haiku_profile() {
-        const TUNED_HAIKU_PROMPTS_VERSION: &str = "42e7efea092c";
+        const TUNED_HAIKU_PROMPTS_VERSION: &str = "0f5df4652b2c";
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let builtin = PromptSet::builtin();
         let haiku = PromptSet::load(Some(&dir), "claude-haiku-5").unwrap();

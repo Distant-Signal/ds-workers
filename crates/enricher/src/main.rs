@@ -457,6 +457,8 @@ const RAIL_REPLACEMENT_DOWNGRADES_METRIC: &str = "enricher_rail_replacement_down
 const ECHO_MISMATCHES_METRIC: &str = "enricher_adversarial_echo_mismatches_total";
 /// `enricher_end_time_checks_total{action}` ([`record_check_report`]).
 const END_TIME_CHECKS_METRIC: &str = "enricher_end_time_checks_total";
+/// `enricher_period_year_checks_total{action}` ([`record_check_report`]).
+const YEAR_CHECKS_METRIC: &str = "enricher_period_year_checks_total";
 /// The calls the echo check re-asks.
 const ECHO_CALLS: [llm::LlmCall; 2] = [
     llm::LlmCall::ResolutionAdversarial,
@@ -488,6 +490,13 @@ fn register_check_metrics() {
     for action in checks::EndTimeAction::ALL {
         metrics::counter!(
             common::metrics::metric_name(END_TIME_CHECKS_METRIC),
+            "action" => action.label()
+        )
+        .increment(0);
+    }
+    for action in checks::YearAction::ALL {
+        metrics::counter!(
+            common::metrics::metric_name(YEAR_CHECKS_METRIC),
             "action" => action.label()
         )
         .increment(0);
@@ -1440,8 +1449,9 @@ fn record_echo_mismatch(
 }
 
 /// Logs and counts what the output checks (`checks.rs`) changed:
-/// `enricher_rail_replacement_downgrades_total` (periods) and
-/// `enricher_end_time_checks_total{action}` (periods).
+/// `enricher_rail_replacement_downgrades_total` (periods),
+/// `enricher_end_time_checks_total{action}` (periods) and
+/// `enricher_period_year_checks_total{action}` (periods).
 fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
     if report.is_clean() {
         return;
@@ -1473,6 +1483,22 @@ fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
         );
         metrics::counter!(
             common::metrics::metric_name(END_TIME_CHECKS_METRIC),
+            "action" => flag.action.label()
+        )
+        .increment(1);
+    }
+    for flag in &report.years {
+        tracing::warn!(
+            incident_id,
+            period_index = flag.period_index,
+            from_date = ?flag.from_date.map(|at| at.to_rfc3339()),
+            to_date = ?flag.to_date.map(|at| at.to_rfc3339()),
+            shifted_years = flag.shifted_years,
+            action = flag.action.label(),
+            "period dates are in a different year from the dates the text states"
+        );
+        metrics::counter!(
+            common::metrics::metric_name(YEAR_CHECKS_METRIC),
             "action" => flag.action.label()
         )
         .increment(1);
@@ -2266,6 +2292,11 @@ mod tests {
                 "distant_signal_enricher_end_time_checks_total{{action=\"{action}\"}} 0"
             ));
         }
+        for action in ["corrected", "flagged"] {
+            want.push(format!(
+                "distant_signal_enricher_period_year_checks_total{{action=\"{action}\"}} 0"
+            ));
+        }
         for line in &want {
             assert!(rendered.lines().any(|l| l == line), "{line}\n{rendered}");
         }
@@ -2282,6 +2313,10 @@ mod tests {
         assert_eq!(
             checks::EndTimeAction::ALL.map(checks::EndTimeAction::label),
             ["corrected", "dropped", "flagged"]
+        );
+        assert_eq!(
+            checks::YearAction::ALL.map(checks::YearAction::label),
+            ["corrected", "flagged"]
         );
     }
 

@@ -17,6 +17,10 @@
 //!   unambiguous one, its end time is dropped; with several ETA-shaped
 //!   periods (a phased notice), or a time placed only by a bare weekday,
 //!   it is only flagged.
+//! - **Stated year** ([`years::check_years`]): a period date on a day and
+//!   month the text states without a year ("Sunday 3 January") must be in
+//!   the year [`years::resolve`] gives it against the reference date; one
+//!   that isn't is moved there, with the rest of its period.
 //!
 //! The third check, that an adversarial pass's verdicts echo the primary
 //! periods, is `combine::echo_mismatch` (and the retry around it).
@@ -35,6 +39,10 @@ use serde::Serialize;
 
 use crate::llm::ExtractionPeriod;
 
+pub(crate) mod years;
+
+pub(crate) use years::{YearAction, YearFlag};
+
 /// The incident text the checks read.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CheckText<'a> {
@@ -52,12 +60,15 @@ pub(crate) struct CheckReport {
     /// Every period whose end time was flagged, and what was done.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub end_times: Vec<EndTimeFlag>,
+    /// Every period whose year was flagged, and what was done.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub years: Vec<YearFlag>,
 }
 
 impl CheckReport {
     /// Whether nothing was changed or flagged.
     pub(crate) fn is_clean(&self) -> bool {
-        self.rail_replacement_downgraded == 0 && self.end_times.is_empty()
+        self.rail_replacement_downgraded == 0 && self.end_times.is_empty() && self.years.is_empty()
     }
 }
 
@@ -97,11 +108,14 @@ impl EndTimeAction {
     }
 }
 
-/// Applies both checks to `periods` in place.
+/// Applies the checks to `periods` in place. The year check runs first,
+/// so the end time check compares stated times with corrected dates.
 pub(crate) fn apply(text: &CheckText<'_>, periods: &mut [ExtractionPeriod]) -> CheckReport {
+    let years = years::check_years(text, periods);
     CheckReport {
         rail_replacement_downgraded: guard_rail_replacement(text, periods),
         end_times: check_end_times(text, periods),
+        years,
     }
 }
 
@@ -356,19 +370,21 @@ fn resolve_day(after: &str, reference_local: NaiveDateTime) -> (NaiveDate, Day) 
         return (today, Day::Named);
     }
     if let (Some(dom), Some(month)) = (caps.name("dom"), caps.name("month")) {
-        let dom: u32 = dom.as_str().parse().unwrap_or(0);
-        let month = MONTHS
-            .iter()
-            .position(|m| *m == month.as_str())
-            .and_then(|i| u32::try_from(i + 1).ok())
-            .unwrap_or(0);
-        // The occurrence closest to the reference day, as the primary
-        // prompt's year inference does.
-        let closest = [today.year() - 1, today.year(), today.year() + 1]
-            .into_iter()
-            .filter_map(|year| NaiveDate::from_ymd_opt(year, month, dom))
-            .min_by_key(|date| (*date - today).num_days().abs());
-        if let Some(date) = closest {
+        // The year rule the stated-year check uses (`years::resolve`).
+        let stated = dom
+            .as_str()
+            .parse()
+            .ok()
+            .zip(years::month_number(month.as_str()))
+            .map(|(day, month)| years::StatedDate {
+                month,
+                day,
+                weekday: caps
+                    .name("weekday")
+                    .and_then(|w| years::weekday(w.as_str())),
+                year: None,
+            });
+        if let Some(date) = stated.and_then(|stated| years::resolve(stated, today)) {
             return (date, Day::Named);
         }
     }
@@ -503,6 +519,8 @@ struct Patterns {
     end_of_day: Regex,
     any_until: Regex,
     day_words: Regex,
+    stated_date: Regex,
+    any_year: Regex,
 }
 
 #[expect(
@@ -535,6 +553,12 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| {
             r"^\s*,?\s*(?:(?P<tomorrow>tomorrow)|(?P<today>today|tonight)|(?:on\s+)?(?:(?P<weekday>monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*)?(?:(?P<dom>\d{{1,2}})(?:st|nd|rd|th)?\s+(?P<month>{}))?)",
             MONTHS.join("|")
         )),
+        stated_date: compile(&format!(
+            r"\b(?:(?P<weekday>{})\s*,?\s+)?(?P<dom>[0-3]?\d)(?:st|nd|rd|th)?\s+(?P<month>{})\b(?:\s*,?\s*(?P<year>20\d\d)\b)?",
+            WEEKDAYS.join("|"),
+            MONTHS.join("|")
+        )),
+        any_year: compile(r"\b20\d\d\b"),
     }
 });
 

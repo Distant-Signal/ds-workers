@@ -178,6 +178,10 @@ struct CheckCounts {
     end_time_records: usize,
     /// Flagged periods, by action (`corrected`, `dropped`, `flagged`).
     end_time_periods: BTreeMap<&'static str, usize>,
+    /// Records with a period year flagged.
+    year_records: usize,
+    /// Periods with a year flagged, by action (`corrected`, `flagged`).
+    year_periods: BTreeMap<&'static str, usize>,
 }
 
 impl CheckCounts {
@@ -202,6 +206,12 @@ impl CheckCounts {
                     .end_time_periods
                     .entry(flag.action.label())
                     .or_default() += 1;
+            }
+            if !report.years.is_empty() {
+                counts.year_records += 1;
+            }
+            for flag in &report.years {
+                *counts.year_periods.entry(flag.action.label()).or_default() += 1;
             }
         }
         counts
