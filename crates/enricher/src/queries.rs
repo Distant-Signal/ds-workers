@@ -108,12 +108,10 @@ pub(crate) async fn fetch_incident_state(
 }
 
 /// Persists a completed extraction. `category`/`periods` are the fields
-/// this crate writes going forward -- `extracted_periods` replaces the six
-/// deprecated flat columns (`extracted_resolution_status`,
-/// `extracted_schedule_window`, `extracted_eta`, `extraction_confidence`,
-/// `extracted_severity`, `extracted_severity_confidence`), which are left
-/// untouched at the SQL/table level (design §3/§5's two-step migration --
-/// this code path simply stops writing them). `periods` is the output of
+/// this crate writes -- `extracted_periods` replaced the six flat
+/// single-fact columns of the original design, which
+/// `20261021090000_drop_incident_flat_extraction_columns.sql` dropped
+/// (multi-period design §5's step 2). `periods` is the output of
 /// `combine::combine_periods`, so its `resolution_status_confidence`/
 /// `severity_confidence` fields are already populated.
 ///

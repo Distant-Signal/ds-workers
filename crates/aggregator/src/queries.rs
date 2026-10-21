@@ -5250,15 +5250,12 @@ mod tests {
         let mid_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(20);
         let user_id = "TEST-PRUNE-TIER-TRACKED-USER";
 
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .bind("prune-tier-tracked@example.com")
-        .bind(user_id)
-        .execute(&pool)
-        .await
-        .expect("seed fixture user");
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fixture user");
 
         let (tracked_id,): (i64,) = sqlx::query_as(
             "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TIER-TRACKED', $1) \
@@ -5327,15 +5324,12 @@ mod tests {
         let old_date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(40);
         let user_id = "TEST-PRUNE-TIER-TRACKED-OLD-USER";
 
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .bind("prune-tier-tracked-old@example.com")
-        .bind(user_id)
-        .execute(&pool)
-        .await
-        .expect("seed fixture user");
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fixture user");
 
         let (tracked_id,): (i64,) = sqlx::query_as(
             "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-PRUNE-TIER-TRACKED-OLD', $1) \

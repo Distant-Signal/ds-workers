@@ -2277,15 +2277,12 @@ mod tests {
     }
 
     async fn seed_user(pool: &PgPool, user_id: &str) {
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .bind(format!("{user_id}@example.com"))
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("seed fixture user");
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("seed fixture user");
     }
 
     async fn cleanup_line_history(pool: &PgPool, line_id: &str) {
@@ -4065,15 +4062,12 @@ mod tests {
         .expect("seed trains row");
 
         for user_id in ["TEST-FANOUT-USER-A", "TEST-FANOUT-USER-B"] {
-            sqlx::query(
-                "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(user_id)
-            .bind(format!("{user_id}@example.com"))
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("seed fixture user");
+            sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+                .bind(user_id)
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("seed fixture user");
             sqlx::query(
                 "INSERT INTO train_subscriptions \
                     (user_id, service_date, pin_origin_crs, pin_scheduled_departure, trains_id, resolution_status) \
@@ -4168,15 +4162,12 @@ mod tests {
             "TEST-DISABLED-SUB-USER-ENABLED",
             "TEST-DISABLED-SUB-USER-DISABLED",
         ] {
-            sqlx::query(
-                "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(user_id)
-            .bind(format!("{user_id}@example.com"))
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("seed fixture user");
+            sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+                .bind(user_id)
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("seed fixture user");
         }
         sqlx::query(
             "INSERT INTO train_subscriptions \
@@ -4271,15 +4262,12 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("seed trains row");
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .bind(format!("{user_id}@example.com"))
-        .bind(user_id)
-        .execute(&pool)
-        .await
-        .expect("seed fixture user");
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed fixture user");
         let mut subscription_ids = Vec::new();
         for _ in 0..2 {
             let (id,): (i64,) = sqlx::query_as(
@@ -4554,15 +4542,12 @@ mod tests {
         .await
         .expect("seed subscribed train");
 
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind("TEST-NOSUB-SUBSCRIBER")
-        .bind("test-nosub-subscriber@example.com")
-        .bind("TEST-NOSUB-SUBSCRIBER")
-        .execute(&pool)
-        .await
-        .expect("seed fixture user");
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind("TEST-NOSUB-SUBSCRIBER")
+            .bind("TEST-NOSUB-SUBSCRIBER")
+            .execute(&pool)
+            .await
+            .expect("seed fixture user");
 
         sqlx::query(
             "INSERT INTO train_subscriptions \
@@ -4709,15 +4694,12 @@ mod sweep_tests {
     }
 
     async fn seed_user(pool: &PgPool, user_id: &str) {
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .bind(format!("{user_id}@example.com"))
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("seed fixture user");
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("seed fixture user");
     }
 
     async fn cleanup_user(pool: &PgPool, user_id: &str) {
@@ -6228,7 +6210,7 @@ mod grant_notice_tests {
             .execute(&pool)
             .await
             .ok();
-        sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $1, $1)")
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1)")
             .bind(user)
             .execute(&pool)
             .await

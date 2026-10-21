@@ -1464,14 +1464,11 @@ mod tests {
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(20);
         let ids = seed(&pool, "TEST-ARCHIVE-TIER-", date, 2).await;
         let user_id = "test-archive-tier-user";
-        sqlx::query(
-            "INSERT INTO users (id, email, name) VALUES ($1, $2, $1) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user_id)
-        .bind("archive-tier@example.com")
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO train_subscriptions \
                  (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure) \
