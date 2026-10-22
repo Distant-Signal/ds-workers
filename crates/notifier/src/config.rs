@@ -97,7 +97,8 @@ pub(crate) struct Config {
     /// a prediction from its previous working, and a high-confidence one at
     /// or above `train_delay_threshold_minutes` is pushed once, sharing the
     /// delay pushes' state (so the delay push that follows does not repeat
-    /// it). 0 turns the check off.
+    /// it). Like the delay push, it defers to an open journey break on the
+    /// train while break notices are on. 0 turns the check off.
     #[arg(long, env, default_value_t = 60)]
     pub predicted_start_poll_interval_secs: u64,
 

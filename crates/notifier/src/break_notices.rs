@@ -20,7 +20,8 @@
 //!   already in the app);
 //! - **one push per user per train** (§6.3): the notice is that train's
 //!   push. Its delivery writes the train's `train_notification_state` at
-//!   the equivalent rank, the train path defers to an open break on the
+//!   the equivalent rank, the train path (delay and cancel pushes, and
+//!   DS-127's predicted late starts) defers to an open break on the
 //!   train ([`break_owns_train`]), and the queue drops a queued plain push
 //!   for the train (`push_queue`'s supersede). Its `tag` is the train's, so
 //!   a plain push that raced it is replaced on the phone.

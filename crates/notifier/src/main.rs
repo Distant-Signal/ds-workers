@@ -657,7 +657,8 @@ async fn run_predicted_start_cycle(
     delay_threshold_minutes: i32,
 ) -> anyhow::Result<()> {
     let candidates =
-        queries::predicted_start_candidates(pool, delay_threshold_minutes, now).await?;
+        predicted_start_pushes(pool, delay_threshold_minutes, now, break_notices::enabled())
+            .await?;
     for candidate in candidates {
         tracing::info!(
             tracked_train_id = candidate.tracked_train_id,
@@ -686,6 +687,37 @@ async fn run_predicted_start_cycle(
         );
     }
     Ok(())
+}
+
+/// The predicted late starts to push this cycle. One push per user per
+/// train (mid-journey changes spec §6.3) holds here as on the delay path:
+/// with break notices on (`defer_to_breaks`), an open break on a journey
+/// using the train owns its push, so the break notice is the only one.
+async fn predicted_start_pushes(
+    pool: &PgPool,
+    delay_threshold_minutes: i32,
+    now: DateTime<Utc>,
+    defer_to_breaks: bool,
+) -> anyhow::Result<Vec<queries::PredictedStartCandidate>> {
+    let candidates =
+        queries::predicted_start_candidates(pool, delay_threshold_minutes, now).await?;
+    if !defer_to_breaks {
+        return Ok(candidates);
+    }
+    let mut pushes = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if break_notices::break_owns_train(pool, &candidate.user_id, candidate.tracked_train_id)
+            .await?
+        {
+            tracing::info!(
+                tracked_train_id = candidate.tracked_train_id,
+                "predicted-start push deferred to the journey's break notice"
+            );
+            continue;
+        }
+        pushes.push(candidate);
+    }
+    Ok(pushes)
 }
 
 /// The predicted-late-start push (DS-127). Worded as an expectation, with
@@ -1481,6 +1513,159 @@ mod db_tests {
         assert_eq!(queue.depth() + queue.in_flight(), 0, "nothing is sent");
         let report = queue.shutdown(Duration::from_secs(5)).await;
         assert!(report.drained);
+    }
+
+    /// One push per user per train (mid-journey changes spec §6.3) holds
+    /// for DS-127's predicted late start too: an open break with
+    /// suggestions on a journey using the train owns its push, so the
+    /// predicted-start push stays quiet while break notices are on, and
+    /// goes out as before when they are off or the journey is muted.
+    /// Fixtures the notifier's role may not write go in through the
+    /// migration owner when it is set.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "scenario test: the fixtures read top to bottom"
+    )]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_journey_break_owns_the_predicted_start_push -- --ignored --test-threads=1`"]
+    async fn a_journey_break_owns_the_predicted_start_push() {
+        let pool = connect().await;
+        let fixtures = match std::env::var("MIGRATION_DATABASE_URL") {
+            Ok(url) => PgPoolOptions::new()
+                .connect(&url)
+                .await
+                .expect("owner pool"),
+            Err(_) => pool.clone(),
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2099, 7, 14).expect("date");
+        let user = "TEST-PREDICTED-START-BREAK";
+        let cleanup = async |fixtures: &PgPool| {
+            for sql in [
+                "DELETE FROM journeys WHERE user_id = $1",
+                "DELETE FROM train_subscriptions WHERE user_id = $1",
+                "DELETE FROM users WHERE id = $1",
+            ] {
+                sqlx::query(sql)
+                    .bind(user)
+                    .execute(fixtures)
+                    .await
+                    .expect(sql);
+            }
+            for sql in [
+                "DELETE FROM trains WHERE service_date = $1",
+                "DELETE FROM schedule_turnarounds WHERE service_date = $1",
+            ] {
+                sqlx::query(sql)
+                    .bind(date)
+                    .execute(fixtures)
+                    .await
+                    .expect(sql);
+            }
+        };
+        cleanup(&fixtures).await;
+        seed_user(&fixtures, user).await;
+
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO schedule_turnarounds (service_date, uid, prev_service_date, prev_uid, \
+             booked_turnaround_minutes, link, origin_tiploc, platform, departs_at) \
+             VALUES ($1, 'PSB0001', $1, 'PSB0000', 9, 'inferred', 'YORK', '3', $2)",
+        )
+        .bind(date)
+        .bind(now + chrono::Duration::minutes(30))
+        .execute(&fixtures)
+        .await
+        .expect("turnaround");
+        let ours: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('PSB0001', $1) RETURNING id",
+        )
+        .bind(date)
+        .fetch_one(&fixtures)
+        .await
+        .expect("our train");
+        let incoming: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('PSB0000', $1) RETURNING id",
+        )
+        .bind(date)
+        .fetch_one(&fixtures)
+        .await
+        .expect("incoming train");
+        // 20 late on a 9-minute turnaround: a high-confidence 15 late.
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status, delay_minutes, event_time) \
+             VALUES ($1, 'en_route', 20, $2)",
+        )
+        .bind(incoming)
+        .bind(now)
+        .execute(&fixtures)
+        .await
+        .expect("incoming state");
+        let subscription: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date, resolution_status, trains_id) \
+             VALUES ($1, $2, 'schedule_matched', $3) RETURNING id",
+        )
+        .bind(user)
+        .bind(date)
+        .bind(ours)
+        .fetch_one(&fixtures)
+        .await
+        .expect("subscription");
+        let journey: i64 =
+            sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+                .bind(user)
+                .fetch_one(&fixtures)
+                .await
+                .expect("journey");
+        let leg: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs (journey_id, leg_order, origin_crs, destination_crs, \
+                 service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'YRK', 'KGX', $2, $3, 'manual') RETURNING id",
+        )
+        .bind(journey)
+        .bind(date)
+        .bind(subscription)
+        .fetch_one(&fixtures)
+        .await
+        .expect("leg");
+        sqlx::query(
+            "INSERT INTO journey_breaks (journey_id, user_id, cause, fault, severity, \
+                 trigger_leg_id, break_position, fingerprint, suggestions) \
+             VALUES ($1, $2, 'connection_missed', 'operator', 1, $3, 1, 'f', \
+                 '{\"suggestions\": []}')",
+        )
+        .bind(journey)
+        .bind(user)
+        .bind(leg)
+        .execute(&fixtures)
+        .await
+        .expect("break");
+
+        let ours_pushed = |pushes: &[queries::PredictedStartCandidate]| {
+            pushes.iter().any(|c| c.tracked_train_id == subscription)
+        };
+        // Break notices off: the predicted start pushes as before.
+        let pushes = predicted_start_pushes(&pool, 15, now, false)
+            .await
+            .expect("pushes");
+        assert!(ours_pushed(&pushes));
+        // On: the open break owns the train's push.
+        let pushes = predicted_start_pushes(&pool, 15, now, true)
+            .await
+            .expect("pushes");
+        assert!(!ours_pushed(&pushes));
+        // A muted journey's break sends nothing, so the train pushes again.
+        sqlx::query("UPDATE journeys SET suggestions_muted = TRUE WHERE id = $1")
+            .bind(journey)
+            .execute(&fixtures)
+            .await
+            .expect("mute");
+        let pushes = predicted_start_pushes(&pool, 15, now, true)
+            .await
+            .expect("pushes");
+        assert!(ours_pushed(&pushes));
+
+        cleanup(&fixtures).await;
     }
 
     async fn seed_user(pool: &PgPool, user_id: &str) {
