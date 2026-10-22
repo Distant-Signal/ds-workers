@@ -1227,33 +1227,52 @@ pub(crate) struct JourneyLegContext {
 /// notified via the existing per-trains_id fan-out. Rare, and no worse
 /// than the ambiguity already inherent in "one physical train, several
 /// subscribers" today.
-pub(crate) async fn journey_leg_for_train_subscription(
-    pool: &PgPool,
-    tracked_train_id: i64,
-) -> anyhow::Result<Option<JourneyLegContext>> {
-    let row = sqlx::query_as::<_, JourneyLegContext>(
+/// [`journey_leg_for_train_subscription`]'s query. Each leg end is the
+/// leg's own code, else its pin, else its train's route
+/// (`ds_store::trains::leg_crs_sql`, DS-144), so a leg saved before its
+/// train had a timetable still names its route in the push.
+static JOURNEY_LEG_CONTEXT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use ds_store::trains::{LegEnd, leg_crs_sql};
+    let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
+    let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
+    let last_destination = leg_crs_sql(LegEnd::Destination, "jl3", "ts3", "tr3");
+    format!(
         "SELECT j.id AS journey_id, j.custom_name AS journey_name, \
                 (SELECT COUNT(*) FROM journey_legs jl2 \
                  WHERE jl2.journey_id = jl.journey_id AND jl2.leg_order <= jl.leg_order) AS leg_position, \
                 (SELECT COUNT(*) FROM journey_legs jl2 WHERE jl2.journey_id = jl.journey_id) AS total_legs, \
-                jl.origin_crs, so.name AS origin_name, jl.destination_crs, sd.name AS destination_name, \
+                {origin} AS origin_crs, so.name AS origin_name, \
+                {destination} AS destination_crs, sd.name AS destination_name, \
                 last_leg.destination_crs AS journey_destination_crs, \
                 sj.name AS journey_destination_name \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
+         LEFT JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+         LEFT JOIN trains tr ON tr.id = ts.trains_id \
          CROSS JOIN LATERAL ( \
-             SELECT jl3.destination_crs FROM journey_legs jl3 WHERE jl3.journey_id = jl.journey_id \
+             SELECT {last_destination} AS destination_crs \
+             FROM journey_legs jl3 \
+             LEFT JOIN train_subscriptions ts3 ON ts3.id = jl3.train_subscription_id \
+             LEFT JOIN trains tr3 ON tr3.id = ts3.trains_id \
+             WHERE jl3.journey_id = jl.journey_id \
              ORDER BY jl3.leg_order DESC LIMIT 1 \
          ) last_leg \
-         LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
-         LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
+         LEFT JOIN stations so ON so.crs = UPPER({origin})::bpchar \
+         LEFT JOIN stations sd ON sd.crs = UPPER({destination})::bpchar \
          LEFT JOIN stations sj ON sj.crs = UPPER(last_leg.destination_crs)::bpchar \
          WHERE jl.train_subscription_id = $1 \
-         ORDER BY jl.id LIMIT 1",
+         ORDER BY jl.id LIMIT 1"
     )
-    .bind(tracked_train_id)
-    .fetch_optional(pool)
-    .await?;
+});
+
+pub(crate) async fn journey_leg_for_train_subscription(
+    pool: &PgPool,
+    tracked_train_id: i64,
+) -> anyhow::Result<Option<JourneyLegContext>> {
+    let row = sqlx::query_as::<_, JourneyLegContext>(JOURNEY_LEG_CONTEXT_SQL.as_str())
+        .bind(tracked_train_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row)
 }
 
@@ -1395,35 +1414,46 @@ pub(crate) struct CommittedLeg {
 /// A leg committed to a bus or ferry (`schedule_services.mode <> 'train'`)
 /// is left out (2026-10-06): it is timetable-only, gets no live alerts, and
 /// Darwin's board would only ever pair it with some other service.
+/// [`list_committed_legs_for_today`]'s query, each leg end read through
+/// `ds_store::trains::leg_crs_sql` (DS-144): a leg saved without codes is
+/// checked against its train's route rather than skipped.
+static COMMITTED_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use ds_store::trains::{LegEnd, leg_crs_sql};
+    let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
+    let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
+    format!(
+        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
+                {origin} AS origin_crs, {destination} AS destination_crs, \
+                so.name AS origin_name, sd.name AS destination_name, \
+                ts.trains_id, ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
+         FROM journey_legs jl \
+         JOIN journeys j ON j.id = jl.journey_id \
+         JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+         LEFT JOIN trains tr ON tr.id = ts.trains_id \
+         LEFT JOIN stations so ON so.crs = UPPER({origin})::bpchar \
+         LEFT JOIN stations sd ON sd.crs = UPPER({destination})::bpchar \
+         LEFT JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
+         WHERE jl.train_subscription_id IS NOT NULL \
+           AND ts.trains_id IS NOT NULL \
+           AND jl.service_date = $1 \
+           AND {origin} IS NOT NULL \
+           AND {destination} IS NOT NULL \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM schedule_services ss \
+               WHERE ss.service_date = tr.service_date AND ss.uid = tr.train_uid \
+                 AND ss.mode <> 'train')"
+    )
+});
+
 pub(crate) async fn list_committed_legs_for_today(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<CommittedLeg>> {
     use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
-                jl.origin_crs, jl.destination_crs, so.name AS origin_name, sd.name AS destination_name, \
-                ts.trains_id, ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
-         FROM journey_legs jl \
-         JOIN journeys j ON j.id = jl.journey_id \
-         JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
-         LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
-         LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
-         LEFT JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
-         LEFT JOIN trains tr ON tr.id = ts.trains_id \
-         WHERE jl.train_subscription_id IS NOT NULL \
-           AND ts.trains_id IS NOT NULL \
-           AND jl.service_date = $1 \
-           AND jl.origin_crs IS NOT NULL \
-           AND jl.destination_crs IS NOT NULL \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM schedule_services ss \
-               WHERE ss.service_date = tr.service_date AND ss.uid = tr.train_uid \
-                 AND ss.mode <> 'train')",
-    )
-    .bind(today)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(COMMITTED_LEGS_SQL.as_str())
+        .bind(today)
+        .fetch_all(pool)
+        .await?;
 
     rows.into_iter()
         .map(|row| {
@@ -1759,30 +1789,44 @@ pub(crate) struct CommitCheckLeg {
     pub arrive_before: Option<chrono::NaiveTime>,
 }
 
-pub(crate) async fn unmatched_auto_legs_for_commit_check(
-    pool: &PgPool,
-    today: chrono::NaiveDate,
-) -> anyhow::Result<Vec<CommitCheckLeg>> {
-    let rows = sqlx::query_as::<_, CommitCheckLeg>(
+/// [`unmatched_auto_legs_for_commit_check`]'s query, each leg end read
+/// through `ds_store::trains::leg_crs_sql` (DS-144), as the other leg
+/// queries here. An unmatched leg rarely has a train to fall back to; one
+/// that still points at a subscription is named by its route.
+static COMMIT_CHECK_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use ds_store::trains::{LegEnd, leg_crs_sql};
+    let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
+    let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
+    format!(
         "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
-                jl.origin_crs, jl.destination_crs, so.name AS origin_name, sd.name AS destination_name, \
+                {origin} AS origin_crs, {destination} AS destination_crs, \
+                so.name AS origin_name, sd.name AS destination_name, \
                 jl.service_date, jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN journey_templates jt ON jt.id = j.source_template_id \
-         LEFT JOIN stations so ON so.crs = UPPER(jl.origin_crs)::bpchar \
-         LEFT JOIN stations sd ON sd.crs = UPPER(jl.destination_crs)::bpchar \
+         LEFT JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
+         LEFT JOIN trains tr ON tr.id = ts.trains_id \
+         LEFT JOIN stations so ON so.crs = UPPER({origin})::bpchar \
+         LEFT JOIN stations sd ON sd.crs = UPPER({destination})::bpchar \
          WHERE jl.match_mode = 'unmatched' \
            AND jl.kind = 'train' \
            AND jl.service_date = $1 \
            AND jt.default_match_mode = 'auto' \
            AND jt.active \
-           AND jl.origin_crs IS NOT NULL \
-           AND jl.destination_crs IS NOT NULL",
+           AND {origin} IS NOT NULL \
+           AND {destination} IS NOT NULL"
     )
-    .bind(today)
-    .fetch_all(pool)
-    .await?;
+});
+
+pub(crate) async fn unmatched_auto_legs_for_commit_check(
+    pool: &PgPool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Vec<CommitCheckLeg>> {
+    let rows = sqlx::query_as::<_, CommitCheckLeg>(COMMIT_CHECK_LEGS_SQL.as_str())
+        .bind(today)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -2088,6 +2132,9 @@ pub(crate) async fn find_or_create_train_with_cif_schedule(
     // UPDATEd when it is missing a column this call can fill, and the
     // insert's `DO UPDATE` only covers a concurrent insert that committed
     // after this statement's snapshot.
+    // One transaction with the subscribers' fill (DS-144): the legs and
+    // pins of this train that still lack a route get this one.
+    let mut tx = pool.begin().await?;
     let row: (i64,) = sqlx::query_as(
         "WITH existing AS ( \
              SELECT id FROM trains WHERE train_uid = $1 AND service_date = $2 \
@@ -2118,8 +2165,10 @@ pub(crate) async fn find_or_create_train_with_cif_schedule(
     .bind(&schedule.true_origin_crs)
     .bind(scheduled_departure)
     .bind(schedule.destination_crs.as_deref())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    ds_store::trains::fill_route_into_subscribers(&mut *tx, row.0).await?;
+    tx.commit().await?;
     Ok(row.0)
 }
 
@@ -3942,6 +3991,92 @@ mod tests {
             .expect("cleanup fixture user");
     }
 
+    /// DS-144: a leg saved before its train had a timetable stored no
+    /// stations, and neither did its subscription's pins. The skip check's
+    /// leg list and the push copy's journey context read the leg's route
+    /// from its train instead of skipping it or naming nothing.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_leg_with_no_stations_of_its_own_reads_its_trains_route \
+                -- --ignored --test-threads=1`"]
+    async fn a_leg_with_no_stations_of_its_own_reads_its_trains_route() {
+        let pool = connect().await;
+        let user_id = "TEST-DS144-NOTIFIER-USER";
+        let service_date: chrono::NaiveDate = "2026-09-22".parse().unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("clear a stale fixture user");
+        seed_user(&pool, user_id).await;
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date, origin_crs, destination_crs) \
+             VALUES ('TEST-DS144-NOTIFIER-UID', $1, 'PAD', 'WOK') \
+             ON CONFLICT (train_uid, service_date) DO UPDATE SET origin_crs = 'PAD' \
+             RETURNING id",
+        )
+        .bind(service_date)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a trains row with a route");
+        let subscription_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date, trains_id, resolution_status) \
+             VALUES ($1, $2, $3, 'resolved') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(service_date)
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a subscription with no pins");
+        let journey_id: i64 =
+            sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("seed journey");
+        let journey_leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, $2, $3, 'manual') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(service_date)
+        .bind(subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a leg with no stations");
+
+        let legs = list_committed_legs_for_today(&pool, service_date)
+            .await
+            .expect("list_committed_legs_for_today");
+        let found = legs
+            .iter()
+            .find(|leg| leg.journey_leg_id == journey_leg_id)
+            .expect("a leg with no stations of its own is still checked");
+        assert_eq!(found.origin_crs, "PAD");
+        assert_eq!(found.destination_crs, "WOK");
+
+        let context = journey_leg_for_train_subscription(&pool, subscription_id)
+            .await
+            .expect("query")
+            .expect("a journey leg");
+        assert_eq!(context.origin_crs.as_deref(), Some("PAD"));
+        assert_eq!(context.destination_crs.as_deref(), Some("WOK"));
+        assert_eq!(context.journey_destination_crs.as_deref(), Some("WOK"));
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture user (cascades the journey and subscription)");
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture train");
+    }
+
     #[tokio::test]
     #[ignore = "requires a live database with Phase 1's journeys/journey_legs tables \
                 already migrated; run with `DATABASE_URL=... cargo test -p notifier \
@@ -5275,6 +5410,122 @@ mod sweep_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+
+    /// DS-144: the CIF enrichment gives a bare `trains` row its route and,
+    /// on the same transaction, the NULL codes of the train legs and the
+    /// NULL pins saved before it had one, without overwriting a set value.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                find_or_create_train_with_cif_schedule_fills_routeless_legs_and_pins \
+                -- --ignored --test-threads=1`"]
+    async fn find_or_create_train_with_cif_schedule_fills_routeless_legs_and_pins() {
+        let pool = connect().await;
+        let train_uid = "TEST-DS144-CIF-UID";
+        let service_date: chrono::NaiveDate = "2026-09-25".parse().unwrap();
+        let user_id = "TEST-DS144-CIF-USER";
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("clear a stale fixture user");
+        seed_user(&pool, user_id).await;
+        sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid = $1")
+            .bind(train_uid)
+            .execute(&pool)
+            .await
+            .expect("clear stale CIF rows");
+        let trains_id = find_or_create_train(&pool, train_uid, service_date)
+            .await
+            .expect("a bare trains row");
+        let subscription_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date, trains_id) \
+             VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(service_date)
+        .bind(trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a subscription with no pins");
+        let journey_id: i64 =
+            sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("seed journey");
+        // The leg boards at WOK (its own choice) and has no destination.
+        let leg_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_legs \
+                (journey_id, leg_order, origin_crs, service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'WOK', $2, $3, 'manual') RETURNING id",
+        )
+        .bind(journey_id)
+        .bind(service_date)
+        .bind(subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a leg with no destination");
+        sqlx::query(
+            "INSERT INTO schedule_destination_departures \
+                (service_date, destination_crs, scheduled, day_offset, train_uid, origin_crs, \
+                 true_origin_crs, destination_arrival, destination_arrival_day_offset) \
+             VALUES ($1, 'BSK', '09:05:00', 0, $2, 'RDG', 'RDG', '09:58:00', 0)",
+        )
+        .bind(service_date)
+        .bind(train_uid)
+        .execute(&pool)
+        .await
+        .expect("seed the CIF schedule");
+
+        let enriched = find_or_create_train_with_cif_schedule(&pool, train_uid, service_date)
+            .await
+            .expect("find_or_create_train_with_cif_schedule");
+        assert_eq!(enriched, trains_id);
+
+        let leg: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT origin_crs, destination_crs FROM journey_legs WHERE id = $1")
+                .bind(leg_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the leg back");
+        assert_eq!(
+            leg,
+            (Some("WOK".to_string()), Some("BSK".to_string())),
+            "the leg's own boarding point stays; its missing end is the terminus"
+        );
+        let pins: (Option<String>, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT pin_origin_crs, pin_destination_crs, pin_scheduled_departure \
+             FROM train_subscriptions WHERE id = $1",
+        )
+        .bind(subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the pins back");
+        assert_eq!(
+            pins,
+            (
+                Some("RDG".to_string()),
+                Some("BSK".to_string()),
+                crate::london_to_utc(service_date.and_hms_opt(9, 5, 0).unwrap()),
+            )
+        );
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture user (cascades the journey and subscription)");
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup fixture train");
+        sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid = $1")
+            .bind(train_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup CIF rows");
     }
 
     /// Finding 5's unit-level regression test for the enrichment itself:
