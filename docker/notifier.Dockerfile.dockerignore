@@ -12,6 +12,7 @@
 !reference-data
 !lines
 !charts/distant-signal/files/db-grants.yaml
+!scripts/rollback-tracked-trains-as-journeys.sql
 **/target
 **/*.env
 **/.env
