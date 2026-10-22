@@ -154,6 +154,23 @@ pub(crate) enum Delivered {
     /// `delegated_grants.push_notified_at`: the "an app was connected"
     /// notice (delegated-access spec 2026-10-14 §5.3).
     GrantCreated { grant_id: i64 },
+    /// `journey_breaks.notified_at`/`notified_severity`: an auto-suggest
+    /// notice (mid-journey changes spec 2026-10-22 §6.3). With a trigger
+    /// train, also its `train_notification_state` at the equivalent rank,
+    /// so the train's own push stays quiet: one push per user per train.
+    JourneyBreak {
+        break_id: i64,
+        severity: i16,
+        trigger: Option<TriggerTrainState>,
+    },
+}
+
+/// The trigger train's state a break notice records for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TriggerTrainState {
+    pub tracked_train_id: i64,
+    pub status: String,
+    pub delay_minutes: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -163,6 +180,7 @@ enum Target {
     SkippedStop(i64),
     Unmatched(i64),
     GrantCreated(i64),
+    JourneyBreak(i64),
 }
 
 impl Delivered {
@@ -175,6 +193,18 @@ impl Delivered {
             Delivered::SkippedStop { journey_leg_id } => Target::SkippedStop(*journey_leg_id),
             Delivered::Unmatched { journey_leg_id } => Target::Unmatched(*journey_leg_id),
             Delivered::GrantCreated { grant_id } => Target::GrantCreated(*grant_id),
+            Delivered::JourneyBreak { break_id, .. } => Target::JourneyBreak(*break_id),
+        }
+    }
+
+    /// The tracked train whose push this is, for a break notice.
+    fn break_trigger_train(&self) -> Option<i64> {
+        match self {
+            Delivered::JourneyBreak {
+                trigger: Some(trigger),
+                ..
+            } => Some(trigger.tracked_train_id),
+            _ => None,
         }
     }
 }
@@ -337,6 +367,24 @@ impl PushBackend for PgBackend {
             Delivered::GrantCreated { grant_id } => {
                 queries::mark_grant_notified(&self.pool, *grant_id, at).await
             }
+            Delivered::JourneyBreak {
+                break_id,
+                severity,
+                trigger,
+            } => {
+                if let Some(trigger) = trigger {
+                    queries::upsert_train_notification_state(
+                        &self.pool,
+                        user_id,
+                        trigger.tracked_train_id,
+                        &trigger.status,
+                        trigger.delay_minutes,
+                        at,
+                    )
+                    .await?;
+                }
+                crate::break_notices::record_notified(&self.pool, *break_id, *severity, at).await
+            }
         }
     }
 }
@@ -487,6 +535,35 @@ impl<B: PushBackend> PushQueue<B> {
             }
         };
 
+        // One push per user per train (mid-journey changes spec §6.3): a
+        // break notice for a train replaces that train's queued plain
+        // push, and a plain push for a train whose break notice is queued
+        // or in flight adds nothing.
+        if let Some(train) = job.delivered.break_trigger_train() {
+            drop_queued_train_push(&mut st, &job.user_id, train);
+        }
+        if let Delivered::Train {
+            tracked_train_id, ..
+        } = &job.delivered
+            && st.slots.iter().any(|((user, _), slot)| {
+                *user == job.user_id
+                    && match slot {
+                        Slot::Queued(queued) => {
+                            queued.delivered.break_trigger_train() == Some(*tracked_train_id)
+                        }
+                        Slot::InFlight { delivered, next } => {
+                            delivered.break_trigger_train() == Some(*tracked_train_id)
+                                || next.as_ref().is_some_and(|parked| {
+                                    parked.delivered.break_trigger_train()
+                                        == Some(*tracked_train_id)
+                                })
+                        }
+                    }
+            })
+        {
+            return EnqueueOutcome::Duplicate;
+        }
+
         match st.slots.get_mut(&key) {
             Some(Slot::Queued(existing)) => {
                 if existing.delivered == job.delivered {
@@ -606,6 +683,33 @@ impl<B: PushBackend> PushQueue<B> {
             .increment(abandoned as u64);
         }
         ShutdownReport { drained, abandoned }
+    }
+}
+
+/// Removes `user_id`'s queued (not yet started) plain push for tracked
+/// train `train`, or one parked behind its in-flight push: a break notice
+/// for that train supersedes it.
+fn drop_queued_train_push(st: &mut State, user_id: &str, train: i64) {
+    let key: JobKey = (user_id.to_string(), Target::Train(train));
+    let removed = match st.slots.get_mut(&key) {
+        Some(Slot::Queued(_)) => {
+            st.slots.remove(&key);
+            if let Some(user) = st.users.get_mut(user_id) {
+                user.ready.retain(|k| *k != key);
+            }
+            true
+        }
+        Some(Slot::InFlight { next, .. }) => next.take().is_some(),
+        None => false,
+    };
+    if removed {
+        st.queued -= 1;
+        if let Some(user) = st.users.get_mut(user_id) {
+            user.queued -= 1;
+        }
+        metrics::counter!(metric("notifier_push_enqueue_total"), "result" => "superseded")
+            .increment(1);
+        publish_gauges(st);
     }
 }
 
@@ -1206,6 +1310,105 @@ mod tests {
             queue.peak_in_flight("tarpit-user"),
             2,
             "per-user cap: never more than 2 of the tarpit user's jobs at once"
+        );
+        queue.shutdown(Duration::from_secs(1)).await;
+    }
+
+    fn train_job(user_id: &str, tracked_train_id: i64) -> PushJob {
+        PushJob {
+            user_id: user_id.to_string(),
+            payload: NotificationPayload {
+                title: "t".to_string(),
+                body: "b".to_string(),
+                url: "/".to_string(),
+                tag: format!("train-{tracked_train_id}"),
+            },
+            delivered: Delivered::Train {
+                tracked_train_id,
+                status: "cancelled".to_string(),
+                delay_minutes: None,
+            },
+            decided_at: Utc::now(),
+        }
+    }
+
+    fn break_job(user_id: &str, break_id: i64, tracked_train_id: i64) -> PushJob {
+        PushJob {
+            user_id: user_id.to_string(),
+            payload: NotificationPayload {
+                title: "t".to_string(),
+                body: "b".to_string(),
+                url: "/".to_string(),
+                tag: format!("train-{tracked_train_id}"),
+            },
+            delivered: Delivered::JourneyBreak {
+                break_id,
+                severity: 3,
+                trigger: Some(TriggerTrainState {
+                    tracked_train_id,
+                    status: "cancelled".to_string(),
+                    delay_minutes: None,
+                }),
+            },
+            decided_at: Utc::now(),
+        }
+    }
+
+    /// One push per user per train (mid-journey changes spec §6.3): a break
+    /// notice for a train replaces that train's queued plain push, and a
+    /// plain push for a train whose notice is queued adds nothing. Another
+    /// user's push for the same train is untouched.
+    #[tokio::test(start_paused = true)]
+    async fn a_break_notice_supersedes_the_trains_own_push() {
+        let backend = FakeBackend::new(Duration::from_secs(5))
+            .with_subscription("traveller", 1, "gate://t")
+            .with_subscription("friend", 2, "gate://f");
+        let gate = Arc::clone(&backend.gate);
+        let queue = PushQueue::start(backend, config());
+
+        // Two line pushes take the traveller's two in-flight slots and hang,
+        // so everything after them waits in the queue.
+        queue.enqueue(line_job("traveller", "L1", 1));
+        queue.enqueue(line_job("traveller", "L2", 1));
+        eventually("the traveller at the in-flight cap", || {
+            queue.in_flight() == 2
+        })
+        .await;
+
+        assert_eq!(
+            queue.enqueue(train_job("traveller", 118)),
+            EnqueueOutcome::Queued
+        );
+        assert_eq!(
+            queue.enqueue(train_job("friend", 118)),
+            EnqueueOutcome::Queued
+        );
+        assert_eq!(
+            queue.enqueue(break_job("traveller", 7, 118)),
+            EnqueueOutcome::Queued
+        );
+        // The traveller's train push is gone; the friend's stays.
+        assert_eq!(queue.depth(), 1 + 1, "{} queued", queue.depth());
+        assert_eq!(
+            queue.enqueue(train_job("traveller", 118)),
+            EnqueueOutcome::Duplicate
+        );
+
+        gate.add_permits(100);
+        queue.wait_idle().await;
+        let delivered: Vec<(String, Delivered)> = recorded(&queue);
+        assert!(delivered.iter().any(|(user, d)| user == "traveller"
+            && matches!(d, Delivered::JourneyBreak { break_id: 7, .. })));
+        assert!(
+            !delivered
+                .iter()
+                .any(|(user, d)| user == "traveller" && matches!(d, Delivered::Train { .. })),
+            "{delivered:?}"
+        );
+        assert!(
+            delivered
+                .iter()
+                .any(|(user, d)| user == "friend" && matches!(d, Delivered::Train { .. }))
         );
         queue.shutdown(Duration::from_secs(1)).await;
     }

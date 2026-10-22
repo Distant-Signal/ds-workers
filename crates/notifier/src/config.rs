@@ -196,6 +196,18 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = true)]
     pub metrics_enabled: bool,
 
+    /// Auto-suggest notices when a journey breaks (mid-journey changes spec
+    /// 2026-10-22 §6): the kill switch, off unless the chart's
+    /// `journeyBreaks.enabled` turns it on. Off, no break notice is sent
+    /// and the train path no longer defers to open breaks (every train
+    /// pushes as before).
+    #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
+    pub journey_break_notices_enabled: bool,
+
+    /// How often open breaks are checked for a notice (§6.3: 15 s).
+    #[arg(long, env, default_value_t = 15)]
+    pub journey_breaks_poll_interval_secs: u64,
+
     /// `/livez` (liveness: loop progress) and `/healthz` (readiness: also
     /// false until the initial database connection is up) -- SVC-08/INF-5.
     #[command(flatten)]
@@ -237,6 +249,11 @@ impl Config {
             self.template_sweep_poll_interval_secs > 0,
             "template_sweep_poll_interval_secs (--template-sweep-poll-interval-secs / \
              TEMPLATE_SWEEP_POLL_INTERVAL_SECS) must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.journey_breaks_poll_interval_secs > 0,
+            "journey_breaks_poll_interval_secs (--journey-breaks-poll-interval-secs / \
+             JOURNEY_BREAKS_POLL_INTERVAL_SECS) must be greater than zero"
         );
         anyhow::ensure!(
             self.push_workers > 0,
@@ -317,6 +334,8 @@ mod tests {
             push_shutdown_grace_secs: 20,
             metrics_port: 9091,
             metrics_enabled: true,
+            journey_break_notices_enabled: false,
+            journey_breaks_poll_interval_secs: 15,
             health: common::service_args::HealthArgs {
                 health_bind_url: "127.0.0.1:0".to_string(),
                 progress_stall_secs: 900,

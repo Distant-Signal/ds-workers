@@ -3,6 +3,7 @@
 //! transitions on a user's pinned lines/tracked trains. See
 //! docs/superpowers/specs/2026-09-02-line-status-notifications-design.md.
 
+mod break_notices;
 mod config;
 mod decision;
 mod push_queue;
@@ -59,6 +60,8 @@ const TEMPLATE_SWEEP_CYCLE: &str = "template_sweep";
 /// The "an app was connected" notices (delegated-access spec 2026-10-14
 /// §5.3), run on the skip-check interval right after that cycle.
 const GRANT_NOTICE_CYCLE: &str = "grant_notice";
+/// Auto-suggest notices for broken journeys (`break_notices`).
+const JOURNEY_BREAKS_CYCLE: &str = "journey_breaks";
 /// Users given a grant notice per cycle (one notice each).
 const GRANT_NOTICE_BATCH: i64 = 100;
 
@@ -152,9 +155,16 @@ async fn run() -> anyhow::Result<()> {
         SKIP_CHECK_CYCLE,
         TEMPLATE_SWEEP_CYCLE,
         GRANT_NOTICE_CYCLE,
+        JOURNEY_BREAKS_CYCLE,
     ] {
         common::metrics::register_cycle("notifier", cycle);
     }
+    break_notices::set_enabled(config.journey_break_notices_enabled);
+    break_notices::register_metrics();
+    tracing::info!(
+        enabled = config.journey_break_notices_enabled,
+        "journey break notices (JOURNEY_BREAK_NOTICES_ENABLED)"
+    );
     queries::register_line_history_metrics();
     queries::register_forward_queue_metrics();
     let line_history_max_age = config.line_history_max_age();
@@ -166,6 +176,7 @@ async fn run() -> anyhow::Result<()> {
     let mut forward_interval = poll_interval(config.forward_queue_poll_interval_secs);
     let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
     let mut template_sweep_interval = poll_interval(config.template_sweep_poll_interval_secs);
+    let mut journey_breaks_interval = poll_interval(config.journey_breaks_poll_interval_secs);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -235,6 +246,19 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier template-sweep cycle failed; will retry next interval");
                 }
                 common::metrics::record_cycle("notifier", TEMPLATE_SWEEP_CYCLE, result.is_ok());
+            }
+            _ = progress.idle(journey_breaks_interval.tick()) => {
+                let result = break_notices::run_break_notice_cycle(
+                    &pool,
+                    &queue,
+                    Utc::now(),
+                    config.train_delay_threshold_minutes,
+                )
+                .await;
+                if let Err(err) = &result {
+                    tracing::error!(error = ?err, "notifier journey-breaks cycle failed; will retry next interval");
+                }
+                common::metrics::record_cycle("notifier", JOURNEY_BREAKS_CYCLE, result.is_ok());
             }
         }
     }
@@ -447,6 +471,18 @@ async fn notify_train_candidates(
             );
             continue;
         };
+        // One push per user per train (mid-journey changes spec §6.3): an
+        // open break on a journey using this train owns its push.
+        if break_notices::enabled()
+            && break_notices::break_owns_train(pool, &candidate.user_id, candidate.tracked_train_id)
+                .await?
+        {
+            tracing::info!(
+                tracked_train_id = candidate.tracked_train_id,
+                "train push deferred to the journey's break notice"
+            );
+            continue;
+        }
         let journey_context =
             queries::journey_leg_for_train_subscription(pool, candidate.tracked_train_id).await?;
         let payload = build_train_notification_payload(
