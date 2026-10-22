@@ -553,7 +553,7 @@ fn build_train_notification_payload(
                 }
                 _ => "Check the latest status.".to_string(),
             },
-            url: format!("/track/{tracked_train_id}"),
+            url: format!("/train/by-id/{tracked_train_id}"),
             tag: format!("train-{tracked_train_id}"),
         };
     };
@@ -1190,7 +1190,7 @@ mod copy_tests {
         let payload = build_train_notification_payload(7, "en_route", Some(18), None);
         assert_eq!(payload.title, "Your train is delayed");
         assert_eq!(payload.body, "Now running about 18 minutes late.");
-        assert_eq!(payload.url, "/track/7");
+        assert_eq!(payload.url, "/train/by-id/7");
         assert_eq!(payload.tag, "train-7");
     }
 
@@ -1199,7 +1199,7 @@ mod copy_tests {
         let context = ctx(1, Some("Weekend in Edinburgh"));
         let payload = build_train_notification_payload(7, "cancelled", None, Some(&context));
         assert_eq!(payload.title, "Your train was cancelled");
-        assert_eq!(payload.url, "/track/7");
+        assert_eq!(payload.url, "/train/by-id/7");
     }
 
     #[test]
