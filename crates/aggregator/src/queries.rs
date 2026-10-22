@@ -979,6 +979,44 @@ pub(crate) async fn prune_schedule_calling_points_full(
     Ok(result.rows_affected())
 }
 
+/// Prunes `schedule_turnarounds` (each train's previous working, DS-127)
+/// for service dates older than `retention_days`: schedule-reference
+/// replaces one date at a time, so old dates would otherwise stay forever.
+/// The same strictly-`<` comparison as the other schedule prunes.
+pub(crate) async fn prune_schedule_turnarounds(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_turnarounds \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// How long a `tracked_stop_boards` row is kept after its last poll. Only
+/// the latest board of a stop that is still to come is ever read (the api
+/// ignores a board over 10 minutes old), so a day is generous.
+pub(crate) const TRACKED_STOP_BOARDS_RETENTION_HOURS: i32 = 24;
+
+/// Prunes `tracked_stop_boards` rows last polled more than
+/// [`TRACKED_STOP_BOARDS_RETENTION_HOURS`] ago: the poller stops polling a
+/// stop once its train has left, and nothing else deletes the row.
+pub(crate) async fn prune_tracked_stop_boards(pool: &PgPool) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM tracked_stop_boards \
+         WHERE polled_at < now() - make_interval(hours => $1::int)",
+        )
+        .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Prunes `schedule_services` rows (one per schedule per service date, the
 /// service-mode product) for service dates older than `retention_days`.
 /// The caller passes the tracked-`trains` window (30 days by default, never

@@ -782,6 +782,116 @@ pub(crate) async fn candidates_for_trains_id(
     Ok(candidates)
 }
 
+/// One subscriber to push a predicted late start to (DS-127).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PredictedStartCandidate {
+    pub tracked_train_id: i64,
+    pub trains_id: i64,
+    pub user_id: String,
+    pub previous_rank: u8,
+    /// The predicted late start, in minutes (high confidence only).
+    pub late_minutes: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct PredictedStartSubscriber {
+    id: i64,
+    user_id: String,
+    trains_id: i64,
+    train_uid: String,
+    service_date: chrono::NaiveDate,
+    last_notified_status: Option<String>,
+    last_notified_delay_minutes: Option<i32>,
+}
+
+/// The subscribers to push a predicted late start to now (DS-127, spec
+/// decision Q2): every enabled subscription (one per user and train, the
+/// journey leg's first, as [`candidates_for_trains_id`] picks) whose train
+/// departs within the prediction horizon and has no TRUST report yet,
+/// whose prediction is `high` confidence at or above
+/// `delay_threshold_minutes`, and whose last push for it was below the
+/// "delayed" rank. The push records itself in `train_notification_state`
+/// like a delay push, so the delay push that follows when TRUST reports the
+/// same lateness is not sent again, and a cancellation still is.
+pub(crate) async fn predicted_start_candidates(
+    pool: &PgPool,
+    delay_threshold_minutes: i32,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Vec<PredictedStartCandidate>> {
+    use ds_store::trains::predicted_start::{self, Confidence};
+
+    let subscribers: Vec<PredictedStartSubscriber> = sqlx::query_as(
+        "SELECT DISTINCT ON (ts.user_id, ts.trains_id) ts.id, ts.user_id, ts.trains_id, \
+                tr.train_uid, tr.service_date, \
+                ns.last_notified_status, ns.last_notified_delay_minutes \
+         FROM schedule_turnarounds st \
+         JOIN trains tr ON tr.train_uid = st.uid AND tr.service_date = st.service_date \
+         JOIN train_subscriptions ts ON ts.trains_id = tr.id AND ts.notifications_enabled \
+         LEFT JOIN train_current_state cs ON cs.trains_id = tr.id \
+         LEFT JOIN train_notification_state ns \
+           ON ns.user_id = ts.user_id AND ns.tracked_train_id = ts.id \
+         WHERE st.departs_at > $1 AND st.departs_at <= $1 + $2::interval \
+           AND (cs.status IS NULL OR cs.status = 'awaiting_activation') \
+           AND cs.delay_minutes IS NULL \
+         ORDER BY ts.user_id, ts.trains_id, \
+                  EXISTS (SELECT 1 FROM journey_legs jl WHERE jl.train_subscription_id = ts.id) DESC, \
+                  ts.id",
+    )
+    .bind(now)
+    .bind(format!("{} seconds", predicted_start::HORIZON.num_seconds()))
+    .fetch_all(pool)
+    .await?;
+    if subscribers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut trains: Vec<(String, chrono::NaiveDate)> = subscribers
+        .iter()
+        .map(|s| (s.train_uid.clone(), s.service_date))
+        .collect();
+    trains.sort();
+    trains.dedup();
+    let predictions = predicted_start::predict_for_trains(pool, &trains, now).await?;
+    let mut candidates = Vec::new();
+    for subscriber in subscribers {
+        let Some(prediction) =
+            predictions.get(&(subscriber.train_uid.clone(), subscriber.service_date))
+        else {
+            continue;
+        };
+        let Some(late_minutes) = prediction
+            .late_minutes
+            .filter(|_| prediction.confidence == Confidence::High)
+        else {
+            continue;
+        };
+        let new_rank = train_severity_rank(
+            "awaiting_activation",
+            Some(late_minutes),
+            delay_threshold_minutes,
+        );
+        let previous_rank = match subscriber.last_notified_status.as_deref() {
+            None => 0,
+            Some(status) => train_severity_rank(
+                status,
+                subscriber.last_notified_delay_minutes,
+                delay_threshold_minutes,
+            ),
+        };
+        if crate::decision::decide_train_notification(previous_rank, new_rank)
+            == crate::decision::NotifyDecision::NotifyNow
+        {
+            candidates.push(PredictedStartCandidate {
+                tracked_train_id: subscriber.id,
+                trains_id: subscriber.trains_id,
+                user_id: subscriber.user_id,
+                previous_rank,
+                late_minutes,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
 /// Watermark now advances over `train_movement_events.trains_id` (Task 9),
 /// the shared, per-physical-train identity -- NOT `tracked_train_id`, which
 /// stops being written by new events as of Task 11.
@@ -2274,6 +2384,151 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect to postgres")
+    }
+
+    /// DS-127: a high-confidence predicted late start at or above the
+    /// threshold is a candidate once; after its push is recorded (as the
+    /// delay pushes record theirs), it is not again, and a subscription
+    /// with notifications off never is. Fixtures that the notifier's role
+    /// may not write go in through the migration owner when it is set.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                predicted_start_candidates -- --ignored --test-threads=1`"]
+    async fn predicted_start_candidates_push_a_high_confidence_late_start_once() {
+        let pool = connect().await;
+        let fixtures = match std::env::var("MIGRATION_DATABASE_URL") {
+            Ok(url) => PgPoolOptions::new()
+                .connect(&url)
+                .await
+                .expect("owner pool"),
+            Err(_) => pool.clone(),
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2099, 7, 13).expect("date");
+        let (user, user_off) = ("TEST-PREDICTED-START", "TEST-PREDICTED-START-OFF");
+        let cleanup = async |fixtures: &PgPool| {
+            for user in [user, user_off] {
+                sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(user)
+                    .execute(fixtures)
+                    .await
+                    .expect("cleanup users");
+            }
+            sqlx::query("DELETE FROM trains WHERE service_date = $1")
+                .bind(date)
+                .execute(fixtures)
+                .await
+                .expect("cleanup trains");
+            sqlx::query("DELETE FROM schedule_turnarounds WHERE service_date = $1")
+                .bind(date)
+                .execute(fixtures)
+                .await
+                .expect("cleanup turnarounds");
+        };
+        cleanup(&fixtures).await;
+        seed_user(&fixtures, user).await;
+        seed_user(&fixtures, user_off).await;
+
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO schedule_turnarounds (service_date, uid, prev_service_date, prev_uid, \
+             booked_turnaround_minutes, link, origin_tiploc, platform, departs_at) \
+             VALUES ($1, 'PSN0001', $1, 'PSN0000', 9, 'inferred', 'YORK', '3', $2)",
+        )
+        .bind(date)
+        .bind(now + chrono::Duration::minutes(30))
+        .execute(&fixtures)
+        .await
+        .expect("turnaround");
+        let ours: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('PSN0001', $1) RETURNING id",
+        )
+        .bind(date)
+        .fetch_one(&fixtures)
+        .await
+        .expect("our train");
+        let incoming: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('PSN0000', $1) RETURNING id",
+        )
+        .bind(date)
+        .fetch_one(&fixtures)
+        .await
+        .expect("incoming train");
+        // 20 late on a 9-minute turnaround: excess 11, late 15, high.
+        sqlx::query(
+            "INSERT INTO train_current_state (trains_id, status, delay_minutes, event_time) \
+             VALUES ($1, 'en_route', 20, $2)",
+        )
+        .bind(incoming)
+        .bind(now)
+        .execute(&fixtures)
+        .await
+        .expect("incoming state");
+        let subscription: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions (user_id, service_date, resolution_status, trains_id) \
+             VALUES ($1, $2, 'schedule_matched', $3) RETURNING id",
+        )
+        .bind(user)
+        .bind(date)
+        .bind(ours)
+        .fetch_one(&fixtures)
+        .await
+        .expect("subscription");
+        sqlx::query(
+            "INSERT INTO train_subscriptions (user_id, service_date, resolution_status, trains_id, \
+             notifications_enabled) VALUES ($1, $2, 'schedule_matched', $3, FALSE)",
+        )
+        .bind(user_off)
+        .bind(date)
+        .bind(ours)
+        .execute(&fixtures)
+        .await
+        .expect("disabled subscription");
+
+        let candidates = predicted_start_candidates(&pool, 15, now)
+            .await
+            .expect("candidates");
+        let ours_only: Vec<&PredictedStartCandidate> =
+            candidates.iter().filter(|c| c.trains_id == ours).collect();
+        assert_eq!(
+            ours_only,
+            [&PredictedStartCandidate {
+                tracked_train_id: subscription,
+                trains_id: ours,
+                user_id: user.to_string(),
+                previous_rank: 0,
+                late_minutes: 15,
+            }]
+        );
+
+        // Below the threshold: nothing.
+        let higher = predicted_start_candidates(&pool, 16, now)
+            .await
+            .expect("candidates");
+        assert!(higher.iter().all(|c| c.trains_id != ours));
+
+        // Pushed once (recorded as the delay pushes are): not again.
+        upsert_train_notification_state(
+            &pool,
+            user,
+            subscription,
+            "awaiting_activation",
+            Some(15),
+            now,
+        )
+        .await
+        .expect("record the push");
+        let again = predicted_start_candidates(&pool, 15, now)
+            .await
+            .expect("candidates");
+        assert!(again.iter().all(|c| c.trains_id != ours));
+        // And the delay push for the same lateness, once TRUST reports it,
+        // ranks the same, so it is not sent either.
+        assert_eq!(
+            train_severity_rank("awaiting_activation", Some(15), 15),
+            train_severity_rank("en_route", Some(16), 15)
+        );
+
+        cleanup(&fixtures).await;
     }
 
     async fn seed_user(pool: &PgPool, user_id: &str) {

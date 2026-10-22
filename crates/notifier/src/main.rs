@@ -62,6 +62,8 @@ const TEMPLATE_SWEEP_CYCLE: &str = "template_sweep";
 const GRANT_NOTICE_CYCLE: &str = "grant_notice";
 /// Auto-suggest notices for broken journeys (`break_notices`).
 const JOURNEY_BREAKS_CYCLE: &str = "journey_breaks";
+/// The predicted-late-start check (DS-127).
+const PREDICTED_START_CYCLE: &str = "predicted_start";
 /// Users given a grant notice per cycle (one notice each).
 const GRANT_NOTICE_BATCH: i64 = 100;
 
@@ -156,6 +158,7 @@ async fn run() -> anyhow::Result<()> {
         TEMPLATE_SWEEP_CYCLE,
         GRANT_NOTICE_CYCLE,
         JOURNEY_BREAKS_CYCLE,
+        PREDICTED_START_CYCLE,
     ] {
         common::metrics::register_cycle("notifier", cycle);
     }
@@ -177,6 +180,10 @@ async fn run() -> anyhow::Result<()> {
     let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
     let mut template_sweep_interval = poll_interval(config.template_sweep_poll_interval_secs);
     let mut journey_breaks_interval = poll_interval(config.journey_breaks_poll_interval_secs);
+    // 0 turns the predicted-late-start check off (its arm never runs).
+    let predicted_start_enabled = config.predicted_start_poll_interval_secs > 0;
+    let mut predicted_start_interval =
+        poll_interval(config.predicted_start_poll_interval_secs.max(1));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -259,6 +266,19 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier journey-breaks cycle failed; will retry next interval");
                 }
                 common::metrics::record_cycle("notifier", JOURNEY_BREAKS_CYCLE, result.is_ok());
+            }
+            _ = progress.idle(predicted_start_interval.tick()), if predicted_start_enabled => {
+                let result = run_predicted_start_cycle(
+                    &pool,
+                    &queue,
+                    Utc::now(),
+                    config.train_delay_threshold_minutes,
+                )
+                .await;
+                if let Err(err) = &result {
+                    tracing::error!(error = ?err, "notifier predicted-start cycle failed; will retry next interval");
+                }
+                common::metrics::record_cycle("notifier", PREDICTED_START_CYCLE, result.is_ok());
             }
         }
     }
@@ -622,6 +642,88 @@ fn build_train_notification_payload(
         body,
         url: format!("/journeys/{}", ctx.journey_id),
         tag: format!("train-{tracked_train_id}"), // unchanged -- still the same underlying tracked-train row
+    }
+}
+
+/// The predicted-late-start check (DS-127, spec decision Q2): pushes a
+/// high-confidence predicted late start at or above the delay threshold,
+/// once, to each subscriber with notifications on. It is recorded as a
+/// delay push for an `awaiting_activation` train, so the escalation-only
+/// rule then keeps the delay push for the same lateness from repeating it.
+async fn run_predicted_start_cycle(
+    pool: &PgPool,
+    queue: &Queue,
+    now: DateTime<Utc>,
+    delay_threshold_minutes: i32,
+) -> anyhow::Result<()> {
+    let candidates =
+        queries::predicted_start_candidates(pool, delay_threshold_minutes, now).await?;
+    for candidate in candidates {
+        tracing::info!(
+            tracked_train_id = candidate.tracked_train_id,
+            trains_id = candidate.trains_id,
+            previous_rank = candidate.previous_rank,
+            late_minutes = candidate.late_minutes,
+            "predicted late start notification candidate"
+        );
+        let journey_context =
+            queries::journey_leg_for_train_subscription(pool, candidate.tracked_train_id).await?;
+        let payload = build_predicted_start_payload(
+            candidate.tracked_train_id,
+            candidate.late_minutes,
+            journey_context.as_ref(),
+        );
+        enqueue_push(
+            queue,
+            &candidate.user_id,
+            payload,
+            Delivered::Train {
+                tracked_train_id: candidate.tracked_train_id,
+                status: "awaiting_activation".to_string(),
+                delay_minutes: Some(candidate.late_minutes),
+            },
+            now,
+        );
+    }
+    Ok(())
+}
+
+/// The predicted-late-start push (DS-127). Worded as an expectation, with
+/// why ("the incoming train is running late"), never as a fact. Same URL
+/// and tag as the delay push, so a later delay or cancellation push
+/// replaces it on the device.
+fn build_predicted_start_payload(
+    tracked_train_id: i64,
+    late_minutes: i32,
+    journey_context: Option<&queries::JourneyLegContext>,
+) -> NotificationPayload {
+    let body_tail = format!(
+        "expected to start about {late_minutes} minutes late: the incoming train is running late."
+    );
+    let tag = format!("train-{tracked_train_id}");
+    let Some(ctx) = journey_context.filter(|ctx| ctx.total_legs > 1) else {
+        return NotificationPayload {
+            title: "Your train may start late".to_string(),
+            body: format!("It is {body_tail}"),
+            url: format!("/track/{tracked_train_id}"),
+            tag,
+        };
+    };
+    let journey_label = push_journey_label(ctx);
+    let route = push_route(
+        ctx.origin_crs.as_deref(),
+        ctx.origin_name.as_deref(),
+        ctx.destination_crs.as_deref(),
+        ctx.destination_name.as_deref(),
+    );
+    NotificationPayload {
+        title: format!("Leg {} of {journey_label} may start late", ctx.leg_position),
+        body: match route {
+            Some(route) => format!("The {route} service is {body_tail}"),
+            None => format!("It is {body_tail}"),
+        },
+        url: format!("/journeys/{}", ctx.journey_id),
+        tag,
     }
 }
 
@@ -1219,6 +1321,32 @@ mod copy_tests {
             journey_destination_crs: Some("BTN".to_string()),
             journey_destination_name: Some("Brighton".to_string()),
         }
+    }
+
+    #[test]
+    fn a_predicted_late_start_is_worded_as_an_expectation() {
+        let payload = build_predicted_start_payload(7, 12, None);
+        assert_eq!(payload.title, "Your train may start late");
+        assert_eq!(
+            payload.body,
+            "It is expected to start about 12 minutes late: the incoming train is running late."
+        );
+        assert_eq!(payload.url, "/track/7");
+        // The delay push's tag: a later delay or cancellation replaces it.
+        assert_eq!(payload.tag, "train-7");
+
+        let context = ctx(3, Some("Weekend in Edinburgh"));
+        let payload = build_predicted_start_payload(7, 12, Some(&context));
+        assert_eq!(
+            payload.title,
+            "Leg 2 of 'Weekend in Edinburgh' may start late"
+        );
+        assert_eq!(
+            payload.body,
+            "The Wakefield Westgate to London Kings Cross service is expected to start about 12 \
+             minutes late: the incoming train is running late."
+        );
+        assert_eq!(payload.url, "/journeys/42");
     }
 
     #[test]

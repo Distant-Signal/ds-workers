@@ -92,6 +92,15 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 3600)]
     pub template_sweep_poll_interval_secs: u64,
 
+    /// Cadence of the predicted-late-start check (DS-127): every tracked
+    /// train within 3 hours of departure with no TRUST report yet is given
+    /// a prediction from its previous working, and a high-confidence one at
+    /// or above `train_delay_threshold_minutes` is pushed once, sharing the
+    /// delay pushes' state (so the delay push that follows does not repeat
+    /// it). 0 turns the check off.
+    #[arg(long, env, default_value_t = 60)]
+    pub predicted_start_poll_interval_secs: u64,
+
     /// Spec §3.2 (2026-09-22 addendum): an `'auto'`-mode leg's commit-check
     /// only runs once "now" is within this many minutes of the leg's earliest
     /// window bound (`depart_after` if set, else `arrive_after`) -- NOT at
@@ -321,6 +330,7 @@ mod tests {
             forward_queue_poll_interval_secs: 15,
             skip_check_poll_interval_secs: 90,
             template_sweep_poll_interval_secs: 3600,
+            predicted_start_poll_interval_secs: 60,
             auto_commit_lead_minutes: 120,
             vapid_private_key: "test".into(),
             vapid_public_key: "test".to_string(),

@@ -914,6 +914,26 @@ async fn run_retention(
     ))
     .increment(schedule_services_pruned);
 
+    let schedule_turnarounds_pruned = retention_step(
+        "schedule_turnarounds",
+        queries::prune_schedule_turnarounds(pool, schedule_derived_products_retention_days),
+    )
+    .await;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_turnarounds_rows_pruned_total"
+    ))
+    .increment(schedule_turnarounds_pruned);
+
+    let tracked_stop_boards_pruned = retention_step(
+        "tracked_stop_boards",
+        queries::prune_tracked_stop_boards(pool),
+    )
+    .await;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_tracked_stop_boards_rows_pruned_total"
+    ))
+    .increment(tracked_stop_boards_pruned);
+
     let schedule_network_departures_pruned = retention_step(
         "schedule_network_departures",
         queries::prune_schedule_network_departures(pool, schedule_derived_products_retention_days),
@@ -1020,6 +1040,8 @@ const RETENTION_TASKS: &[&str] = &[
     "schedule_destination_departures",
     "schedule_calling_points_full",
     "schedule_services",
+    "schedule_turnarounds",
+    "tracked_stop_boards",
     "schedule_network_departures",
     "schedule_line_population",
     "line_train_summaries",
