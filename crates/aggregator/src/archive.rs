@@ -1204,15 +1204,32 @@ mod tests {
             .expect("connect")
     }
 
+    /// The pool fixtures are written through: the owner
+    /// (`MIGRATION_DATABASE_URL`) when it is set, otherwise `pool`. These
+    /// tests run as the aggregator's role in CI, narrowed (DS-118), which
+    /// may write none of the rows they seed; only the archive's own reads,
+    /// row lock and delete run as it.
+    async fn fixtures(pool: &PgPool) -> PgPool {
+        match std::env::var("MIGRATION_DATABASE_URL") {
+            Ok(url) if !url.is_empty() => sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .expect("connect to MIGRATION_DATABASE_URL for fixtures"),
+            _ => pool.clone(),
+        }
+    }
+
     /// Seeds `count` trains on `date` (uid prefix `tag`), each with two
-    /// movement events, one current-state row and one `train_reasons` row.
-    /// Returns the ids.
+    /// movement events, one current-state row and one `train_reasons` row,
+    /// as the owner ([`fixtures`]). Returns the ids.
     async fn seed(pool: &PgPool, tag: &str, date: NaiveDate, count: i64) -> Vec<i64> {
         sqlx::query("DELETE FROM trains WHERE train_uid LIKE $1 || '%'")
             .bind(tag)
             .execute(pool)
             .await
             .unwrap();
+        let pool = &fixtures(pool).await;
         let ids: Vec<i64> = sqlx::query_scalar(
             "INSERT INTO trains (train_uid, service_date, origin_crs, calling_points) \
              SELECT $1 || gs, $2, 'EUS', '[{\"crs\":\"EUS\"}]'::jsonb \
@@ -1463,10 +1480,11 @@ mod tests {
         // tracked tier.
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(20);
         let ids = seed(&pool, "TEST-ARCHIVE-TIER-", date, 2).await;
+        let owner = fixtures(&pool).await;
         let user_id = "test-archive-tier-user";
         sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING")
             .bind(user_id)
-            .execute(&pool)
+            .execute(&owner)
             .await
             .unwrap();
         sqlx::query(
@@ -1477,7 +1495,7 @@ mod tests {
         .bind(user_id)
         .bind(ids[1])
         .bind(date)
-        .execute(&pool)
+        .execute(&owner)
         .await
         .unwrap();
 
@@ -1508,7 +1526,7 @@ mod tests {
 
         sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
             .bind(user_id)
-            .execute(&pool)
+            .execute(&owner)
             .await
             .unwrap();
         sqlx::query("DELETE FROM trains WHERE id = ANY($1)")
@@ -1553,7 +1571,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2001, 7, 8).unwrap();
         let ids = seed(&pool, "TEST-ARCHIVE-CHANGED-", date, 2).await;
         let flaky = Arc::new(FlakyStore::default());
-        *flaky.mutate_on_put.lock().unwrap() = Some((pool.clone(), ids[0]));
+        *flaky.mutate_on_put.lock().unwrap() = Some((fixtures(&pool).await, ids[0]));
         let a = archiver(flaky.clone(), FailurePolicy::Retain);
 
         let first = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
