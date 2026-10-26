@@ -22,7 +22,7 @@ ds-store = { path = "../ds-store" }
 metrics = "0.24"
 # The output checks' text patterns (`src/checks.rs`).
 regex = "1"
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "multipart", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # `raw_value`: a batch request is held as its serialised body

@@ -91,10 +91,10 @@ async fn group_last_delivered_id_on(conn: &mut RedisConn, stream: &str) -> Optio
             let mut last: Option<String> = None;
             let mut iter = fields.into_iter();
             while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
-                let key: String = redis::from_redis_value(&key)?;
+                let key: String = redis::from_redis_value_ref(&key)?;
                 match key.as_str() {
-                    "name" => name = redis::from_redis_value(&value).ok(),
-                    "last-delivered-id" => last = redis::from_redis_value(&value).ok(),
+                    "name" => name = redis::from_redis_value_ref(&value).ok(),
+                    "last-delivered-id" => last = redis::from_redis_value_ref(&value).ok(),
                     _ => {}
                 }
             }
@@ -147,9 +147,9 @@ async fn recreate_group_on(
         let mut last = None;
         let mut iter = info.into_iter();
         while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
-            let key: String = redis::from_redis_value(&key)?;
+            let key: String = redis::from_redis_value_ref(&key)?;
             if key == "last-generated-id" {
-                last = redis::from_redis_value::<Option<String>>(&value)?;
+                last = redis::from_redis_value_ref::<Option<String>>(&value)?;
             }
         }
         Some(last.unwrap_or_else(|| "0-0".to_string()))
@@ -245,7 +245,7 @@ async fn read_one_on(
     if let Some(incident_id) = entry
         .map
         .get("incident_id")
-        .and_then(|v| redis::from_redis_value::<String>(v).ok())
+        .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
     {
         Ok(Some((entry.id, incident_id)))
     } else {
@@ -335,7 +335,7 @@ async fn claim_stale_on(
             if let Some(incident_id) = entry
                 .map
                 .get("incident_id")
-                .and_then(|v| redis::from_redis_value::<String>(v).ok())
+                .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
             {
                 claimed.push((entry.id, incident_id));
             } else {
@@ -393,10 +393,10 @@ pub(crate) async fn group_lag(conn: &mut RedisConn) -> anyhow::Result<Option<i64
         let mut lag: Option<i64> = None;
         let mut iter = fields.into_iter();
         while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
-            let key: String = redis::from_redis_value(&key)?;
+            let key: String = redis::from_redis_value_ref(&key)?;
             match key.as_str() {
-                "name" => name = redis::from_redis_value(&value).ok(),
-                "lag" => lag = redis::from_redis_value(&value).ok(),
+                "name" => name = redis::from_redis_value_ref(&value).ok(),
+                "lag" => lag = redis::from_redis_value_ref(&value).ok(),
                 _ => {}
             }
         }
