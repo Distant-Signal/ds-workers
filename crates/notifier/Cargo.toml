@@ -39,6 +39,9 @@ reqwest = { version = "0.13.4", default-features = false, features = ["native-tl
 http = "0.2"
 
 [dev-dependencies]
+# The shared DB-test fixtures (`ds_store::test_support`: `FixtureCleanup`,
+# `assert_synthetic_date`) for `settings_db_tests`.
+ds-store = { path = "../ds-store", features = ["test-support"] }
 # `PUSH_SEND_TIMEOUT` regression test (M2, 2026-09 security/bug review):
 # a local wiremock server whose delayed response outlasts a short injected
 # per-attempt timeout. Same version `common` already uses.

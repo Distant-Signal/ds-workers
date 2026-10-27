@@ -281,6 +281,11 @@ pub(crate) trait PushBackend: Send + Sync + 'static {
         payload: &NotificationPayload,
     ) -> impl Future<Output = SendOutcome> + Send;
     fn delete_subscription(&self, id: i64) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Stamps a subscription that a push was just delivered to (the device
+    /// list's "last used", DS-153). Best effort; a no-op by default.
+    fn mark_pushed(&self, _id: i64) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
     fn record_delivered(
         &self,
         user_id: &str,
@@ -317,6 +322,10 @@ impl PushBackend for PgBackend {
 
     async fn delete_subscription(&self, id: i64) -> anyhow::Result<()> {
         queries::delete_push_subscription(&self.pool, id).await
+    }
+
+    async fn mark_pushed(&self, id: i64) -> anyhow::Result<()> {
+        queries::mark_push_subscription_pushed(&self.pool, id).await
     }
 
     async fn record_delivered(
@@ -949,6 +958,7 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
                 SendOutcome::Sent => {
                     any_sent = true;
                     lock(&shared.timeouts).remove(&subscription.id);
+                    mark_pushed(backend, subscription.id).await;
                 }
                 SendOutcome::Expired => {
                     lock(&shared.timeouts).remove(&subscription.id);
@@ -1011,6 +1021,18 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
         }
     }
     JobResult::BookkeepingFailed
+}
+
+/// [`PushBackend::mark_pushed`], logging a failure: it only feeds the
+/// device list.
+async fn mark_pushed<B: PushBackend>(backend: &B, subscription_id: i64) {
+    if let Err(err) = backend.mark_pushed(subscription_id).await {
+        tracing::warn!(
+            error = ?err,
+            subscription_id,
+            "could not stamp the subscription's last push"
+        );
+    }
 }
 
 async fn prune<B: PushBackend>(

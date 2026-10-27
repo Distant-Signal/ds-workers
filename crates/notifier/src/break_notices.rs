@@ -55,6 +55,8 @@ pub(crate) struct BreakNoticeRow {
     /// That train's current status, for its `train_notification_state`.
     pub trigger_status: Option<String>,
     pub trigger_delay_minutes: Option<i32>,
+    /// The owner's own delay threshold (DS-153), NULL for the default.
+    pub delay_threshold_minutes: Option<i16>,
 }
 
 /// Open breaks with suggestions ready that are not yet notified at their
@@ -65,7 +67,8 @@ pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakN
                 b.opened_at, b.confirmations, b.suggestions, j.suggestions_muted, \
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
-                cs.status AS trigger_status, cs.delay_minutes AS trigger_delay_minutes \
+                cs.status AS trigger_status, cs.delay_minutes AS trigger_delay_minutes, \
+                p.delay_threshold_minutes \
          FROM journey_breaks b \
          JOIN journeys j ON j.id = b.journey_id AND j.user_id = b.user_id \
          LEFT JOIN notification_preferences p ON p.user_id = b.user_id \
@@ -406,7 +409,11 @@ pub(crate) async fn run_break_notice_cycle(
             continue;
         }
         let trigger = row.trigger_tracked_train_id.map(|tracked_train_id| {
-            let (status, delay_minutes) = equivalent_train_state(&row, delay_threshold_minutes);
+            let threshold = crate::queries::user_delay_threshold(
+                row.delay_threshold_minutes,
+                delay_threshold_minutes,
+            );
+            let (status, delay_minutes) = equivalent_train_state(&row, threshold);
             crate::push_queue::TriggerTrainState {
                 tracked_train_id,
                 status,
@@ -419,16 +426,21 @@ pub(crate) async fn run_break_notice_cycle(
             severity = row.severity,
             "journey break notice"
         );
-        queue.enqueue(crate::push_queue::PushJob {
-            user_id: row.user_id.clone(),
-            payload: build_break_payload(&row),
-            delivered: crate::push_queue::Delivered::JourneyBreak {
-                break_id: row.id,
-                severity: row.severity,
-                trigger,
+        crate::hold::dispatch(
+            pool,
+            queue,
+            crate::push_queue::PushJob {
+                user_id: row.user_id.clone(),
+                payload: build_break_payload(&row),
+                delivered: crate::push_queue::Delivered::JourneyBreak {
+                    break_id: row.id,
+                    severity: row.severity,
+                    trigger,
+                },
+                decided_at: now,
             },
-            decided_at: now,
-        });
+        )
+        .await?;
     }
     Ok(())
 }
@@ -491,6 +503,7 @@ mod tests {
             trigger_tracked_train_id: Some(118),
             trigger_status: Some("en_route".to_string()),
             trigger_delay_minutes: Some(9),
+            delay_threshold_minutes: None,
         }
     }
 

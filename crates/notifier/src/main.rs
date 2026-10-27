@@ -6,9 +6,12 @@
 mod break_notices;
 mod config;
 mod decision;
+mod hold;
 mod push_queue;
 mod queries;
 mod send;
+#[cfg(test)]
+mod settings_db_tests;
 mod skip_check;
 mod vapid_key;
 
@@ -64,6 +67,9 @@ const GRANT_NOTICE_CYCLE: &str = "grant_notice";
 const JOURNEY_BREAKS_CYCLE: &str = "journey_breaks";
 /// The predicted-late-start check (DS-127).
 const PREDICTED_START_CYCLE: &str = "predicted_start";
+/// Quiet hours (DS-153): held pushes released once the user's quiet hours
+/// end (`hold::run_release_cycle`), on the main poll's tick.
+const HELD_RELEASE_CYCLE: &str = "held_release";
 /// Users given a grant notice per cycle (one notice each).
 const GRANT_NOTICE_BATCH: i64 = 100;
 
@@ -153,6 +159,7 @@ async fn run() -> anyhow::Result<()> {
     // DistantSignalNotifierCycleFailing (see common::metrics::register_cycle).
     for cycle in [
         LINE_STATUS_CYCLE,
+        HELD_RELEASE_CYCLE,
         FORWARD_QUEUE_CYCLE,
         SKIP_CHECK_CYCLE,
         TEMPLATE_SWEEP_CYCLE,
@@ -164,6 +171,7 @@ async fn run() -> anyhow::Result<()> {
     }
     break_notices::set_enabled(config.journey_break_notices_enabled);
     break_notices::register_metrics();
+    hold::register_metrics();
     tracing::info!(
         enabled = config.journey_break_notices_enabled,
         "journey break notices (JOURNEY_BREAK_NOTICES_ENABLED)"
@@ -213,6 +221,17 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier cycle failed; will retry next interval");
                 }
                 common::metrics::record_cycle("notifier", LINE_STATUS_CYCLE, result.is_ok());
+                let result = hold::run_release_cycle(
+                    &pool,
+                    &queue,
+                    Utc::now(),
+                    config.train_delay_threshold_minutes,
+                )
+                .await;
+                if let Err(err) = &result {
+                    tracing::error!(error = ?err, "notifier held-push release failed; will retry next interval");
+                }
+                common::metrics::record_cycle("notifier", HELD_RELEASE_CYCLE, result.is_ok());
             }
             _ = progress.idle(forward_interval.tick()) => {
                 let result = run_forward_queue_cycle(
@@ -331,21 +350,29 @@ fn line_url(line_id: &str) -> String {
     }
 }
 
-/// Hands one decided notification to the push queue. Never blocks; see
-/// `push_queue`'s module doc for what happens when the queue refuses it.
-fn enqueue_push(
+/// Hands one decided notification on through the quiet-hours step
+/// (`hold::dispatch`): to the push queue, which never blocks (see
+/// `push_queue`'s module doc for what happens when it refuses one), or to
+/// `notification_holds` until the user's quiet hours end.
+async fn enqueue_push(
+    pool: &PgPool,
     queue: &Queue,
     user_id: &str,
     payload: NotificationPayload,
     delivered: Delivered,
     now: DateTime<Utc>,
-) {
-    queue.enqueue(PushJob {
-        user_id: user_id.to_string(),
-        payload,
-        delivered,
-        decided_at: now,
-    });
+) -> anyhow::Result<()> {
+    hold::dispatch(
+        pool,
+        queue,
+        PushJob {
+            user_id: user_id.to_string(),
+            payload,
+            delivered,
+            decided_at: now,
+        },
+    )
+    .await
 }
 
 async fn run_cycle(
@@ -410,6 +437,7 @@ async fn run_cycle(
                 tag: format!("line-{}", candidate.line_id),
             };
             enqueue_push(
+                pool,
                 queue,
                 &user_id,
                 payload,
@@ -418,7 +446,8 @@ async fn run_cycle(
                     rank: candidate.new_rank,
                 },
                 now,
-            );
+            )
+            .await?;
         }
     }
     queries::advance_cursor_with_grace_bounded(
@@ -512,6 +541,7 @@ async fn notify_train_candidates(
             journey_context.as_ref(),
         );
         enqueue_push(
+            pool,
             queue,
             &candidate.user_id,
             payload,
@@ -521,7 +551,8 @@ async fn notify_train_candidates(
                 delay_minutes,
             },
             now,
-        );
+        )
+        .await?;
     }
     Ok(())
 }
@@ -675,6 +706,7 @@ async fn run_predicted_start_cycle(
             journey_context.as_ref(),
         );
         enqueue_push(
+            pool,
             queue,
             &candidate.user_id,
             payload,
@@ -684,7 +716,8 @@ async fn run_predicted_start_cycle(
                 delay_minutes: Some(candidate.late_minutes),
             },
             now,
-        );
+        )
+        .await?;
     }
     Ok(())
 }
@@ -828,24 +861,33 @@ async fn sample_forward_queue(pool: &PgPool, now: DateTime<Utc>) {
 /// The push a new delegated-access grant sends to each of the user's
 /// devices: who can now do what, and where to disconnect it.
 fn grant_notice_payload(grant: &queries::NewGrantRow) -> NotificationPayload {
+    let has = |scope: &str| grant.scopes.iter().any(|s| s == scope);
     let abilities: Vec<&str> = [
         ("journeys:write", "save"),
         ("journeys:read", "read"),
         ("journeys:delete", "delete"),
     ]
     .into_iter()
-    .filter(|(scope, _)| grant.scopes.iter().any(|s| s == scope))
+    .filter(|(scope, _)| has(scope))
     .map(|(_, verb)| verb)
     .collect();
-    let what = match abilities.as_slice() {
-        [] => "use".to_string(),
-        [only] => (*only).to_string(),
-        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    let journeys = match abilities.as_slice() {
+        [] => None,
+        [only] => Some(format!("{only} your journeys")),
+        [first @ .., last] => Some(format!("{} and {last} your journeys", first.join(", "))),
+    };
+    // `preferences:read` (DS-153): read only.
+    let settings = has("preferences:read").then_some("see your notification settings");
+    let what = match (journeys, settings) {
+        (Some(journeys), Some(settings)) => format!("{journeys}, and {settings}"),
+        (Some(journeys), None) => journeys,
+        (None, Some(settings)) => settings.to_string(),
+        (None, None) => "use your journeys".to_string(),
     };
     NotificationPayload {
         title: format!("{} connected", grant.client_display_name),
         body: format!(
-            "{} can now {what} your journeys. Not you? Disconnect it in Connected apps.",
+            "{} can now {what}. Not you? Disconnect it in Connected apps.",
             grant.client_display_name
         ),
         url: "/account/connected-apps".to_string(),
@@ -865,12 +907,14 @@ async fn run_grant_notice_cycle(
 ) -> anyhow::Result<()> {
     for grant in queries::poll_new_grants(pool, GRANT_NOTICE_BATCH).await? {
         enqueue_push(
+            pool,
             queue,
             &grant.user_id,
             grant_notice_payload(&grant),
             Delivered::GrantCreated { grant_id: grant.id },
             now,
-        );
+        )
+        .await?;
     }
     Ok(())
 }
@@ -932,6 +976,7 @@ async fn run_skip_check_cycle(
         };
 
         enqueue_push(
+            pool,
             queue,
             &leg.user_id,
             payload,
@@ -939,7 +984,8 @@ async fn run_skip_check_cycle(
                 journey_leg_id: leg.journey_leg_id,
             },
             now,
-        );
+        )
+        .await?;
     }
 
     Ok(())
@@ -1060,6 +1106,10 @@ async fn run_template_sweep_cycle(
                 );
                 continue;
             }
+            // The owner turned "needs attention" pushes off (DS-153).
+            if !leg.notify_attention {
+                continue;
+            }
             let already_notified =
                 queries::unmatched_notification_state(pool, &leg.user_id, leg.journey_leg_id)
                     .await?
@@ -1085,6 +1135,7 @@ async fn run_template_sweep_cycle(
                 tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
             };
             enqueue_push(
+                pool,
                 queue,
                 &leg.user_id,
                 payload,
@@ -1092,7 +1143,8 @@ async fn run_template_sweep_cycle(
                     journey_leg_id: leg.journey_leg_id,
                 },
                 now,
-            );
+            )
+            .await?;
             continue;
         }
 
@@ -1238,7 +1290,7 @@ mod drain_support {
         )
     }
 
-    async fn drain(queue: Queue) {
+    pub(crate) async fn drain(queue: Queue) {
         queue.wait_idle().await;
         let report = queue.shutdown(Duration::from_secs(5)).await;
         assert!(report.drained, "the test push queue must drain");
@@ -3241,6 +3293,26 @@ mod grant_notice_tests {
         assert!(
             all.body
                 .contains("can now save, read and delete your journeys.")
+        );
+    }
+
+    #[test]
+    fn the_notice_names_reading_the_notification_settings() {
+        let both = grant_notice_payload(&grant(&["journeys:read", "preferences:read"]));
+        assert!(
+            both.body.contains(
+                "can now read your journeys, and see your notification settings. Not you?"
+            ),
+            "{}",
+            both.body
+        );
+        let alone = grant_notice_payload(&grant(&["preferences:read"]));
+        assert!(
+            alone
+                .body
+                .contains("can now see your notification settings. Not you?"),
+            "{}",
+            alone.body
         );
     }
 }
