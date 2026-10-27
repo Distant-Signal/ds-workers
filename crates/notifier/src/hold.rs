@@ -239,6 +239,7 @@ async fn store_hold(pool: &PgPool, job: &PushJob) -> anyhow::Result<()> {
                 tracked_train_id,
                 status,
                 delay_minutes,
+                ..
             } => (
                 None,
                 None,
@@ -493,6 +494,7 @@ fn delivered_of(hold: &HoldRow) -> Option<Delivered> {
         tracked_train_id: hold.tracked_train_id?,
         status: hold.train_status.clone()?,
         delay_minutes: hold.train_delay_minutes,
+        awaiting_reason: false,
     })
 }
 
@@ -562,11 +564,13 @@ mod tests {
             tracked_train_id: 1,
             status: "en_route".into(),
             delay_minutes: Some(20),
+            awaiting_reason: false,
         };
         let cancel = Delivered::Train {
             tracked_train_id: 1,
             status: "cancelled".into(),
             delay_minutes: None,
+            awaiting_reason: true,
         };
         let line = Delivered::Line {
             line_id: "victoria".into(),

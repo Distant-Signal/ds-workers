@@ -750,3 +750,212 @@ async fn the_auto_commit_reuses_a_trains_subscription_without_turning_it_back_on
             .expect("read notifications_enabled");
     assert!(!enabled, "the user's off sticks");
 }
+
+// --- Cancellation reasons in pushes (DS-184, `cancel_reason`) ---
+
+/// Four public calls for `trains_id`: Test Alfa (QYA, TIPLOC TSTCXA, STANOX
+/// 99841) to Test Delta (QYD), ten minutes apart. [`route_cleanup`]
+/// removes the crosswalk and station rows again.
+async fn seed_route(pool: &PgPool, trains_id: i64) {
+    for (index, (letter, name)) in [
+        ("A", "Alfa"),
+        ("B", "Bravo"),
+        ("C", "Charlie"),
+        ("D", "Delta"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stanox = format!("9984{}", index + 1);
+        exec(
+            pool,
+            &format!(
+                "INSERT INTO stanox_crs (stanox, crs, tiploc, station_name, source_sequence) \
+                 VALUES ('{stanox}', 'QY{letter}', 'TSTCX{letter}', 'Test {name}', 1) \
+                 ON CONFLICT DO NOTHING"
+            ),
+        )
+        .await;
+        exec(
+            pool,
+            &format!(
+                "INSERT INTO stations (crs, name) VALUES ('QY{letter}', 'Test {name}') \
+                 ON CONFLICT DO NOTHING"
+            ),
+        )
+        .await;
+    }
+    let calling_points = serde_json::json!([
+        {"tiploc": "TSTCXA", "kind": "Origin", "bookedDeparture": "08:00:00",
+         "publicDeparture": "08:00:00"},
+        {"tiploc": "TSTCXB", "kind": "Intermediate", "bookedArrival": "08:10:00",
+         "bookedDeparture": "08:11:00", "publicArrival": "08:10:00", "publicDeparture": "08:11:00"},
+        {"tiploc": "TSTCXC", "kind": "Intermediate", "bookedArrival": "08:20:00",
+         "bookedDeparture": "08:21:00", "publicArrival": "08:20:00", "publicDeparture": "08:21:00"},
+        {"tiploc": "TSTCXD", "kind": "Terminate", "bookedArrival": "08:30:00",
+         "publicArrival": "08:30:00"},
+    ]);
+    sqlx::query("UPDATE trains SET calling_points = $1 WHERE id = $2")
+        .bind(calling_points)
+        .bind(trains_id)
+        .execute(pool)
+        .await
+        .expect("seed calling points");
+}
+
+async fn route_cleanup(pool: &PgPool) -> ds_store::test_support::FixtureCleanup {
+    ds_store::test_support::FixtureCleanup::new(
+        pool,
+        [
+            "DELETE FROM stanox_crs WHERE tiploc LIKE 'TSTCX_'".to_string(),
+            "DELETE FROM stations WHERE crs IN ('QYA', 'QYB', 'QYC', 'QYD')".to_string(),
+        ],
+    )
+    .await
+}
+
+/// TRUST's `0002` for `trains_id`: cancelled en route at Test Bravo.
+async fn store_cancel_reason(pool: &PgPool, trains_id: i64, code: &str) {
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO train_reasons \
+                 (trains_id, msg_type, reason_code, canx_type, loc_stanox, event_at) \
+             VALUES ({trains_id}, '0002', '{code}', 'EN ROUTE', '99842', NOW()) \
+             ON CONFLICT (trains_id, msg_type) DO UPDATE SET reason_code = EXCLUDED.reason_code"
+        ),
+    )
+    .await;
+}
+
+type FollowupState = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// The delivered train push's (`last_notified_at`, `reason_followup_until`).
+async fn followup_state(pool: &PgPool, user: &str) -> Option<FollowupState> {
+    sqlx::query_as(
+        "SELECT last_notified_at, reason_followup_until \
+         FROM train_notification_state WHERE user_id = $1",
+    )
+    .bind(user)
+    .fetch_optional(pool)
+    .await
+    .expect("read train_notification_state")
+}
+
+async fn follow_up(pool: &PgPool, now: chrono::DateTime<chrono::Utc>) {
+    let queue = crate::drain_support::test_queue(pool);
+    crate::cancel_reason::run_reason_followup_cycle(pool, &queue, now)
+        .await
+        .expect("run_reason_followup_cycle");
+    crate::drain_support::drain(queue).await;
+}
+
+/// `now` at the database's microsecond precision, so a stored timestamp
+/// reads back equal.
+fn db_now() -> chrono::DateTime<chrono::Utc> {
+    use chrono::SubsecRound;
+    chrono::Utc::now().trunc_subsecs(6)
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn a_cancellation_push_without_its_reason_is_followed_up_once_when_it_arrives() {
+    const USER: &str = "TEST-NOTIFSET-CANX-REASON";
+    const UID: &str = "TEST-NOTIFSET-CANX1";
+    let pool = connect().await;
+    let _cleanup = cleanup(&pool, USER, UID).await;
+    let _route = route_cleanup(&pool).await;
+    let fixture = seed(&pool, USER, UID).await;
+    seed_route(&pool, fixture.train).await;
+    let now = db_now();
+
+    // Cancelled, with TRUST's reason not stored yet: the push goes at
+    // once, and its delivery opens the follow-up window.
+    set_train_state(&pool, fixture.train, "cancelled", 0).await;
+    decide_train(&pool, fixture.train, now).await;
+    let pushed = followup_state(&pool, USER).await.expect("pushed");
+    assert_eq!(
+        pushed,
+        (now, Some(now + crate::cancel_reason::FOLLOWUP_WINDOW)),
+        "a follow-up may come"
+    );
+
+    // No reason yet: nothing more.
+    follow_up(&pool, now + chrono::Duration::minutes(1)).await;
+    assert_eq!(followup_state(&pool, USER).await, Some(pushed));
+
+    // The reason arrives, placing the cancellation at Test Bravo: the
+    // copy says so, and the follow-up goes once.
+    store_cancel_reason(&pool, fixture.train, "IA").await;
+    let summary = crate::cancel_reason::summary_for_train(&pool, fixture.train).await;
+    let copy = crate::cancel_reason::CancelCopy::from_summary(summary.as_ref());
+    assert_eq!(copy.predicate(), "terminates at Test Bravo");
+    assert_eq!(
+        copy.reason_sentence().as_deref(),
+        Some("Reason: Signal failure (including no fault found).")
+    );
+    let later = now + chrono::Duration::minutes(2);
+    follow_up(&pool, later).await;
+    assert_eq!(
+        followup_state(&pool, USER).await,
+        Some((later, None)),
+        "followed up, and the window closed"
+    );
+    follow_up(&pool, later + chrono::Duration::minutes(1)).await;
+    assert_eq!(
+        followup_state(&pool, USER).await,
+        Some((later, None)),
+        "never a third push"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn a_reason_follow_up_respects_the_cancel_switch_the_window_and_a_known_reason() {
+    const USER: &str = "TEST-NOTIFSET-CANX-GATES";
+    const UID: &str = "TEST-NOTIFSET-CANX2";
+    let pool = connect().await;
+    let _cleanup = cleanup(&pool, USER, UID).await;
+    let _route = route_cleanup(&pool).await;
+    let fixture = seed(&pool, USER, UID).await;
+    seed_route(&pool, fixture.train).await;
+    let now = db_now();
+
+    set_train_state(&pool, fixture.train, "cancelled", 0).await;
+    decide_train(&pool, fixture.train, now).await;
+    let pushed = followup_state(&pool, USER).await.expect("pushed");
+    assert!(pushed.1.is_some());
+    store_cancel_reason(&pool, fixture.train, "IA").await;
+
+    // The cancellation switch turned off meanwhile: no follow-up.
+    set_prefs(&pool, USER, "train_cancel", "FALSE").await;
+    follow_up(&pool, now + chrono::Duration::minutes(1)).await;
+    assert_eq!(followup_state(&pool, USER).await, Some(pushed));
+
+    // Back on, but past the window: still none.
+    set_prefs(&pool, USER, "train_cancel", "TRUE").await;
+    follow_up(
+        &pool,
+        now + crate::cancel_reason::FOLLOWUP_WINDOW + chrono::Duration::seconds(1),
+    )
+    .await;
+    assert_eq!(followup_state(&pool, USER).await, Some(pushed));
+
+    // A train reinstated inside the window gets no "cancelled" follow-up.
+    set_train_state(&pool, fixture.train, "en_route", 0).await;
+    follow_up(&pool, now + chrono::Duration::minutes(2)).await;
+    assert_eq!(followup_state(&pool, USER).await, Some(pushed));
+
+    // A cancellation pushed with its reason already stored opens no window.
+    sqlx::query("DELETE FROM train_notification_state WHERE user_id = $1")
+        .bind(USER)
+        .execute(&pool)
+        .await
+        .expect("forget the push");
+    set_train_state(&pool, fixture.train, "cancelled", 0).await;
+    decide_train(&pool, fixture.train, now).await;
+    assert_eq!(followup_state(&pool, USER).await, Some((now, None)));
+}

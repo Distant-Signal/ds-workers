@@ -1210,6 +1210,9 @@ pub(crate) async fn upsert_line_notification_state(
     Ok(())
 }
 
+/// Records a delivered train push. `reason_followup_until` is set for a
+/// cancellation push sent without its reason (`cancel_reason`) and cleared
+/// (`None`) by every other push, the follow-up included.
 pub(crate) async fn upsert_train_notification_state(
     pool: &PgPool,
     user_id: &str,
@@ -1217,21 +1220,25 @@ pub(crate) async fn upsert_train_notification_state(
     status: &str,
     delay_minutes: Option<i32>,
     at: DateTime<Utc>,
+    reason_followup_until: Option<DateTime<Utc>>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO train_notification_state \
-           (user_id, tracked_train_id, last_notified_status, last_notified_delay_minutes, last_notified_at) \
-         VALUES ($1, $2, $3, $4, $5) \
+           (user_id, tracked_train_id, last_notified_status, last_notified_delay_minutes, \
+            last_notified_at, reason_followup_until) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (user_id, tracked_train_id) DO UPDATE SET \
            last_notified_status = EXCLUDED.last_notified_status, \
            last_notified_delay_minutes = EXCLUDED.last_notified_delay_minutes, \
-           last_notified_at = EXCLUDED.last_notified_at",
+           last_notified_at = EXCLUDED.last_notified_at, \
+           reason_followup_until = EXCLUDED.reason_followup_until",
     )
     .bind(user_id)
     .bind(tracked_train_id)
     .bind(status)
     .bind(delay_minutes)
     .bind(at)
+    .bind(reason_followup_until)
     .execute(pool)
     .await?;
     Ok(())
@@ -2632,6 +2639,7 @@ mod tests {
             "awaiting_activation",
             Some(15),
             now,
+            None,
         )
         .await
         .expect("record the push");

@@ -146,6 +146,10 @@ pub(crate) enum Delivered {
         tracked_train_id: i64,
         status: String,
         delay_minutes: Option<i32>,
+        /// A cancellation push sent without its reason: its delivery opens
+        /// the window for one follow-up (`cancel_reason`); any other push
+        /// closes it.
+        awaiting_reason: bool,
     },
     /// `journey_leg_notification_state.last_notified_skipped = TRUE`.
     SkippedStop { journey_leg_id: i64 },
@@ -343,6 +347,7 @@ impl PushBackend for PgBackend {
                 tracked_train_id,
                 status,
                 delay_minutes,
+                awaiting_reason,
             } => {
                 queries::upsert_train_notification_state(
                     &self.pool,
@@ -351,6 +356,7 @@ impl PushBackend for PgBackend {
                     status,
                     *delay_minutes,
                     at,
+                    awaiting_reason.then(|| at + crate::cancel_reason::FOLLOWUP_WINDOW),
                 )
                 .await
             }
@@ -389,6 +395,9 @@ impl PushBackend for PgBackend {
                         &trigger.status,
                         trigger.delay_minutes,
                         at,
+                        // The notice is the train's push; it is never
+                        // replaced by a plain reason follow-up.
+                        None,
                     )
                     .await?;
                 }
@@ -1349,6 +1358,7 @@ mod tests {
                 tracked_train_id,
                 status: "cancelled".to_string(),
                 delay_minutes: None,
+                awaiting_reason: false,
             },
             decided_at: Utc::now(),
         }

@@ -61,6 +61,12 @@ pub(crate) struct BreakNoticeRow {
     /// Whether the trigger train's own pushes are on
     /// (`train_subscriptions.notifications_enabled`); TRUE without one.
     pub trigger_pushes_on: bool,
+    /// The trigger train's shared `trains` row, for its cancellation reason.
+    pub trigger_trains_id: Option<i64>,
+    /// The trigger train's cancellation reason text (DS-184), filled by the
+    /// cycle for a cancellation; the notice leads with it.
+    #[sqlx(skip)]
+    pub cancel_reason: Option<String>,
     /// The owner's own delay threshold (DS-153), NULL for the default.
     pub delay_threshold_minutes: Option<i16>,
 }
@@ -75,6 +81,7 @@ pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakN
                 jl.train_subscription_id AS trigger_tracked_train_id, \
                 cs.status AS trigger_status, cs.delay_minutes AS trigger_delay_minutes, \
                 COALESCE(ts.notifications_enabled, TRUE) AS trigger_pushes_on, \
+                ts.trains_id AS trigger_trains_id, \
                 p.delay_threshold_minutes \
          FROM journey_breaks b \
          JOIN journeys j ON j.id = b.journey_id AND j.user_id = b.user_id \
@@ -233,6 +240,17 @@ fn train_name(departure: Option<DateTime<Utc>>, destination: Option<&str>) -> Op
     Some(format!("{} to {}", london_clock(departure?), destination?))
 }
 
+/// A notice's body: why the train is not running first, when known
+/// (DS-184: "Reason: Signal failure."), then the lead and the next option.
+fn joined_body(cancel_reason: Option<&str>, lead: Option<String>, body: String) -> String {
+    let reason = cancel_reason.map(|r| format!("Reason: {r}."));
+    [reason, lead, Some(body)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The notice's copy (§6.4, and the decided style: "You'll miss the 10:16
 /// to Charing Cross. Next: 10:31, arrive 10:52. Tap to switch."), from the
 /// stored suggestion set. The Recommended train is named only when it is
@@ -321,10 +339,7 @@ pub(crate) fn build_break_payload(row: &BreakNoticeRow) -> NotificationPayload {
         }
         (None, _) => "Tap to see your options.".to_string(),
     };
-    let body = match lead {
-        Some(lead) => format!("{lead} {body}"),
-        None => body,
-    };
+    let body = joined_body(row.cancel_reason.as_deref(), lead, body);
     NotificationPayload {
         title,
         body,
@@ -413,7 +428,7 @@ pub(crate) async fn run_break_notice_cycle(
     if !enabled() {
         return Ok(());
     }
-    for row in breaks_to_notify(pool).await? {
+    for mut row in breaks_to_notify(pool).await? {
         let decision = decide_break_notice(&row, now);
         count_once(&row, decision);
         if decision != BreakDecision::Send {
@@ -423,6 +438,17 @@ pub(crate) async fn run_break_notice_cycle(
                 "break notice not sent"
             );
             continue;
+        }
+        // A cancelled trigger train's reason, when TRUST has given one. The
+        // notice is not followed up when it comes later: its suggestions
+        // are what it is for, and a plain follow-up would replace them.
+        if (matches!(row.cause.as_str(), "cancelled" | "part_cancelled")
+            || row.trigger_status.as_deref() == Some("cancelled"))
+            && let Some(trains_id) = row.trigger_trains_id
+        {
+            let summary = crate::cancel_reason::summary_for_train(pool, trains_id).await;
+            row.cancel_reason =
+                crate::cancel_reason::CancelCopy::from_summary(summary.as_ref()).reason;
         }
         let trigger = row.trigger_tracked_train_id.map(|tracked_train_id| {
             let threshold = crate::queries::user_delay_threshold(
@@ -521,6 +547,8 @@ mod tests {
             trigger_status: Some("en_route".to_string()),
             trigger_delay_minutes: Some(9),
             trigger_pushes_on: true,
+            trigger_trains_id: None,
+            cancel_reason: None,
             delay_threshold_minutes: None,
         }
     }
@@ -547,6 +575,18 @@ mod tests {
         assert_eq!(
             payload.body,
             "2 other ways to Charing Cross. First arrives 10:52. Tap to see them."
+        );
+    }
+
+    #[test]
+    fn a_cancelled_trains_reason_leads_the_notice() {
+        let mut r = row("cancelled");
+        r.cancel_reason = Some("Signal failure".to_string());
+        let payload = build_break_payload(&r);
+        assert_eq!(payload.title, "10:16 to Charing Cross cancelled");
+        assert_eq!(
+            payload.body,
+            "Reason: Signal failure. Next: 10:31, arrive 10:52. Tap to switch."
         );
     }
 
