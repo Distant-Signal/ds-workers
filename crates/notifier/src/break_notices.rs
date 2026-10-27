@@ -16,6 +16,9 @@
 //! - **opt-outs**: the user's `notification_preferences.journey_suggestions`
 //!   and the journey's `suggestions_muted` suppress the push (the in-app
 //!   banner still shows, and the train's own push then goes out as usual);
+//!   so does turning the trigger train's own pushes off
+//!   (`train_subscriptions.notifications_enabled`, DS-153): that train then
+//!   sends nothing, suggestions included;
 //! - **owner only**, and never for "I missed this train" (the user is
 //!   already in the app);
 //! - **one push per user per train** (§6.3): the notice is that train's
@@ -55,6 +58,9 @@ pub(crate) struct BreakNoticeRow {
     /// That train's current status, for its `train_notification_state`.
     pub trigger_status: Option<String>,
     pub trigger_delay_minutes: Option<i32>,
+    /// Whether the trigger train's own pushes are on
+    /// (`train_subscriptions.notifications_enabled`); TRUE without one.
+    pub trigger_pushes_on: bool,
     /// The owner's own delay threshold (DS-153), NULL for the default.
     pub delay_threshold_minutes: Option<i16>,
 }
@@ -68,6 +74,7 @@ pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakN
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
                 cs.status AS trigger_status, cs.delay_minutes AS trigger_delay_minutes, \
+                COALESCE(ts.notifications_enabled, TRUE) AS trigger_pushes_on, \
                 p.delay_threshold_minutes \
          FROM journey_breaks b \
          JOIN journeys j ON j.id = b.journey_id AND j.user_id = b.user_id \
@@ -87,8 +94,8 @@ pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakN
 /// Whether an open, notifiable break owns tracked train
 /// `tracked_train_id`'s push: one of the user's journeys has a leg on that
 /// subscription and an open break, with suggestions planned, whose push is
-/// not opted out. The train path then stays quiet; the break notice says
-/// more (§6.3). A break the api could not plan for yet owns nothing, so a
+/// not opted out (nor its trigger train's pushes turned off, DS-153). The
+/// train path then stays quiet; the break notice says more (§6.3). A break the api could not plan for yet owns nothing, so a
 /// planning failure never silences the train.
 pub(crate) async fn break_owns_train(
     pool: &PgPool,
@@ -101,10 +108,13 @@ pub(crate) async fn break_owns_train(
              JOIN journeys j ON j.id = b.journey_id \
              JOIN journey_legs jl ON jl.journey_id = b.journey_id \
              LEFT JOIN notification_preferences p ON p.user_id = b.user_id \
+             LEFT JOIN journey_legs tl ON tl.id = b.trigger_leg_id \
+             LEFT JOIN train_subscriptions tts ON tts.id = tl.train_subscription_id \
              WHERE b.user_id = $1 AND b.status = 'open' AND b.cause <> 'user_missed' \
                AND b.suggestions IS NOT NULL \
                AND jl.train_subscription_id = $2 \
-               AND NOT j.suggestions_muted AND COALESCE(p.journey_suggestions, TRUE))",
+               AND NOT j.suggestions_muted AND COALESCE(p.journey_suggestions, TRUE) \
+               AND COALESCE(tts.notifications_enabled, TRUE))",
     )
     .bind(user_id)
     .bind(tracked_train_id)
@@ -140,6 +150,8 @@ pub(crate) enum BreakDecision {
     Send,
     SuppressOptOut,
     SuppressMuted,
+    /// The trigger train's own pushes are off (DS-153).
+    SuppressTrainOff,
     SuppressNotWorse,
     SuppressActed,
     /// Seen by one sweep only, and not a cancellation: wait for the next.
@@ -154,6 +166,7 @@ impl BreakDecision {
             BreakDecision::Send => "sent",
             BreakDecision::SuppressOptOut => "opt_out",
             BreakDecision::SuppressMuted => "muted",
+            BreakDecision::SuppressTrainOff => "train_off",
             BreakDecision::SuppressNotWorse => "not_worse",
             BreakDecision::SuppressActed => "acted",
             BreakDecision::SuppressUnconfirmed => "unconfirmed",
@@ -178,6 +191,9 @@ pub(crate) fn decide_break_notice(row: &BreakNoticeRow, now: DateTime<Utc>) -> B
     }
     if row.suggestions_muted {
         return BreakDecision::SuppressMuted;
+    }
+    if !row.trigger_pushes_on {
+        return BreakDecision::SuppressTrainOff;
     }
     // Opened recently and no worse since: the user is on it. A first
     // notice is never pre-empted this way only if it was opened before it
@@ -451,6 +467,7 @@ pub(crate) fn register_metrics() {
         BreakDecision::Send,
         BreakDecision::SuppressOptOut,
         BreakDecision::SuppressMuted,
+        BreakDecision::SuppressTrainOff,
         BreakDecision::SuppressNotWorse,
         BreakDecision::SuppressActed,
         BreakDecision::SuppressUnconfirmed,
@@ -503,6 +520,7 @@ mod tests {
             trigger_tracked_train_id: Some(118),
             trigger_status: Some("en_route".to_string()),
             trigger_delay_minutes: Some(9),
+            trigger_pushes_on: true,
             delay_threshold_minutes: None,
         }
     }
@@ -613,6 +631,14 @@ mod tests {
                     ..row("connection_missed")
                 },
                 BreakDecision::SuppressMuted,
+            ),
+            // The trigger train's own pushes are off (DS-153).
+            (
+                BreakNoticeRow {
+                    trigger_pushes_on: false,
+                    ..row("cancelled")
+                },
+                BreakDecision::SuppressTrainOff,
             ),
             // One sweep only: wait, unless cancelled.
             (
@@ -786,6 +812,39 @@ mod db_tests {
             .expect("record");
         let rows = breaks_to_notify(&pool).await.expect("breaks");
         assert!(rows.iter().all(|row| row.id != break_id));
+        cleanup(&pool).await;
+    }
+
+    /// DS-153: a train with its own pushes off sends nothing, its break's
+    /// suggestions included, and a break on it owns no other push.
+    #[tokio::test]
+    #[ignore = "requires a live database: DATABASE_URL"]
+    async fn a_break_on_a_train_with_its_pushes_off_sends_no_suggestions() {
+        let pool = connect().await;
+        cleanup(&pool).await;
+        let (_journey_id, break_id, tracked_train_id) = seed(&pool).await;
+        sqlx::query("UPDATE train_subscriptions SET notifications_enabled = FALSE WHERE id = $1")
+            .bind(tracked_train_id)
+            .execute(&pool)
+            .await
+            .expect("turn the train's pushes off");
+
+        let rows = breaks_to_notify(&pool).await.expect("breaks");
+        let row = rows
+            .iter()
+            .find(|row| row.id == break_id)
+            .expect("the open break is still listed (the banner still shows)");
+        assert!(!row.trigger_pushes_on);
+        assert_eq!(
+            decide_break_notice(row, Utc::now()),
+            BreakDecision::SuppressTrainOff
+        );
+        assert!(
+            !break_owns_train(&pool, USER, tracked_train_id)
+                .await
+                .expect("owns"),
+            "a silenced break owns no push"
+        );
         cleanup(&pool).await;
     }
 }

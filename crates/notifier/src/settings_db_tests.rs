@@ -720,3 +720,33 @@ async fn a_snooze_holds_pushes_until_it_ends_and_lets_cancellations_through() {
         Some(("cancelled".to_string(), Some(20)))
     );
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn the_auto_commit_reuses_a_trains_subscription_without_turning_it_back_on() {
+    const USER: &str = "TEST-NOTIFSET-REPIN";
+    const UID: &str = "TEST-NOTIFSET-REPIN1";
+    let pool = connect().await;
+    let _cleanup = cleanup(&pool, USER, UID).await;
+    let fixture = seed(&pool, USER, UID).await;
+    exec(
+        &pool,
+        &format!(
+            "UPDATE train_subscriptions SET notifications_enabled = FALSE WHERE id = {}",
+            fixture.subscription
+        ),
+    )
+    .await;
+    // Another leg matched onto the same train: the same row, still off.
+    let reused = queries::create_subscription_for_train(&pool, fixture.train, USER)
+        .await
+        .expect("create_subscription_for_train");
+    assert_eq!(reused, fixture.subscription);
+    let enabled: bool =
+        sqlx::query_scalar("SELECT notifications_enabled FROM train_subscriptions WHERE id = $1")
+            .bind(reused)
+            .fetch_one(&pool)
+            .await
+            .expect("read notifications_enabled");
+    assert!(!enabled, "the user's off sticks");
+}
