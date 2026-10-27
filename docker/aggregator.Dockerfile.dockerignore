@@ -12,6 +12,7 @@
 !reference-data
 !lines
 !charts/distant-signal/files/db-grants.yaml
+!charts/distant-signal/files/postgres-grants.sql
 !scripts/rollback-tracked-trains-as-journeys.sql
 **/target
 **/*.env
