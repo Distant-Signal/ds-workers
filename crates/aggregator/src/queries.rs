@@ -996,6 +996,67 @@ pub(crate) async fn prune_schedule_turnarounds(pool: &PgPool, retention_days: i6
     Ok(result.rows_affected())
 }
 
+/// Prunes `schedule_associations` (the CIF joins and divides in force per
+/// date, DS-152) for service dates older than `retention_days`, like the
+/// other schedule products: schedule-reference replaces one date at a time.
+pub(crate) async fn prune_schedule_associations(pool: &PgPool, retention_days: i64) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM schedule_associations \
+         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
+        )
+        .bind(retention_days.to_string()),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// How many days past its scheduled start date a Darwin Push Port row
+/// (DS-152) is kept. Only today's and tomorrow's trains are read (a
+/// tracked train's platforms, a previous working's link), and an overnight
+/// train finishes the day after its start, so two days is generous.
+pub(crate) const DARWIN_RETENTION_DAYS: i32 = 2;
+
+/// Prunes `darwin_calls` (DS-152) past [`DARWIN_RETENTION_DAYS`] after the
+/// service's scheduled start date. ingest-writer only upserts the Darwin
+/// tables, so nothing else deletes them.
+pub(crate) async fn prune_darwin_calls(pool: &PgPool) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query("DELETE FROM darwin_calls WHERE ssd < CURRENT_DATE - $1::int")
+            .bind(DARWIN_RETENTION_DAYS),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Prunes `darwin_services` (DS-152), as [`prune_darwin_calls`].
+pub(crate) async fn prune_darwin_services(pool: &PgPool) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query("DELETE FROM darwin_services WHERE ssd < CURRENT_DATE - $1::int")
+            .bind(DARWIN_RETENTION_DAYS),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Prunes `darwin_associations` (DS-152) by the main service's scheduled
+/// start date, or, when its RID gave none, by when it was last written.
+pub(crate) async fn prune_darwin_associations(pool: &PgPool) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM darwin_associations \
+             WHERE COALESCE(main_ssd, updated_at::date) < CURRENT_DATE - $1::int",
+        )
+        .bind(DARWIN_RETENTION_DAYS),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// How long a `tracked_stop_boards` row is kept after its last poll. Only
 /// the latest board of a stop that is still to come is ever read (the api
 /// ignores a board over 10 minutes old), so a day is generous.
@@ -1009,6 +1070,22 @@ pub(crate) async fn prune_tracked_stop_boards(pool: &PgPool) -> Result<u64> {
         pool,
         sqlx::query(
             "DELETE FROM tracked_stop_boards \
+         WHERE polled_at < now() - make_interval(hours => $1::int)",
+        )
+        .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Prunes `tracked_stop_arrival_boards` rows (DS-152) last polled more than
+/// [`TRACKED_STOP_BOARDS_RETENTION_HOURS`] ago, for the same reason as
+/// [`prune_tracked_stop_boards`].
+pub(crate) async fn prune_tracked_stop_arrival_boards(pool: &PgPool) -> Result<u64> {
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(
+            "DELETE FROM tracked_stop_arrival_boards \
          WHERE polled_at < now() - make_interval(hours => $1::int)",
         )
         .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS),
@@ -1692,6 +1769,92 @@ pub(crate) async fn prune_half_hourly_coverage_stats(
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+
+    /// DS-152: the Darwin tables keep today's and recent service dates and
+    /// lose the ones past `DARWIN_RETENTION_DAYS`.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_darwin -- --ignored --test-threads=1`"]
+    async fn prune_darwin_drops_only_old_service_dates() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres");
+        let rids = ["TESTDS152OLD", "TESTDS152NEW"];
+        let cleanup = async |pool: &PgPool| {
+            for table in ["darwin_calls", "darwin_services"] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE rid = ANY($1)"))
+                    .bind(&rids[..])
+                    .execute(pool)
+                    .await
+                    .expect("cleanup");
+            }
+            sqlx::query("DELETE FROM darwin_associations WHERE main_rid = ANY($1)")
+                .bind(&rids[..])
+                .execute(pool)
+                .await
+                .expect("cleanup");
+        };
+        cleanup(&pool).await;
+        for (rid, age) in [(rids[0], 5), (rids[1], 0)] {
+            sqlx::query(
+                "INSERT INTO darwin_services (rid, uid, ssd, message_ts) \
+                 VALUES ($1, 'T99999', CURRENT_DATE - $2::int, now())",
+            )
+            .bind(rid)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .expect("service");
+            sqlx::query(
+                "INSERT INTO darwin_calls (rid, tiploc, wtd, ssd) \
+                 VALUES ($1, 'YORK', '10:00', CURRENT_DATE - $2::int)",
+            )
+            .bind(rid)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .expect("call");
+            sqlx::query(
+                "INSERT INTO darwin_associations (main_rid, assoc_rid, tiploc, category, main_ssd, \
+                 message_ts) VALUES ($1, 'TESTDS152X', 'YORK', 'NP', CURRENT_DATE - $2::int, now())",
+            )
+            .bind(rid)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .expect("association");
+        }
+
+        assert!(prune_darwin_calls(&pool).await.expect("prune calls") >= 1);
+        assert!(prune_darwin_services(&pool).await.expect("prune services") >= 1);
+        assert!(
+            prune_darwin_associations(&pool)
+                .await
+                .expect("prune associations")
+                >= 1
+        );
+
+        for table in ["darwin_calls", "darwin_services"] {
+            let left: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT rid FROM {table} WHERE rid = ANY($1)"))
+                    .bind(&rids[..])
+                    .fetch_all(&pool)
+                    .await
+                    .expect("read");
+            assert_eq!(left, vec![rids[1].to_string()], "{table}");
+        }
+        let left: Vec<String> =
+            sqlx::query_scalar("SELECT main_rid FROM darwin_associations WHERE main_rid = ANY($1)")
+                .bind(&rids[..])
+                .fetch_all(&pool)
+                .await
+                .expect("read");
+        assert_eq!(left, vec![rids[1].to_string()]);
+        cleanup(&pool).await;
+    }
 
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \

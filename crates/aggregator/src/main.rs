@@ -924,6 +924,43 @@ async fn run_retention(
     ))
     .increment(schedule_turnarounds_pruned);
 
+    let schedule_associations_pruned = retention_step(
+        "schedule_associations",
+        queries::prune_schedule_associations(pool, schedule_derived_products_retention_days),
+    )
+    .await;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_schedule_associations_rows_pruned_total"
+    ))
+    .increment(schedule_associations_pruned);
+
+    // The Darwin Push Port tables (DS-152), a fixed few days past their
+    // service date.
+    for (task, pruned) in [
+        (
+            "darwin_calls",
+            retention_step("darwin_calls", queries::prune_darwin_calls(pool)).await,
+        ),
+        (
+            "darwin_services",
+            retention_step("darwin_services", queries::prune_darwin_services(pool)).await,
+        ),
+        (
+            "darwin_associations",
+            retention_step(
+                "darwin_associations",
+                queries::prune_darwin_associations(pool),
+            )
+            .await,
+        ),
+    ] {
+        metrics::counter!(
+            common::metrics::metric_name("aggregator_darwin_rows_pruned_total"),
+            "table" => task
+        )
+        .increment(pruned);
+    }
+
     let tracked_stop_boards_pruned = retention_step(
         "tracked_stop_boards",
         queries::prune_tracked_stop_boards(pool),
@@ -933,6 +970,16 @@ async fn run_retention(
         "aggregator_tracked_stop_boards_rows_pruned_total"
     ))
     .increment(tracked_stop_boards_pruned);
+
+    let tracked_stop_arrival_boards_pruned = retention_step(
+        "tracked_stop_arrival_boards",
+        queries::prune_tracked_stop_arrival_boards(pool),
+    )
+    .await;
+    metrics::counter!(common::metrics::metric_name(
+        "aggregator_tracked_stop_arrival_boards_rows_pruned_total"
+    ))
+    .increment(tracked_stop_arrival_boards_pruned);
 
     let schedule_network_departures_pruned = retention_step(
         "schedule_network_departures",
@@ -1041,7 +1088,12 @@ const RETENTION_TASKS: &[&str] = &[
     "schedule_calling_points_full",
     "schedule_services",
     "schedule_turnarounds",
+    "schedule_associations",
+    "darwin_calls",
+    "darwin_services",
+    "darwin_associations",
     "tracked_stop_boards",
+    "tracked_stop_arrival_boards",
     "schedule_network_departures",
     "schedule_line_population",
     "line_train_summaries",

@@ -850,7 +850,9 @@ struct PredictedStartSubscriber {
 /// The subscribers to push a predicted late start to now (DS-127, spec
 /// decision Q2): every enabled subscription (one per user and train, the
 /// journey leg's first, as [`candidates_for_trains_id`] picks) whose train
-/// departs within the prediction horizon and has no TRUST report yet,
+/// departs within the prediction horizon (by `schedule_turnarounds`, or,
+/// for a train only Darwin's live next-working link knows (DS-152), by its
+/// date and then the prediction's own departure) and has no TRUST report yet,
 /// whose prediction is `high` confidence at or above
 /// `delay_threshold_minutes` (the subscriber's own threshold when they set
 /// one, DS-153), and whose last push for it was below the "delayed" rank.
@@ -870,14 +872,21 @@ pub(crate) async fn predicted_start_candidates(
                 tr.train_uid, tr.service_date, \
                 ns.last_notified_status, ns.last_notified_delay_minutes, \
                 np.delay_threshold_minutes \
-         FROM schedule_turnarounds st \
-         JOIN trains tr ON tr.train_uid = st.uid AND tr.service_date = st.service_date \
+         FROM trains tr \
          JOIN train_subscriptions ts ON ts.trains_id = tr.id AND ts.notifications_enabled \
+         LEFT JOIN schedule_turnarounds st \
+           ON st.uid = tr.train_uid AND st.service_date = tr.service_date \
          LEFT JOIN notification_preferences np ON np.user_id = ts.user_id \
          LEFT JOIN train_current_state cs ON cs.trains_id = tr.id \
          LEFT JOIN train_notification_state ns \
            ON ns.user_id = ts.user_id AND ns.tracked_train_id = ts.id \
-         WHERE st.departs_at > $1 AND st.departs_at <= $1 + $2::interval \
+         WHERE ((st.departs_at > $1 AND st.departs_at <= $1 + $2::interval) \
+                OR (st.uid IS NULL \
+                    AND tr.service_date BETWEEN ($1 AT TIME ZONE 'Europe/London')::date - 1 \
+                                            AND ($1 AT TIME ZONE 'Europe/London')::date + 1 \
+                    AND EXISTS (SELECT 1 FROM darwin_previous_workings dp \
+                                WHERE dp.service_date = tr.service_date \
+                                  AND dp.uid = tr.train_uid))) \
            AND (cs.status IS NULL OR cs.status = 'awaiting_activation') \
            AND cs.delay_minutes IS NULL \
            AND COALESCE(np.predicted_start, TRUE) \
@@ -906,6 +915,12 @@ pub(crate) async fn predicted_start_candidates(
         else {
             continue;
         };
+        // A train linked only by Darwin (DS-152) was picked by its date, not
+        // its departure: push only before it departs (the prediction
+        // itself already waits for the horizon).
+        if prediction.departs_at <= now {
+            continue;
+        }
         let Some(late_minutes) = prediction
             .late_minutes
             .filter(|_| prediction.confidence == Confidence::High)
