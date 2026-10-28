@@ -15,6 +15,12 @@ const CONSUMER: &str = "enricher-1";
 /// (`XREADGROUP ... BLOCK`).
 const READ_BLOCK_MS: usize = 5000;
 
+/// What `read_one` actually blocks for: [`READ_BLOCK_MS`], except in this
+/// crate's own tests. Every Redis test there reads its stream until it is
+/// empty, and each empty read waited the full 5 s; they add their entries
+/// before reading them, so none needs the wait.
+const BLOCK_MS: usize = if cfg!(test) { 100 } else { READ_BLOCK_MS };
+
 // Every command is bounded by `common::redis_conn::RESPONSE_TIMEOUT`, so a
 // blocking read must return well within it or a quiet stream would look
 // like a dead connection.
@@ -226,7 +232,7 @@ async fn read_one_on(
             &redis::streams::StreamReadOptions::default()
                 .group(GROUP, CONSUMER)
                 .count(1)
-                .block(READ_BLOCK_MS),
+                .block(BLOCK_MS),
         )
         .await?;
 
