@@ -1,6 +1,6 @@
 # Backfilling `incidents.extracted_category`
 
-Since 791feee3 (14 Oct 2026, merged in 6c6d0911) the enricher stores
+Since 01fca3e9 (14 Oct 2026, merged in 01fca3e9) the enricher stores
 `incidents.extracted_category` as one of a fixed set of 22 values
 (`crates/enricher/src/category.rs`; anything unrecognised becomes `other`).
 Rows extracted before that still hold the model's free text: `signal_failure`
@@ -15,10 +15,10 @@ the column holds one vocabulary for whoever reads it next.
 ## Which rows, and how many
 
 A row needs it when `extracted_category` is set and not one of the 22 values.
-791feee3 didn't change the extraction model version
+01fca3e9 didn't change the extraction model version
 (`<model>@periods-v2`), so the sweep doesn't re-extract old rows. An old row
 only gets a normalised value when its text changes. Expect most rows extracted
-before the deploy of 6c6d0911 to still need it.
+before the deploy of 01fca3e9 to still need it.
 
 The count and the values below come from the code and the fixtures, not
 production (this work didn't query prod). The dry run reports the real count
