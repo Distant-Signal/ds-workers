@@ -108,7 +108,6 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 1000 --gid 1000 aggregator
 
 COPY --from=builder /usr/local/bin/aggregator /usr/local/bin/aggregator
-COPY --chown=aggregator:aggregator lines/ /app/lines/
 
 # Numeric USER, not the `aggregator` name useradd created above: Kubernetes'
 # runAsNonRoot admission check (this chart's podSecurityContext sets

@@ -1,5 +1,5 @@
 use clap::Parser;
-use common::config::{LineCatalogue, parse_lines};
+use ds_lines::{LineCatalogue, parse_lines};
 
 /// Rejects a negative retention value, loudly, at startup.
 ///
@@ -37,11 +37,12 @@ pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: common::secret::Secret,
 
-    /// Directory of line-catalogue TOML files, loaded once at startup.
-    /// Same default as the `api` crate's `--lines-dir`, since both load
-    /// the same catalogue independently (see the plan's Global
+    /// The line catalogue, loaded once at startup: the one built into the
+    /// binary (`ds_lines::EMBEDDED`), or a directory of line-catalogue TOML
+    /// files. Same default as the `api` crate's `--lines-dir`, since both
+    /// load the same catalogue independently (see the plan's Global
     /// Constraints on keeping this behind a narrow, swappable interface).
-    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = "/app/lines", value_parser = parse_lines)]
+    #[arg(long = "lines-dir", env = "LINES_DIR", default_value = ds_lines::EMBEDDED, value_parser = parse_lines)]
     pub lines: LineCatalogue,
 
     /// DESIGN.md §4 target cadence is "every 30-60s"; 60 is the
@@ -345,24 +346,27 @@ pub(crate) struct Config {
 mod tests {
     use super::*;
 
-    fn lines_dir() -> String {
-        common::manifest_dir!()
-            .join("../../lines")
-            .to_str()
-            .expect("utf8 lines dir path")
-            .to_string()
-    }
-
     fn minimal_args(extra: &[&str]) -> Vec<String> {
         let mut args = vec![
             "aggregator".to_string(),
             "--database-url".to_string(),
             "postgres://user:pass@localhost/db".to_string(),
-            "--lines-dir".to_string(),
-            lines_dir(),
         ];
         args.extend(extra.iter().map(ToString::to_string));
         args
+    }
+
+    /// With no `--lines-dir`, the aggregator matches against the embedded
+    /// catalogue (`ds_lines` proves that equals `lines/`).
+    #[test]
+    fn the_default_catalogue_is_the_embedded_one() {
+        let config = Config::try_parse_from(minimal_args(&[])).expect("parses");
+        let embedded = ds_lines::embedded().expect("embedded catalogue");
+        assert!(!config.lines.is_empty());
+        let ids = |lines: &[common::LineDefinition]| -> Vec<String> {
+            lines.iter().map(|l| l.id.clone()).collect()
+        };
+        assert_eq!(ids(&config.lines), ids(&embedded));
     }
 
     #[test]
