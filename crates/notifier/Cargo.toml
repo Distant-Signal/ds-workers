@@ -16,6 +16,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { path = "../common", features = ["postgres"] }
+ds-runtime = { path = "../ds-runtime", features = ["postgres"] }
 dotenvy = "0.15.7"
 # The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.3).
 ds-store = { path = "../ds-store" }
@@ -32,8 +33,8 @@ tracing = "0.1.44"
 # client-agnostic `request_builder` (see `send.rs::send_message` for why:
 # L9, the transport's resolver must enforce the SSRF guard itself).
 web-push = { version = "0.11", default-features = false }
-# The push transport itself (L9 follow-up): `common`'s public-only-resolver
-# client. Same version/features `common` already builds, so no new crate.
+# The push transport itself (L9 follow-up): `ds-runtime`'s public-only-resolver
+# client. Same version/features `ds-runtime` already builds, so no new crate.
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
 # `web_push::request_builder::build_request`/`parse_response` speak
 # http 0.2 types; same `0.2` web-push itself pins.
@@ -52,7 +53,7 @@ wiremock = "0.6"
 # time a loaded CI runner can blow. Same tokio, one more feature.
 tokio = { version = "1.52.3", features = ["test-util"] }
 # Only the query-count tests' `SqlxQueryCounter` layer; the binary's own
-# subscriber is `common::logging`.
+# subscriber is `ds_runtime::logging`.
 tracing-subscriber = "0.3.23"
 # The stale line-history counter's test (ingest plan 3c.4) reads a local
 # recorder. Already in Cargo.lock, at the version the other crates use.

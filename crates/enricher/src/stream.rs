@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use common::redis_conn::RedisConn;
+use ds_runtime::redis_conn::RedisConn;
 use redis::AsyncCommands;
 
 const STREAM: &str = "incident-text-changed";
@@ -21,11 +21,11 @@ const READ_BLOCK_MS: usize = 5000;
 /// before reading them, so none needs the wait.
 const BLOCK_MS: usize = if cfg!(test) { 100 } else { READ_BLOCK_MS };
 
-// Every command is bounded by `common::redis_conn::RESPONSE_TIMEOUT`, so a
+// Every command is bounded by `ds_runtime::redis_conn::RESPONSE_TIMEOUT`, so a
 // blocking read must return well within it or a quiet stream would look
 // like a dead connection.
 const _: () =
-    assert!((READ_BLOCK_MS as u128) * 2 < common::redis_conn::RESPONSE_TIMEOUT.as_millis());
+    assert!((READ_BLOCK_MS as u128) * 2 < ds_runtime::redis_conn::RESPONSE_TIMEOUT.as_millis());
 
 /// Creates the consumer group if it doesn't already exist, and the stream
 /// itself if this is the very first run (`MKSTREAM`). `BUSYGROUP` (group
@@ -129,7 +129,7 @@ async fn group_last_delivered_id_on(conn: &mut RedisConn, stream: &str) -> Optio
 /// When the group still exists but stands BEHIND `last_delivered` (Redis
 /// restarted and reloaded an older copy of its data; 2026-10-09 redelivery
 /// review), it is moved forward to it, so incidents already extracted are
-/// not handed out again: `common::redis_group::restore_group_position`.
+/// not handed out again: `ds_runtime::redis_group::restore_group_position`.
 pub(crate) async fn recreate_group(
     conn: &mut RedisConn,
     last_delivered: &mut Option<String>,
@@ -166,8 +166,8 @@ async fn recreate_group_on(
     let created = ensure_group_at(conn, stream, &start_id).await?;
     if !created
         && let Some(remembered) = last_delivered.as_deref()
-        && let common::redis_group::GroupPosition::Restored { was } =
-            common::redis_group::restore_group_position(conn, stream, GROUP, remembered).await?
+        && let ds_runtime::redis_group::GroupPosition::Restored { was } =
+            ds_runtime::redis_group::restore_group_position(conn, stream, GROUP, remembered).await?
     {
         tracing::warn!(
             stream,
@@ -177,7 +177,7 @@ async fn recreate_group_on(
             "consumer group went backwards (Redis reloaded an older copy of its data); moved \
              it forward to the last entry read, so those incidents are not handed out again"
         );
-        metrics::counter!(common::metrics::metric_name(GROUP_RESTORED_METRIC)).increment(1);
+        metrics::counter!(ds_runtime::metrics::metric_name(GROUP_RESTORED_METRIC)).increment(1);
     }
     if let Some(id) = group_last_delivered_id_on(conn, stream).await {
         *last_delivered = Some(id);
@@ -463,7 +463,7 @@ mod redis_tests {
 
     async fn cleanup(stream: &str) {
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut conn).await;
     }
 
@@ -486,7 +486,7 @@ mod redis_tests {
     async fn read_one_acks_and_skips_an_entry_missing_incident_id() {
         let stream = unique_stream("read-one-missing-id");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         xadd_without_incident_id(&mut conn, &stream).await;
 
@@ -523,7 +523,7 @@ mod redis_tests {
     async fn claim_stale_acks_and_skips_a_reclaimed_entry_missing_incident_id() {
         let stream = unique_stream("claim-stale-missing-id");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         xadd_without_incident_id(&mut conn, &stream).await;
 
@@ -603,7 +603,7 @@ mod redis_tests {
     async fn entries_written_before_a_lost_group_is_recreated_are_not_lost() {
         let stream = unique_stream("nogroup-recreated-stream");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         let mut last = group_last_delivered_id_on(&mut conn, &stream).await;
         xadd_incident(&mut conn, &stream, "before").await;
@@ -634,7 +634,7 @@ mod redis_tests {
     async fn a_group_deleted_by_hand_resumes_without_replaying_the_stream() {
         let stream = unique_stream("nogroup-destroyed");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         let mut last = group_last_delivered_id_on(&mut conn, &stream).await;
         for i in 0..3 {
@@ -671,7 +671,7 @@ mod redis_tests {
     async fn a_group_that_went_backwards_is_moved_forward_again() {
         let stream = unique_stream("rewound");
         let client = redis::Client::open(redis_url()).unwrap();
-        let mut conn = common::redis_conn::connect(&client).await.unwrap();
+        let mut conn = ds_runtime::redis_conn::connect(&client).await.unwrap();
         ensure_group_on(&mut conn, &stream).await.unwrap();
         let mut last = group_last_delivered_id_on(&mut conn, &stream).await;
         for i in 0..3 {

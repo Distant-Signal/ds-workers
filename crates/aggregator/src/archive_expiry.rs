@@ -292,7 +292,7 @@ fn get(v: &[(&'static str, u64)], table: &str) -> u64 {
     reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52"
 )]
 pub(crate) fn init_metrics(settings: &ExpirySettings) {
-    use common::metrics::metric_name;
+    use ds_runtime::metrics::metric_name;
     for table in EXPIRY_TABLES {
         let table = *table;
         metrics::gauge!(metric_name("aggregator_archive_expiry_candidates"), "table" => table)
@@ -369,7 +369,7 @@ impl Expirer {
         reason = "metric gauges take f64, and these counts and timestamps stay far below 2^52; long but linear; splitting it would scatter its shared state across helpers"
     )]
     pub(crate) async fn run_once(&self, today: NaiveDate) -> ExpiryOutcome {
-        use common::metrics::metric_name;
+        use ds_runtime::metrics::metric_name;
         let retention = self.settings.retention_days;
         let mut out = ExpiryOutcome::default();
         // (service_date, key, table) for every expired, matching key.

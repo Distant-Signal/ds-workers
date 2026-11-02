@@ -461,7 +461,7 @@ impl LlmCall {
 pub(crate) fn register_usage_metrics(model: &str, base_url: &str, profile: &str) {
     register_token_series(TOKENS_METRIC);
     metrics::gauge!(
-        common::metrics::metric_name(MODEL_INFO_METRIC),
+        ds_runtime::metrics::metric_name(MODEL_INFO_METRIC),
         "model" => model.to_string(),
         "profile" => profile.to_string(),
         "base_url_host" => base_url_host(base_url)
@@ -473,7 +473,7 @@ pub(crate) fn register_usage_metrics(model: &str, base_url: &str, profile: &str)
 pub(crate) fn register_call_model_info(llm: &LlmClient) {
     for call in LlmCall::ALL {
         metrics::gauge!(
-            common::metrics::metric_name(CALL_MODEL_INFO_METRIC),
+            ds_runtime::metrics::metric_name(CALL_MODEL_INFO_METRIC),
             "call" => call.label(),
             "model" => llm.model_for(call).to_string(),
             "profile" => llm.profile_for(call).to_string()
@@ -488,7 +488,7 @@ pub(crate) fn register_token_series(metric: &'static str) {
     for call in LlmCall::ALL {
         for kind in TOKEN_KINDS {
             metrics::counter!(
-                common::metrics::metric_name(metric),
+                ds_runtime::metrics::metric_name(metric),
                 "call" => call.label(),
                 "kind" => kind
             )
@@ -528,7 +528,7 @@ pub(crate) fn record_token_usage_to(metric: &'static str, call: LlmCall, usage: 
     ] {
         if let Some(count) = count {
             metrics::counter!(
-                common::metrics::metric_name(metric),
+                ds_runtime::metrics::metric_name(metric),
                 "call" => call.label(),
                 "kind" => kind
             )

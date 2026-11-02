@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 use ds_store::maintenance::Needs;
 use sqlx::PgPool;
 
@@ -256,14 +256,14 @@ pub(crate) async fn run(pool: &PgPool, options: &Options) -> anyhow::Result<Repo
 /// `enricher normalise-categories`).
 pub(crate) async fn main() -> ExitCode {
     // `info` unless RUST_LOG says otherwise: the counts are the output.
-    common::logging::init_with_filter(
+    ds_runtime::logging::init_with_filter(
         "enricher-normalise-categories",
-        common::logging::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| common::logging::EnvFilter::new("info")),
+        ds_runtime::logging::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| ds_runtime::logging::EnvFilter::new("info")),
     );
     // `skip(1)`: the binary's path; the subcommand stands in as the name.
     let args = Args::parse_from(std::env::args_os().skip(1));
-    common::logging::exit_code(cli(args).await)
+    ds_runtime::logging::exit_code(cli(args).await)
 }
 
 async fn cli(args: Args) -> anyhow::Result<()> {
@@ -275,7 +275,7 @@ async fn cli(args: Args) -> anyhow::Result<()> {
         .context("set DATABASE_URL (or --database-url)")?;
     // One connection, whatever DB_MAX_CONNECTIONS the pod sets: the role's
     // CONNECTION LIMIT leaves one spare beside the service's own pool.
-    let mut settings = common::pg::PoolSettings::from_env("enricher-normalise-categories", 1)?;
+    let mut settings = ds_runtime::pg::PoolSettings::from_env("enricher-normalise-categories", 1)?;
     settings.max_connections = 1;
     let pool = settings.connect(url).await?;
     let user = ds_store::maintenance::refuse_api_role(&pool, TOOL, ROLE).await?;

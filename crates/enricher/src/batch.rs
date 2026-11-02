@@ -60,7 +60,7 @@
 //! into [`BatchItem`]s, and moved (never cloned) through the stage. An
 //! adversarial stage is combined and written [`WRITE_CHUNK`] incidents at
 //! a time, each result dropped once used. Afterwards
-//! `common::heap::release_freed_memory` hands the freed heap back to the kernel.
+//! `ds_runtime::heap::release_freed_memory` hands the freed heap back to the kernel.
 //!
 //! **Results.** Matched by `custom_id` (`p-<n>`, `r-<n>`, `s-<n>`, `n` the
 //! item's index), never by position. `errored`, `canceled`, `expired`,
@@ -248,7 +248,7 @@ const BATCH_EVENTS: [&str; 7] = [
 
 fn record_batch_event(provider: &'static str, stage: Stage, event: &'static str) {
     metrics::counter!(
-        common::metrics::metric_name(BATCHES_METRIC),
+        ds_runtime::metrics::metric_name(BATCHES_METRIC),
         "provider" => provider,
         "stage" => stage.as_str(),
         "event" => event
@@ -263,7 +263,7 @@ pub(crate) fn register_metrics(provider: &'static str) {
     for stage in [Stage::Primary, Stage::Adversarial] {
         for event in BATCH_EVENTS {
             metrics::counter!(
-                common::metrics::metric_name(BATCHES_METRIC),
+                ds_runtime::metrics::metric_name(BATCHES_METRIC),
                 "provider" => provider,
                 "stage" => stage.as_str(),
                 "event" => event
@@ -282,7 +282,7 @@ pub(crate) fn register_metrics(provider: &'static str) {
             "missing",
         ] {
             metrics::counter!(
-                common::metrics::metric_name(REQUESTS_METRIC),
+                ds_runtime::metrics::metric_name(REQUESTS_METRIC),
                 "provider" => provider,
                 "call" => call.label(),
                 "result" => result
@@ -293,15 +293,15 @@ pub(crate) fn register_metrics(provider: &'static str) {
     if provider == "openai" {
         for event in ["uploaded", "deleted", "delete_failed"] {
             metrics::counter!(
-                common::metrics::metric_name(llm::batch_api::FILES_METRIC),
+                ds_runtime::metrics::metric_name(llm::batch_api::FILES_METRIC),
                 "provider" => provider,
                 "event" => event
             )
             .increment(0);
         }
     }
-    metrics::gauge!(common::metrics::metric_name(IN_FLIGHT_METRIC)).set(0.0);
-    metrics::gauge!(common::metrics::metric_name(OLDEST_AGE_METRIC)).set(0.0);
+    metrics::gauge!(ds_runtime::metrics::metric_name(IN_FLIGHT_METRIC)).set(0.0);
+    metrics::gauge!(ds_runtime::metrics::metric_name(OLDEST_AGE_METRIC)).set(0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +500,7 @@ pub(crate) fn plan_adversarial(items: Vec<BatchItem>, outcomes: &mut BatchResult
 fn apply_records(enricher: &Enricher, plan: &StagePlan) {
     for record in &plan.records {
         metrics::counter!(
-            common::metrics::metric_name(REQUESTS_METRIC),
+            ds_runtime::metrics::metric_name(REQUESTS_METRIC),
             "provider" => enricher.llm.provider_label(),
             "call" => record.call.label(),
             "result" => record.result
@@ -756,7 +756,7 @@ pub(crate) async fn sweep_with_batches(
         }
     }
     drop(prepared);
-    common::heap::release_freed_memory();
+    ds_runtime::heap::release_freed_memory();
     Vec::new()
 }
 
@@ -838,8 +838,9 @@ pub(crate) async fn poll_once(enricher: &Enricher, max_items: usize) {
     match load_batches(&enricher.pool).await {
         Ok(rows) => {
             let count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-            metrics::gauge!(common::metrics::metric_name(IN_FLIGHT_METRIC)).set(f64::from(count));
-            metrics::gauge!(common::metrics::metric_name(OLDEST_AGE_METRIC))
+            metrics::gauge!(ds_runtime::metrics::metric_name(IN_FLIGHT_METRIC))
+                .set(f64::from(count));
+            metrics::gauge!(ds_runtime::metrics::metric_name(OLDEST_AGE_METRIC))
                 .set(f64::from(oldest_age_secs(&rows, Utc::now())));
             for row in &rows {
                 if let Err(err) = poll_batch(enricher, max_items, row).await {
@@ -964,7 +965,7 @@ async fn poll_batch(enricher: &Enricher, max_items: usize, row: &BatchRow) -> an
     };
     // A stage's items, results and request bodies are freed by now,
     // whether it succeeded or not.
-    common::heap::release_freed_memory();
+    ds_runtime::heap::release_freed_memory();
     finished?;
     // Counted once the row is processed, so a stage retried next tick is
     // not counted twice.

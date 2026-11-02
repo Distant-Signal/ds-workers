@@ -269,14 +269,14 @@ pub(crate) fn compare(
 /// class ("do small edits re-roll untouched fields?").
 pub(crate) fn record(incident_id: &str, report: &ChurnReport, edit_class: &'static str) {
     metrics::counter!(
-        common::metrics::metric_name("enricher_extraction_rerun_total"),
+        ds_runtime::metrics::metric_name("enricher_extraction_rerun_total"),
         "changed" => if report.changed.is_empty() { "false" } else { "true" },
         "edit_class" => edit_class
     )
     .increment(1);
     for field in &report.changed {
         metrics::counter!(
-            common::metrics::metric_name("enricher_extraction_churn_total"),
+            ds_runtime::metrics::metric_name("enricher_extraction_churn_total"),
             "field" => field.label(),
             "edit_class" => edit_class
         )

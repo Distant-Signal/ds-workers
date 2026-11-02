@@ -91,7 +91,7 @@ struct Args {
 /// The subcommand's entry point (`main.rs` dispatches here on
 /// `enricher eval`).
 pub(crate) async fn main() -> ExitCode {
-    common::logging::init("enricher-eval");
+    ds_runtime::logging::init("enricher-eval");
     // `skip(1)`: the binary's path; "eval" stands in as the command name.
     let args = Args::parse_from(std::env::args_os().skip(1));
     match run(&args).await {

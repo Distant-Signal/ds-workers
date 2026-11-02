@@ -312,7 +312,7 @@ pub(crate) fn apply_windows(
         let enforce_sparse = settings.enforces_sparse(line, full_coverage_enabled_default);
         let Some(recent) = windows.get(line_id).and_then(|w| w.recent.as_ref()) else {
             metrics::counter!(
-                common::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
+                ds_runtime::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
                 "verdict" => "missing",
                 "basis" => basis_label(None)
             )
@@ -354,14 +354,14 @@ pub(crate) fn apply_windows(
             other => other.label(),
         };
         metrics::counter!(
-            common::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
+            ds_runtime::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
             "verdict" => label,
             "basis" => basis_label(basis)
         )
         .increment(1);
         if let Some(severity) = decision.would_escalate_to {
             metrics::counter!(
-                common::metrics::metric_name("aggregator_full_coverage_window_escalations_total"),
+                ds_runtime::metrics::metric_name("aggregator_full_coverage_window_escalations_total"),
                 "severity" => severity.description(),
                 "mode" => if enforced { "enforce" } else { "shadow" },
                 "below_min_rank" => if decision.below_min_rank { "true" } else { "false" },
@@ -696,13 +696,13 @@ pub(crate) fn init_metrics() {
         ("stale_row", None),
     ] {
         metrics::counter!(
-            common::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
+            ds_runtime::metrics::metric_name("aggregator_full_coverage_window_verdicts_total"),
             "verdict" => verdict,
             "basis" => basis_label(basis)
         )
         .increment(0);
     }
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_full_coverage_window_stats_pruned_total"
     ))
     .increment(0);

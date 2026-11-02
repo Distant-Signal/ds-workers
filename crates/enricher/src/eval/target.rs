@@ -12,7 +12,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser};
 use serde::{Deserialize, Serialize};
 
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 
 use crate::auth::LlmAuthMode;
 use crate::config::{AnthropicConfig, Config, LlmAuthConfig, ProviderPolicyConfig};

@@ -116,7 +116,7 @@ fn skip_bad_row<T>(table: &'static str, key: Option<String>, result: Result<T>) 
                 error = ?err,
                 "skipping a malformed row rather than failing the whole aggregation cycle"
             );
-            metrics::counter!(common::metrics::metric_name(
+            metrics::counter!(ds_runtime::metrics::metric_name(
                 "aggregator_malformed_rows_skipped_total"
             ))
             .increment(1);
@@ -793,7 +793,7 @@ pub(crate) async fn write_line_status(
 }
 
 /// `statement_timeout` for each retention prune statement, raised with
-/// `SET LOCAL` above the pool's 60s default (`common::pg`). The unbatched
+/// `SET LOCAL` above the pool's 60s default (`ds_runtime::pg`). The unbatched
 /// `schedule_*` prunes delete a whole service date at a time
 /// (`schedule_calling_points_full`: ~1M rows), which can legitimately take
 /// minutes; 10 minutes still bounds a runaway well inside the cycle.
@@ -808,7 +808,7 @@ pub(crate) async fn execute_retention_delete(
     query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
 ) -> Result<sqlx::postgres::PgQueryResult> {
     let mut tx = pool.begin().await?;
-    common::pg::set_local_statement_timeout(&mut tx, RETENTION_STATEMENT_TIMEOUT).await?;
+    ds_runtime::pg::set_local_statement_timeout(&mut tx, RETENTION_STATEMENT_TIMEOUT).await?;
     let result = query.execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(result)
