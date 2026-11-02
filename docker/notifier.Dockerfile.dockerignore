@@ -7,6 +7,7 @@
 # docstring, "Build inputs".
 *
 !Cargo.toml
+!.cargo/config.toml
 !Cargo.lock
 !crates
 !reference-data

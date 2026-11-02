@@ -71,6 +71,12 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     fi
 
 COPY . .
+# The project URL in every outbound User-Agent (crates/common's
+# user_agent!): containers.yml passes the building repository's URL, so the
+# images follow the repository's owner. Declared after the cook so it never
+# invalidates the dependency layer. Unset or empty (a local or compose
+# build), it is unset below and .cargo/config.toml's default applies.
+ARG DS_PROJECT_URL
 # The same flags as the cook. cargo's log is printed after the build, then
 # checked: a `Compiling` line without an /app path is a dependency the cook
 # should have built, so the cook no longer matches and the build fails. The
@@ -78,6 +84,7 @@ COPY . .
 # layer stays small in the build cache.
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    if [ -z "${DS_PROJECT_URL}" ]; then unset DS_PROJECT_URL; fi; \
     if [ "${CARGO_PROFILE}" = "release" ]; then \
       cargo build --release --locked --bin notifier > /tmp/cargo-build.log 2>&1; \
     else \
