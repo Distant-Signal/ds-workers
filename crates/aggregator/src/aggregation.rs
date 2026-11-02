@@ -1945,9 +1945,9 @@ mod tests {
     use super::*;
 
     fn load_all_lines() -> HashMap<String, LineDefinition> {
-        let dir = common::manifest_dir!().join("../../lines");
-        LineDefinition::from_dir(&dir)
-            .expect("lines/ directory should parse")
+        ds_lines::embedded()
+            .expect("the embedded catalogue loads")
+            .0
             .into_iter()
             .map(|l| (l.id.clone(), l))
             .collect()
