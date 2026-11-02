@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum as _};
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 
 use crate::auth::{
     AuthentikConfig, ExchangeTarget, FederatedTokenSource, FederationConfig, LlmAuth, LlmAuthMode,
@@ -11,7 +11,7 @@ use crate::llm::ProviderKind;
 use crate::llm::anthropic::{AnthropicSettings, PromptCache};
 
 /// CLI/env configuration for the `enricher` service.
-/// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
+/// `Debug` is safe to log: every credential is a [`ds_runtime::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
@@ -24,13 +24,13 @@ pub(crate) struct Config {
 
     /// Redis AUTH password (chart `redis.auth`, from a Secret). Unset or
     /// empty: no AUTH, `redis_url` is used as-is. Applied to `redis_url` by
-    /// `common::redis_auth::redis_url_with_password`, never logged.
+    /// `ds_runtime::redis_auth::redis_url_with_password`, never logged.
     #[arg(long, env, hide_env_values = true)]
     pub redis_password: Option<Secret>,
 
     /// Redis ACL user (chart `redis.acl`; ingest architecture phase 0c).
     /// Unset or empty: the `default` user, exactly as before. Combined with
-    /// `redis_password` by `common::redis_auth::redis_url_with_credentials`.
+    /// `redis_password` by `ds_runtime::redis_auth::redis_url_with_credentials`.
     #[arg(long, env)]
     pub redis_username: Option<String>,
 
@@ -132,7 +132,7 @@ pub(crate) struct Config {
     pub reclaim_min_idle_secs: u64,
 
     /// Port for this service's Prometheus `/metrics` endpoint. The enricher
-    /// has no HTTP server of its own, so `common::metrics::install_with_buckets`
+    /// has no HTTP server of its own, so `ds_runtime::metrics::install_with_buckets`
     /// starts a dedicated listener on this port.
     #[arg(long, env, default_value_t = 9091)]
     pub metrics_port: u16,
@@ -164,7 +164,7 @@ pub(crate) struct Config {
     /// `/livez` (liveness: loop progress) and `/healthz` (readiness: also
     /// false until the initial database connection is up) -- SVC-08/INF-5.
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 /// The endpoint, model and provider after defaults and validation.

@@ -476,7 +476,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn metric(suffix: &str) -> String {
-    common::metrics::metric_name(suffix)
+    ds_runtime::metrics::metric_name(suffix)
 }
 
 impl<B: PushBackend> PushQueue<B> {

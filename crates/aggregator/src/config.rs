@@ -30,12 +30,12 @@ fn non_negative_retention(s: &str) -> anyhow::Result<i64> {
 }
 
 /// CLI/env configuration for the `aggregator` service.
-/// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
+/// `Debug` is safe to log: every credential is a [`ds_runtime::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
-    pub database_url: common::secret::Secret,
+    pub database_url: ds_runtime::secret::Secret,
 
     /// Directory of line-catalogue TOML files, loaded once at startup.
     /// Same default as the `api` crate's `--lines-dir`, since both load
@@ -293,7 +293,7 @@ pub(crate) struct Config {
     pub untracked_trains_retention_days: i64,
 
     /// Port for the aggregator's Prometheus `/metrics` endpoint. The
-    /// aggregator has no HTTP server of its own, so `common::metrics::install`
+    /// aggregator has no HTTP server of its own, so `ds_runtime::metrics::install`
     /// starts a dedicated listener on this port.
     #[arg(long, env, default_value_t = 9091)]
     pub metrics_port: u16,
@@ -313,7 +313,7 @@ pub(crate) struct Config {
     /// `/livez` (liveness: loop progress) and `/healthz` (readiness: also
     /// false until the initial database connection is up) -- SVC-08/INF-5.
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 
     /// Global override for `LineDefinition.full_coverage_enabled`
     /// (Decision 3's per-line TOML rollout gate, `crates/common/src/lib.rs`).

@@ -122,7 +122,7 @@ fn record_at(
         "enrichment committed"
     );
     metrics::histogram!(
-        common::metrics::metric_name(METRIC),
+        ds_runtime::metrics::metric_name(METRIC),
         "path" => path.label(),
         "outcome" => outcome.label()
     )
@@ -169,7 +169,9 @@ mod tests {
     fn records_one_sample_with_its_labels_and_skips_unchanged_text() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
             .set_buckets_for_metric(
-                metrics_exporter_prometheus::Matcher::Full(common::metrics::metric_name(METRIC)),
+                metrics_exporter_prometheus::Matcher::Full(ds_runtime::metrics::metric_name(
+                    METRIC,
+                )),
                 &BUCKETS,
             )
             .unwrap()
@@ -188,7 +190,7 @@ mod tests {
         record_at(Path::Sweep, Outcome::Stored, None, now);
 
         let rendered = handle.render();
-        let name = common::metrics::metric_name(METRIC);
+        let name = ds_runtime::metrics::metric_name(METRIC);
         for line in [
             format!("{name}_count{{path=\"batch\",outcome=\"stored\"}} 1"),
             format!("{name}_sum{{path=\"batch\",outcome=\"stored\"}} 21600"),

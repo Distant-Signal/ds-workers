@@ -1,8 +1,8 @@
 use clap::Parser;
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 
 /// CLI/env configuration for the `notifier` service.
-/// `Debug` is safe to log: every credential is a [`common::secret::Secret`]
+/// `Debug` is safe to log: every credential is a [`ds_runtime::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
 pub(crate) struct Config {
@@ -140,7 +140,7 @@ pub(crate) struct Config {
     #[arg(long, env)]
     pub vapid_subject: String,
 
-    /// `main.rs` builds its `common::logging::init_with_filter(...)` filter
+    /// `main.rs` builds its `ds_runtime::logging::init_with_filter(...)` filter
     /// directly from THIS field's value, NOT from
     /// `EnvFilter::from_default_env()` (which every other binary in this
     /// workspace uses, and which reads `RUST_LOG`) -- so the env var clap
@@ -221,7 +221,7 @@ pub(crate) struct Config {
     /// `/livez` (liveness: loop progress) and `/healthz` (readiness: also
     /// false until the initial database connection is up) -- SVC-08/INF-5.
     #[command(flatten)]
-    pub health: common::service_args::HealthArgs,
+    pub health: ds_runtime::service_args::HealthArgs,
 }
 
 impl Config {
@@ -347,7 +347,7 @@ mod tests {
             metrics_enabled: true,
             journey_break_notices_enabled: false,
             journey_breaks_poll_interval_secs: 15,
-            health: common::service_args::HealthArgs {
+            health: ds_runtime::service_args::HealthArgs {
                 health_bind_url: "127.0.0.1:0".to_string(),
                 progress_stall_secs: 900,
             },

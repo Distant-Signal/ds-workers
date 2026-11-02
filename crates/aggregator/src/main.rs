@@ -26,7 +26,7 @@ use dedup::SeenServiceLedger;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 #[expect(
@@ -36,7 +36,7 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("aggregator");
+    ds_runtime::logging::init("aggregator");
 
     let config = Config::parse();
     // Fails startup on an enabled-but-incomplete archive config; `None`
@@ -59,7 +59,7 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!(?expirer, "cold archive expiry enabled");
     }
     if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
         ds_store::pool::register_metrics();
     }
     full_coverage_window::init_metrics();
@@ -76,7 +76,7 @@ async fn run() -> anyhow::Result<()> {
     // reboot) instead of exiting into CrashLoopBackOff. `/healthz` stays
     // 503 until this returns; `/livez` stays 200 while it retries.
     // application_name, statement/idle-in-transaction timeouts and a short
-    // acquire_timeout; see `common::pg`. The retention prunes and archive
+    // acquire_timeout; see `ds_runtime::pg`. The retention prunes and archive
     // batches raise the statement timeout for their own transactions.
     // ds_store's wrapper adds the db_pool_* metrics.
     let pool = ds_store::pool::PoolSettings::from_env("distant-signal-aggregator", 10)?
@@ -119,7 +119,7 @@ async fn run() -> anyhow::Result<()> {
             "aggregator_archive_upload_failures_total",
             "aggregator_archive_batches_changed_total",
         ] {
-            metrics::counter!(common::metrics::metric_name(name)).increment(0);
+            metrics::counter!(ds_runtime::metrics::metric_name(name)).increment(0);
         }
     }
     if archiver.as_ref().is_some_and(|a| a.archives("trains")) {
@@ -128,7 +128,7 @@ async fn run() -> anyhow::Result<()> {
         // process start like every other cycle gauge, so the chart's
         // DistantSignalArchiveStale neither fires on a fresh pod nor stays
         // silent on one whose every archive cycle fails.
-        common::metrics::register_cycle(ARCHIVE_METRICS_SERVICE, ARCHIVE_TRAINS_CYCLE);
+        ds_runtime::metrics::register_cycle(ARCHIVE_METRICS_SERVICE, ARCHIVE_TRAINS_CYCLE);
     }
     register_retention_metrics();
     // Its own task: a slow LIST or a store outage touches neither
@@ -146,8 +146,8 @@ async fn run() -> anyhow::Result<()> {
 
     // aggregator_cycles_total{cycle="aggregate",result} and
     // aggregator_last_success_timestamp_seconds, read by the chart's
-    // DistantSignalAggregatorCycleFailing (see common::metrics::register_cycle).
-    common::metrics::register_cycle("aggregator", AGGREGATE_CYCLE);
+    // DistantSignalAggregatorCycleFailing (see ds_runtime::metrics::register_cycle).
+    ds_runtime::metrics::register_cycle("aggregator", AGGREGATE_CYCLE);
     let mut interval = cycle_interval(Duration::from_secs(config.poll_interval_secs));
 
     loop {
@@ -167,11 +167,11 @@ async fn run() -> anyhow::Result<()> {
         if let Err(err) = &result {
             tracing::error!(error = ?err, "aggregation cycle failed; will retry next interval");
         }
-        common::metrics::record_cycle("aggregator", AGGREGATE_CYCLE, result.is_ok());
+        ds_runtime::metrics::record_cycle("aggregator", AGGREGATE_CYCLE, result.is_ok());
 
         // Aggregation only, since retention moved to its own task (SVC-06);
         // retention has `aggregator_retention_duration_seconds`.
-        metrics::histogram!(common::metrics::metric_name(
+        metrics::histogram!(ds_runtime::metrics::metric_name(
             "aggregator_cycle_duration_seconds"
         ))
         .record(cycle_start.elapsed().as_secs_f64());
@@ -257,7 +257,7 @@ async fn retention_loop(
         interval.tick().await;
         let started = std::time::Instant::now();
         run_retention_pass(&pool, &settings, archiver.as_ref()).await;
-        metrics::histogram!(common::metrics::metric_name(
+        metrics::histogram!(ds_runtime::metrics::metric_name(
             "aggregator_retention_duration_seconds"
         ))
         .record(started.elapsed().as_secs_f64());
@@ -295,7 +295,7 @@ async fn run_retention_pass(
         ),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_full_coverage_window_stats_pruned_total"
     ))
     .increment(pruned);
@@ -687,23 +687,25 @@ async fn run_cycle(
         tx.commit().await?;
     }
 
-    metrics::gauge!(common::metrics::metric_name("aggregator_lines_total"))
+    metrics::gauge!(ds_runtime::metrics::metric_name("aggregator_lines_total"))
         .set(reports.len() as f64);
-    metrics::gauge!(common::metrics::metric_name("aggregator_incidents_loaded"))
-        .set(incidents.len() as f64);
-    metrics::counter!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(
+        "aggregator_incidents_loaded"
+    ))
+    .set(incidents.len() as f64);
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_deduped_new_services_total"
     ))
     .increment(new_services_this_cycle);
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_daily_stats_recorded_total"
     ))
     .increment(daily_stats_recorded);
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_half_hourly_stats_recorded_total"
     ))
     .increment(half_hourly_stats_recorded);
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_coverage_stats_recorded_total"
     ))
     .increment(coverage_stats_recorded);
@@ -769,7 +771,7 @@ async fn run_retention(
     archiver: Option<&archive::Archiver>,
 ) {
     let pruned = retention_step("history", queries::prune_history(pool, retention_days)).await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_history_rows_pruned_total"
     ))
     .increment(pruned);
@@ -797,7 +799,7 @@ async fn run_retention(
         queries::prune_trust_event_backlog(pool, trust_event_backlog_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_trust_event_backlog_rows_pruned_total"
     ))
     .increment(trust_event_backlog_pruned);
@@ -831,7 +833,7 @@ async fn run_retention(
                 // the chart's DistantSignalArchiveStale: a cycle succeeds
                 // when it neither errored nor failed an upload (a run with
                 // nothing due yet is a success).
-                common::metrics::record_cycle(
+                ds_runtime::metrics::record_cycle(
                     ARCHIVE_METRICS_SERVICE,
                     ARCHIVE_TRAINS_CYCLE,
                     result.as_ref().is_ok_and(|o| !o.upload_failed),
@@ -856,7 +858,7 @@ async fn run_retention(
             .await
         }
     };
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_trains_rows_pruned_total"
     ))
     .increment(trains_pruned);
@@ -874,7 +876,7 @@ async fn run_retention(
         ),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_destination_departures_rows_pruned_total"
     ))
     .increment(schedule_destination_departures_pruned);
@@ -893,7 +895,7 @@ async fn run_retention(
         queries::prune_schedule_calling_points_full(pool, schedule_derived_products_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_calling_points_full_rows_pruned_total"
     ))
     .increment(schedule_calling_points_full_pruned);
@@ -909,7 +911,7 @@ async fn run_retention(
         ),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_services_rows_pruned_total"
     ))
     .increment(schedule_services_pruned);
@@ -919,7 +921,7 @@ async fn run_retention(
         queries::prune_schedule_turnarounds(pool, schedule_derived_products_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_turnarounds_rows_pruned_total"
     ))
     .increment(schedule_turnarounds_pruned);
@@ -929,7 +931,7 @@ async fn run_retention(
         queries::prune_schedule_associations(pool, schedule_derived_products_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_associations_rows_pruned_total"
     ))
     .increment(schedule_associations_pruned);
@@ -955,7 +957,7 @@ async fn run_retention(
         ),
     ] {
         metrics::counter!(
-            common::metrics::metric_name("aggregator_darwin_rows_pruned_total"),
+            ds_runtime::metrics::metric_name("aggregator_darwin_rows_pruned_total"),
             "table" => task
         )
         .increment(pruned);
@@ -966,7 +968,7 @@ async fn run_retention(
         queries::prune_tracked_stop_boards(pool),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_tracked_stop_boards_rows_pruned_total"
     ))
     .increment(tracked_stop_boards_pruned);
@@ -976,7 +978,7 @@ async fn run_retention(
         queries::prune_tracked_stop_arrival_boards(pool),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_tracked_stop_arrival_boards_rows_pruned_total"
     ))
     .increment(tracked_stop_arrival_boards_pruned);
@@ -986,7 +988,7 @@ async fn run_retention(
         queries::prune_schedule_network_departures(pool, schedule_derived_products_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_network_departures_rows_pruned_total"
     ))
     .increment(schedule_network_departures_pruned);
@@ -996,7 +998,7 @@ async fn run_retention(
         queries::prune_schedule_line_population(pool, schedule_line_population_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_schedule_line_population_rows_pruned_total"
     ))
     .increment(schedule_line_population_pruned);
@@ -1006,7 +1008,7 @@ async fn run_retention(
         queries::prune_line_train_summaries(pool, schedule_line_population_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_line_train_summaries_rows_pruned_total"
     ))
     .increment(line_train_summaries_pruned);
@@ -1016,7 +1018,7 @@ async fn run_retention(
         queries::prune_daily_stats(pool, daily_stats_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_daily_stats_pruned_total"
     ))
     .increment(daily_stats_pruned);
@@ -1025,7 +1027,7 @@ async fn run_retention(
         queries::prune_half_hourly_stats(pool, half_hourly_stats_retention_hours),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_half_hourly_stats_pruned_total"
     ))
     .increment(half_hourly_stats_pruned);
@@ -1040,7 +1042,7 @@ async fn run_retention(
         queries::prune_half_hourly_coverage_stats(pool, half_hourly_stats_retention_hours),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_coverage_stats_pruned_total"
     ))
     .increment(daily_coverage_stats_pruned + half_hourly_coverage_stats_pruned);
@@ -1052,7 +1054,7 @@ async fn run_retention(
         queries::prune_full_coverage_line_stats(pool, full_coverage_line_stats_retention_days),
     )
     .await;
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         "aggregator_full_coverage_line_stats_pruned_total"
     ))
     .increment(full_coverage_line_stats_pruned);
@@ -1072,7 +1074,7 @@ async fn run_retention(
 }
 
 /// The `service` and `cycle` of the cold archive's cycle metrics
-/// (`common::metrics::register_cycle`):
+/// (`ds_runtime::metrics::register_cycle`):
 /// `aggregator_archive_cycles_total{cycle="trains",result}` and
 /// `aggregator_archive_last_success_timestamp_seconds{cycle="trains"}`.
 const ARCHIVE_METRICS_SERVICE: &str = "aggregator_archive";
@@ -1108,7 +1110,7 @@ const RETENTION_TASKS: &[&str] = &[
 fn register_retention_metrics() {
     for task in RETENTION_TASKS {
         metrics::counter!(
-            common::metrics::metric_name("aggregator_retention_errors_total"),
+            ds_runtime::metrics::metric_name("aggregator_retention_errors_total"),
             "task" => *task
         )
         .increment(0);
@@ -1133,7 +1135,7 @@ async fn retention_step(
                 "retention step failed; the other steps still run, and this one retries next interval"
             );
             metrics::counter!(
-                common::metrics::metric_name("aggregator_retention_errors_total"),
+                ds_runtime::metrics::metric_name("aggregator_retention_errors_total"),
                 "task" => task
             )
             .increment(1);

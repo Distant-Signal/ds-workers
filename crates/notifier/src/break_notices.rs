@@ -408,7 +408,7 @@ fn count_once(row: &BreakNoticeRow, decision: BreakDecision) {
     }
     if counted.insert((row.id, row.severity, decision.label())) {
         metrics::counter!(
-            common::metrics::metric_name("notifier_journey_break_notice_total"),
+            ds_runtime::metrics::metric_name("notifier_journey_break_notice_total"),
             "result" => decision.label()
         )
         .increment(1);
@@ -500,7 +500,7 @@ pub(crate) fn register_metrics() {
         BreakDecision::SuppressInApp,
     ] {
         metrics::counter!(
-            common::metrics::metric_name("notifier_journey_break_notice_total"),
+            ds_runtime::metrics::metric_name("notifier_journey_break_notice_total"),
             "result" => decision.label()
         )
         .increment(0);
