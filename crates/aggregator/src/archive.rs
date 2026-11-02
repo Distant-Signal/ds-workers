@@ -132,7 +132,7 @@ pub(crate) enum FailurePolicy {
     Delete,
 }
 
-pub(crate) use common::secret::Secret;
+pub(crate) use ds_runtime::secret::Secret;
 
 /// CLI/env settings for the cold archive, flattened into `Config`.
 ///
@@ -660,13 +660,13 @@ pub(crate) async fn archive_and_prune_trains(
                     for &(table, n) in &exported.rows {
                         outcome.add_rows(table, n);
                         metrics::counter!(
-                            common::metrics::metric_name("aggregator_archive_rows_total"),
+                            ds_runtime::metrics::metric_name("aggregator_archive_rows_total"),
                             "table" => table
                         )
                         .increment(n);
                     }
                     outcome.objects_written += exported.objects;
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "aggregator_archive_objects_total"
                     ))
                     .increment(exported.objects);
@@ -674,7 +674,7 @@ pub(crate) async fn archive_and_prune_trains(
                 }
                 Err(err) => {
                     outcome.upload_failed = true;
-                    metrics::counter!(common::metrics::metric_name(
+                    metrics::counter!(ds_runtime::metrics::metric_name(
                         "aggregator_archive_upload_failures_total"
                     ))
                     .increment(1);
@@ -715,7 +715,7 @@ pub(crate) async fn archive_and_prune_trains(
         )
         .await?
         else {
-            metrics::counter!(common::metrics::metric_name(
+            metrics::counter!(ds_runtime::metrics::metric_name(
                 "aggregator_archive_batches_changed_total"
             ))
             .increment(1);
@@ -797,7 +797,8 @@ async fn export_and_upload(
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await?;
-        common::pg::set_local_statement_timeout(&mut tx, ARCHIVE_BATCH_STATEMENT_TIMEOUT).await?;
+        ds_runtime::pg::set_local_statement_timeout(&mut tx, ARCHIVE_BATCH_STATEMENT_TIMEOUT)
+            .await?;
         let fingerprints = fingerprints(&mut tx, ids).await?;
         for export in TRAINS_GROUP_EXPORTS {
             let sql = format!(
@@ -841,7 +842,7 @@ async fn delete_batch(
     untracked_retention_days: i64,
 ) -> Result<Option<u64>> {
     let mut tx = pool.begin().await?;
-    common::pg::set_local_statement_timeout(&mut tx, ARCHIVE_BATCH_STATEMENT_TIMEOUT).await?;
+    ds_runtime::pg::set_local_statement_timeout(&mut tx, ARCHIVE_BATCH_STATEMENT_TIMEOUT).await?;
     // `FOR UPDATE OF t` also blocks a concurrent train_subscriptions or
     // movement-event insert referencing these rows (their FK takes a KEY
     // SHARE lock) until we commit or roll back.

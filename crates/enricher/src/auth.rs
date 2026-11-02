@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::secret::Secret;
+use ds_runtime::secret::Secret;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::LlmCallError;
@@ -539,7 +539,7 @@ fn deadlines(
 
 fn record_exchange(stage: Stage, outcome: &'static str) {
     metrics::counter!(
-        common::metrics::metric_name(EXCHANGE_METRIC),
+        ds_runtime::metrics::metric_name(EXCHANGE_METRIC),
         "stage" => stage.label(),
         "outcome" => outcome
     )
@@ -551,7 +551,8 @@ fn record_exchange(stage: Stage, outcome: &'static str) {
     reason = "a token lifetime in seconds is far below 2^52"
 )]
 fn record_remaining(remaining: Duration) {
-    metrics::gauge!(common::metrics::metric_name(REMAINING_METRIC)).set(remaining.as_secs() as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name(REMAINING_METRIC))
+        .set(remaining.as_secs() as f64);
 }
 
 impl FederatedTokenSource {
@@ -586,7 +587,7 @@ impl FederatedTokenSource {
         for stage in stages {
             for outcome in EXCHANGE_OUTCOMES {
                 metrics::counter!(
-                    common::metrics::metric_name(EXCHANGE_METRIC),
+                    ds_runtime::metrics::metric_name(EXCHANGE_METRIC),
                     "stage" => stage.label(),
                     "outcome" => outcome
                 )
@@ -1526,7 +1527,7 @@ pub(crate) mod tests {
         let logs = LogCapture::default();
         // The production JSON subscriber, as this (single-threaded) test
         // runtime's default.
-        let subscriber = common::logging::json_subscriber(
+        let subscriber = ds_runtime::logging::json_subscriber(
             "enricher",
             tracing_subscriber::EnvFilter::new("trace"),
             logs.clone(),

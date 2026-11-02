@@ -283,7 +283,7 @@ pub(crate) const LINE_HISTORY_SKIPPED_METRIC: &str = "notifier_line_history_skip
 /// the series exists from startup.
 pub(crate) fn register_line_history_metrics() {
     metrics::counter!(
-        common::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC),
+        ds_runtime::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC),
         "reason" => "stale"
     )
     .increment(0);
@@ -596,7 +596,7 @@ pub(crate) async fn poll_line_candidates_with_max_age(
              LINE_HISTORY_MAX_AGE_SECS); the cursor moves past them"
         );
         metrics::counter!(
-            common::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC),
+            ds_runtime::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC),
             "reason" => "stale"
         )
         .increment(stale);
@@ -1139,8 +1139,9 @@ pub(crate) async fn forward_queue_stats(pool: &PgPool) -> anyhow::Result<Forward
     reason = "metric gauges take f64; a row count or an age in seconds stays far below 2^52"
 )]
 pub(crate) fn publish_forward_queue_stats(stats: &ForwardQueueStats, now: DateTime<Utc>) {
-    metrics::gauge!(common::metrics::metric_name(FORWARD_QUEUE_ROWS_METRIC)).set(stats.rows as f64);
-    metrics::gauge!(common::metrics::metric_name(
+    metrics::gauge!(ds_runtime::metrics::metric_name(FORWARD_QUEUE_ROWS_METRIC))
+        .set(stats.rows as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name(
         FORWARD_QUEUE_OLDEST_AGE_METRIC
     ))
     .set(stats.oldest_age_seconds(now) as f64);
@@ -2282,7 +2283,7 @@ pub(crate) async fn find_or_create_train_with_cif_schedule(
 /// alongside the commit it must be atomic with.
 ///
 /// Takes the same `(user_id, trains_id)` advisory lock as the original
-/// (DB2-21, `common::pg::lock_user_train_subscription`), so this copy and
+/// (DB2-21, `ds_runtime::pg::lock_user_train_subscription`), so this copy and
 /// the api's serialise against each other too.
 pub(crate) async fn create_subscription_for_train<'e, A>(
     conn: A,
@@ -2293,7 +2294,7 @@ where
     A: sqlx::Acquire<'e, Database = sqlx::Postgres>,
 {
     let mut tx = conn.begin().await?;
-    common::pg::lock_user_train_subscription(&mut tx, user_id, trains_id).await?;
+    ds_runtime::pg::lock_user_train_subscription(&mut tx, user_id, trains_id).await?;
     let row: (i64,) = sqlx::query_as(
         "WITH existing AS ( \
              SELECT id FROM train_subscriptions \
@@ -2814,7 +2815,7 @@ mod tests {
     fn stale_skips(rendered: &str) -> u64 {
         let prefix = format!(
             "{}{{reason=\"stale\"}} ",
-            common::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC)
+            ds_runtime::metrics::metric_name(LINE_HISTORY_SKIPPED_METRIC)
         );
         rendered
             .lines()

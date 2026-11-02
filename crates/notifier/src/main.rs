@@ -79,7 +79,7 @@ const GRANT_NOTICE_BATCH: i64 = 100;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 #[expect(
@@ -111,9 +111,9 @@ async fn run() -> anyhow::Result<()> {
         "vapid_subject (--vapid-subject / VAPID_SUBJECT) must not be empty"
     );
 
-    common::logging::init_with_filter(
+    ds_runtime::logging::init_with_filter(
         "notifier",
-        common::logging::EnvFilter::new(&config.log_level),
+        ds_runtime::logging::EnvFilter::new(&config.log_level),
     );
 
     // Parse the private key once, in any accepted format, and refuse to
@@ -128,7 +128,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     if config.metrics_enabled {
-        common::metrics::install(config.metrics_port)?;
+        ds_runtime::metrics::install(config.metrics_port)?;
         ds_store::pool::register_metrics();
     }
 
@@ -137,7 +137,7 @@ async fn run() -> anyhow::Result<()> {
     // reboot) instead of exiting into CrashLoopBackOff. `/healthz` stays
     // 503 until this returns; `/livez` stays 200 while it retries.
     // application_name, statement/idle-in-transaction timeouts and a short
-    // acquire_timeout; see `common::pg`. ds_store's wrapper adds the
+    // acquire_timeout; see `ds_runtime::pg`. ds_store's wrapper adds the
     // db_pool_* metrics.
     let pool = ds_store::pool::PoolSettings::from_env("distant-signal-notifier", 5)?
         .connect_until_ready(config.database_url.expose(), Some(&progress))
@@ -160,7 +160,7 @@ async fn run() -> anyhow::Result<()> {
     let cursor_grace = chrono::Duration::seconds(config.cursor_grace_seconds);
     // notifier_cycles_total{cycle,result} and
     // notifier_last_success_timestamp_seconds{cycle}, read by the chart's
-    // DistantSignalNotifierCycleFailing (see common::metrics::register_cycle).
+    // DistantSignalNotifierCycleFailing (see ds_runtime::metrics::register_cycle).
     for cycle in [
         LINE_STATUS_CYCLE,
         HELD_RELEASE_CYCLE,
@@ -172,7 +172,7 @@ async fn run() -> anyhow::Result<()> {
         PREDICTED_START_CYCLE,
         CANCEL_REASON_CYCLE,
     ] {
-        common::metrics::register_cycle("notifier", cycle);
+        ds_runtime::metrics::register_cycle("notifier", cycle);
     }
     break_notices::set_enabled(config.journey_break_notices_enabled);
     break_notices::register_metrics();
@@ -225,7 +225,7 @@ async fn run() -> anyhow::Result<()> {
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", LINE_STATUS_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", LINE_STATUS_CYCLE, result.is_ok());
                 let result = hold::run_release_cycle(
                     &pool,
                     &queue,
@@ -236,7 +236,7 @@ async fn run() -> anyhow::Result<()> {
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier held-push release failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", HELD_RELEASE_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", HELD_RELEASE_CYCLE, result.is_ok());
             }
             _ = progress.idle(forward_interval.tick()) => {
                 let result = run_forward_queue_cycle(
@@ -250,26 +250,26 @@ async fn run() -> anyhow::Result<()> {
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier forward-queue cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", FORWARD_QUEUE_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", FORWARD_QUEUE_CYCLE, result.is_ok());
                 sample_forward_queue(&pool, Utc::now()).await;
                 let result =
                     cancel_reason::run_reason_followup_cycle(&pool, &queue, Utc::now()).await;
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier cancellation-reason cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", CANCEL_REASON_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", CANCEL_REASON_CYCLE, result.is_ok());
             }
             _ = progress.idle(skip_check_interval.tick()) => {
                 let result = run_skip_check_cycle(&pool, &queue, Utc::now()).await;
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", SKIP_CHECK_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", SKIP_CHECK_CYCLE, result.is_ok());
                 let result = run_grant_notice_cycle(&pool, &queue, Utc::now()).await;
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier grant-notice cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", GRANT_NOTICE_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", GRANT_NOTICE_CYCLE, result.is_ok());
             }
             _ = progress.idle(template_sweep_interval.tick()) => {
                 let result = run_template_sweep_cycle(
@@ -282,7 +282,7 @@ async fn run() -> anyhow::Result<()> {
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier template-sweep cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", TEMPLATE_SWEEP_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", TEMPLATE_SWEEP_CYCLE, result.is_ok());
             }
             _ = progress.idle(journey_breaks_interval.tick()) => {
                 let result = break_notices::run_break_notice_cycle(
@@ -295,7 +295,7 @@ async fn run() -> anyhow::Result<()> {
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier journey-breaks cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", JOURNEY_BREAKS_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", JOURNEY_BREAKS_CYCLE, result.is_ok());
             }
             _ = progress.idle(predicted_start_interval.tick()), if predicted_start_enabled => {
                 let result = run_predicted_start_cycle(
@@ -308,7 +308,7 @@ async fn run() -> anyhow::Result<()> {
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier predicted-start cycle failed; will retry next interval");
                 }
-                common::metrics::record_cycle("notifier", PREDICTED_START_CYCLE, result.is_ok());
+                ds_runtime::metrics::record_cycle("notifier", PREDICTED_START_CYCLE, result.is_ok());
             }
         }
     }

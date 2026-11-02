@@ -47,8 +47,10 @@ pub(crate) const TOKEN_EXPIRED_CODE: &str = "token_expired";
     reason = "a token lifetime in seconds is far below 2^52"
 )]
 fn record_submit_token_remaining(remaining: std::time::Duration) {
-    metrics::gauge!(common::metrics::metric_name(SUBMIT_TOKEN_REMAINING_METRIC))
-        .set(remaining.as_secs() as f64);
+    metrics::gauge!(ds_runtime::metrics::metric_name(
+        SUBMIT_TOKEN_REMAINING_METRIC
+    ))
+    .set(remaining.as_secs() as f64);
 }
 
 /// The batch's `endpoint` and each line's `url`: the synchronous path's

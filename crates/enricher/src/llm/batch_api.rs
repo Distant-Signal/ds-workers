@@ -301,7 +301,7 @@ pub(crate) enum BatchPoll {
 
 pub(crate) fn record_file_event(provider: &'static str, event: &'static str) {
     metrics::counter!(
-        common::metrics::metric_name(FILES_METRIC),
+        ds_runtime::metrics::metric_name(FILES_METRIC),
         "provider" => provider,
         "event" => event
     )

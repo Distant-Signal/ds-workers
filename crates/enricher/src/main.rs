@@ -69,7 +69,7 @@ async fn main() -> std::process::ExitCode {
         Some(arg) if arg == "normalise-categories" => return category_backfill::main().await,
         _ => {}
     }
-    common::logging::exit_code(run().await)
+    ds_runtime::logging::exit_code(run().await)
 }
 
 #[expect(
@@ -79,10 +79,10 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
-    common::logging::init("enricher");
+    ds_runtime::logging::init("enricher");
     // Before any batch work: the batch path's freed peaks go back to the
-    // kernel (`common::heap`).
-    common::heap::pin_mmap_threshold();
+    // kernel (`ds_runtime::heap`).
+    ds_runtime::heap::pin_mmap_threshold();
 
     let config = Config::parse();
     // `LLM_PROVIDER` with its defaults (`anthropic` fills in the base URL
@@ -115,12 +115,15 @@ async fn run() -> anyhow::Result<()> {
     )?;
     if config.metrics_enabled {
         let buckets = llm_duration_buckets(config.llm_request_timeout_secs);
-        common::metrics::install_with_buckets(
+        ds_runtime::metrics::install_with_buckets(
             config.metrics_port,
             &[
-                (&common::metrics::metric_name(LLM_DURATION_METRIC), &buckets),
                 (
-                    &common::metrics::metric_name(latency::METRIC),
+                    &ds_runtime::metrics::metric_name(LLM_DURATION_METRIC),
+                    &buckets,
+                ),
+                (
+                    &ds_runtime::metrics::metric_name(latency::METRIC),
                     &latency::BUCKETS,
                 ),
             ],
@@ -175,7 +178,7 @@ async fn run() -> anyhow::Result<()> {
     // CrashLoopBackOff. `/healthz` stays 503 until all three steps below
     // are done; `/livez` stays 200 while they retry.
     // application_name, statement/idle-in-transaction timeouts and a short
-    // acquire_timeout; see `common::pg`. ds_store's wrapper adds the
+    // acquire_timeout; see `ds_runtime::pg`. ds_store's wrapper adds the
     // db_pool_* metrics.
     let pool = ds_store::pool::PoolSettings::from_env("distant-signal-enricher", 5)?
         .connect_until_ready(config.database_url.expose(), Some(&progress))
@@ -185,27 +188,27 @@ async fn run() -> anyhow::Result<()> {
     ds_store::schema::wait_for_schema(&pool, ds_store::schema::DbRole::Enricher, Some(&progress))
         .await?;
 
-    let redis_url = common::redis_auth::redis_url_with_credentials(
+    let redis_url = ds_runtime::redis_auth::redis_url_with_credentials(
         config.redis_url.expose(),
         config.redis_username.as_deref(),
         config.redis_password.as_ref(),
     )?;
     let redis_client = redis::Client::open(redis_url.expose())?;
-    // Bounded connections (`common::redis_conn`): no redis-rs-internal
+    // Bounded connections (`ds_runtime::redis_conn`): no redis-rs-internal
     // retries (minutes, unlogged, with the defaults), a connect timeout and a
     // per-command response timeout. A Redis outage later on fails
     // `read_one` within seconds, and the loop below logs, backs off and
     // retries -- beating progress every iteration.
-    let mut redis = common::redis_conn::connect_until_ready(
+    let mut redis = ds_runtime::redis_conn::connect_until_ready(
         "Redis",
         &redis_client,
-        common::startup::CONNECT_BACKOFF,
+        ds_runtime::startup::CONNECT_BACKOFF,
         Some(&progress),
     )
     .await;
-    common::startup::retry_until_ready(
+    ds_runtime::startup::retry_until_ready(
         "Redis consumer group",
-        common::startup::CONNECT_BACKOFF,
+        ds_runtime::startup::CONNECT_BACKOFF,
         Some(&progress),
         || {
             let mut conn = redis.clone();
@@ -215,7 +218,10 @@ async fn run() -> anyhow::Result<()> {
     .await;
     // The group's position, kept for `stream::recreate_group`.
     let mut last_delivered = stream::group_last_delivered_id(&mut redis).await;
-    metrics::counter!(common::metrics::metric_name(stream::GROUP_RESTORED_METRIC)).increment(0);
+    metrics::counter!(ds_runtime::metrics::metric_name(
+        stream::GROUP_RESTORED_METRIC
+    ))
+    .increment(0);
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // `config.llm_model` is the ONLY thing ever sent to the endpoint as the
@@ -307,10 +313,10 @@ async fn run() -> anyhow::Result<()> {
         tokio::spawn(batch::poll_loop(Arc::clone(&enricher), settings));
     }
 
-    let reclaim_redis = common::redis_conn::connect_until_ready(
+    let reclaim_redis = ds_runtime::redis_conn::connect_until_ready(
         "Redis (reclaim connection)",
         &redis_client,
-        common::startup::CONNECT_BACKOFF,
+        ds_runtime::startup::CONNECT_BACKOFF,
         Some(&progress),
     )
     .await;
@@ -444,7 +450,7 @@ const DEFERRED_METRIC: &str = "enricher_deferred_to_batch_total";
 
 fn register_deferred_metrics() {
     for path in ["stream", "reclaim"] {
-        metrics::counter!(common::metrics::metric_name(DEFERRED_METRIC), "path" => path)
+        metrics::counter!(ds_runtime::metrics::metric_name(DEFERRED_METRIC), "path" => path)
             .increment(0);
     }
 }
@@ -470,7 +476,7 @@ const ECHO_RESULTS: [&str; 2] = ["recovered", "failed"];
 /// The output checks' counters at 0, every label combination, so "no
 /// events" reads as 0 rather than an absent series (`rate()`, `absent()`).
 fn register_check_metrics() {
-    metrics::counter!(common::metrics::metric_name(
+    metrics::counter!(ds_runtime::metrics::metric_name(
         RAIL_REPLACEMENT_DOWNGRADES_METRIC
     ))
     .increment(0);
@@ -478,7 +484,7 @@ fn register_check_metrics() {
         for kind in combine::EchoMismatch::LABELS {
             for result in ECHO_RESULTS {
                 metrics::counter!(
-                    common::metrics::metric_name(ECHO_MISMATCHES_METRIC),
+                    ds_runtime::metrics::metric_name(ECHO_MISMATCHES_METRIC),
                     "call" => call.label(),
                     "kind" => kind,
                     "result" => result
@@ -489,14 +495,14 @@ fn register_check_metrics() {
     }
     for action in checks::EndTimeAction::ALL {
         metrics::counter!(
-            common::metrics::metric_name(END_TIME_CHECKS_METRIC),
+            ds_runtime::metrics::metric_name(END_TIME_CHECKS_METRIC),
             "action" => action.label()
         )
         .increment(0);
     }
     for action in checks::YearAction::ALL {
         metrics::counter!(
-            common::metrics::metric_name(YEAR_CHECKS_METRIC),
+            ds_runtime::metrics::metric_name(YEAR_CHECKS_METRIC),
             "action" => action.label()
         )
         .increment(0);
@@ -528,7 +534,7 @@ fn deferred_outcome(path: &'static str, incident_id: &str, preflight: &Preflight
                 path,
                 "leaving this text change for the next sweep (LLM_MODE=batch/batch-only)"
             );
-            metrics::counter!(common::metrics::metric_name(DEFERRED_METRIC), "path" => path)
+            metrics::counter!(ds_runtime::metrics::metric_name(DEFERRED_METRIC), "path" => path)
                 .increment(1);
             true
         }
@@ -599,7 +605,7 @@ fn record_in_flight_skip(caller: &'static str, incident_id: &str) {
         "incident is already being processed by another loop; skipping"
     );
     metrics::counter!(
-        common::metrics::metric_name("enricher_in_flight_skips_total"),
+        ds_runtime::metrics::metric_name("enricher_in_flight_skips_total"),
         "caller" => caller
     )
     .increment(1);
@@ -810,12 +816,12 @@ where
 /// 429 waits included.
 fn record_llm_call_metrics(call: &'static str, elapsed: Duration, outcome: &'static str) {
     metrics::histogram!(
-        common::metrics::metric_name(LLM_DURATION_METRIC),
+        ds_runtime::metrics::metric_name(LLM_DURATION_METRIC),
         "call" => call
     )
     .record(elapsed.as_secs_f64());
     metrics::counter!(
-        common::metrics::metric_name("enricher_llm_call_total"),
+        ds_runtime::metrics::metric_name("enricher_llm_call_total"),
         "call" => call,
         "outcome" => outcome
     )
@@ -986,7 +992,7 @@ async fn preflight(enricher: &Enricher, incident_id: &str, path: latency::Path) 
         .await
         {
             Ok(true) => {
-                metrics::counter!(common::metrics::metric_name(
+                metrics::counter!(ds_runtime::metrics::metric_name(
                     "enricher_extraction_carried_forward_total"
                 ))
                 .increment(1);
@@ -1176,7 +1182,7 @@ fn note_truncation(incident_id: &str, primary: &llm::PrimaryExtraction) {
             kept_count = primary.periods.len(),
             "primary extraction exceeded the period cap; truncated to the N most severe/soonest periods"
         );
-        metrics::counter!(common::metrics::metric_name(
+        metrics::counter!(ds_runtime::metrics::metric_name(
             "enricher_period_truncations_total"
         ))
         .increment(1);
@@ -1440,7 +1446,7 @@ fn record_echo_mismatch(
         "adversarial verdicts did not echo the primary periods; asked that pass again"
     );
     metrics::counter!(
-        common::metrics::metric_name(ECHO_MISMATCHES_METRIC),
+        ds_runtime::metrics::metric_name(ECHO_MISMATCHES_METRIC),
         "call" => call.label(),
         "kind" => mismatch.label(),
         "result" => result
@@ -1462,7 +1468,7 @@ fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
             periods = report.rail_replacement_downgraded,
             "rail_replacement_bus cleared: the text mentions no replacement service"
         );
-        metrics::counter!(common::metrics::metric_name(
+        metrics::counter!(ds_runtime::metrics::metric_name(
             RAIL_REPLACEMENT_DOWNGRADES_METRIC
         ))
         .increment(u64::try_from(report.rail_replacement_downgraded).unwrap_or(u64::MAX));
@@ -1482,7 +1488,7 @@ fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
             "period end time is an hour or more from every end time the text states"
         );
         metrics::counter!(
-            common::metrics::metric_name(END_TIME_CHECKS_METRIC),
+            ds_runtime::metrics::metric_name(END_TIME_CHECKS_METRIC),
             "action" => flag.action.label()
         )
         .increment(1);
@@ -1498,7 +1504,7 @@ fn record_check_report(incident_id: &str, report: &checks::CheckReport) {
             "period dates are in a different year from the dates the text states"
         );
         metrics::counter!(
-            common::metrics::metric_name(YEAR_CHECKS_METRIC),
+            ds_runtime::metrics::metric_name(YEAR_CHECKS_METRIC),
             "action" => flag.action.label()
         )
         .increment(1);
@@ -1601,7 +1607,7 @@ where
 )]
 async fn reclaim_loop(
     enricher: Arc<Enricher>,
-    mut redis: common::redis_conn::RedisConn,
+    mut redis: ds_runtime::redis_conn::RedisConn,
     interval_secs: u64,
     min_idle_secs: u64,
 ) {
@@ -1612,14 +1618,16 @@ async fn reclaim_loop(
 
         match stream::group_lag(&mut redis).await {
             Ok(Some(lag)) => {
-                metrics::gauge!(common::metrics::metric_name("enricher_stream_lag"))
+                metrics::gauge!(ds_runtime::metrics::metric_name("enricher_stream_lag"))
                     .set(lag as f64);
             }
             Ok(None) => {}
             Err(err) => tracing::warn!(error = ?err, "failed to sample stream consumer-group lag"),
         }
-        metrics::gauge!(common::metrics::metric_name("enricher_mismatch_incidents"))
-            .set(enricher.mismatch_tracker.len() as f64);
+        metrics::gauge!(ds_runtime::metrics::metric_name(
+            "enricher_mismatch_incidents"
+        ))
+        .set(enricher.mismatch_tracker.len() as f64);
 
         match stream::claim_stale(&mut redis, min_idle).await {
             Ok(entries) => {

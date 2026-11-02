@@ -173,10 +173,10 @@ pub(crate) async fn send_to_subscription(
     // immediately before the real send, closes that window: this is a
     // fresh, real DNS resolution against the endpoint's CURRENT state, not
     // a cached judgment from registration time. See
-    // `common::outbound_endpoint_guard`'s own module doc for the shared
+    // `ds_runtime::outbound_endpoint_guard`'s own module doc for the shared
     // implementation both crates now call.
     if let Err(err) =
-        common::outbound_endpoint_guard::validate_outbound_url(&subscription.endpoint).await
+        ds_runtime::outbound_endpoint_guard::validate_outbound_url(&subscription.endpoint).await
     {
         tracing::error!(
             endpoint = %subscription.endpoint,
@@ -312,7 +312,7 @@ async fn send_to_subscription_with_timeout(
 }
 
 /// The HTTP client every push send goes through (L9 follow-up,
-/// 2026-09-27): `common::outbound_endpoint_guard::public_only_client_builder`,
+/// 2026-09-27): `ds_runtime::outbound_endpoint_guard::public_only_client_builder`,
 /// i.e. a resolver that refuses private/internal/loopback answers at
 /// CONNECT time, plus no redirects. This replaces
 /// `web_push::HyperWebPushClient`, whose connector resolves the endpoint's
@@ -327,7 +327,7 @@ async fn send_to_subscription_with_timeout(
 fn push_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        common::outbound_endpoint_guard::public_only_client_builder()
+        ds_runtime::outbound_endpoint_guard::public_only_client_builder()
             .build()
             .expect("the push HTTP client's static configuration is always valid")
     })
@@ -339,7 +339,7 @@ const MAX_PUSH_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 enum PushSendError {
-    /// Resolution (including a [`common::outbound_endpoint_guard::PublicOnlyResolver`]
+    /// Resolution (including a [`ds_runtime::outbound_endpoint_guard::PublicOnlyResolver`]
     /// refusal), connect, TLS or body-read failure -- always transient.
     Transport(reqwest::Error),
     /// The push service answered with a non-success status (or an
@@ -666,7 +666,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
     /// and refuse, not merely rely on `crates/api` having caught it once
     /// in the past. Using a bare private IPv4 literal (not a hostname)
     /// means this needs no real DNS/network access to fail the check --
-    /// `common::outbound_endpoint_guard::validate_outbound_url` parses an
+    /// `ds_runtime::outbound_endpoint_guard::validate_outbound_url` parses an
     /// IP literal locally.
     #[tokio::test]
     async fn refuses_to_send_when_the_endpoint_now_resolves_to_a_private_address() {
