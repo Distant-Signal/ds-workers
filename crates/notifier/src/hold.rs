@@ -65,13 +65,14 @@ const RESULTS: &[&str] = &[
 /// Registers every `result` at 0, so `increase()` sees the first one.
 pub(crate) fn register_metrics() {
     for result in RESULTS {
-        metrics::counter!(common::metrics::metric_name(HOLDS_METRIC), "result" => *result)
+        metrics::counter!(ds_runtime::metrics::metric_name(HOLDS_METRIC), "result" => *result)
             .increment(0);
     }
 }
 
 fn count(result: &'static str) {
-    metrics::counter!(common::metrics::metric_name(HOLDS_METRIC), "result" => result).increment(1);
+    metrics::counter!(ds_runtime::metrics::metric_name(HOLDS_METRIC), "result" => result)
+        .increment(1);
 }
 
 /// A user's quiet hours, as stored (all three or none), and their snooze.
