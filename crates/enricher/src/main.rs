@@ -56,8 +56,18 @@ use sqlx::PgPool;
 /// the module-wide default buckets with nothing to flag it.
 const LLM_DURATION_METRIC: &str = "enricher_llm_call_duration_seconds";
 
+/// The Postgres pool size when `DATABASE_MAX_CONNECTIONS` is unset.
+const DB_POOL_SIZE: u32 = 5;
+
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("enricher")
+        .postgres_pool(DB_POOL_SIZE)
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     // `enricher eval ...`: the one-off model comparison (`eval::cli`,
     // docs/enricher-model-eval.md, "In-cluster run"). Never reached by the
     // service, whose container passes no arguments.
@@ -180,7 +190,7 @@ async fn run() -> anyhow::Result<()> {
     // application_name, statement/idle-in-transaction timeouts and a short
     // acquire_timeout; see `ds_runtime::pg`. ds_store's wrapper adds the
     // db_pool_* metrics.
-    let pool = ds_store::pool::PoolSettings::from_env("distant-signal-enricher", 5)?
+    let pool = ds_store::pool::PoolSettings::from_env("distant-signal-enricher", DB_POOL_SIZE)?
         .connect_until_ready(config.database_url.expose(), Some(&progress))
         .await?;
     // The schema gate (spec §12.2): no loop and no readiness until the
