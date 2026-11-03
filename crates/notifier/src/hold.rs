@@ -134,9 +134,19 @@ pub(crate) enum Gate {
     NotNow,
 }
 
+/// A notice that something can now use the account (a new delegated
+/// grant or a new personal API token): it goes out whatever the quiet
+/// hours, because it is how the user learns of access they did not give.
+fn is_account_security_notice(delivered: &Delivered) -> bool {
+    matches!(
+        delivered,
+        Delivered::GrantCreated { .. } | Delivered::TokenCreated { .. }
+    )
+}
+
 /// The quiet-hours rule for one push. Pure.
 pub(crate) fn gate(delivered: &Delivered, quiet: bool) -> Gate {
-    if matches!(delivered, Delivered::GrantCreated { .. }) || !quiet {
+    if is_account_security_notice(delivered) || !quiet {
         return Gate::Send;
     }
     if is_cancellation(delivered) {
@@ -188,7 +198,7 @@ async fn quiet_hours_for(pool: &PgPool, user_id: &str) -> anyhow::Result<QuietHo
 /// nowhere while the user's quiet hours last ([`gate`]). A push that goes
 /// to the queue deletes its target's hold: it is newer.
 pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyhow::Result<()> {
-    let quiet = if matches!(job.delivered, Delivered::GrantCreated { .. }) {
+    let quiet = if is_account_security_notice(&job.delivered) {
         false
     } else {
         in_quiet_hours(&quiet_hours_for(pool, &job.user_id).await?, job.decided_at)
@@ -583,6 +593,10 @@ mod tests {
         assert_eq!(gate(&cancel, true), Gate::Send);
         assert_eq!(
             gate(&Delivered::GrantCreated { grant_id: 1 }, true),
+            Gate::Send
+        );
+        assert_eq!(
+            gate(&Delivered::TokenCreated { token_id: 1 }, true),
             Gate::Send
         );
         assert_eq!(
