@@ -275,7 +275,12 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier skip-check cycle failed; will retry next interval");
                 }
                 ds_runtime::metrics::record_cycle("notifier", SKIP_CHECK_CYCLE, result.is_ok());
-                let result = run_grant_notice_cycle(&pool, &queue, Utc::now()).await;
+                // New delegated grants, then new personal API tokens: both
+                // are account-access notices, recorded as one cycle.
+                let result = match run_grant_notice_cycle(&pool, &queue, Utc::now()).await {
+                    Ok(()) => run_token_notice_cycle(&pool, &queue, Utc::now()).await,
+                    Err(err) => Err(err),
+                };
                 if let Err(err) = &result {
                     tracing::error!(error = ?err, "notifier grant-notice cycle failed; will retry next interval");
                 }
@@ -947,6 +952,44 @@ fn grant_notice_payload(grant: &queries::NewGrantRow) -> NotificationPayload {
         url: "/account/connected-apps".to_string(),
         tag: format!("grant-created-{}", grant.id),
     }
+}
+
+/// The push a new personal API token sends to each of the user's devices
+/// (docs/specs/personal-api-tokens.md §15 decision 3): which token, and
+/// where to revoke it if the user did not create it.
+fn token_notice_payload(token: &queries::NewTokenRow) -> NotificationPayload {
+    NotificationPayload {
+        title: "New API token created".to_string(),
+        body: format!(
+            "A personal API token called \"{}\" can now read your Distant Signal data. \
+             Not you? Revoke it in Connected apps.",
+            token.name
+        ),
+        url: "/account/connected-apps".to_string(),
+        tag: format!("token-created-{}", token.id),
+    }
+}
+
+/// Enqueues one notice per user for the oldest unrevoked personal API
+/// token whose notice has not gone out, the same way as
+/// [`run_grant_notice_cycle`]. Runs in the grant notice's cycle.
+async fn run_token_notice_cycle(
+    pool: &PgPool,
+    queue: &Queue,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for token in queries::poll_new_tokens(pool, GRANT_NOTICE_BATCH).await? {
+        enqueue_push(
+            pool,
+            queue,
+            &token.user_id,
+            token_notice_payload(&token),
+            Delivered::TokenCreated { token_id: token.id },
+            now,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Enqueues one notice per user for the oldest active grant whose notice
@@ -3391,6 +3434,29 @@ mod sweep_cycle_tests {
             .await
             .ok();
         cleanup_user(&pool, user_id).await;
+    }
+}
+
+#[cfg(test)]
+mod token_notice_tests {
+    use super::*;
+
+    #[test]
+    fn the_token_notice_names_the_token_and_where_to_revoke_it() {
+        let payload = token_notice_payload(&queries::NewTokenRow {
+            id: 42,
+            user_id: "u".to_string(),
+            name: "Kitchen display".to_string(),
+        });
+        assert_eq!(payload.title, "New API token created");
+        assert!(
+            payload.body.contains("\"Kitchen display\""),
+            "{}",
+            payload.body
+        );
+        assert!(payload.body.contains("Revoke it in Connected apps"));
+        assert_eq!(payload.url, "/account/connected-apps");
+        assert_eq!(payload.tag, "token-created-42");
     }
 }
 

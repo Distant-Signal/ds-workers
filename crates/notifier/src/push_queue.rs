@@ -158,6 +158,9 @@ pub(crate) enum Delivered {
     /// `delegated_grants.push_notified_at`: the "an app was connected"
     /// notice (delegated-access spec 2026-10-14 §5.3).
     GrantCreated { grant_id: i64 },
+    /// `personal_api_tokens.push_notified_at`: the "a personal API token
+    /// was created" notice (docs/specs/personal-api-tokens.md).
+    TokenCreated { token_id: i64 },
     /// `journey_breaks.notified_at`/`notified_severity`: an auto-suggest
     /// notice (mid-journey changes spec 2026-10-22 §6.3). With a trigger
     /// train, also its `train_notification_state` at the equivalent rank,
@@ -184,6 +187,7 @@ enum Target {
     SkippedStop(i64),
     Unmatched(i64),
     GrantCreated(i64),
+    TokenCreated(i64),
     JourneyBreak(i64),
 }
 
@@ -197,6 +201,7 @@ impl Delivered {
             Delivered::SkippedStop { journey_leg_id } => Target::SkippedStop(*journey_leg_id),
             Delivered::Unmatched { journey_leg_id } => Target::Unmatched(*journey_leg_id),
             Delivered::GrantCreated { grant_id } => Target::GrantCreated(*grant_id),
+            Delivered::TokenCreated { token_id } => Target::TokenCreated(*token_id),
             Delivered::JourneyBreak { break_id, .. } => Target::JourneyBreak(*break_id),
         }
     }
@@ -381,6 +386,9 @@ impl PushBackend for PgBackend {
             }
             Delivered::GrantCreated { grant_id } => {
                 queries::mark_grant_notified(&self.pool, *grant_id, at).await
+            }
+            Delivered::TokenCreated { token_id } => {
+                queries::mark_token_notified(&self.pool, *token_id, at).await
             }
             Delivered::JourneyBreak {
                 break_id,

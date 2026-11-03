@@ -1404,6 +1404,51 @@ pub(crate) async fn mark_grant_notified(
     Ok(())
 }
 
+/// A personal API token whose "a token was created" push has not gone out
+/// yet (docs/specs/personal-api-tokens.md §15 decision 3): the same
+/// compensating control as a new delegated grant's notice.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct NewTokenRow {
+    pub id: i64,
+    pub user_id: String,
+    pub name: String,
+}
+
+/// Unrevoked tokens whose notice has not been sent, at most one per user
+/// (that user's oldest), oldest first, at most `limit` users: the same
+/// rules as [`poll_new_grants`].
+pub(crate) async fn poll_new_tokens(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<NewTokenRow>> {
+    Ok(sqlx::query_as::<_, NewTokenRow>(
+        "SELECT id, user_id, name FROM ( \
+             SELECT DISTINCT ON (user_id) id, user_id, name, created_at \
+             FROM personal_api_tokens \
+             WHERE revoked_at IS NULL AND push_notified_at IS NULL \
+             ORDER BY user_id, created_at, id \
+         ) due ORDER BY created_at, id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Records that a token's notice was delivered (or that the user has no
+/// push subscription, which counts as handled).
+pub(crate) async fn mark_token_notified(
+    pool: &PgPool,
+    token_id: i64,
+    at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE personal_api_tokens SET push_notified_at = $2 \
+         WHERE id = $1 AND push_notified_at IS NULL",
+    )
+    .bind(token_id)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn push_subscriptions_for_user(
     pool: &PgPool,
     user_id: &str,
@@ -6789,6 +6834,90 @@ mod sweep_tests {
 /// 2026-10-14 §5.3): which grants are due, and marking one sent. Run as the
 /// notifier's own role in the per-service CI step, which proves its column
 /// grants on `delegated_grants`.
+#[cfg(test)]
+mod token_notice_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                -- --ignored --test-threads=1`"]
+    async fn due_tokens_are_polled_until_marked() {
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        let user = "TEST-TOKEN-NOTICE-USER";
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1)")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        let mut ids = Vec::new();
+        for (index, (created_at, revoked)) in [
+            ("now()", false),
+            ("now()", true),
+            ("now() - INTERVAL '2 days'", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id: i64 = sqlx::query_scalar(&format!(
+                "INSERT INTO personal_api_tokens \
+                     (user_id, name, token_hash, hint, scopes, created_at, expires_at, \
+                      revoked_at, revoked_reason) \
+                 VALUES ($1, 'Display', sha256(convert_to($1 || $2, 'UTF8')), 'AbC1', \
+                         '{{lines:read}}', {created_at}, now() + INTERVAL '30 days', {}, {}) \
+                 RETURNING id",
+                if revoked { "now()" } else { "NULL" },
+                if revoked { "'user'" } else { "NULL" },
+            ))
+            .bind(user)
+            .bind(index.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("seed token");
+            ids.push(id);
+        }
+        let (fresh, revoked, stale) = (ids[0], ids[1], ids[2]);
+        let due = |pool: PgPool| async move {
+            poll_new_tokens(&pool, 10_000)
+                .await
+                .expect("poll")
+                .into_iter()
+                .filter(|token| token.user_id == user)
+                .map(|token| token.id)
+                .collect::<Vec<i64>>()
+        };
+        assert_eq!(
+            due(pool.clone()).await,
+            vec![stale],
+            "the user's oldest first"
+        );
+        mark_token_notified(&pool, stale, Utc::now())
+            .await
+            .expect("mark");
+        assert_eq!(due(pool.clone()).await, vec![fresh], "then the next one");
+        mark_token_notified(&pool, fresh, Utc::now())
+            .await
+            .expect("mark");
+        let after = due(pool.clone()).await;
+        assert!(after.is_empty(), "{after:?}");
+        assert!(!after.contains(&revoked));
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+}
+
 #[cfg(test)]
 mod grant_notice_tests {
     use super::*;
