@@ -834,7 +834,7 @@ mod tests {
             ]
         );
         assert_eq!(record.echo_retries(), 1);
-        assert!(record.echo_mismatches().is_empty());
+        assert_eq!(record.echo_mismatches(), []);
         assert_eq!(record.outcome().unwrap().periods.len(), 2);
 
         let backend = FakeBackend::default().agreeing("a", &two_periods).with(

@@ -1406,7 +1406,7 @@ mod tests {
         assert_eq!(summary(&chunked), summary(&whole));
         assert_eq!(whole.ready.len(), n - n.div_ceil(5));
         assert!(results.outcomes.is_empty(), "{:?}", results.outcomes.keys());
-        assert!(into_chunks(Vec::new(), 0).is_empty());
+        assert_eq!(into_chunks(Vec::new(), 0), [] as [Vec<BatchItem>; 0]);
         assert_eq!(into_chunks(items(), 0).len(), n, "a size of 0 counts as 1");
     }
 
@@ -1425,7 +1425,7 @@ mod tests {
             vec![item(0, "A"), item(1, "B")],
             parse_results_jsonl(&format!("{refused}\n{truncated}")).into(),
         );
-        assert!(plan.next.is_empty());
+        assert_eq!(plan.next, []);
         assert_eq!(plan.text_failures.len(), 2);
         assert!(
             plan.text_failures[0].2.contains("refused"),

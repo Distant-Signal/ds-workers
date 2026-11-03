@@ -279,7 +279,7 @@ fn the_reported_october_notice_is_left_alone_or_moved_back() {
     let reference = "2026-10-16T07:45:27Z";
     let stored = period(Some("2026-10-24T23:00:00Z"), Some("2026-10-26T00:00:00Z"));
     let mut periods = [stored.clone()];
-    assert!(check(summary, description, reference, &mut periods).is_empty());
+    assert_eq!(check(summary, description, reference, &mut periods), []);
     assert_eq!(periods[0], stored);
 
     // A year late: 25 October 2027 is a Monday, still BST (the clocks go
@@ -335,14 +335,14 @@ fn an_implausible_unmatched_year_is_only_flagged() {
 
     // The same dates in a text that states a year are not flagged.
     let mut periods = [stored.clone()];
-    assert!(
+    assert_eq!(
         check(
             "Engineering work in October 2027",
             "",
             "2026-10-16T07:00:00Z",
             &mut periods,
-        )
-        .is_empty()
+        ),
+        []
     );
 }
 
@@ -381,21 +381,21 @@ fn a_summary_cut_off_before_its_month_is_not_corrected() {
                        <p>Repalcement buses will run between Basingstoke and Southampton \
                        Central.</p>";
     let reference = "2026-10-12T10:23:09Z";
-    assert!(stated_dates(summary).is_empty());
+    assert_eq!(stated_dates(summary), []);
 
     let undated = ExtractionPeriod {
         date_range: None,
         ..period(None, None)
     };
     let mut periods = [undated.clone()];
-    assert!(check(summary, description, reference, &mut periods).is_empty());
+    assert_eq!(check(summary, description, reference, &mut periods), []);
     assert_eq!(periods[0], undated);
 
     let mut periods = [period(
         Some("2027-01-04T00:00:00Z"),
         Some("2027-01-09T00:00:00Z"),
     )];
-    assert!(check(summary, description, reference, &mut periods).is_empty());
+    assert_eq!(check(summary, description, reference, &mut periods), []);
 
     let october = period(Some("2027-10-03T23:00:00Z"), Some("2027-10-08T23:00:00Z"));
     let mut periods = [october.clone()];

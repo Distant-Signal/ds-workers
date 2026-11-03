@@ -877,7 +877,7 @@ mod tests {
         assert_eq!(get(&out.candidates, "train_current_state"), 0);
         assert_eq!(get(&out.would_delete, "trains"), 2);
         assert_eq!(get(&out.would_delete, "train_movement_events"), 1);
-        assert!(out.deleted.is_empty());
+        assert_eq!(out.deleted, []);
         assert_eq!(get(&out.unmatched, "trains"), 1);
         assert_eq!(
             (out.list_errors, out.delete_errors, out.cap_reached),
@@ -894,7 +894,7 @@ mod tests {
 
         assert_eq!(get(&out.deleted, "trains"), 2);
         assert_eq!(get(&out.deleted, "train_movement_events"), 1);
-        assert!(out.would_delete.is_empty());
+        assert_eq!(out.would_delete, []);
         let mut expected = vec![
             key("trains", "2026-10-02", 4),
             key("train_current_state", "2028-09-30", 5),
@@ -906,7 +906,7 @@ mod tests {
 
         // A second run finds nothing more to do.
         let again = e.run_once(d(TODAY)).await;
-        assert!(again.deleted.is_empty());
+        assert_eq!(again.deleted, []);
         assert_eq!(get(&again.candidates, "trains"), 0);
     }
 

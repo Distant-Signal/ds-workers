@@ -981,7 +981,7 @@ mod tests {
     fn off_changes_nothing_and_records_nothing() {
         let mut f = fixture();
         let before = serde_json::to_value(&f.reports).unwrap();
-        assert!(run(&mut f, &settings(WindowMode::Off, "*"), true).is_empty());
+        assert_eq!(run(&mut f, &settings(WindowMode::Off, "*"), true), []);
         assert_eq!(serde_json::to_value(&f.reports).unwrap(), before);
     }
 

@@ -2679,7 +2679,7 @@ mod tests {
         b.sample_stations = vec![" wos".to_string(), "WDM".to_string()];
         let lines = HashMap::from([("a".to_string(), a), ("b".to_string(), b)]);
         assert_eq!(sampled_stations(&lines), vec!["LMS", "WDM", "WOS"]);
-        assert!(sampled_stations(&HashMap::new()).is_empty());
+        assert_eq!(sampled_stations(&HashMap::new()), [] as [String; 0]);
     }
 
     #[test]

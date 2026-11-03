@@ -1406,7 +1406,7 @@ mod tests {
             (3, 6, 3),
             "nothing may be deleted"
         );
-        assert!(objects_under(flaky.as_ref(), "cold").await.is_empty());
+        assert_eq!(objects_under(flaky.as_ref(), "cold").await, []);
 
         sqlx::query("DELETE FROM trains WHERE id = ANY($1)")
             .bind(&ids)

@@ -198,21 +198,33 @@ async fn the_delay_and_cancel_switches_and_the_users_threshold_gate_train_pushes
 
     // Delays off.
     set_prefs(&pool, USER, "train_delay", "FALSE").await;
-    assert!(train_candidate_ranks(&pool, fixture.train).await.is_empty());
+    assert_eq!(
+        train_candidate_ranks(&pool, fixture.train).await,
+        [] as [u8; 0]
+    );
 
     // The user's own threshold replaces the default: 30 holds a 20-minute
     // delay back, 10 lets a 12-minute one through that 15 would not.
     set_prefs(&pool, USER, "delay_threshold_minutes", "30").await;
-    assert!(train_candidate_ranks(&pool, fixture.train).await.is_empty());
+    assert_eq!(
+        train_candidate_ranks(&pool, fixture.train).await,
+        [] as [u8; 0]
+    );
     set_train_state(&pool, fixture.train, "en_route", 12).await;
-    assert!(train_candidate_ranks(&pool, fixture.train).await.is_empty());
+    assert_eq!(
+        train_candidate_ranks(&pool, fixture.train).await,
+        [] as [u8; 0]
+    );
     set_prefs(&pool, USER, "delay_threshold_minutes", "10").await;
     assert_eq!(train_candidate_ranks(&pool, fixture.train).await, [1]);
 
     // Cancellations off: no cancel push, whatever the delay switch says.
     set_train_state(&pool, fixture.train, "cancelled", 0).await;
     set_prefs(&pool, USER, "train_cancel", "FALSE").await;
-    assert!(train_candidate_ranks(&pool, fixture.train).await.is_empty());
+    assert_eq!(
+        train_candidate_ranks(&pool, fixture.train).await,
+        [] as [u8; 0]
+    );
     set_prefs(&pool, USER, "train_delay, train_cancel", "FALSE, TRUE").await;
     assert_eq!(train_candidate_ranks(&pool, fixture.train).await, [2]);
 }
@@ -256,7 +268,7 @@ async fn line_pushes_respect_the_line_status_switch() {
     let users = queries::pinned_users_for_line(&pool, LINE)
         .await
         .expect("users");
-    assert!(users.is_empty());
+    assert_eq!(users, [] as [String; 0]);
 }
 
 #[tokio::test]
@@ -291,11 +303,11 @@ async fn a_pinned_line_with_its_alerts_off_sends_no_line_push() {
         ),
     )
     .await;
-    assert!(
+    assert_eq!(
         queries::pinned_users_for_line(&pool, LINE)
             .await
-            .expect("users")
-            .is_empty()
+            .expect("users"),
+        [] as [String; 0]
     );
     assert_eq!(
         queries::pinned_users_for_line(&pool, OTHER_LINE)
@@ -520,7 +532,7 @@ async fn quiet_hours_hold_a_delay_and_release_only_its_latest_state() {
 
     // Quiet hours over: the latest state goes, once.
     release(&pool, now + chrono::Duration::hours(2)).await;
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
     assert_eq!(
         delivered_train_state(&pool, USER).await,
         Some(("en_route".to_string(), Some(25)))
@@ -528,7 +540,7 @@ async fn quiet_hours_hold_a_delay_and_release_only_its_latest_state() {
     // And the escalation rule still holds afterwards: the same lateness
     // decides nothing new.
     decide_train(&pool, fixture.train, now + chrono::Duration::hours(2)).await;
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
 }
 
 #[tokio::test]
@@ -581,7 +593,7 @@ async fn a_held_push_that_is_no_longer_news_is_dropped_unsent() {
     // The train finished before quiet hours ended.
     set_train_state(&pool, fixture.train, "completed", 20).await;
     release(&pool, now + chrono::Duration::hours(2)).await;
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
     assert_eq!(delivered_train_state(&pool, USER).await, None);
 
     // Held again, then the user turns the train's pushes off.
@@ -597,7 +609,7 @@ async fn a_held_push_that_is_no_longer_news_is_dropped_unsent() {
     )
     .await;
     release(&pool, now + chrono::Duration::hours(2)).await;
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
     assert_eq!(delivered_train_state(&pool, USER).await, None);
 }
 
@@ -676,7 +688,7 @@ async fn quiet_hours_hold_a_line_push_and_skip_full_poll_pushes_until_they_end()
     .await
     .expect("read line state");
     assert_eq!(line_rank, Some(2));
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
 }
 
 #[tokio::test]
@@ -704,7 +716,7 @@ async fn a_snooze_holds_pushes_until_it_ends_and_lets_cancellations_through() {
     assert_eq!(holds(&pool, USER).await.len(), 1, "still snoozed");
     assert_eq!(delivered_train_state(&pool, USER).await, None);
     release(&pool, until + chrono::Duration::seconds(1)).await;
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
     assert_eq!(
         delivered_train_state(&pool, USER).await,
         Some(("en_route".to_string(), Some(20))),
@@ -714,7 +726,7 @@ async fn a_snooze_holds_pushes_until_it_ends_and_lets_cancellations_through() {
     // A cancellation is not held by a snooze either.
     set_train_state(&pool, fixture.train, "cancelled", 20).await;
     decide_train(&pool, fixture.train, now).await;
-    assert!(holds(&pool, USER).await.is_empty());
+    assert_eq!(holds(&pool, USER).await, []);
     assert_eq!(
         delivered_train_state(&pool, USER).await,
         Some(("cancelled".to_string(), Some(20)))

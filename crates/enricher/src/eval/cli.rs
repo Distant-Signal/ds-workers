@@ -665,7 +665,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.target, ["a", "b"]);
         assert_eq!(args.repeats, 1);
-        assert!(args.cases.is_empty());
+        assert_eq!(args.cases, [] as [String; 0]);
     }
 
     /// A result line carries the parsed extraction, every call's raw output
