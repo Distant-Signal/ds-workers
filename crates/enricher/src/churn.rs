@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(pairing.by_key, vec![(2, 0)]);
         assert_eq!(pairing.by_position, vec![(0, 1)]);
         assert_eq!(pairing.unpaired_old, vec![1]);
-        assert!(pairing.unpaired_new.is_empty());
+        assert_eq!(pairing.unpaired_new, [] as [usize; 0]);
         let report = compare(Some("x"), &old, "x", &new);
         assert_eq!(
             fields(&report),

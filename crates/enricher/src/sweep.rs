@@ -128,7 +128,10 @@ mod tests {
     fn matching_hash_and_model_does_not_need_extraction() {
         let hash = text_hash("text", "desc");
         let rows = vec![row("A", "text", Some(&hash), Some("gpt-oss-20b"))];
-        assert!(incidents_needing_extraction(&rows, "gpt-oss-20b").is_empty());
+        assert_eq!(
+            incidents_needing_extraction(&rows, "gpt-oss-20b"),
+            [] as [String; 0]
+        );
     }
 
     #[test]

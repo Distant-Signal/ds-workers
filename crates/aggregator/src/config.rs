@@ -441,7 +441,7 @@ mod tests {
         );
         assert_eq!(expiry.archive_expiry_retention_days, 730);
         assert_eq!(expiry.archive_expiry_max_deletes_per_run, 20_000);
-        assert!(expiry.archive_protected_prefixes.is_empty());
+        assert_eq!(expiry.archive_protected_prefixes, [] as [String; 0]);
         let window = &config.full_coverage_window;
         assert_eq!(
             window.mode,

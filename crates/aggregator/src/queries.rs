@@ -3750,7 +3750,9 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 record_daily_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
-    #[expect(clippy::float_cmp, reason = "a sum of no samples is exactly 0.0")]
+    // `allow`, not `expect`: clippy 1.99's `float_cmp` no longer fires
+    // here, but older toolchains' does (workspace Cargo.toml).
+    #[allow(clippy::float_cmp, reason = "a sum of no samples is exactly 0.0")]
     async fn record_daily_stats_none_still_counts_the_cycle_but_adds_nothing() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
@@ -4291,7 +4293,9 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
                 record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing -- --ignored --test-threads=1` \
                 against docker compose's postgres"]
-    #[expect(clippy::float_cmp, reason = "a sum of no samples is exactly 0.0")]
+    // `allow`, not `expect`: clippy 1.99's `float_cmp` no longer fires
+    // here, but older toolchains' does (workspace Cargo.toml).
+    #[allow(clippy::float_cmp, reason = "a sum of no samples is exactly 0.0")]
     async fn record_daily_coverage_stats_none_still_counts_the_cycle_but_adds_nothing() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");

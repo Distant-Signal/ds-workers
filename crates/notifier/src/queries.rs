@@ -4918,7 +4918,7 @@ mod tests {
         ) = poll_forward_queue(&pool, max_id, TEST_POLL_BATCH_ROWS)
             .await
             .expect("poll_forward_queue again from the new watermark");
-        assert!(touched_again.is_empty());
+        assert_eq!(touched_again, [] as [i64; 0]);
         assert_eq!(max_id_again, max_id);
 
         sqlx::query("DELETE FROM notifier_forward_queue WHERE id = $1")

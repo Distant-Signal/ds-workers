@@ -1901,7 +1901,10 @@ mod tests {
             "normal",
             Some("diversion"),
         ));
-        assert!(match_periods(std::slice::from_ref(&unrelated), gold, opts()).is_empty());
+        assert_eq!(
+            match_periods(std::slice::from_ref(&unrelated), gold, opts()),
+            []
+        );
 
         let mut one_gold = labelled_case();
         one_gold
@@ -1952,7 +1955,10 @@ mod tests {
             "normal",
             Some("rail_replacement_bus"),
         ));
-        assert!(match_periods(std::slice::from_ref(&no_dates), gold, opts()).is_empty());
+        assert_eq!(
+            match_periods(std::slice::from_ref(&no_dates), gold, opts()),
+            []
+        );
         // ...but with the dates left unscored, 3 of 4 is.
         let mut undated = gold[0].clone();
         undated.date_range = Gold::Unscored;
@@ -1997,13 +2003,13 @@ mod tests {
         let judgements = judge_period(&predicted, &gold, opts());
         let to_date = judgements.iter().find(|j| j.field == "to_date").unwrap();
         assert_eq!(to_date.verdict, Verdict::CorrectNull);
-        assert!(
+        assert_eq!(
             match_periods(
                 std::slice::from_ref(&predicted),
                 std::slice::from_ref(&gold),
                 opts()
-            )
-            .is_empty()
+            ),
+            []
         );
     }
 
@@ -2028,13 +2034,13 @@ mod tests {
             judgements.iter().filter(|j| j.verdict.is_correct()).count(),
             2
         );
-        assert!(
+        assert_eq!(
             match_periods(
                 std::slice::from_ref(&half),
                 std::slice::from_ref(&undated),
                 opts()
-            )
-            .is_empty()
+            ),
+            []
         );
     }
 
@@ -2350,7 +2356,7 @@ mod tests {
             &[bare_record(&case.id, case.input_hash(), 0)],
             opts(),
         );
-        assert!(record_warnings("t", &clean).is_empty());
+        assert_eq!(record_warnings("t", &clean), [] as [String; 0]);
     }
 
     /// A primary output that matches `labelled_case` exactly.

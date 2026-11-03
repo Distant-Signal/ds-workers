@@ -1696,7 +1696,7 @@ mod tests {
             } else {
                 assert_eq!(deleted, [7], "pruned on the 3rd consecutive timeout");
             }
-            assert!(recorded(&queue).is_empty());
+            assert_eq!(recorded(&queue), []);
         }
 
         queue.enqueue(line_job("u", "L", 2));
@@ -1754,7 +1754,7 @@ mod tests {
         queue.enqueue(line_job("u", "L", 2));
         queue.wait_idle().await;
         assert_eq!(lock(&queue.shared.backend.deleted).clone(), [9]);
-        assert!(recorded(&queue).is_empty());
+        assert_eq!(recorded(&queue), []);
         queue.shutdown(Duration::from_secs(1)).await;
     }
 

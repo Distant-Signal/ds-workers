@@ -2882,7 +2882,7 @@ mod tests {
 
         // Twenty: one primary batch with twenty requests, none left over.
         let left = batch::sweep_with_batches(&enricher, &settings, ids.clone()).await;
-        assert!(left.is_empty());
+        assert_eq!(left, [] as [String; 0]);
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/messages/batches");

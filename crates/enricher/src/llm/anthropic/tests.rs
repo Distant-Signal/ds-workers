@@ -1077,8 +1077,11 @@ fn the_cache_minimum_is_checked_per_call_and_model() {
         .with_anthropic(AnthropicSettings::default())
         .with_adversarial(adversarial.as_ref())
     };
-    assert!(cache_minimum_shortfalls(&sonnet(None)).is_empty());
-    assert!(cache_minimum_shortfalls(&sonnet(Some("claude-haiku-5-5"))).is_empty());
+    assert_eq!(cache_minimum_shortfalls(&sonnet(None)), []);
+    assert_eq!(
+        cache_minimum_shortfalls(&sonnet(Some("claude-haiku-5-5"))),
+        []
+    );
     let old = sonnet(Some("claude-haiku-4-5"));
     let flagged: Vec<_> = cache_minimum_shortfalls(&old)
         .into_iter()
