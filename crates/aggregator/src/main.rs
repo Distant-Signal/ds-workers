@@ -24,8 +24,18 @@ use common::{Defaults, LineDefinition, LineStatus, LineStatusReport};
 use config::Config;
 use dedup::SeenServiceLedger;
 
+/// The Postgres pool size when `DATABASE_MAX_CONNECTIONS` is unset.
+const DB_POOL_SIZE: u32 = 10;
+
+/// What `--print-config-defaults` prints (`ds_runtime::service_args`).
+fn config_defaults() -> ds_runtime::service_args::ConfigDefaults {
+    ds_runtime::service_args::ConfigDefaults::for_config::<Config>("aggregator")
+        .postgres_pool(DB_POOL_SIZE)
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    ds_runtime::service_args::exit_if_print_config_defaults(config_defaults);
     ds_runtime::logging::exit_code(run().await)
 }
 
@@ -79,7 +89,7 @@ async fn run() -> anyhow::Result<()> {
     // acquire_timeout; see `ds_runtime::pg`. The retention prunes and archive
     // batches raise the statement timeout for their own transactions.
     // ds_store's wrapper adds the db_pool_* metrics.
-    let pool = ds_store::pool::PoolSettings::from_env("distant-signal-aggregator", 10)?
+    let pool = ds_store::pool::PoolSettings::from_env("distant-signal-aggregator", DB_POOL_SIZE)?
         .connect_until_ready(config.database_url.expose(), Some(&progress))
         .await?;
     // The schema gate (spec §12.2): no loop and no readiness until the
