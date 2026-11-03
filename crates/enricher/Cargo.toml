@@ -7,7 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-health-http = { path = "../health-http" }
+health-http = { workspace = true }
 anyhow = "1.0.102"
 # Already in the tree through reqwest: the `OpenAI` batch upload's body, so
 # its 401 retry shares the bytes instead of copying the whole input file.
@@ -16,11 +16,11 @@ chrono = { version = "0.4.44", features = ["serde"] }
 # Europe/London for the stated-end-time check (`src/checks.rs`).
 chrono-tz = "0.10"
 clap = { version = "4.6.1", features = ["derive", "env"] }
-common = { path = "../common", features = ["postgres", "redis"] }
-ds-runtime = { path = "../ds-runtime", features = ["postgres", "redis"] }
+common = { workspace = true, features = ["default", "postgres", "redis"] }
+ds-runtime = { workspace = true, features = ["default", "postgres", "redis"] }
 dotenvy = "0.15.7"
 # The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.3).
-ds-store = { path = "../ds-store" }
+ds-store = { workspace = true }
 metrics = "0.24"
 # The output checks' text patterns (`src/checks.rs`).
 regex = "1"
