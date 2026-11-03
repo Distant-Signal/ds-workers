@@ -10,9 +10,6 @@
 !.cargo/config.toml
 !Cargo.lock
 !crates
-!reference-data
-!lines
-!charts/distant-signal/files/postgres-grants.sql
 !scripts/rollback-tracked-trains-as-journeys.sql
 !api-types
 **/target
