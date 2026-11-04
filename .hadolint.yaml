@@ -1,0 +1,34 @@
+# hadolint config for every tracked Dockerfile (docker/*.Dockerfile,
+# frontend/Dockerfile). CI: the `scripts-lint` job, via Distant-Signal/ci's
+# lint-scripts.py, which passes this file explicitly. hadolint is
+# pinned in pyproject.toml's `lint` dependency group (hadolint-py).
+#
+# Strict by default: every rule on at its default severity, and any finding,
+# down to style level, fails. hadolint also runs its embedded ShellCheck
+# over each shell-form RUN, but with default checks only (it does not read
+# .shellcheckrc); Distant-Signal/ci's lint-containers.py re-checks every RUN body with
+# the full .shellcheckrc, and also requires every image to be digest-pinned
+# (hadolint has no rule for that).
+# Opt out per instruction with the line directly above it:
+#   # hadolint ignore=DLxxxx # reason
+# never with a global `ignored:` list here, unless a rule genuinely
+# conflicts repo-wide. There are none at present.
+#
+# Local opt-outs in use:
+#   DL3008 (pin versions in apt-get install), every `apt-get install`: the
+#   repo pins the base image by digest (Renovate bumps it, pinDigests) and
+#   takes whatever Debian packages that release's archive carries at build
+#   time. Pinning `pkg=version` would break rebuilds: each bookworm suite in
+#   the archive keeps only its current version of a package (a security or
+#   point release removes the old one), so a pin fails to install from the
+#   moment Debian ships a fix until someone bumps it. Renovate's dockerfile
+#   manager can extract `pkg=version` pins (deb datasource), but that would
+#   need per-suite registry config (bookworm, -updates, -security) and would
+#   still leave builds broken in the window before its PR merges.
+failure-threshold: style
+
+# Every FROM is a Docker Hub official image (rust, debian, node), pinned by
+# tag and digest. A new registry (ghcr.io, quay.io, ...) fails DL3026 until
+# it is added here deliberately.
+trustedRegistries:
+  - docker.io

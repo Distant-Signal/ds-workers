@@ -1,0 +1,13 @@
+# ShellCheck config for every tracked *.sh (CI: the `scripts-lint` job in
+# .github/workflows/ci.yml, which runs Distant-Signal/ci's lint-scripts.py)
+# and, via its lint-containers.py, the Dockerfile RUN bodies and
+# docker-compose inline shell. actionlint does NOT read it: it runs
+# shellcheck with --norc, so lint-scripts.py passes
+# the same settings to the workflow `run:` blocks through SHELLCHECK_OPTS
+# ('--enable=all --severity=style'). Keep the two in step.
+# Strict by default: every optional check on, report down to style level.
+# Opt out per line with `# shellcheck disable=SCxxxx # reason`, never here,
+# unless a rule genuinely conflicts repo-wide.
+enable=all
+external-sources=true
+severity=style

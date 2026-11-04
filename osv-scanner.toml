@@ -1,0 +1,7 @@
+# Time-boxed exceptions for .github/workflows/dependency-scan.yml, for the
+# lockfiles in the repo root (Cargo.lock, uv.lock). frontend/ has its own
+# osv-scanner.toml. Every entry needs a reason and an ignoreUntil, so the
+# finding is reported again at expiry: as a blocking error if it is
+# CVSS >= 9.0 with a fixed version by then, otherwise as a non-blocking
+# warning (see that workflow's header).
+

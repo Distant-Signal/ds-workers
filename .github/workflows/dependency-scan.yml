@@ -1,0 +1,28 @@
+name: Dependency vulnerability scan
+
+# Distant-Signal/ci's OSV scan of Cargo.lock and uv.lock (exceptions in
+# osv-scanner.toml): blocks a pull request on a critical, fixable finding;
+# the daily run keeps one tracking issue up to date.
+
+concurrency:
+  group: dependency-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-scan:
+    uses: Distant-Signal/ci/.github/workflows/dependency-scan.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    permissions:
+      contents: read
+      checks: write
+      issues: write

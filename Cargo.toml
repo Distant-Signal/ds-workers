@@ -1,0 +1,82 @@
+# ds-workers's workspace (see README.md).
+[workspace]
+# A virtual manifest has no edition, so the resolver is set explicitly. "3"
+# (Rust 1.84+) prefers dependency versions whose rust-version fits ours when
+# Cargo.lock is updated.
+resolver = "3"
+members = [
+    "crates/aggregator",
+    "crates/enricher",
+    "crates/notifier",
+]
+
+# ds-core's crates (repo split spec §5.2): git dependencies on the public
+# ds-core repository, every one on the same tag. Cargo.lock records the
+# commit; scripts/check-core-pin.py checks both. Members inherit these
+# with `{ workspace = true, features = [...] }`; common's and ds-runtime's
+# default features are off here, so a member that wants them lists
+# "default". To build against a local ds-core checkout, see README.md.
+[workspace.dependencies]
+common = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0", default-features = false }
+ds-runtime = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0", default-features = false }
+health-http = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
+ds-store = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
+ds-lines = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.1.0" }
+
+[workspace.package]
+edition = "2024"
+# MSRV: CI's msrv job checks it with `cargo +1.88.0 check`, and every
+# Dockerfile builds with rust:1.88.0.
+rust-version = "1.88"
+# Nothing here is published; this also lets deny.toml skip the workspace's
+# own crates.
+publish = false
+# The whole repository is AGPL-3.0-or-later (LICENSE). Every crate inherits
+# it with `license.workspace = true`.
+license = "AGPL-3.0-or-later"
+
+# Strict baseline from the "Strict Config Starting Points" guide. Every crate
+# opts in with `[lints] workspace = true`. Lints stay at "warn" here and CI
+# fails on them with `-D warnings`, so a new toolchain's lints don't break a
+# local build. Opt out per item with `#[expect(lint, reason = "...")]`.
+[workspace.lints.rust]
+# Deviation: the guide says "forbid", but forbid can't be relaxed per item.
+# Three places need unsafe: api's ticket-parse child sets rlimits through
+# libc before exec, the enricher's `malloc_trim` after a batch stage, and
+# the enricher's test-only allocator meter. Each carries
+# `#[expect(unsafe_code, reason = "...")]` and a SAFETY comment; any other
+# unsafe still fails CI.
+unsafe_code = "deny"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# Deviation: the guide's `missing_docs` is for library crates. Every crate
+# here is a service binary or a workspace-internal library with
+# `publish = false`, so the guide says to drop it.
+
+[workspace.lints.clippy]
+# Groups at priority -1, so the single-lint lines below override them.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Restriction lints, opted into one by one.
+allow_attributes_without_reason = "warn"
+# Deviation: `allow_attributes` (force `expect` over `allow`) is left off.
+# CI lints with the MSRV toolchain and local runs use a newer one, and a few
+# lints fire on only one of them, where `#[expect]` would be unfulfilled on
+# the other. Prefer `#[expect]`; use `#[allow(..., reason)]` only for those.
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+print_stdout = "warn"
+undocumented_unsafe_blocks = "warn"
+# Pedantic lints allowed globally, each for the guide's reason.
+# Internal crates with no external API users: `# Errors` / `# Panics` doc
+# sections would be noise.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Fires on nearly every pure function; `#[must_use]` on the few that matter
+# (the builder methods) is clearer.
+must_use_candidate = "allow"
+# `module_name_repetitions` needs no allow: clippy moved it to `restriction`
+# in Rust 1.84, so `pedantic` no longer enables it.

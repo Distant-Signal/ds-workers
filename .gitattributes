@@ -1,0 +1,14 @@
+# LF everywhere, including on Windows checkouts.
+* text=auto eol=lf
+
+# Captured feed fixtures stay byte-for-byte: the CIF delivery excerpt is
+# CRLF, as Network Rail delivers it, and the tests parse it that way.
+crates/*/tests/fixtures/** -text
+
+# Collapse lockfiles in diffs and leave them out of language stats.
+*.lock              linguist-generated=true
+package-lock.json   linguist-generated=true
+
+# Binary assets.
+*.png binary
+*.zip binary

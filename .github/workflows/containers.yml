@@ -1,0 +1,80 @@
+name: Containers
+
+# Builds ds-workers's images with Distant-Signal/ci's image.yml and, on a
+# push to main, the weekly rebuild or a manual run, publishes them to the
+# same packages the monorepo built: ghcr.io/distant-signal/images/<service>
+# (spec §5.4, §5.9). ds-deploy's Renovate picks the new digests up; nothing
+# here touches the chart.
+#
+# Labels (spec §5.1, §5.3): org.distant-signal.core-version is the ds-core
+# tag in Cargo.lock (scripts/release-order.py labels).
+# Package setup on the first push (spec §5.9): each package's "Manage
+# Actions access" must give this repository write access, and its
+# visibility must stay public.
+
+concurrency:
+  group: containers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      no-cache:
+        description: Rebuild each image's runtime stage without the cache (Debian security updates)
+        type: boolean
+        default: false
+
+jobs:
+  image-labels:
+    name: image labels
+    runs-on: ubuntu-26.04
+    outputs:
+      labels: ${{ steps.labels.outputs.labels }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Each image's version labels
+        id: labels
+        run: python3 scripts/release-order.py labels --github-output
+
+  build-and-push:
+    name: ${{ matrix.service }}
+    needs: image-labels
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless signing and the attestation
+      attestations: write # the build provenance attestation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: aggregator
+            dockerfile: docker/aggregator.Dockerfile
+          - service: enricher
+            dockerfile: docker/enricher.Dockerfile
+          - service: notifier
+            dockerfile: docker/notifier.Dockerfile
+    uses: Distant-Signal/ci/.github/workflows/image.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    with:
+      service: ${{ matrix.service }}
+      dockerfile: ${{ matrix.dockerfile }}
+      publish: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+      rebuild-runtime: ${{ github.event_name == 'schedule' || inputs.no-cache == true }}
+      # The project URL every outbound User-Agent carries (ds-runtime's
+      # user_agent!): the landing repository, which upstream data providers
+      # know, whichever repository builds the image.
+      build-args: DS_PROJECT_URL=https://github.com/Distant-Signal/distant-signal
+      labels: ${{ fromJSON(needs.image-labels.outputs.labels)[matrix.service] }}
+      # No chart job in this repository reads the digests (ds-deploy pins them).
+      record-digest: false

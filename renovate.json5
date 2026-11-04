@@ -1,0 +1,73 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+
+  // The Distant Signal preset (Distant-Signal/ci): grouping, schedules,
+  // pinning, and the MSRV and image rules every repository shares. Only
+  // ds-workers's own rules are here.
+  "extends": ["github>Distant-Signal/ci//renovate/default.json5"],
+
+  // The builder's rust image and cargo-chef in docker/services.toml, which
+  // Distant-Signal/ci's gen-rust-dockerfiles.py renders into every
+  // docker/*.Dockerfile: bumped with the Dockerfiles' own FROM and `cargo
+  // install` lines (the dockerfile manager, and the second rule here) in the
+  // same PR, so `gen-rust-dockerfiles.py --check` stays green. Candidates for
+  // the ci preset, which every Rust service repository would share.
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)docker/services\\.toml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>docker) depName=(?<depName>\\S+)\\nrust-image = \"(?<currentValue>[^\"@]+)@(?<currentDigest>sha256:[0-9a-f]+)\"",
+      ],
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/(^|/)docker/services\\.toml$/",
+        "/(^|/)docker/[^/]+\\.Dockerfile$/",
+      ],
+      "matchStrings": [
+        "cargo-chef = \"(?<currentValue>[^\"]+)\"",
+        "cargo install cargo-chef --locked --version (?<currentValue>\\S+)",
+      ],
+      "datasourceTemplate": "crate",
+      "depNameTemplate": "cargo-chef",
+    },
+  ],
+
+  "packageRules": [
+    {
+      // ds-core (repo split spec §5.2): every core crate is a git
+      // dependency on the same tag of Distant-Signal/ds-core. One PR,
+      // renovate/ds-core, moves every `tag =` line and Cargo.lock
+      // together; a release is never split across PRs. Its CI is the
+      // compatibility test, and it automerges when green. Repository rules
+      // come after the preset's, so this wins over "cargo non-major".
+      // Renovate's cargo manager extracts a github.com git dependency with
+      // a `tag` as datasource github-tags, packageName
+      // Distant-Signal/ds-core, one dep per crate (checked with
+      // `renovate --platform=local --dry-run=extract`, 44.126.1).
+      "matchManagers": ["cargo"],
+      "matchDatasources": ["github-tags"],
+      "matchPackageNames": ["Distant-Signal/ds-core"],
+      "groupName": "ds-core",
+      "groupSlug": "ds-core",
+      "separateMajorMinor": false,
+      "separateMinorPatch": false,
+      "schedule": ["at any time"],
+      "automerge": true,
+      "automergeType": "pr",
+    },
+    {
+      // notifier's direct `http` dependency exists only to name the types
+      // web_push::request_builder takes and returns, and web-push (0.11.0,
+      // the latest) is on http 0.2. http 1 there can't compile (#32). Lift
+      // this once web-push moves to http 1. (Moved from the monorepo.)
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["crates/notifier/Cargo.toml"],
+      "matchPackageNames": ["http"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false,
+    },
+  ],
+}

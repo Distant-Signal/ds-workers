@@ -1,0 +1,101 @@
+name: CI
+
+# ds-workers's CI (repo split spec §5.5): Distant-Signal/ci's reusable
+# workflows, pinned by SHA (Renovate bumps the pins), plus this repository's
+# own checks (repo-checks). Each reusable workflow's check shows as
+# `<job> / <job inside it>`.
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # The first run: the extract is pushed while Actions is off, and GitHub
+  # doesn't replay that push (phase 4, ds-core #1).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # clippy in both feature sets (-D warnings), the MSRV check (rust-version
+  # = "1.88", with exactly that toolchain), cargo-deny (deny.toml: the only
+  # git source allowed is Distant-Signal/ds-core), rustfmt, and cargo build
+  # and test (the tests that need no database).
+  rust:
+    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    with:
+      toolchain: 1.88.0
+      msrv: 1.88.0
+      apt-packages: libssl-dev pkg-config
+
+  actionlint:
+    uses: FasterSpeeding/Piped/.github/workflows/lint-actions.yml@5bbddb5d32d5bde939b18f6c6bcfa0e36779412f # master @ 2026-09-01
+
+  # The `#[ignore]`d DB, Redis tests, built once into a nextest
+  # archive and run as the passes in .github/db-tests.toml, each against its
+  # own Postgres and Valkey. The schema, grants and role harness are
+  # ds-core's at this repository's core version (Cargo.lock), not anything
+  # in this tree (spec §5.1).
+  rust-db-tests:
+    uses: Distant-Signal/ci/.github/workflows/rust-db-tests.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    with:
+      toolchain: 1.88.0
+      # renovate: datasource=docker depName=postgres
+      postgres-image: postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
+      # renovate: datasource=docker depName=valkey/valkey
+      redis-image: valkey/valkey:8.1.10-trixie@sha256:640c5e62cea04b6d6f2084232651d0cc70362d31f4f805e7be94dbed6855e8f2
+
+  # No commit may use a retired identity or carry AI attribution.
+  commit-identity:
+    uses: Distant-Signal/ci/.github/workflows/identity.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+
+  # LICENSE is the canonical GNU AGPL v3 text, byte for byte.
+  licence:
+    uses: Distant-Signal/ci/.github/workflows/licence.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+
+  # shellcheck, shfmt, ruff, mypy --strict, actionlint run: blocks,
+  # hadolint and lint-containers over this repository, then the ignored-
+  # benchmark gate (the DB passes run every `#[ignore]`d test).
+  scripts-lint:
+    uses: Distant-Signal/ci/.github/workflows/scripts-lint.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    with:
+      check-bench-gates: true
+
+  # ds-workers's own checks:
+  #   - the Rust Dockerfiles' generated cargo-chef stages and build-context
+  #     allowlists match docker/services.toml (Distant-Signal/ci's
+  #     gen-rust-dockerfiles.py, at the same commit as the workflows above);
+  #   - every ds-core crate is a git dependency on one tag, Cargo.lock
+  #     agrees, and nothing else is a git or out-of-tree path dependency
+  #     (scripts/check-core-pin.py): a service repository depends on ds-core
+  #     only (spec §3.2);
+  #   - the image version labels resolve (scripts/release-order.py labels):
+  #     core-version is the ds-core tag in Cargo.lock.
+  repo-checks:
+    name: repo checks (Dockerfile generator, ds-core pin, image labels)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout Distant-Signal/ci (the reusable workflows' commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Distant-Signal/ci
+          ref: 076703ad053c64bdef82ac934e5cfe1d185be567
+          path: .ds-ci
+          persist-credentials: false
+
+      - name: Rust Dockerfiles match docker/services.toml
+        run: python3 .ds-ci/scripts/gen-rust-dockerfiles.py --check
+
+      - name: ds-core is pinned to one tag
+        run: python3 scripts/check-core-pin.py
+
+      - name: Image version labels
+        run: python3 scripts/release-order.py labels

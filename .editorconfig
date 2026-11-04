@@ -1,0 +1,33 @@
+# EditorConfig: https://editorconfig.org
+# Baseline from the "Strict Config Starting Points" guide. shfmt reads the
+# [*.sh] section (when run without formatting flags), so this is the single
+# source of truth for shell formatting: equivalent to `shfmt -i 4 -ci -bn`.
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+
+# Prettier's default width, which the frontend uses.
+[*.{yml,yaml,json,json5,md}]
+indent_style = space
+indent_size = 2
+
+[*.sh]
+indent_style = space
+indent_size = 4
+switch_case_indent = true
+binary_next_line = true
+
+# Two trailing spaces are a Markdown line break.
+[*.md]
+trim_trailing_whitespace = false
+
+# Captured feed fixtures stay byte-for-byte (some are CRLF, as delivered).
+[{crates/*/tests/fixtures/**,frontend/test/fixtures/**,frontend/e2e/fixtures/**}]
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+charset = unset

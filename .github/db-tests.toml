@@ -1,0 +1,66 @@
+# ds-workers's DB test passes (Distant-Signal/ci's rust-db-tests.yml reads
+# this file; format: that repository's scripts/db-tests-passes.py).
+#
+# The monorepo's passes, split by crate (repo split spec §5.1): the steps
+# for ds-workers's packages are in scripts/db-tests.py. The schema, the
+# grants and the role harness are ds-core's, at the release Cargo.lock pins:
+# scripts/core-checkout.py clones it (target/ds-core-<sha>) and checks the
+# commit, and each pass runs that checkout's migrations and its
+# scripts/test-postgres-roles.py (the phase 4 decision). Nothing in this
+# tree migrates.
+#
+# Every script runs with bash -euo pipefail from the repository root, with
+# DATABASE_URL (the superuser), REDIS_URL, DB_TESTS_ARCHIVE, sqlx-cli,
+# cargo-nextest and `uv sync --locked --group lint`.
+
+[archive]
+run = '''
+uv run --locked --no-default-groups scripts/db-tests.py archive --archive-file "${DB_TESTS_ARCHIVE}"
+'''
+
+[[pass]]
+id = "superuser"
+name = "DB tests as the superuser (+ Redis)"
+run = '''
+CORE="$(uv run --no-sync scripts/core-checkout.py)"
+echo "== Run the migrations (ds-core at ${CORE})"
+(cd "${CORE}/crates/ds-store" && sqlx migrate run)
+
+echo "== DB/Redis-backed tests as the superuser (scripts/db-tests.py run superuser)"
+uv run --no-sync scripts/db-tests.py run superuser --archive-file "${DB_TESTS_ARCHIVE}" --extract-to "${GITHUB_WORKSPACE}"
+'''
+
+# The Postgres role split (ds-core's docs/postgres-app-role.md): the suites
+# as the DML-only app role on a database migrated as the superuser (today's
+# production), MIGRATION_DATABASE_URL the schema owner. --check-setup-job
+# also runs the pinned release's roles setup through the setup Job's
+# entrypoint behind an ACCESS SHARE reader. (`new`, the roles first, runs in
+# ds-core: it tests the migrations.)
+[[pass]]
+id = "app-role"
+name = "DB tests as the app role (existing cluster)"
+run = '''
+CORE="$(uv run --no-sync scripts/core-checkout.py)"
+echo "== DB-backed tests as the non-superuser app role (existing cluster)"
+uv run --no-sync python "${CORE}/scripts/test-postgres-roles.py" --mode existing --check-setup-job -- \
+  uv run --no-sync scripts/db-tests.py run existing --archive-file "${DB_TESTS_ARCHIVE}" --extract-to "${GITHUB_WORKSPACE}"
+'''
+
+# Each suite as its own service's role (Stage 0b), from the pinned
+# release's access/postgres-grants.sql. The api, aggregator, enricher and
+# notifier roles are `--observe`d (members of app again) until their
+# fixtures move to the owner pool; see the monorepo's db-tests.toml history
+# for each role's story.
+[[pass]]
+id = "per-service"
+name = "DB tests as each service's role (Stage 0b, release D)"
+run = '''
+CORE="$(uv run --no-sync scripts/core-checkout.py)"
+echo "== DB-backed tests as each service's own role (Stage 0b)"
+uv run --no-sync python "${CORE}/scripts/test-postgres-roles.py" --mode per-service --check-setup-job --observe api,aggregator,enricher,notifier -- \
+  uv run --no-sync scripts/db-tests.py run per-service --archive-file "${DB_TESTS_ARCHIVE}" --extract-to "${GITHUB_WORKSPACE}"
+
+echo "== Release D's narrowed roles (api, aggregator, enricher, notifier)"
+uv run --no-sync python "${CORE}/scripts/test-postgres-roles.py" --mode per-service --narrow api,aggregator,enricher,notifier -- \
+  uv run --no-sync scripts/db-tests.py run narrow --archive-file "${DB_TESTS_ARCHIVE}" --extract-to "${GITHUB_WORKSPACE}"
+'''

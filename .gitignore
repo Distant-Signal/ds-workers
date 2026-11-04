@@ -1,0 +1,23 @@
+/target
+
+# Local secrets and config: every `*.env` file at any depth.
+*.env
+!*.env.example
+
+# Per-developer mise tool overrides.
+mise.local.toml
+
+# Python tool state from `uv sync` / `uv run` and the lint tools.
+.venv/
+__pycache__/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Core dumps from crashed test or bench processes (they can hold process memory).
+core.[0-9]*
+
+# The enricher model-eval harness's local targets file (internal hostnames;
+# crates/enricher/eval/targets.example.toml is the committed template).
+# Reports go to target/enricher-eval/, already ignored above.
+/crates/enricher/eval/targets.toml

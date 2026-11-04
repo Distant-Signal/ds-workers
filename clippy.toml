@@ -1,0 +1,13 @@
+# Keys are kebab-case. msrv is read from Cargo.toml's rust-version, so it
+# isn't repeated here.
+# A panic is the right failure in a test.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = false
+# `sqlx::migrate!` and `#[sqlx::test(migrations = ...)]` embed every
+# migration in one array of `Migration`s (about 88 bytes each), which went
+# past the default 16 KiB `large_stack_arrays` threshold at the 187th
+# migration (DS-146). Raised for that array, which grows with every
+# migration (room for about 370); a 64 KiB buffer is still caught.
+array-size-threshold = 32768

@@ -1,0 +1,15 @@
+# ds-workers's Rust images, for Distant-Signal/ci's gen-rust-dockerfiles.py:
+# each service's binaries (ENTRYPOINT first) and the build context's
+# allowlist (`inputs`). `--check` runs in CI (ci.yml, repo-checks).
+inputs = ["Cargo.toml", ".cargo/config.toml", "Cargo.lock", "crates"]
+# The builder's toolchain image and cargo-chef. Renovate bumps them with the
+# Dockerfiles' FROM and `cargo install` lines, in one PR.
+# renovate: datasource=docker depName=rust
+rust-image = "1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0"
+# renovate: datasource=crate depName=cargo-chef
+cargo-chef = "0.1.78"
+
+[services]
+"aggregator" = ["aggregator"]
+"enricher" = ["enricher"]
+"notifier" = ["notifier"]

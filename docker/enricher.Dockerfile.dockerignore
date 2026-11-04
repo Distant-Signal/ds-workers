@@ -10,8 +10,6 @@
 !.cargo/config.toml
 !Cargo.lock
 !crates
-!scripts/rollback-tracked-trains-as-journeys.sql
-!api-types
 **/target
 **/*.env
 **/.env

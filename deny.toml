@@ -1,0 +1,81 @@
+# cargo-deny: licences, advisories, bans and sources. CI's `cargo-deny` job
+# (ci.yml) runs `cargo deny --locked check bans licenses sources` as a
+# blocking check, `cargo deny --locked fetch` as a blocking step, and
+# `check advisories` as a non-blocking check that only warns.
+# Baseline: the "Strict Config Starting Points" guide's deny.toml.
+
+[graph]
+all-features = true
+
+[advisories]
+# Overlap, kept on purpose: dependency-scan.yml's OSV scan already reports
+# RustSec advisories for Cargo.lock (and npm, and images), and blocks on
+# critical + fixable ones. This section reports the same database, plus
+# yanked crates, which OSV doesn't check, as a CI warning (not a gate):
+# cargo-deny's advisories v2 has no severity threshold to block on. It clones the advisory DB from github.com, which GitHub-hosted CI
+# can reach.
+version = 2
+yanked = "deny"
+# Each ignore needs a reason and is revisited when the advisory changes.
+ignore = [
+    # rsa: Marvin timing attack on private-key operations; no fixed release.
+    # api's openidconnect only verifies RS256 ID-token signatures with the
+    # IdP's public keys, and notifier's web-push signs VAPID with ES256, so
+    # no RSA private key is ever used.
+    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operations: OIDC verifies with public keys, VAPID is ES256" },
+    # ttf-parser is unmaintained (no fix), pulled in by pdf-extract via
+    # lopdf. PDF tickets are parsed in api's resource-limited child process
+    # (data::ticket_subprocess), so a parser bug can't take the server down.
+    { id = "RUSTSEC-2026-0192", reason = "only via pdf-extract, which runs in the sandboxed ticket-parse child" },
+]
+
+[licenses]
+version = 2
+allow = [
+    # The workspace's own licence (Cargo.toml [workspace.package]). Not
+    # needed while [licenses.private] ignores the unpublished crates, but it
+    # makes the own-licence policy explicit (repo split spec §6).
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # Not in the guide's list: webpki-roots / webpki-root-certs (via reqwest
+    # and rustls) ship Mozilla's root certificates under this permissive
+    # data licence.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+# The workspace's own crates are AGPL-3.0-or-later; publish = false
+# (inherited from [workspace.package]) is what lets this skip them. Every
+# dependency's licence above is compatible with the AGPL.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicates are reported, not failed: 46 crates have more than one version
+# today (reqwest 0.12 and 0.13, rand, base64, windows-sys, ...), and fixing
+# them means upstream bumps. Tighten to "deny" once the tree is clean.
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between workspace crates have no version, which
+# `wildcards` would otherwise flag.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io only. The guide's Forgejo registry entry is dropped: this repo
+# has no .cargo/config.toml registries and no crate comes from elsewhere.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The core crates (repo split spec §5.2): git dependencies on the public
+# ds-core repository, pinned by tag. Nothing else may come from git.
+allow-git = ["https://github.com/Distant-Signal/ds-core"]

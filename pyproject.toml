@@ -1,0 +1,110 @@
+# Tooling config for the repo's scripts (scripts/*.py, every *.sh, and the
+# workflow run: blocks), managed with uv (Ranma-Config new-service guidance
+# 3.3a). CI: the `scripts-lint` job in .github/workflows/ci.yml, which runs
+# Distant-Signal/ci's scripts/lint-scripts.py in this project; locally,
+# `uv run python ../ci/scripts/lint-scripts.py` (with a checkout of
+# Distant-Signal/ci beside this one) runs the same checks.
+#
+# Strict by default. Opt out per line (`# noqa: XXXX  # reason`,
+# `# type: ignore[code]  # reason`) rather than here, unless a rule genuinely
+# conflicts repo-wide.
+
+[project]
+# Not a package: the table exists so uv has a requires-python (uv's
+# documented layout for a non-package project, with `package = false` below).
+name = "distant-signal-scripts"
+version = "0"
+# PEP 639 SPDX expression: the repository's licence (LICENSE).
+license = "AGPL-3.0-or-later"
+# The oldest Python the scripts support; equal to ruff's target-version and
+# mypy's python_version below. .python-version (3.14) is what CI and
+# `uv run` actually use.
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false # don't build or install the repo itself
+# `uv sync` / `uv run` install the lint group without a --group flag, so
+# `uv run python ../ci/scripts/lint-scripts.py` works from a fresh clone.
+default-groups = ["lint"]
+
+[dependency-groups]
+# Every tool the scripts-lint job runs, pinned exactly; uv.lock pins the
+# rest of the tree with hashes. Renovate's pep621 manager bumps these and
+# uv.lock together. shellcheck-py / shfmt-py / actionlint-py / hadolint-py
+# ship the upstream static binaries: shellcheck 0.11.0, shfmt 3.14.1
+# (shfmt-py's own version number is independent of shfmt's), actionlint
+# 1.7.12, hadolint 2.15.1 (hadolint-py's Linux x86_64 wheel carries the
+# byte-identical hadolint/hadolint v2.15.1 release binary, checked against
+# that release's checksums.sha256). PyYAML is the one dependency of
+# scripts/release-order.py and of Distant-Signal/ci's lint-containers.py;
+# types-PyYAML lets mypy check them.
+lint = [
+    "actionlint-py==1.7.12.25",
+    "hadolint-py==2.15.1.2",
+    "mypy==2.4.0",
+    "pyyaml==6.0.3",
+    "ruff==0.17.2",
+    "shellcheck-py==0.11.0.1",
+    "shfmt-py==4.2.0",
+    "types-pyyaml==6.0.12.20260906",
+]
+
+[tool.ruff]
+# Oldest Python the scripts support (tomllib needs 3.11; Ubuntu 24.04 ships
+# 3.12). CI runs 3.14.
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # Mutually exclusive docstring-layout pairs: pydocstyle requires one of
+    # each pair to be off. Keep D211 (no blank line before a class
+    # docstring) and D212 (summary on the first line).
+    "D203",
+    "D213",
+    # Conflict with `ruff format` (ruff's documented formatter conflicts).
+    "COM812",
+    "ISC001",
+    # The repo has no LICENSE and no per-file copyright headers anywhere
+    # (Rust, TypeScript or shell); a header only in Python files would be
+    # the odd one out.
+    "CPY001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/tests/**" = [
+    "INP001", # test modules found by unittest discovery, not a package
+    # unittest-style tests (stdlib only, no pytest in the lint group) use
+    # self.assert*, which these pytest-oriented rules reject.
+    "PT009",
+    "PT027",
+    # Literal expected values are the point of a test.
+    "PLR2004",
+]
+
+[tool.ruff.format]
+# Defaults (double quotes, spaces, magic trailing comma).
+
+[tool.mypy]
+# mypy over pyright: it installs from PyPI with the rest of the pinned lint
+# group (no Node runtime in this job), and `strict = true` is a stable,
+# documented flag set. The extra flags below go beyond --strict.
+strict = true
+python_version = "3.12"
+files = ["scripts"]
+warn_unreachable = true
+enable_error_code = [
+    "deprecated",
+    "exhaustive-match",
+    "explicit-override",
+    "ignore-without-code",
+    "mutable-override",
+    "possibly-undefined",
+    "redundant-expr",
+    "redundant-self",
+    "truthy-bool",
+    "truthy-iterable",
+    "unimported-reveal",
+    "unused-awaitable",
+]

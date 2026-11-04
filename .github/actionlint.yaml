@@ -1,0 +1,8 @@
+# actionlint (the Piped lint-actions workflow and scripts-lint's
+# actionlint-py) validates `runs-on:` labels against a built-in list of
+# GitHub-hosted runners. Its latest release (1.7.12) predates the
+# ubuntu-26.04 image, so the label is declared here until actionlint knows
+# it. Drop this file once the pinned actionlint lists ubuntu-26.04.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
