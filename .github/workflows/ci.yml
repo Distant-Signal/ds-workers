@@ -27,7 +27,7 @@ jobs:
   # git source allowed is Distant-Signal/ds-core), rustfmt, and cargo build
   # and test (the tests that need no database).
   rust:
-    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
     with:
       toolchain: 1.88.0
       msrv: 1.88.0
@@ -42,7 +42,7 @@ jobs:
   # ds-core's at this repository's core version (Cargo.lock), not anything
   # in this tree (spec §5.1).
   rust-db-tests:
-    uses: Distant-Signal/ci/.github/workflows/rust-db-tests.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/rust-db-tests.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
     with:
       toolchain: 1.88.0
       # renovate: datasource=docker depName=postgres
@@ -52,17 +52,17 @@ jobs:
 
   # No commit may use a retired identity or carry AI attribution.
   commit-identity:
-    uses: Distant-Signal/ci/.github/workflows/identity.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/identity.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
 
   # LICENSE is the canonical GNU AGPL v3 text, byte for byte.
   licence:
-    uses: Distant-Signal/ci/.github/workflows/licence.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/licence.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
 
   # shellcheck, shfmt, ruff, mypy --strict, actionlint run: blocks,
   # hadolint and lint-containers over this repository, then the ignored-
   # benchmark gate (the DB passes run every `#[ignore]`d test).
   scripts-lint:
-    uses: Distant-Signal/ci/.github/workflows/scripts-lint.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/scripts-lint.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
     with:
       check-bench-gates: true
 
@@ -74,7 +74,8 @@ jobs:
   #     agrees, and nothing else is a git or out-of-tree path dependency
   #     (scripts/check-core-pin.py): a service repository depends on ds-core
   #     only (spec §3.2);
-  #   - the image version labels resolve (scripts/release-order.py labels):
+  #   - the image version labels resolve (Distant-Signal/ci's
+  #     release-order.py labels, at the same commit):
   #     core-version is the ds-core tag in Cargo.lock.
   repo-checks:
     name: repo checks (Dockerfile generator, ds-core pin, image labels)
@@ -87,7 +88,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Distant-Signal/ci
-          ref: 076703ad053c64bdef82ac934e5cfe1d185be567
+          ref: d734bc69e3127d208304c9d6a5a04b9e5645fc76
           path: .ds-ci
           persist-credentials: false
 
@@ -98,4 +99,4 @@ jobs:
         run: python3 scripts/check-core-pin.py
 
       - name: Image version labels
-        run: python3 scripts/release-order.py labels
+        run: python3 .ds-ci/scripts/release-order.py labels

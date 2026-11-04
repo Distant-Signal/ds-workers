@@ -7,7 +7,8 @@ name: Containers
 # here touches the chart.
 #
 # Labels (spec §5.1, §5.3): org.distant-signal.core-version is the ds-core
-# tag in Cargo.lock (scripts/release-order.py labels).
+# tag in Cargo.lock (Distant-Signal/ci's scripts/release-order.py labels,
+# at the workflow pin).
 # Package setup on the first push (spec §5.9): each package's "Manage
 # Actions access" must give this repository write access, and its
 # visibility must stay public.
@@ -43,9 +44,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Checkout Distant-Signal/ci (the reusable workflows' commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Distant-Signal/ci
+          ref: d734bc69e3127d208304c9d6a5a04b9e5645fc76
+          path: .ds-ci
+          persist-credentials: false
+
       - name: Each image's version labels
         id: labels
-        run: python3 scripts/release-order.py labels --github-output
+        run: python3 .ds-ci/scripts/release-order.py labels --github-output
 
   build-and-push:
     name: ${{ matrix.service }}
@@ -65,7 +74,7 @@ jobs:
             dockerfile: docker/enricher.Dockerfile
           - service: notifier
             dockerfile: docker/notifier.Dockerfile
-    uses: Distant-Signal/ci/.github/workflows/image.yml@076703ad053c64bdef82ac934e5cfe1d185be567 # main
+    uses: Distant-Signal/ci/.github/workflows/image.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
     with:
       service: ${{ matrix.service }}
       dockerfile: ${{ matrix.dockerfile }}

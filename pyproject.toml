@@ -37,8 +37,7 @@ default-groups = ["lint"]
 # 1.7.12, hadolint 2.15.1 (hadolint-py's Linux x86_64 wheel carries the
 # byte-identical hadolint/hadolint v2.15.1 release binary, checked against
 # that release's checksums.sha256). PyYAML is the one dependency of
-# scripts/release-order.py and of Distant-Signal/ci's lint-containers.py;
-# types-PyYAML lets mypy check them.
+# Distant-Signal/ci's lint-containers.py; types-PyYAML lets mypy check it.
 lint = [
     "actionlint-py==1.7.12.25",
     "hadolint-py==2.15.1.2",
