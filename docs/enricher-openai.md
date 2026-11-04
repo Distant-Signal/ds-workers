@@ -242,7 +242,7 @@ in the fallback, at most what is left of the projected token.
   (`success`, `token_file_error`, `invalid_grant`, `invalid_client`,
   `invalid_subject_token`, `http_error`, `timeout`, `error`) and
   `enricher_llm_token_remaining_seconds`. The alert is
-  [DistantSignalEnricherTokenExchangeFailing](alerts.md#distantsignalenrichertokenexchangefailing).
+  [DistantSignalEnricherTokenExchangeFailing](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalenrichertokenexchangefailing).
 - At startup, a WIF mode with a missing ID or URL, with `LLM_API_KEY` set, or
   with an unreadable or empty token file is an error, and the pod does not
   start.
@@ -813,7 +813,7 @@ So for every batch submission the enricher (service and eval alike):
   `errored`: per request in `enricher_llm_batch_requests_total`, and once
   per batch as `enricher_llm_batches_total{event="auth_expired"}` (also for
   a batch that `failed` outright with `token_expired`). That fires
-  [DistantSignalEnricherBatchAuthExpired](alerts.md#distantsignalenricherbatchauthexpired).
+  [DistantSignalEnricherBatchAuthExpired](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalenricherbatchauthexpired).
   The incidents are dropped like any failed request and go into the next
   sweep's batch, created with a new token. They are not backed off (the
   text isn't at fault), and nothing is resubmitted before that sweep, so
