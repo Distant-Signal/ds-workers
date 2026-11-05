@@ -971,3 +971,225 @@ async fn a_reason_follow_up_respects_the_cancel_switch_the_window_and_a_known_re
     decide_train(&pool, fixture.train, now).await;
     assert_eq!(followup_state(&pool, USER).await, Some((now, None)));
 }
+
+// --- Iarnród Éireann trains (distant-signal's
+// docs/superpowers/specs/2026-11-05-irish-rail-train-tracking-design.md
+// §8): an `ie:` train has no CRS anywhere, no movements and no CIF calls,
+// so its delay is the writer's `Late` from the boards.
+
+/// The live station the Irish fixtures are tracked from.
+const IE_STATION: &str = "ZTSTN";
+
+/// One user tracking Iarnród Éireann train `uid` (`ie:<code>`) as the api's
+/// `POST /Journeys/irish-train` does: names on the train, no CRS pins, a
+/// resolved subscription with `pin_origin_ref`, and a one-leg journey
+/// with no codes. Returns the `trains` id and the subscription id.
+async fn seed_irish(pool: &PgPool, user: &str, uid: &str) -> (i64, i64) {
+    exec(
+        pool,
+        &format!("INSERT INTO users (id, name) VALUES ('{user}', '{user}') ON CONFLICT DO NOTHING"),
+    )
+    .await;
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO island_of_ireland_live_stations (code, name) \
+             VALUES ('{IE_STATION}', 'Zesttown Central') ON CONFLICT (code) DO NOTHING"
+        ),
+    )
+    .await;
+    let trains_id: i64 = sqlx::query_scalar(
+        "INSERT INTO trains (train_uid, service_date, origin_name, destination_name) \
+         VALUES ($1, $2, 'Zesttown Central', 'Zorough') RETURNING id",
+    )
+    .bind(uid)
+    .bind(day())
+    .fetch_one(pool)
+    .await
+    .expect("seed train");
+    let subscription_id: i64 = sqlx::query_scalar(
+        "INSERT INTO train_subscriptions \
+             (user_id, service_date, trains_id, resolution_status, pin_origin_ref) \
+         VALUES ($1, $2, $3, 'resolved', $4) RETURNING id",
+    )
+    .bind(user)
+    .bind(day())
+    .bind(trains_id)
+    .bind(format!("ie:{IE_STATION}"))
+    .fetch_one(pool)
+    .await
+    .expect("seed subscription");
+    let journey_id: i64 =
+        sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+            .bind(user)
+            .fetch_one(pool)
+            .await
+            .expect("seed journey");
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO journey_legs \
+                 (journey_id, leg_order, service_date, train_subscription_id, match_mode) \
+             VALUES ({journey_id}, 1, '{}', {subscription_id}, 'manual')",
+            day()
+        ),
+    )
+    .await;
+    (trains_id, subscription_id)
+}
+
+/// [`cleanup`], plus the fixture live station.
+async fn cleanup_irish(
+    pool: &PgPool,
+    user: &str,
+    uid: &str,
+) -> ds_store::test_support::FixtureCleanup {
+    ds_store::test_support::FixtureCleanup::new(
+        pool,
+        [
+            format!("DELETE FROM journeys WHERE user_id = '{user}'"),
+            format!("DELETE FROM users WHERE id = '{user}'"),
+            format!(
+                "DELETE FROM trains WHERE train_uid = '{uid}' AND service_date = '{}'",
+                day()
+            ),
+            format!("DELETE FROM island_of_ireland_live_stations WHERE code = '{IE_STATION}'"),
+        ],
+    )
+    .await
+}
+
+/// An Irish train's state as the writer derives it: `delay` NULL with no
+/// report.
+async fn set_irish_state(pool: &PgPool, trains_id: i64, status: &str, delay: Option<i32>) {
+    exec(
+        pool,
+        &format!("DELETE FROM train_current_state WHERE trains_id = {trains_id}"),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO train_current_state (trains_id, status, delay_minutes, event_time) \
+         VALUES ($1, $2, $3, now())",
+    )
+    .bind(trains_id)
+    .bind(status)
+    .bind(delay)
+    .execute(pool)
+    .await
+    .expect("set state");
+}
+
+/// 14 minutes late is under the default threshold; 16 is over it and
+/// pushes, once (escalation only), with the working delay as the stop
+/// delay. The writer's forward-queue signal is what wakes the notifier.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn an_irish_train_pushes_once_when_its_delay_crosses_the_threshold() {
+    const USER: &str = "TEST-NOTIFSET-IE-DELAY";
+    const UID: &str = "ie:ZN01";
+    let pool = connect().await;
+    let _cleanup = cleanup_irish(&pool, USER, UID).await;
+    let (train, _) = seed_irish(&pool, USER, UID).await;
+    let now = chrono::Utc::now();
+
+    set_irish_state(&pool, train, "en_route", Some(14)).await;
+    assert_eq!(train_candidate_ranks(&pool, train).await, [0_u8; 0]);
+    decide_train(&pool, train, now).await;
+    assert_eq!(delivered_train_state(&pool, USER).await, None);
+
+    // 16 late, signalled as the writer does: the forward-queue cycle
+    // picks the train up and pushes.
+    set_irish_state(&pool, train, "en_route", Some(16)).await;
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO notifier_forward_queue (trains_id, event_summary, dedup_key) \
+             VALUES ({train}, 'en_route (board)', 'ie:ZN01:{}:en_route:16')",
+            day()
+        ),
+    )
+    .await;
+    let candidates = queries::candidates_for_trains_id(&pool, train, 15)
+        .await
+        .expect("candidates");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| (c.new_rank, c.delay_minutes))
+            .collect::<Vec<_>>(),
+        [(1, Some(16))]
+    );
+    let queue = crate::drain_support::test_queue(&pool);
+    crate::run_forward_queue_cycle(&pool, &queue, now, 15, chrono::Duration::zero())
+        .await
+        .expect("run_forward_queue_cycle");
+    crate::drain_support::drain(queue).await;
+    assert_eq!(
+        delivered_train_state(&pool, USER).await,
+        Some(("en_route".to_string(), Some(16)))
+    );
+
+    // Later the same rank: nothing new.
+    set_irish_state(&pool, train, "en_route", Some(19)).await;
+    assert_eq!(train_candidate_ranks(&pool, train).await, [0_u8; 0]);
+}
+
+/// "No Information" on the boards: the writer stores no delay (its `Late`
+/// of 0 means nothing), so it never ranks, even at the lowest threshold.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn an_irish_train_with_no_report_never_pushes() {
+    const USER: &str = "TEST-NOTIFSET-IE-NOREPORT";
+    const UID: &str = "ie:ZN02";
+    let pool = connect().await;
+    let _cleanup = cleanup_irish(&pool, USER, UID).await;
+    let (train, _) = seed_irish(&pool, USER, UID).await;
+    set_prefs(&pool, USER, "delay_threshold_minutes", "5").await;
+
+    set_irish_state(&pool, train, "awaiting_activation", None).await;
+    assert_eq!(train_candidate_ranks(&pool, train).await, [0_u8; 0]);
+    decide_train(&pool, train, chrono::Utc::now()).await;
+    assert_eq!(delivered_train_state(&pool, USER).await, None);
+}
+
+/// The push names the station the train was tracked from, by its name;
+/// a GB subscription (no ref) gets none.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL (a migrated database)"]
+async fn an_irish_push_says_where_it_was_tracked_from() {
+    const USER: &str = "TEST-NOTIFSET-IE-FROM";
+    const UID: &str = "ie:ZN03";
+    const GB_UID: &str = "TEST-NOTIFSET-IEGB";
+    let pool = connect().await;
+    let _cleanup = cleanup_irish(&pool, USER, UID).await;
+    let _cleanup_gb = cleanup(&pool, USER, GB_UID).await;
+    let (_, subscription) = seed_irish(&pool, USER, UID).await;
+    let gb = seed(&pool, USER, GB_UID).await;
+
+    let from = queries::irish_from_station(&pool, subscription)
+        .await
+        .expect("irish_from_station");
+    assert_eq!(from.as_deref(), Some("Zesttown Central"));
+    assert_eq!(
+        queries::irish_from_station(&pool, gb.subscription)
+            .await
+            .expect("irish_from_station"),
+        None
+    );
+
+    // A one-leg journey with no codes: the plain copy, with the station.
+    let context = queries::journey_leg_for_train_subscription(&pool, subscription)
+        .await
+        .expect("journey context");
+    let payload = crate::build_train_notification_payload(
+        subscription,
+        "en_route",
+        Some(16),
+        context.as_ref(),
+        None,
+        from.as_deref(),
+    );
+    assert_eq!(payload.title, "Your train from Zesttown Central is delayed");
+    assert_eq!(payload.body, "Now running about 16 minutes late.");
+    assert_eq!(payload.url, format!("/train/by-id/{subscription}"));
+}

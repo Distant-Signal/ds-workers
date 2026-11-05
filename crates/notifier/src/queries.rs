@@ -1338,6 +1338,43 @@ static JOURNEY_LEG_CONTEXT_SQL: std::sync::LazyLock<String> = std::sync::LazyLoc
     )
 });
 
+/// The station an Iarnród Éireann subscription was tracked from
+/// (`train_subscriptions.pin_origin_ref`, `ie:<StationCode>`), by name:
+/// the catalogue's name for that live code, else the live station list's.
+/// `None` for a GB subscription, one tracked with no station, or a code we
+/// have no name for (a push never shows a bare station code).
+pub(crate) async fn irish_from_station(
+    pool: &PgPool,
+    tracked_train_id: i64,
+) -> anyhow::Result<Option<String>> {
+    let pin: Option<Option<String>> =
+        sqlx::query_scalar("SELECT pin_origin_ref FROM train_subscriptions WHERE id = $1")
+            .bind(tracked_train_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(code) = pin
+        .flatten()
+        .as_deref()
+        .and_then(common::island_of_ireland::tracking::station_code_from_ref)
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let name: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE( \
+             (SELECT s.name FROM island_of_ireland_stations s \
+              WHERE s.network = 'republic-of-ireland' AND s.live_code = $1 \
+              ORDER BY s.id LIMIT 1), \
+             (SELECT l.name FROM island_of_ireland_live_stations l WHERE l.code = $1))",
+    )
+    .bind(&code)
+    .fetch_one(pool)
+    .await?;
+    Ok(name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty()))
+}
+
 pub(crate) async fn journey_leg_for_train_subscription(
     pool: &PgPool,
     tracked_train_id: i64,

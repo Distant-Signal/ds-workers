@@ -567,12 +567,14 @@ async fn notify_train_candidates(
         } else {
             None
         };
+        let from_station = queries::irish_from_station(pool, candidate.tracked_train_id).await?;
         let payload = build_train_notification_payload(
             candidate.tracked_train_id,
             &status,
             delay_minutes,
             journey_context.as_ref(),
             cancel_copy.as_ref(),
+            from_station.as_deref(),
         );
         // Without its reason yet, the push may get one follow-up.
         let awaiting_reason = cancel_copy.as_ref().is_some_and(|c| c.reason.is_none());
@@ -658,12 +660,18 @@ fn push_journey_label(ctx: &queries::JourneyLegContext) -> String {
 /// "was cancelled", "terminates at York", "now starts from York" or "is
 /// part cancelled", then "Reason: <text>." when the reason is known; `None`
 /// words it as a plain cancellation.
+///
+/// `from_station` names the station an Iarnród Éireann train was tracked
+/// from ([`queries::irish_from_station`]): its delay push says "Your train
+/// from Dublin Connolly is delayed", since the train has no GB route to
+/// name it by. `None` for every GB train.
 fn build_train_notification_payload(
     tracked_train_id: i64,
     status: &str,
     delay_minutes: Option<i32>,
     journey_context: Option<&queries::JourneyLegContext>,
     cancel_copy: Option<&cancel_reason::CancelCopy>,
+    from_station: Option<&str>,
 ) -> NotificationPayload {
     let is_cancelled = status == "cancelled";
     let plain = cancel_reason::CancelCopy::from_summary(None);
@@ -675,10 +683,10 @@ fn build_train_notification_payload(
         // Fallback: no journey_legs row, or a trivial one-leg journey --
         // today's copy/URL, with the cancellation's place and reason.
         return NotificationPayload {
-            title: if is_cancelled {
-                format!("Your train {}", cancel.predicate())
-            } else {
-                "Your train is delayed".to_string()
+            title: match (is_cancelled, from_station) {
+                (true, _) => format!("Your train {}", cancel.predicate()),
+                (false, Some(from)) => format!("Your train from {from} is delayed"),
+                (false, None) => "Your train is delayed".to_string(),
             },
             body: match delay_minutes {
                 Some(minutes) if !is_cancelled => {
@@ -1532,17 +1540,35 @@ mod copy_tests {
 
     #[test]
     fn no_journey_context_falls_back_to_todays_exact_copy() {
-        let payload = build_train_notification_payload(7, "en_route", Some(18), None, None);
+        let payload = build_train_notification_payload(7, "en_route", Some(18), None, None, None);
         assert_eq!(payload.title, "Your train is delayed");
         assert_eq!(payload.body, "Now running about 18 minutes late.");
         assert_eq!(payload.url, "/train/by-id/7");
         assert_eq!(payload.tag, "train-7");
     }
 
+    /// An Iarnród Éireann train's delay push names where it was tracked
+    /// from (design §8); no station leaves today's copy.
+    #[test]
+    fn an_irish_delay_says_where_it_was_tracked_from() {
+        let payload = build_train_notification_payload(
+            7,
+            "en_route",
+            Some(16),
+            None,
+            None,
+            Some("Dublin Connolly"),
+        );
+        assert_eq!(payload.title, "Your train from Dublin Connolly is delayed");
+        assert_eq!(payload.body, "Now running about 16 minutes late.");
+        assert_eq!(payload.url, "/train/by-id/7");
+    }
+
     #[test]
     fn a_one_leg_journey_also_falls_back_to_todays_exact_copy() {
         let context = ctx(1, Some("Weekend in Edinburgh"));
-        let payload = build_train_notification_payload(7, "cancelled", None, Some(&context), None);
+        let payload =
+            build_train_notification_payload(7, "cancelled", None, Some(&context), None, None);
         assert_eq!(payload.title, "Your train was cancelled");
         assert_eq!(payload.url, "/train/by-id/7");
     }
@@ -1551,7 +1577,7 @@ mod copy_tests {
     fn a_multi_leg_journey_names_the_leg_and_journey() {
         let context = ctx(3, Some("Weekend in Edinburgh"));
         let payload =
-            build_train_notification_payload(7, "en_route", Some(18), Some(&context), None);
+            build_train_notification_payload(7, "en_route", Some(18), Some(&context), None, None);
         assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' is delayed");
         assert_eq!(
             payload.body,
@@ -1565,7 +1591,7 @@ mod copy_tests {
     fn an_unnamed_multi_leg_journey_falls_back_to_a_generic_journey_label() {
         let context = ctx(2, None);
         let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None);
+            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
         assert_eq!(
             payload.title,
             "Leg 2 of your journey to Brighton is delayed"
@@ -1578,7 +1604,7 @@ mod copy_tests {
         context.journey_destination_crs = None;
         context.journey_destination_name = None;
         let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None);
+            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
         assert_eq!(payload.title, "Leg 2 of your journey is delayed");
     }
 
@@ -1586,7 +1612,8 @@ mod copy_tests {
     fn an_unnamed_journey_whose_end_has_no_name_uses_its_code() {
         let mut context = ctx(2, Some("   "));
         context.journey_destination_name = None;
-        let payload = build_train_notification_payload(7, "cancelled", None, Some(&context), None);
+        let payload =
+            build_train_notification_payload(7, "cancelled", None, Some(&context), None, None);
         assert_eq!(payload.title, "Leg 2 of your journey to BTN was cancelled");
     }
 
@@ -1595,7 +1622,7 @@ mod copy_tests {
         let mut context = ctx(2, None);
         context.destination_name = None;
         let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None);
+            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
         assert_eq!(
             payload.body,
             "WAV to KGX, now running about 5 minutes late."
@@ -1605,7 +1632,8 @@ mod copy_tests {
     #[test]
     fn a_multi_leg_cancellation_names_the_route_when_known() {
         let context = ctx(2, Some("Weekend in Edinburgh"));
-        let payload = build_train_notification_payload(7, "cancelled", None, Some(&context), None);
+        let payload =
+            build_train_notification_payload(7, "cancelled", None, Some(&context), None, None);
         assert_eq!(
             payload.title,
             "Leg 2 of 'Weekend in Edinburgh' was cancelled"
@@ -1622,7 +1650,7 @@ mod copy_tests {
         context.origin_crs = None;
         context.destination_crs = None;
         let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None);
+            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
         assert_eq!(payload.body, "Now running about 5 minutes late.");
     }
 
@@ -1640,13 +1668,14 @@ mod copy_tests {
             Some("Signal failure"),
         );
         let payload =
-            build_train_notification_payload(7, "cancelled", None, None, Some(&terminates));
+            build_train_notification_payload(7, "cancelled", None, None, Some(&terminates), None);
         assert_eq!(payload.title, "Your train terminates at York");
         assert_eq!(payload.body, "Reason: Signal failure.");
         assert_eq!(payload.tag, "train-7");
 
         let full = copy(cancel_reason::CancelWhat::Cancelled, Some("Driver"));
-        let payload = build_train_notification_payload(7, "cancelled", None, None, Some(&full));
+        let payload =
+            build_train_notification_payload(7, "cancelled", None, None, Some(&full), None);
         assert_eq!(payload.title, "Your train was cancelled");
         assert_eq!(payload.body, "Reason: Driver.");
 
@@ -1655,7 +1684,8 @@ mod copy_tests {
             cancel_reason::CancelWhat::StartsFrom("Leeds".to_string()),
             None,
         );
-        let payload = build_train_notification_payload(7, "cancelled", None, None, Some(&starts));
+        let payload =
+            build_train_notification_payload(7, "cancelled", None, None, Some(&starts), None);
         assert_eq!(payload.title, "Your train now starts from Leeds");
         assert_eq!(payload.body, "Check the latest status.");
     }
@@ -1673,6 +1703,7 @@ mod copy_tests {
             None,
             Some(&context),
             Some(&terminates),
+            None,
         );
         assert_eq!(
             payload.title,
@@ -1684,8 +1715,14 @@ mod copy_tests {
              Reason: Signal failure."
         );
         let part = copy(cancel_reason::CancelWhat::PartCancelled, None);
-        let payload =
-            build_train_notification_payload(7, "cancelled", None, Some(&context), Some(&part));
+        let payload = build_train_notification_payload(
+            7,
+            "cancelled",
+            None,
+            Some(&context),
+            Some(&part),
+            None,
+        );
         assert_eq!(
             payload.body,
             "The Wakefield Westgate to London Kings Cross service is part cancelled."
@@ -1695,7 +1732,8 @@ mod copy_tests {
     #[test]
     fn a_delay_push_ignores_any_cancellation_copy() {
         let full = copy(cancel_reason::CancelWhat::Cancelled, Some("Driver"));
-        let payload = build_train_notification_payload(7, "en_route", Some(18), None, Some(&full));
+        let payload =
+            build_train_notification_payload(7, "en_route", Some(18), None, Some(&full), None);
         assert_eq!(payload.title, "Your train is delayed");
         assert_eq!(payload.body, "Now running about 18 minutes late.");
     }
