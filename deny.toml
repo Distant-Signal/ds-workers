@@ -27,6 +27,11 @@ ignore = [
     # lopdf. PDF tickets are parsed in api's resource-limited child process
     # (data::ticket_subprocess), so a parser bug can't take the server down.
     { id = "RUSTSEC-2026-0192", reason = "only via pdf-extract, which runs in the sandboxed ticket-parse child" },
+    # crypto-bigint 0.5: constant-time operations may branch on secrets
+    # (fixed in 0.7.6). Only via web-push 0.11 -> jwt-simple 0.12 ->
+    # p256 0.13, with no newer web-push. The full reasoning, and the
+    # 2027-02-05 review date, are in osv-scanner.toml (DS-337).
+    { id = "RUSTSEC-2026-0387", reason = "only via web-push's VAPID signing; no web-push release on crypto-bigint 0.7; see osv-scanner.toml" },
 ]
 
 [licenses]
