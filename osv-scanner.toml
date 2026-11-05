@@ -5,3 +5,22 @@
 # CVSS >= 9.0 with a fixed version by then, otherwise as a non-blocking
 # warning (see that workflow's header).
 
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-02-05T00:00:00Z
+reason = """\
+crypto-bigint 0.5.5 (operations meant to be constant-time may branch on \
+secret values, depending on the compiler and CPU; fixed in 0.7.6). Only \
+via web-push 0.11 -> jwt-simple 0.12 -> p256/elliptic-curve 0.13, which \
+pin crypto-bigint 0.5; web-push 0.11 is the latest release and still \
+requires jwt-simple ^0.12, so there is no upgrade path. The secret it \
+touches is the notifier's VAPID key, used for one ES256 signature per \
+push. Low risk: the only signing-time observers are push services, \
+behind network and TLS jitter far larger than any branch, and a \
+recovered VAPID key alone can't read or forge subscribers' payloads \
+(those need each subscription's p256dh/auth keys, encrypted by ece over \
+OpenSSL, not crypto-bigint). Recorded under DS-337. At expiry, take a \
+web-push release on jwt-simple >= 0.13 (or sign VAPID JWTs ourselves \
+with p256 0.14) if one exists, otherwise review again.\
+"""
