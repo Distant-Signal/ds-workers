@@ -1992,7 +1992,7 @@ static COMMIT_CHECK_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
          WHERE jl.match_mode = 'unmatched' \
            AND jl.kind = 'train' \
            AND jl.service_date = $1 \
-           AND jt.default_match_mode = 'auto' \
+           AND jt.default_match_mode = $2 \
            AND jt.active \
            AND {origin} IS NOT NULL \
            AND {destination} IS NOT NULL"
@@ -2005,6 +2005,25 @@ pub(crate) async fn unmatched_auto_legs_for_commit_check(
 ) -> anyhow::Result<Vec<CommitCheckLeg>> {
     let rows = sqlx::query_as::<_, CommitCheckLeg>(COMMIT_CHECK_LEGS_SQL.as_str())
         .bind(today)
+        .bind("auto")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// The `'manual'`-mode ("remind me, don't guess") counterpart of
+/// [`unmatched_auto_legs_for_commit_check`]: today's unmatched train legs of
+/// active `'manual'` templates, for the "pick your train" reminder
+/// (`main.rs`'s `run_template_sweep_cycle`, stage 3). The same query and
+/// columns, `notify_attention` included: the reminder is the same
+/// "recurring journey needs you" switch (`template_attention`).
+pub(crate) async fn unmatched_manual_legs_for_reminder(
+    pool: &PgPool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Vec<CommitCheckLeg>> {
+    let rows = sqlx::query_as::<_, CommitCheckLeg>(COMMIT_CHECK_LEGS_SQL.as_str())
+        .bind(today)
+        .bind("manual")
         .fetch_all(pool)
         .await?;
     Ok(rows)

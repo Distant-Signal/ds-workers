@@ -1099,7 +1099,8 @@ async fn run_skip_check_cycle(
 /// The recurring-journey materialization sweep's own cycle (Task 4/5,
 /// spec §3.1-3.2). "Today" is a plain Europe/London calendar date (see
 /// this plan's Architecture section for why not a rail day) -- computed
-/// once per tick from `now` and used for both stages.
+/// once per tick from `now` and used for all three stages (mint,
+/// auto-commit, manual reminder).
 ///
 /// `now` is INJECTED, not read from the clock inside here -- the same
 /// convention `api::data::reconciliation::retry_schedule_enrichment_for_nr_primary_trains`
@@ -1161,17 +1162,16 @@ async fn run_template_sweep_cycle(
             leg.arrive_after,
             leg.arrive_before,
         );
-        let due_bound_utc = match window.due_check_bound() {
-            Some(bound) => {
-                let Some(bound_utc) = london_to_utc(leg.service_date.and_time(bound)) else {
-                    continue; // nonexistent local time (spring-forward gap) -- best-effort, skip this tick
-                };
-                bound_utc
-            }
-            // Fully open: there is no stated time to wait for, so this leg
-            // is due whenever the sweep looks -- and `now`, not midnight, is
-            // what "nearest/next" is then measured against below.
-            None => now,
+        // Fully open: no stated time, so nothing to pick against but the
+        // clock, and the first hourly tick of the day would commit it to
+        // the first train of the day (DS-375). Left unmatched instead, as
+        // if the template were 'manual'; the website asks for a time, and
+        // the api refuses 'auto' for such a leg from now on.
+        let Some(bound) = window.due_check_bound() else {
+            continue;
+        };
+        let Some(due_bound_utc) = london_to_utc(leg.service_date.and_time(bound)) else {
+            continue; // nonexistent local time (spring-forward gap) -- best-effort, skip this tick
         };
         if !decision::is_due_for_commit_check(now, due_bound_utc, auto_commit_lead_minutes) {
             continue;
@@ -1339,6 +1339,98 @@ async fn run_template_sweep_cycle(
         }
     }
 
+    // --- Stage 3: remind 'manual' legs to pick a train ---
+    remind_manual_legs(pool, queue, now, today, auto_commit_lead_minutes).await
+}
+
+/// Stage 3 of [`run_template_sweep_cycle`]: the "pick your train" reminder
+/// for today's unmatched legs of `'manual'` ("remind me, don't guess")
+/// templates (design doc §3.3 and §4.2, Phase D). One push per leg, from
+/// the same lead before the leg's window that `'auto'` commits at, until
+/// the leg's latest stated time (`decision::decide_template_reminder`).
+/// Deep-links to the journey, whose open leg card is the train picker.
+///
+/// Sent state is the leg's `last_notified_unmatched` (written by the push
+/// worker on delivery, `Delivered::Unmatched`), shared with the `'auto'`
+/// "needs attention" push: each tells the user the leg needs them, so a
+/// leg gets one or the other, once. It shares that push's tag too, so a
+/// device shows at most one. Quiet hours don't send it (`hold::gate`'s
+/// `NotNow`): the next tick decides it again, while the window lasts.
+/// A leg with no time at all has no window to remind ahead of and is
+/// skipped; the website asks for a time. Off with `template_attention`.
+async fn remind_manual_legs(
+    pool: &PgPool,
+    queue: &Queue,
+    now: DateTime<Utc>,
+    today: chrono::NaiveDate,
+    lead_minutes: i64,
+) -> anyhow::Result<()> {
+    for leg in queries::unmatched_manual_legs_for_reminder(pool, today).await? {
+        if !leg.notify_attention {
+            continue;
+        }
+        let window = decision::commit_check_window(
+            leg.depart_after,
+            leg.depart_before,
+            leg.arrive_after,
+            leg.arrive_before,
+        );
+        let (Some(first), Some(last)) = (
+            window.due_check_bound(),
+            decision::latest_stated_time(
+                leg.depart_after,
+                leg.depart_before,
+                leg.arrive_after,
+                leg.arrive_before,
+            ),
+        ) else {
+            continue;
+        };
+        let (Some(first_utc), Some(last_utc)) = (
+            london_to_utc(leg.service_date.and_time(first)),
+            london_to_utc(leg.service_date.and_time(last)),
+        ) else {
+            continue; // a spring-forward gap: best effort, as stage 2
+        };
+        let already_notified =
+            queries::unmatched_notification_state(pool, &leg.user_id, leg.journey_leg_id)
+                .await?
+                .unwrap_or(false);
+        if decision::decide_template_reminder(
+            now,
+            first_utc,
+            last_utc,
+            lead_minutes,
+            already_notified,
+        ) != decision::NotifyDecision::NotifyNow
+        {
+            continue;
+        }
+        let route = push_route(
+            Some(&leg.origin_crs),
+            leg.origin_name.as_deref(),
+            Some(&leg.destination_crs),
+            leg.destination_name.as_deref(),
+        )
+        .unwrap_or_default();
+        let payload = NotificationPayload {
+            title: "Pick today's train".to_string(),
+            body: format!("Your {route} journey is coming up. Tap to choose a train."),
+            url: format!("/journeys/{}", leg.journey_id),
+            tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+        };
+        enqueue_push(
+            pool,
+            queue,
+            &leg.user_id,
+            payload,
+            Delivered::Unmatched {
+                journey_leg_id: leg.journey_leg_id,
+            },
+            now,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -2291,9 +2383,8 @@ mod db_tests {
 
 #[cfg(test)]
 #[expect(
-    clippy::items_after_statements,
     clippy::too_many_lines,
-    reason = "test code: fixtures sit next to their use; scenario tests read top to bottom"
+    reason = "test code: scenario tests read top to bottom"
 )]
 mod sweep_cycle_tests {
     use super::drain_support::*;
@@ -2615,179 +2706,225 @@ mod sweep_cycle_tests {
         cleanup_user(&pool, user_id).await;
     }
 
-    /// End-to-end regression test for a template leg with NO time window
-    /// at all (`api::data::journey_templates::validate_template_leg`'s own
-    /// doc comment confirms this is a deliberately allowed state -- a
-    /// template leg is never itself "matched," so the "at least one
-    /// window bound" rule an ordinary journey leg needs doesn't apply
-    /// here). Seeds a template leg with `depart_after`/`depart_before`/
-    /// `arrive_after`/`arrive_before` all omitted (NULL), and publishes
-    /// TWO candidate departures rather than one -- both to prove
-    /// `schedule_candidates_for_leg` returns every departure for the
-    /// route/date when every bound is NULL (not zero, not the whole
-    /// network), and so `pick_nearest_to_now_candidate`'s "closest to now"
-    /// choice between the two candidates is a real assertion, not
-    /// vacuously true with a single candidate.
-    ///
-    /// Before this fix: `unmatched_auto_legs_for_commit_check`'s own WHERE
-    /// clause required `depart_after IS NOT NULL OR arrive_after IS NOT
-    /// NULL`, so this leg was never even selected for a commit-check, and
-    /// `main.rs`'s own `let Some(earliest_bound) = ... else { continue }`
-    /// independently skipped it even if it had been -- either way, this
-    /// leg would stay `'unmatched'` forever. This test fails on either the
-    /// pre-fix query or the pre-fix `main.rs` guard alone, so it is a real
-    /// regression test for both halves of that fix together.
+    /// End-to-end: an `'auto'` template leg with NO time window at all is
+    /// minted but never auto-committed (DS-375), even with candidates
+    /// published for the day and at any hour. It used to be committed to
+    /// the next train at whichever tick saw it first, which at the first
+    /// hourly tick of the day is the first train of the day. Nor is it
+    /// pushed about: no "needs attention" (it has candidates) and no
+    /// reminder (no window to remind ahead of).
     #[tokio::test]
-    #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
-                run with `DATABASE_URL=... cargo test -p notifier \
-                run_template_sweep_cycle_mints_and_auto_commits_a_leg_with_no_time_window \
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                run_template_sweep_cycle_never_auto_commits_a_leg_with_no_time_window \
                 -- --ignored --test-threads=1`"]
-    async fn run_template_sweep_cycle_mints_and_auto_commits_a_leg_with_no_time_window() {
+    async fn run_template_sweep_cycle_never_auto_commits_a_leg_with_no_time_window() {
         let pool = connect().await;
         let user_id = "TEST-SWEEP-CYCLE-OPEN-WINDOW-USER";
-        let nearer_uid = "TEST-SWEEP-CYCLE-OPEN-WINDOW-NEARER-UID";
-        let farther_uid = "TEST-SWEEP-CYCLE-OPEN-WINDOW-FARTHER-UID";
-        seed_user(&pool, user_id).await;
         let today = today_london();
-        let now_local = Utc::now().with_timezone(&chrono_tz::Europe::London).time();
-
-        let template_id: i64 = sqlx::query_scalar(
-            "INSERT INTO journey_templates (user_id, custom_name, default_match_mode, days_of_week, active) \
-             VALUES ($1, 'E2E Open Window Auto Template', 'auto', $2, TRUE) RETURNING id",
+        seed_user(&pool, user_id).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Open Window Auto Template",
+            today,
+            None,
+            None,
         )
-        .bind(user_id)
-        .bind(decision::weekday_bit(today))
-        .fetch_one(&pool)
-        .await
-        .expect("seed template");
+        .await;
+        seed_departure(&pool, today, "TEST-SWEEP-OPEN-FIRST", 5, 30).await;
+        seed_departure(&pool, today, "TEST-SWEEP-OPEN-COMMUTER", 8, 15).await;
 
-        // No depart_after/depart_before/arrive_after/arrive_before column
-        // at all in this INSERT -- every one of the four stays NULL.
-        sqlx::query(
-            "INSERT INTO journey_template_legs (template_id, leg_order, origin_crs, destination_crs) \
-             VALUES ($1, 1, 'RDG', 'WOK')",
+        for (hour, minute) in [(0, 37), (7, 30), (12, 0)] {
+            sweep_and_drain(&pool, london_now(today, hour, minute), 120)
+                .await
+                .expect("run_template_sweep_cycle must succeed");
+        }
+
+        let (leg_id, match_mode, train_subscription_id) =
+            template_leg_state(&pool, template_id).await;
+        assert_eq!(match_mode, "unmatched");
+        assert_eq!(train_subscription_id, None);
+        assert_eq!(
+            queries::unmatched_notification_state(&pool, user_id, leg_id)
+                .await
+                .expect("read unmatched state"),
+            None,
+            "a leg with no time is not pushed about"
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Today's minted leg of a one-leg template: `(id, match_mode,
+    /// train_subscription_id)`.
+    async fn template_leg_state(pool: &PgPool, template_id: i64) -> (i64, String, Option<i64>) {
+        sqlx::query_as(
+            "SELECT jl.id, jl.match_mode, jl.train_subscription_id FROM journey_legs jl \
+             JOIN journeys j ON j.id = jl.journey_id WHERE j.source_template_id = $1",
         )
         .bind(template_id)
-        .execute(&pool)
+        .fetch_one(pool)
         .await
-        .expect("seed fully-open-window template leg");
+        .expect("today's journey must have been minted")
+    }
 
-        // Two candidates: one an hour from now, one twelve hours from
-        // now -- both real, in-range departures given no window bound at
-        // all, but only the nearer one should win the auto-commit.
-        // `day_offset`-aware, same "seconds past midnight on
-        // `service_date`" arithmetic `decision::pick_nearest_to_now_candidate`
-        // itself uses -- this test must stay correct even when it happens
-        // to run within a few hours of real local midnight, where a naive
-        // `now_local + Duration::hours(12)` would wrap the clock time back
-        // toward "now" without also advancing `day_offset`, silently
-        // reintroducing the exact bug that function's own regression test
-        // (`nearest_to_now_candidate_is_day_offset_aware_across_a_midnight_boundary`)
-        // already covers for the pure-decision layer.
-        fn offset_from_now(
-            now_local: chrono::NaiveTime,
-            add_hours: i64,
-        ) -> (i16, chrono::NaiveTime) {
-            use chrono::Timelike;
-            let total_secs = i64::from(now_local.num_seconds_from_midnight()) + add_hours * 3600;
-            let day_offset =
-                i16::try_from(total_secs.div_euclid(86_400)).expect("small day offset");
-            let secs_in_day =
-                u32::try_from(total_secs.rem_euclid(86_400)).expect("secs in day fits u32");
-            let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs_in_day, 0)
-                .expect("valid wall-clock time");
-            (day_offset, time)
-        }
-        let (nearer_day_offset, nearer_time) = offset_from_now(now_local, 1);
-        let (farther_day_offset, farther_time) = offset_from_now(now_local, 12);
+    /// Seeds one `'manual'` ("remind me, don't guess") template, due today,
+    /// with one RDG to WOK leg leaving between `depart_after` and
+    /// `depart_before`. Returns the template id.
+    async fn seed_manual_template(
+        pool: &PgPool,
+        user_id: &str,
+        today: chrono::NaiveDate,
+        depart_after: Option<chrono::NaiveTime>,
+        depart_before: Option<chrono::NaiveTime>,
+    ) -> i64 {
+        let template_id = seed_auto_template(
+            pool,
+            user_id,
+            "E2E Manual Reminder",
+            today,
+            depart_after,
+            depart_before,
+        )
+        .await;
         sqlx::query(
-            "INSERT INTO schedule_destination_departures \
-                (service_date, destination_crs, scheduled, day_offset, train_uid, origin_crs) \
-             VALUES ($1, 'WOK', $2, $3, $4, 'RDG'), ($1, 'WOK', $5, $6, $7, 'RDG')",
+            "UPDATE journey_templates SET default_match_mode = 'manual', auto_commit_rule = NULL \
+             WHERE id = $1",
         )
-        .bind(today)
-        .bind(nearer_time)
-        .bind(nearer_day_offset)
-        .bind(nearer_uid)
-        .bind(farther_time)
-        .bind(farther_day_offset)
-        .bind(farther_uid)
+        .bind(template_id)
+        .execute(pool)
+        .await
+        .expect("make the template manual");
+        template_id
+    }
+
+    /// When the leg's reminder was recorded as sent, if it was.
+    async fn reminded_at(pool: &PgPool, user_id: &str, leg_id: i64) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar(
+            "SELECT last_notified_unmatched_at FROM journey_leg_notification_state \
+             WHERE user_id = $1 AND journey_leg_id = $2 AND last_notified_unmatched",
+        )
+        .bind(user_id)
+        .bind(leg_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read reminder state")
+        .flatten()
+    }
+
+    /// Phase D: a `'manual'` template's unmatched leg gets one "pick your
+    /// train" push, from two hours before its window, and the sweep never
+    /// picks a train for it.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_manual_template_leg_is_reminded_once_ahead_of_its_window \
+                -- --ignored --test-threads=1`"]
+    async fn a_manual_template_leg_is_reminded_once_ahead_of_its_window() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-REMIND-USER";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id = seed_manual_template(
+            &pool,
+            user_id,
+            today,
+            chrono::NaiveTime::from_hms_opt(8, 0, 0),
+            chrono::NaiveTime::from_hms_opt(8, 10, 0),
+        )
+        .await;
+        seed_departure(&pool, today, "TEST-SWEEP-REMIND-0805", 8, 5).await;
+
+        // 05:30: today's journey is added, but it is too early to remind.
+        sweep_and_drain(&pool, london_now(today, 5, 30), 120)
+            .await
+            .expect("sweep at 05:30");
+        let (leg_id, _, _) = template_leg_state(&pool, template_id).await;
+        assert_eq!(reminded_at(&pool, user_id, leg_id).await, None);
+
+        // 06:30: inside the two hours; reminded.
+        sweep_and_drain(&pool, london_now(today, 6, 30), 120)
+            .await
+            .expect("sweep at 06:30");
+        let first = reminded_at(&pool, user_id, leg_id).await;
+        assert!(first.is_some(), "the reminder must have been sent");
+
+        // 07:30: not again.
+        sweep_and_drain(&pool, london_now(today, 7, 30), 120)
+            .await
+            .expect("sweep at 07:30");
+        assert_eq!(reminded_at(&pool, user_id, leg_id).await, first);
+
+        let (_, match_mode, train_subscription_id) = template_leg_state(&pool, template_id).await;
+        assert_eq!(match_mode, "unmatched", "a manual leg is never picked for");
+        assert_eq!(train_subscription_id, None);
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// No reminder for a manual leg whose window has already passed, one
+    /// with no time at all, or one whose owner turned recurring journey
+    /// notifications off.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_manual_template_leg_is_not_reminded_late_without_a_time_or_when_off \
+                -- --ignored --test-threads=1`"]
+    async fn a_manual_template_leg_is_not_reminded_late_without_a_time_or_when_off() {
+        let pool = connect().await;
+        let today = today_london();
+        let eight = chrono::NaiveTime::from_hms_opt(8, 0, 0);
+        let ten_past = chrono::NaiveTime::from_hms_opt(8, 10, 0);
+
+        // The window has passed by the first tick that sees the leg.
+        let user_id = "TEST-SWEEP-REMIND-LATE-USER";
+        seed_user(&pool, user_id).await;
+        let template_id = seed_manual_template(&pool, user_id, today, eight, ten_past).await;
+        sweep_and_drain(&pool, london_now(today, 8, 30), 120)
+            .await
+            .expect("sweep at 08:30");
+        let (leg_id, _, _) = template_leg_state(&pool, template_id).await;
+        assert_eq!(reminded_at(&pool, user_id, leg_id).await, None, "too late");
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+
+        // No time at all: nothing to remind ahead of.
+        let user_id = "TEST-SWEEP-REMIND-OPEN-USER";
+        seed_user(&pool, user_id).await;
+        let template_id = seed_manual_template(&pool, user_id, today, None, None).await;
+        for (hour, minute) in [(0, 37), (7, 30), (12, 0)] {
+            sweep_and_drain(&pool, london_now(today, hour, minute), 120)
+                .await
+                .expect("sweep");
+        }
+        let (leg_id, _, _) = template_leg_state(&pool, template_id).await;
+        assert_eq!(reminded_at(&pool, user_id, leg_id).await, None, "no time");
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+
+        // Recurring journey notifications off.
+        let user_id = "TEST-SWEEP-REMIND-OFF-USER";
+        seed_user(&pool, user_id).await;
+        sqlx::query(
+            "INSERT INTO notification_preferences (user_id, template_attention) VALUES ($1, FALSE) \
+             ON CONFLICT (user_id) DO UPDATE SET template_attention = FALSE",
+        )
+        .bind(user_id)
         .execute(&pool)
         .await
-        .expect("seed published schedule rows");
-
-        sweep_and_drain(
-            &pool,
-            Utc::now(),
-            120, // the spec's own suggested default -- irrelevant here since a fully-open leg is always due
-        )
-        .await
-        .expect("run_template_sweep_cycle must succeed for a fully-open-window leg");
-
-        let journey_id: i64 =
-            sqlx::query_scalar("SELECT id FROM journeys WHERE source_template_id = $1")
-                .bind(template_id)
-                .fetch_one(&pool)
-                .await
-                .expect("a journey must have been minted for this template");
-
-        let (match_mode, train_subscription_id): (String, Option<i64>) = sqlx::query_as(
-            "SELECT match_mode, train_subscription_id FROM journey_legs WHERE journey_id = $1",
-        )
-        .bind(journey_id)
-        .fetch_one(&pool)
-        .await
-        .expect("the minted leg must exist");
+        .expect("turn recurring journey notifications off");
+        let template_id = seed_manual_template(&pool, user_id, today, eight, ten_past).await;
+        sweep_and_drain(&pool, london_now(today, 6, 30), 120)
+            .await
+            .expect("sweep at 06:30");
+        let (leg_id, _, _) = template_leg_state(&pool, template_id).await;
         assert_eq!(
-            match_mode, "auto",
-            "a fully-open-window leg under an 'auto'-mode template must still get auto-committed"
+            reminded_at(&pool, user_id, leg_id).await,
+            None,
+            "turned off"
         );
-        let train_subscription_id =
-            train_subscription_id.expect("a train_subscription_id must be set on auto-commit");
-
-        let committed_train_uid: String = sqlx::query_scalar(
-            "SELECT t.train_uid FROM train_subscriptions ts \
-             JOIN trains t ON t.id = ts.trains_id \
-             WHERE ts.id = $1",
-        )
-        .bind(train_subscription_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read the committed train's own uid");
-        assert_eq!(
-            committed_train_uid, nearer_uid,
-            "with no window at all, the sweep must still pick the candidate genuinely nearest \
-             to now, not the farther one and not an arbitrary one"
-        );
-
-        sqlx::query("DELETE FROM journeys WHERE id = $1")
-            .bind(journey_id)
-            .execute(&pool)
-            .await
-            .ok(); // cascades journey_legs + journey_leg_notification_state
-        sqlx::query("DELETE FROM train_subscriptions WHERE id = $1")
-            .bind(train_subscription_id)
+        sqlx::query("DELETE FROM notification_preferences WHERE user_id = $1")
+            .bind(user_id)
             .execute(&pool)
             .await
             .ok();
-        sqlx::query("DELETE FROM trains WHERE train_uid IN ($1, $2)")
-            .bind(nearer_uid)
-            .bind(farther_uid)
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM schedule_destination_departures WHERE train_uid IN ($1, $2)")
-            .bind(nearer_uid)
-            .bind(farther_uid)
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
-            .bind(template_id)
-            .execute(&pool)
-            .await
-            .ok(); // cascades journey_template_legs
-        cleanup_user(&pool, user_id).await;
+        cleanup_template_fixture(&pool, user_id, template_id).await;
     }
 
     /// End-to-end: seeds one `'auto'`-mode template + one template leg, and
@@ -2937,10 +3074,9 @@ mod sweep_cycle_tests {
     /// `'auto'` and never re-evaluated, so the user got delay/cancellation/
     /// skip pushes all day for a train they were never on.
     ///
-    /// Asserts the sensible near-future service wins instead. Fails on the
-    /// pre-fix code (which commits `...-OVERNIGHT-UID`), and the assertion is
-    /// a real one rather than vacuous: there are two genuine candidates and
-    /// the "wrong" one is the one absolute nearness prefers.
+    /// The next-upcoming fix made the sweep commit the 07:15 instead, but
+    /// that was still a guess for a leg with no time; since DS-375 such a
+    /// leg is never auto-committed at all.
     #[tokio::test]
     #[ignore = "requires a live database with this plan's Task 3 migration already applied; \
                 run with `DATABASE_URL=... cargo test -p notifier \
@@ -2973,17 +3109,18 @@ mod sweep_cycle_tests {
             .expect("run_template_sweep_cycle must succeed");
 
         assert_eq!(
-            committed_train_uid(&pool, template_id).await.as_deref(),
-            Some(commuter_uid),
-            "an open-window leg must be committed to the next UPCOMING service (07:15), never to \
-             the 00:34 overnight one that had already departed 3 minutes before this tick -- \
-             being nearest in absolute clock distance is not being the right train"
+            committed_train_uid(&pool, template_id).await,
+            None,
+            "an open-window leg must not be committed at all (DS-375): not to the 00:34 \
+             overnight service that had already departed, and not to {commuter_uid} either"
         );
 
         cleanup_template_fixture(&pool, user_id, template_id).await;
     }
 
-    /// Finding 1's regression test at a mid-morning tick, with THREE
+    /// Finding 1's regression test at a mid-morning tick, for a leg with
+    /// only an upper bound (11:00; one with none is never committed since
+    /// DS-375), with THREE
     /// candidates -- the "realistic multi-candidate scenario" half of the
     /// same fix, and the one that proves the rule is "next upcoming", not
     /// merely "not an overnight train":
@@ -3015,7 +3152,7 @@ mod sweep_cycle_tests {
             "E2E Mid-morning Open Window",
             today,
             None,
-            None,
+            chrono::NaiveTime::from_hms_opt(11, 0, 0), // "before 11:00", no lower bound
         )
         .await;
         seed_departure(&pool, today, overnight_uid, 0, 34).await;
@@ -3029,7 +3166,7 @@ mod sweep_cycle_tests {
         assert_eq!(
             committed_train_uid(&pool, template_id).await.as_deref(),
             Some(upcoming_uid),
-            "with no window bound at all, the sweep must pick the next service still to depart \
+            "with no lower bound, the sweep must pick the next service still to depart \
              (10:15) -- not the 09:10 that left 20 minutes ago (nearest by absolute distance), \
              and not last night's 00:34"
         );
@@ -3050,8 +3187,15 @@ mod sweep_cycle_tests {
         let train_uid = "TEST-SWEEP-BUSPREF-TRAIN";
         let today = today_london();
         seed_user(&pool, user_id).await;
-        let template_id =
-            seed_auto_template(&pool, user_id, "E2E Bus Preference", today, None, None).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Bus Preference",
+            today,
+            chrono::NaiveTime::from_hms_opt(9, 0, 0),
+            None,
+        )
+        .await;
         seed_departure(&pool, today, bus_uid, 9, 40).await;
         seed_departure(&pool, today, train_uid, 10, 15).await;
         sqlx::query(
@@ -3077,8 +3221,15 @@ mod sweep_cycle_tests {
 
         // Only the bus left: it is taken rather than leaving the leg empty.
         seed_user(&pool, user_id).await;
-        let template_id =
-            seed_auto_template(&pool, user_id, "E2E Bus Fallback", today, None, None).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Bus Fallback",
+            today,
+            chrono::NaiveTime::from_hms_opt(9, 0, 0),
+            None,
+        )
+        .await;
         seed_departure(&pool, today, bus_uid, 9, 40).await;
         sweep_and_drain(&pool, london_now(today, 9, 30), 120)
             .await
@@ -3179,8 +3330,15 @@ mod sweep_cycle_tests {
         let train_uid = "TEST-SWEEP-ENRICH-UID";
         let today = today_london();
         seed_user(&pool, user_id).await;
-        let template_id =
-            seed_auto_template(&pool, user_id, "E2E Enrichment", today, None, None).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Enrichment",
+            today,
+            chrono::NaiveTime::from_hms_opt(9, 0, 0),
+            None,
+        )
+        .await;
         seed_departure(&pool, today, train_uid, 23, 30).await;
 
         sweep_and_drain(&pool, london_now(today, 9, 30), 120)
