@@ -20,6 +20,13 @@
 //!   and break-notice cycles are full polls over current state, which
 //!   decide them again once quiet hours end, if they still apply.
 //!
+//! A regular journey's leave-by reminder and morning summary (regular
+//! journeys design §5.3, decision 4) tell quiet hours from a snooze: in
+//! quiet hours they go through unless the user turned
+//! `leave_by_quiet_hours` off, and a snooze, which the user chose for now,
+//! stops them. Either way they are never held: a late leave-by is worse
+//! than none.
+//!
 //! # Release
 //!
 //! [`run_release_cycle`] looks at every hold each main poll. Once the
@@ -58,6 +65,7 @@ const RESULTS: &[&str] = &[
     "held",
     "not_sent_quiet",
     "cancellation_through",
+    "leave_by_through",
     "released",
     "dropped_stale",
 ];
@@ -86,17 +94,33 @@ pub(crate) struct QuietHours {
     pub snoozed_until: Option<DateTime<Utc>>,
 }
 
-/// Whether pushes wait at `now`: the user snoozed them until later, or
-/// `now` is inside their quiet hours (`start` inclusive, `end` exclusive,
-/// local time in `timezone`; a window whose end is before its start runs
-/// through midnight). An unknown zone is read as Europe/London (the api
-/// accepts only zones it knows).
+/// Why pushes wait at `now`, if they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quiet {
+    /// Nothing waits.
+    No,
+    /// Inside the user's daily quiet hours.
+    Hours,
+    /// The user snoozed pushes until later (this wins over quiet hours).
+    Snoozed,
+}
+
+/// Whether pushes wait at `now` ([`quiet_at`]).
 pub(crate) fn in_quiet_hours(quiet: &QuietHours, now: DateTime<Utc>) -> bool {
+    quiet_at(quiet, now) != Quiet::No
+}
+
+/// Why pushes wait at `now`: the user snoozed them until later, or `now`
+/// is inside their quiet hours (`start` inclusive, `end` exclusive, local
+/// time in `timezone`; a window whose end is before its start runs through
+/// midnight). An unknown zone is read as Europe/London (the api accepts
+/// only zones it knows).
+pub(crate) fn quiet_at(quiet: &QuietHours, now: DateTime<Utc>) -> Quiet {
     if quiet.snoozed_until.is_some_and(|until| now < until) {
-        return true;
+        return Quiet::Snoozed;
     }
     let (Some(start), Some(end)) = (quiet.start, quiet.end) else {
-        return false;
+        return Quiet::No;
     };
     let zone: chrono_tz::Tz = quiet
         .timezone
@@ -104,11 +128,12 @@ pub(crate) fn in_quiet_hours(quiet: &QuietHours, now: DateTime<Utc>) -> bool {
         .and_then(|name| name.parse().ok())
         .unwrap_or(chrono_tz::Europe::London);
     let local = now.with_timezone(&zone).time();
-    match start.cmp(&end) {
+    let inside = match start.cmp(&end) {
         std::cmp::Ordering::Less => start <= local && local < end,
         std::cmp::Ordering::Greater => local >= start || local < end,
         std::cmp::Ordering::Equal => false,
-    }
+    };
+    if inside { Quiet::Hours } else { Quiet::No }
 }
 
 /// Whether a push goes through quiet hours: a cancellation.
@@ -144,10 +169,26 @@ fn is_account_security_notice(delivered: &Delivered) -> bool {
     )
 }
 
-/// The quiet-hours rule for one push. Pure.
-pub(crate) fn gate(delivered: &Delivered, quiet: bool) -> Gate {
-    if is_account_security_notice(delivered) || !quiet {
+/// A regular journey's leave-by reminder or morning summary.
+fn is_regular_journey_push(delivered: &Delivered) -> bool {
+    matches!(
+        delivered,
+        Delivered::LeaveBy { .. } | Delivered::MorningSummary { .. }
+    )
+}
+
+/// The quiet-hours rule for one push. Pure. `leave_by_quiet_hours` is the
+/// user's "During quiet hours" switch for leave-by reminders.
+pub(crate) fn gate(delivered: &Delivered, quiet: Quiet, leave_by_quiet_hours: bool) -> Gate {
+    if is_account_security_notice(delivered) || quiet == Quiet::No {
         return Gate::Send;
+    }
+    if is_regular_journey_push(delivered) {
+        return if quiet == Quiet::Hours && leave_by_quiet_hours {
+            Gate::Send
+        } else {
+            Gate::NotNow
+        };
     }
     if is_cancellation(delivered) {
         return Gate::Send;
@@ -174,39 +215,54 @@ type QuietHoursRow = (
     Option<NaiveTime>,
     Option<String>,
     Option<DateTime<Utc>>,
+    bool,
 );
 
-async fn quiet_hours_for(pool: &PgPool, user_id: &str) -> anyhow::Result<QuietHours> {
+/// The user's quiet hours and snooze, and their leave-by "During quiet
+/// hours" switch (on without a row).
+async fn quiet_hours_for(pool: &PgPool, user_id: &str) -> anyhow::Result<(QuietHours, bool)> {
     let row: Option<QuietHoursRow> = sqlx::query_as(
-        "SELECT quiet_hours_start, quiet_hours_end, quiet_hours_timezone, snoozed_until \
+        "SELECT quiet_hours_start, quiet_hours_end, quiet_hours_timezone, snoozed_until, \
+                leave_by_quiet_hours \
          FROM notification_preferences WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row
-        .map(|(start, end, timezone, snoozed_until)| QuietHours {
-            start,
-            end,
-            timezone,
-            snoozed_until,
-        })
-        .unwrap_or_default())
+    Ok(row.map_or_else(
+        || (QuietHours::default(), true),
+        |(start, end, timezone, snoozed_until, leave_by_quiet_hours)| {
+            (
+                QuietHours {
+                    start,
+                    end,
+                    timezone,
+                    snoozed_until,
+                },
+                leave_by_quiet_hours,
+            )
+        },
+    ))
 }
 
 /// Hands one decided push on: to the queue, to `notification_holds`, or
 /// nowhere while the user's quiet hours last ([`gate`]). A push that goes
 /// to the queue deletes its target's hold: it is newer.
 pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyhow::Result<()> {
-    let quiet = if is_account_security_notice(&job.delivered) {
-        false
+    let (quiet, leave_by_quiet_hours) = if is_account_security_notice(&job.delivered) {
+        (Quiet::No, true)
     } else {
-        in_quiet_hours(&quiet_hours_for(pool, &job.user_id).await?, job.decided_at)
+        let (hours, leave_by_quiet_hours) = quiet_hours_for(pool, &job.user_id).await?;
+        (quiet_at(&hours, job.decided_at), leave_by_quiet_hours)
     };
-    match gate(&job.delivered, quiet) {
+    match gate(&job.delivered, quiet, leave_by_quiet_hours) {
         Gate::Send => {
-            if quiet {
-                count("cancellation_through");
+            if quiet != Quiet::No {
+                count(if is_regular_journey_push(&job.delivered) {
+                    "leave_by_through"
+                } else {
+                    "cancellation_through"
+                });
             }
             if let Some(target) = hold_target(&job.delivered) {
                 sqlx::query("DELETE FROM notification_holds WHERE user_id = $1 AND target = $2")
@@ -473,6 +529,7 @@ pub(crate) async fn run_release_cycle(
                         body: hold.body.clone(),
                         url: hold.url.clone(),
                         tag: hold.tag.clone(),
+                        renotify: false,
                     },
                     delivered,
                     decided_at: now,
@@ -587,24 +644,32 @@ mod tests {
             line_id: "victoria".into(),
             rank: 2,
         };
-        assert_eq!(gate(&delay, false), Gate::Send);
-        assert_eq!(gate(&delay, true), Gate::Hold);
-        assert_eq!(gate(&line, true), Gate::Hold);
-        assert_eq!(gate(&cancel, true), Gate::Send);
+        assert_eq!(gate(&delay, Quiet::No, true), Gate::Send);
+        assert_eq!(gate(&delay, Quiet::Hours, true), Gate::Hold);
+        assert_eq!(gate(&line, Quiet::Hours, true), Gate::Hold);
+        assert_eq!(gate(&cancel, Quiet::Hours, true), Gate::Send);
         assert_eq!(
-            gate(&Delivered::GrantCreated { grant_id: 1 }, true),
+            gate(&Delivered::GrantCreated { grant_id: 1 }, Quiet::Hours, true),
             Gate::Send
         );
         assert_eq!(
-            gate(&Delivered::TokenCreated { token_id: 1 }, true),
+            gate(&Delivered::TokenCreated { token_id: 1 }, Quiet::Hours, true),
             Gate::Send
         );
         assert_eq!(
-            gate(&Delivered::SkippedStop { journey_leg_id: 1 }, true),
+            gate(
+                &Delivered::SkippedStop { journey_leg_id: 1 },
+                Quiet::Hours,
+                true
+            ),
             Gate::NotNow
         );
         assert_eq!(
-            gate(&Delivered::Unmatched { journey_leg_id: 1 }, true),
+            gate(
+                &Delivered::Unmatched { journey_leg_id: 1 },
+                Quiet::Hours,
+                true
+            ),
             Gate::NotNow
         );
         let cancelled_break = Delivered::JourneyBreak {
@@ -616,13 +681,60 @@ mod tests {
                 delay_minutes: None,
             }),
         };
-        assert_eq!(gate(&cancelled_break, true), Gate::Send);
+        assert_eq!(gate(&cancelled_break, Quiet::Hours, true), Gate::Send);
         let missed_break = Delivered::JourneyBreak {
             break_id: 1,
             severity: 1,
             trigger: None,
         };
-        assert_eq!(gate(&missed_break, true), Gate::NotNow);
+        assert_eq!(gate(&missed_break, Quiet::Hours, true), Gate::NotNow);
+        // A snooze holds a line or train push as quiet hours do.
+        assert_eq!(gate(&delay, Quiet::Snoozed, true), Gate::Hold);
+    }
+
+    /// Decision 4: a leave-by goes through quiet hours unless the user
+    /// turned that off, never through a snooze, and is never held.
+    #[test]
+    fn a_leave_by_goes_through_quiet_hours_but_not_a_snooze() {
+        let leave_by = Delivered::LeaveBy {
+            journey_id: 1,
+            leg_id: 2,
+            leave_by: utc(8, 20),
+            moved: false,
+            ttl_cap_secs: 900,
+            trigger: None,
+        };
+        let summary = Delivered::MorningSummary {
+            service_date: utc(7, 0).date_naive(),
+            first_leave_by: utc(8, 20),
+        };
+        for push in [&leave_by, &summary] {
+            assert_eq!(gate(push, Quiet::No, false), Gate::Send);
+            assert_eq!(gate(push, Quiet::Hours, true), Gate::Send);
+            assert_eq!(gate(push, Quiet::Hours, false), Gate::NotNow);
+            assert_eq!(gate(push, Quiet::Snoozed, true), Gate::NotNow);
+            assert_eq!(gate(push, Quiet::Snoozed, false), Gate::NotNow);
+        }
+    }
+
+    #[test]
+    fn a_snooze_wins_over_quiet_hours() {
+        let both = QuietHours {
+            start: Some("22:00:00".parse().unwrap()),
+            end: Some("07:00:00".parse().unwrap()),
+            timezone: Some("UTC".into()),
+            snoozed_until: Some(utc(23, 30)),
+        };
+        assert_eq!(quiet_at(&both, utc(23, 0)), Quiet::Snoozed);
+        assert_eq!(
+            quiet_at(&both, utc(23, 45)),
+            Quiet::Hours,
+            "the snooze ended"
+        );
+        assert_eq!(quiet_at(&both, utc(12, 0)), Quiet::Snoozed);
+        let mut hours_only = both.clone();
+        hours_only.snoozed_until = None;
+        assert_eq!(quiet_at(&hours_only, utc(23, 0)), Quiet::Hours);
     }
 
     fn train_hold(status: &str, delay: Option<i32>) -> HoldRow {
