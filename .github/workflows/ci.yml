@@ -27,9 +27,10 @@ jobs:
   # git source allowed is Distant-Signal/ds-core), rustfmt, and cargo build
   # and test (the tests that need no database).
   rust:
-    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
+    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@4ffee4c03a4f18c5b45d065a04e389353e9d186a # main
     with:
-      toolchain: 1.88.0
+      # renovate: datasource=rust-version depName=rust
+      toolchain: 1.99.0
       msrv: 1.88.0
       apt-packages: libssl-dev pkg-config
 
@@ -42,9 +43,10 @@ jobs:
   # ds-core's at this repository's core version (Cargo.lock), not anything
   # in this tree (spec §5.1).
   rust-db-tests:
-    uses: Distant-Signal/ci/.github/workflows/rust-db-tests.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
+    uses: Distant-Signal/ci/.github/workflows/rust-db-tests.yml@4ffee4c03a4f18c5b45d065a04e389353e9d186a # main
     with:
-      toolchain: 1.88.0
+      # renovate: datasource=rust-version depName=rust
+      toolchain: 1.99.0
       # renovate: datasource=docker depName=postgres
       postgres-image: postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
       # renovate: datasource=docker depName=valkey/valkey
@@ -52,17 +54,17 @@ jobs:
 
   # No commit may use a retired identity or carry AI attribution.
   commit-identity:
-    uses: Distant-Signal/ci/.github/workflows/identity.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
+    uses: Distant-Signal/ci/.github/workflows/identity.yml@4ffee4c03a4f18c5b45d065a04e389353e9d186a # main
 
   # LICENSE is the canonical GNU AGPL v3 text, byte for byte.
   licence:
-    uses: Distant-Signal/ci/.github/workflows/licence.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
+    uses: Distant-Signal/ci/.github/workflows/licence.yml@4ffee4c03a4f18c5b45d065a04e389353e9d186a # main
 
   # shellcheck, shfmt, ruff, mypy --strict, actionlint run: blocks,
   # hadolint and lint-containers over this repository, then the ignored-
   # benchmark gate (the DB passes run every `#[ignore]`d test).
   scripts-lint:
-    uses: Distant-Signal/ci/.github/workflows/scripts-lint.yml@d734bc69e3127d208304c9d6a5a04b9e5645fc76 # main
+    uses: Distant-Signal/ci/.github/workflows/scripts-lint.yml@4ffee4c03a4f18c5b45d065a04e389353e9d186a # main
     with:
       check-bench-gates: true
 
@@ -88,7 +90,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Distant-Signal/ci
-          ref: d734bc69e3127d208304c9d6a5a04b9e5645fc76
+          ref: 4ffee4c03a4f18c5b45d065a04e389353e9d186a
           path: .ds-ci
           persist-credentials: false
 
