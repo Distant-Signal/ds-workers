@@ -1972,6 +1972,15 @@ pub(crate) struct CommitCheckLeg {
     /// The template has a usual itinerary (regular journeys, phase 1): the
     /// pick reminder links to the journey with the usual train first.
     pub has_usual_itinerary: bool,
+    /// The api's plan sweep's view of the journey (regular journeys phase
+    /// 3, `journeys.regular_plan_status`): `pending`, `suggested`,
+    /// `committed` or `no_service`; `None` when it never planned it.
+    pub regular_plan_status: Option<String>,
+    /// Why the sweep chose its suggestion: `usual`, `same_operator` or
+    /// `best` (the usual train doesn't run that day).
+    pub plan_reason: Option<String>,
+    /// The suggestion's first departure.
+    pub plan_departure: Option<DateTime<Utc>>,
 }
 
 /// [`unmatched_auto_legs_for_commit_check`]'s query, each leg end read
@@ -1979,6 +1988,24 @@ pub(crate) struct CommitCheckLeg {
 /// queries here. An unmatched leg rarely has a train to fall back to; one
 /// that still points at a subscription is named by its route.
 static COMMIT_CHECK_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    commit_check_legs_sql(
+        "AND jt.default_match_mode = $2 \
+         AND ($3 OR jt.target_kind IS NULL)",
+    )
+});
+
+/// [`no_service_target_legs`]' query: [`COMMIT_CHECK_LEGS_SQL`]'s legs of
+/// templates with a target whose journey the plan sweep found no way for.
+static NO_SERVICE_TARGET_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    commit_check_legs_sql(
+        "AND jt.target_kind IS NOT NULL \
+         AND j.regular_plan_status = 'no_service'",
+    )
+});
+
+/// Today's (`$1`) unmatched train legs of active templates, with `filter`
+/// (more `AND` conditions on `jl`, `j` and `jt`) appended.
+fn commit_check_legs_sql(filter: &str) -> String {
     use ds_store::trains::{LegEnd, leg_crs_sql};
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
@@ -1988,7 +2015,9 @@ static COMMIT_CHECK_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
                 so.name AS origin_name, sd.name AS destination_name, \
                 jl.service_date, jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before, \
                 COALESCE(np.template_attention, TRUE) AS notify_attention, \
-                (jt.usual_itinerary IS NOT NULL) AS has_usual_itinerary \
+                (jt.usual_itinerary IS NOT NULL) AS has_usual_itinerary, \
+                j.regular_plan_status, j.regular_plan->>'reason' AS plan_reason, \
+                (j.regular_plan->'choice'->>'departure')::timestamptz AS plan_departure \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN journey_templates jt ON jt.id = j.source_template_id \
@@ -2000,13 +2029,17 @@ static COMMIT_CHECK_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
          WHERE jl.match_mode = 'unmatched' \
            AND jl.kind = 'train' \
            AND jl.service_date = $1 \
-           AND jt.default_match_mode = $2 \
            AND jt.active \
            AND {origin} IS NOT NULL \
-           AND {destination} IS NOT NULL"
+           AND {destination} IS NOT NULL \
+           {filter}"
     )
-});
+}
 
+///
+/// Templates with a target are left out (regular journeys phase 3, §6.5):
+/// the api's plan sweep chooses their train, and their "needs attention"
+/// push comes from [`no_service_target_legs`].
 pub(crate) async fn unmatched_auto_legs_for_commit_check(
     pool: &PgPool,
     today: chrono::NaiveDate,
@@ -2014,6 +2047,22 @@ pub(crate) async fn unmatched_auto_legs_for_commit_check(
     let rows = sqlx::query_as::<_, CommitCheckLeg>(COMMIT_CHECK_LEGS_SQL.as_str())
         .bind(today)
         .bind("auto")
+        .bind(false)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Today's unmatched train legs of templates with a target, in either
+/// mode, whose journey the api's plan sweep found no way for
+/// (`regular_plan_status = 'no_service'`, decided only on a published day):
+/// the "needs attention" push's legs for regular journeys (§6.5).
+pub(crate) async fn no_service_target_legs(
+    pool: &PgPool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<Vec<CommitCheckLeg>> {
+    let rows = sqlx::query_as::<_, CommitCheckLeg>(NO_SERVICE_TARGET_LEGS_SQL.as_str())
+        .bind(today)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -2032,6 +2081,7 @@ pub(crate) async fn unmatched_manual_legs_for_reminder(
     let rows = sqlx::query_as::<_, CommitCheckLeg>(COMMIT_CHECK_LEGS_SQL.as_str())
         .bind(today)
         .bind("manual")
+        .bind(true)
         .fetch_all(pool)
         .await?;
     Ok(rows)

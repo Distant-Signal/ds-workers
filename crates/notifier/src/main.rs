@@ -1253,33 +1253,7 @@ async fn run_template_sweep_cycle(
             {
                 continue;
             }
-            let payload = NotificationPayload {
-                title: "Your regular journey needs attention".to_string(),
-                body: format!(
-                    "No {} service was found for today within your usual window.",
-                    push_route(
-                        Some(&leg.origin_crs),
-                        leg.origin_name.as_deref(),
-                        Some(&leg.destination_crs),
-                        leg.destination_name.as_deref(),
-                    )
-                    .unwrap_or_default()
-                ),
-                url: format!("/journeys/{}", leg.journey_id),
-                tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
-                renotify: false,
-            };
-            enqueue_push(
-                pool,
-                queue,
-                &leg.user_id,
-                payload,
-                Delivered::Unmatched {
-                    journey_leg_id: leg.journey_leg_id,
-                },
-                now,
-            )
-            .await?;
+            enqueue_needs_attention(pool, queue, &leg, now).await?;
             continue;
         }
 
@@ -1369,8 +1343,96 @@ async fn run_template_sweep_cycle(
         }
     }
 
+    // --- Stage 2b: regular journeys the api's plan sweep found no way for ---
+    notify_no_service_target_legs(pool, queue, now, today, auto_commit_lead_minutes).await?;
+
     // --- Stage 3: remind 'manual' legs to pick a train ---
     remind_manual_legs(pool, queue, now, today, auto_commit_lead_minutes).await
+}
+
+/// "Your regular journey needs attention" for one leg, once (the caller
+/// checks `notify_attention` and the once-only rule): `Delivered::Unmatched`
+/// records it, under the leg's unmatched tag.
+async fn enqueue_needs_attention(
+    pool: &PgPool,
+    queue: &Queue,
+    leg: &queries::CommitCheckLeg,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let payload = NotificationPayload {
+        title: "Your regular journey needs attention".to_string(),
+        body: format!(
+            "No {} service was found for today within your usual window.",
+            push_route(
+                Some(&leg.origin_crs),
+                leg.origin_name.as_deref(),
+                Some(&leg.destination_crs),
+                leg.destination_name.as_deref(),
+            )
+            .unwrap_or_default()
+        ),
+        url: format!("/journeys/{}", leg.journey_id),
+        tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+        renotify: false,
+    };
+    enqueue_push(
+        pool,
+        queue,
+        &leg.user_id,
+        payload,
+        Delivered::Unmatched {
+            journey_leg_id: leg.journey_leg_id,
+        },
+        now,
+    )
+    .await
+}
+
+/// Stage 2b of [`run_template_sweep_cycle`] (regular journeys phase 3,
+/// §6.5): templates with a target are planned by the api's plan sweep, not
+/// stage 2, so their "needs attention" push reads the sweep's
+/// `no_service` (decided only on a published day) instead of an empty
+/// candidate list. Same push, tag and once-only rule as stage 2's, sent
+/// from the same lead before the leg's window, in either mode (a remind
+/// mode journey with no way there gets this instead of the pick reminder).
+async fn notify_no_service_target_legs(
+    pool: &PgPool,
+    queue: &Queue,
+    now: DateTime<Utc>,
+    today: chrono::NaiveDate,
+    lead_minutes: i64,
+) -> anyhow::Result<()> {
+    for leg in queries::no_service_target_legs(pool, today).await? {
+        if !leg.notify_attention {
+            continue;
+        }
+        let window = decision::commit_check_window(
+            leg.depart_after,
+            leg.depart_before,
+            leg.arrive_after,
+            leg.arrive_before,
+        );
+        let Some(bound) = window.due_check_bound() else {
+            continue;
+        };
+        let Some(due_bound_utc) = london_to_utc(leg.service_date.and_time(bound)) else {
+            continue;
+        };
+        if !decision::is_due_for_commit_check(now, due_bound_utc, lead_minutes) {
+            continue;
+        }
+        let already_notified =
+            queries::unmatched_notification_state(pool, &leg.user_id, leg.journey_leg_id)
+                .await?
+                .unwrap_or(false);
+        if decision::decide_unmatched_notification(already_notified)
+            != decision::NotifyDecision::NotifyNow
+        {
+            continue;
+        }
+        enqueue_needs_attention(pool, queue, &leg, now).await?;
+    }
+    Ok(())
 }
 
 /// Stage 1 of [`run_template_sweep_cycle`] for one service date: mints
@@ -1428,7 +1490,8 @@ async fn remind_manual_legs(
     lead_minutes: i64,
 ) -> anyhow::Result<()> {
     for leg in queries::unmatched_manual_legs_for_reminder(pool, today).await? {
-        if !leg.notify_attention {
+        // No way there today: stage 2b's "needs attention" is the push.
+        if !leg.notify_attention || leg.regular_plan_status.as_deref() == Some("no_service") {
             continue;
         }
         let window = decision::commit_check_window(
@@ -1477,7 +1540,7 @@ async fn remind_manual_legs(
         .unwrap_or_default();
         let payload = NotificationPayload {
             title: "Pick today's train".to_string(),
-            body: format!("Your {route} journey is coming up. Tap to choose a train."),
+            body: pick_reminder_body(&route, &leg),
             url: pick_reminder_url(leg.journey_id, leg.has_usual_itinerary),
             tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
             renotify: false,
@@ -1495,6 +1558,30 @@ async fn remind_manual_legs(
         .await?;
     }
     Ok(())
+}
+
+/// The pick reminder's text (regular journeys §6.5). With the api's plan
+/// sweep's suggestion it names the train: "Pick your train for Woking to
+/// London Waterloo. Your usual 08:12 is running.", or, when the usual
+/// train doesn't run that day, the closest one. Otherwise, as before.
+fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
+    let suggested = (leg.regular_plan_status.as_deref() == Some("suggested"))
+        .then_some(leg.plan_departure)
+        .flatten();
+    let Some(departure) = suggested else {
+        return format!("Your {route} journey is coming up. Tap to choose a train.");
+    };
+    let time = departure
+        .with_timezone(&chrono_tz::Europe::London)
+        .format("%H:%M");
+    if leg.plan_reason.as_deref() == Some("best") {
+        format!(
+            "Pick your train for {route}. Your usual train isn't running today, so the {time} \
+             is the closest."
+        )
+    } else {
+        format!("Pick your train for {route}. Your usual {time} is running.")
+    }
 }
 
 /// The pick reminder's link: the journey, with `?pick=usual` when its
@@ -2899,6 +2986,85 @@ mod sweep_cycle_tests {
         .flatten()
     }
 
+    fn reminder_leg(
+        status: Option<&str>,
+        reason: Option<&str>,
+        departure: Option<&str>,
+    ) -> queries::CommitCheckLeg {
+        queries::CommitCheckLeg {
+            journey_leg_id: 1,
+            journey_id: 2,
+            user_id: "u".to_string(),
+            origin_crs: "WOK".to_string(),
+            destination_crs: "WAT".to_string(),
+            origin_name: None,
+            destination_name: None,
+            service_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap(),
+            depart_after: None,
+            depart_before: None,
+            arrive_after: None,
+            arrive_before: None,
+            notify_attention: true,
+            has_usual_itinerary: true,
+            regular_plan_status: status.map(str::to_string),
+            plan_reason: reason.map(str::to_string),
+            plan_departure: departure.map(|d| d.parse().unwrap()),
+        }
+    }
+
+    /// The pick reminder names the plan sweep's suggestion (§6.5), in
+    /// London time (GMT in November), and keeps its old text without one.
+    #[test]
+    fn the_pick_reminder_names_the_suggested_train() {
+        let route = "Woking to London Waterloo";
+        let usual = reminder_leg(
+            Some("suggested"),
+            Some("usual"),
+            Some("2026-11-10T08:12:00Z"),
+        );
+        assert_eq!(
+            pick_reminder_body(route, &usual),
+            "Pick your train for Woking to London Waterloo. Your usual 08:12 is running."
+        );
+        let renamed = reminder_leg(
+            Some("suggested"),
+            Some("same_operator"),
+            Some("2026-11-10T08:14:00Z"),
+        );
+        assert!(pick_reminder_body(route, &renamed).ends_with("Your usual 08:14 is running."));
+        let closest = reminder_leg(
+            Some("suggested"),
+            Some("best"),
+            Some("2026-11-10T08:40:00Z"),
+        );
+        assert_eq!(
+            pick_reminder_body(route, &closest),
+            "Pick your train for Woking to London Waterloo. Your usual train isn't running \
+             today, so the 08:40 is the closest."
+        );
+        for leg in [
+            reminder_leg(None, None, None),
+            reminder_leg(Some("pending"), None, None),
+            reminder_leg(
+                Some("committed"),
+                Some("usual"),
+                Some("2026-11-10T08:12:00Z"),
+            ),
+        ] {
+            assert_eq!(
+                pick_reminder_body(route, &leg),
+                "Your Woking to London Waterloo journey is coming up. Tap to choose a train."
+            );
+        }
+        for leg in [usual, renamed, closest] {
+            let body = pick_reminder_body(route, &leg);
+            assert!(
+                !body.contains(['\u{2014}', '\u{2013}', '\u{2026}', '\u{2192}']),
+                "{body}"
+            );
+        }
+    }
+
     #[test]
     fn the_pick_reminder_links_to_the_usual_train_when_there_is_one() {
         assert_eq!(pick_reminder_url(42, false), "/journeys/42");
@@ -3253,6 +3419,137 @@ mod sweep_cycle_tests {
             .execute(&pool)
             .await
             .ok(); // cascades journey_template_legs
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// Gives a seeded template a target (regular journeys phase 1's
+    /// columns): RDG to WOK, leave after 08:00.
+    async fn make_target_template(pool: &PgPool, template_id: i64) {
+        sqlx::query(
+            "UPDATE journey_templates SET origin_crs = 'RDG', destination_crs = 'WOK', \
+                    target_kind = 'depart_after', target_time = '08:00' WHERE id = $1",
+        )
+        .bind(template_id)
+        .execute(pool)
+        .await
+        .expect("give the template a target");
+    }
+
+    /// Regular journeys phase 3 (§6.5): stage 2 leaves a template with a
+    /// target to the api's plan sweep, even with a train in its window.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                stage_two_leaves_a_target_template_to_the_plan_sweep -- --ignored --test-threads=1`"]
+    async fn stage_two_leaves_a_target_template_to_the_plan_sweep() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-TARGET-USER";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        let template_id = seed_auto_template(
+            &pool,
+            user_id,
+            "E2E Target Template",
+            today,
+            chrono::NaiveTime::from_hms_opt(8, 0, 0),
+            chrono::NaiveTime::from_hms_opt(8, 10, 0),
+        )
+        .await;
+        make_target_template(&pool, template_id).await;
+        seed_departure(&pool, today, "TEST-SWEEP-TARGET-0805", 8, 5).await;
+
+        sweep_and_drain(&pool, london_now(today, 7, 0), 120)
+            .await
+            .expect("sweep at 07:00");
+        let (leg_id, match_mode, train_subscription_id) =
+            template_leg_state(&pool, template_id).await;
+        assert_eq!(
+            match_mode, "unmatched",
+            "the plan sweep commits it, not stage 2"
+        );
+        assert_eq!(train_subscription_id, None);
+        assert_eq!(reminded_at(&pool, user_id, leg_id).await, None);
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
+    }
+
+    /// Regular journeys phase 3 (§6.5): the "needs attention" push for a
+    /// template with a target comes from the plan sweep's `no_service`,
+    /// once, from the lead before the window, in either mode; a remind
+    /// mode journey with no way there gets it instead of the pick reminder.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                a_target_templates_no_service_is_pushed_once -- --ignored --test-threads=1`"]
+    async fn a_target_templates_no_service_is_pushed_once() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-NO-SERVICE-USER";
+        let today = today_london();
+        seed_user(&pool, user_id).await;
+        for mode in ["auto", "manual"] {
+            let template_id = seed_auto_template(
+                &pool,
+                user_id,
+                "E2E No Service",
+                today,
+                chrono::NaiveTime::from_hms_opt(8, 0, 0),
+                chrono::NaiveTime::from_hms_opt(8, 10, 0),
+            )
+            .await;
+            sqlx::query("UPDATE journey_templates SET default_match_mode = $2 WHERE id = $1")
+                .bind(template_id)
+                .bind(mode)
+                .execute(&pool)
+                .await
+                .expect("set the mode");
+            make_target_template(&pool, template_id).await;
+
+            // 05:00: minted, and too early for anything.
+            sweep_and_drain(&pool, london_now(today, 5, 0), 120)
+                .await
+                .expect("sweep at 05:00");
+            let (leg_id, _, _) = template_leg_state(&pool, template_id).await;
+            assert_eq!(reminded_at(&pool, user_id, leg_id).await, None, "{mode}");
+
+            // Not planned yet (the sweep off): no push from an empty list.
+            sweep_and_drain(&pool, london_now(today, 6, 30), 120)
+                .await
+                .expect("sweep at 06:30");
+            if mode == "auto" {
+                assert_eq!(reminded_at(&pool, user_id, leg_id).await, None, "{mode}");
+            } else {
+                // A remind mode leg still gets its pick reminder.
+                assert!(reminded_at(&pool, user_id, leg_id).await.is_some());
+                sqlx::query("DELETE FROM journey_leg_notification_state WHERE journey_leg_id = $1")
+                    .bind(leg_id)
+                    .execute(&pool)
+                    .await
+                    .expect("forget the reminder");
+            }
+
+            sqlx::query(
+                "UPDATE journeys SET regular_plan_status = 'no_service', regular_plan = '{}', \
+                        regular_planned_at = now() WHERE source_template_id = $1",
+            )
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("the sweep found no way there");
+            sweep_and_drain(&pool, london_now(today, 6, 40), 120)
+                .await
+                .expect("sweep at 06:40");
+            let first = reminded_at(&pool, user_id, leg_id).await;
+            assert!(first.is_some(), "{mode}: needs attention must be sent");
+            sweep_and_drain(&pool, london_now(today, 7, 0), 120)
+                .await
+                .expect("sweep at 07:00");
+            assert_eq!(
+                reminded_at(&pool, user_id, leg_id).await,
+                first,
+                "{mode}: once"
+            );
+
+            cleanup_template_fixture(&pool, user_id, template_id).await;
+            seed_user(&pool, user_id).await;
+        }
         cleanup_user(&pool, user_id).await;
     }
 
