@@ -16,7 +16,7 @@
 # its own leaves it at "release".
 ARG CARGO_PROFILE=release
 
-FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS chef
+FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS chef
 
 # The registry and git caches hold only downloaded sources, so every
 # service shares them. `sharing=locked`: docker-compose builds in parallel.

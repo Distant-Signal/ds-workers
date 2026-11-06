@@ -25,8 +25,9 @@ ds-lines = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.4.1" }
 
 [workspace.package]
 edition = "2024"
-# MSRV: CI's msrv job checks it with `cargo +1.88.0 check`, and every
-# Dockerfile builds with rust:1.88.0.
+# MSRV: CI's msrv job checks it with `cargo +1.88.0 check`. The other CI
+# jobs and every Dockerfile build with a newer stable (1.99.0), which
+# Renovate moves forward; the MSRV moves only on purpose.
 rust-version = "1.88"
 # Nothing here is published; this also lets deny.toml skip the workspace's
 # own crates.
