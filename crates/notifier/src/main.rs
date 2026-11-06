@@ -162,7 +162,10 @@ async fn run() -> anyhow::Result<()> {
     // (SVC-02): a cycle only decides and enqueues, so a slow or tarpitting
     // push endpoint can no longer hold up any cycle.
     let queue = PushQueue::start(
-        PgBackend::new(pool.clone(), Pusher::new(vapid_key, &config.vapid_subject)),
+        PgBackend::new(
+            pool.clone(),
+            Pusher::new(vapid_key, &config.vapid_subject, config.push_ttl_secs),
+        ),
         config.push_queue_config(),
     );
 

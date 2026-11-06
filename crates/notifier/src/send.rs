@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
+pub(crate) use web_push::Urgency;
 use web_push::{ContentEncoding, SubscriptionInfo, WebPushMessage, WebPushMessageBuilder};
 
 use crate::queries::PushSubscriptionRow;
@@ -48,6 +49,43 @@ use crate::vapid_key::VapidKey;
 /// endpoint while still bounding the damage a tarpit endpoint can do to one
 /// send attempt.
 const PUSH_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `PUSH_TTL_SECS`'s default: how long a push service keeps a push it could
+/// not deliver yet (the `TTL` header, RFC 8030 §5.2). Without it web-push
+/// 0.11 sends its own default of 28 days, so a phone that was offline for a
+/// week showed a week-old delay or cancellation when it came back. One hour
+/// covers a tunnel, a flat battery on a short trip or a phone left in a bag,
+/// and every train, line and journey push is about the next hour or two, so
+/// after that it is more likely wrong than useful. The same for
+/// cancellations: an hour-old one has usually been replaced by the
+/// journey's own state on the page. The account security notices are the
+/// exception (`push_queue::SECURITY_NOTICE_TTL_SECS`).
+pub(crate) const DEFAULT_PUSH_TTL_SECS: u32 = 3600;
+
+/// The Web Push delivery headers a push is sent with: `TTL` (RFC 8030
+/// §5.2) and `Urgency` (§5.3). No `Topic` (§5.4) yet: pushes already
+/// replace each other on the device by `NotificationPayload::tag`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeliveryOptions {
+    pub ttl_secs: u32,
+    pub urgency: Urgency,
+}
+
+/// A push's `TTL`: the configured one (`PUSH_TTL_SECS`) or a fixed one for
+/// its class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ttl {
+    Configured,
+    Fixed(u32),
+}
+
+/// How one class of push is delivered (`push_queue::Delivered::push_class`
+/// has the mapping): its `Urgency` and its `TTL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PushClass {
+    pub urgency: Urgency,
+    pub ttl: Ttl,
+}
 
 /// Exactly the SW contract this plan's Global Constraints section fixes.
 /// Any change to this shape must be reflected in Task 9's push-handler
@@ -87,6 +125,8 @@ pub(crate) enum SendOutcome {
 pub(crate) struct Pusher {
     vapid_key: VapidKey,
     vapid_subject: std::sync::Arc<str>,
+    /// The `TTL` every push is sent with (`PUSH_TTL_SECS`).
+    ttl_secs: u32,
     per_attempt_timeout: Duration,
     /// `false` only for tests that target a local `http://127.0.0.1` mock,
     /// which the L9 send-time re-validation would (correctly) refuse.
@@ -98,6 +138,7 @@ impl std::fmt::Debug for Pusher {
         f.debug_struct("Pusher")
             .field("vapid_key", &self.vapid_key)
             .field("vapid_subject", &self.vapid_subject)
+            .field("ttl_secs", &self.ttl_secs)
             .field("per_attempt_timeout", &self.per_attempt_timeout)
             .field("revalidate_endpoint", &self.revalidate_endpoint)
             .finish()
@@ -105,12 +146,13 @@ impl std::fmt::Debug for Pusher {
 }
 
 impl Pusher {
-    /// The production sender: L9 send-time re-validation on, and
-    /// `PUSH_SEND_TIMEOUT` per attempt.
-    pub(crate) fn new(vapid_key: VapidKey, vapid_subject: &str) -> Self {
+    /// The production sender: L9 send-time re-validation on,
+    /// `PUSH_SEND_TIMEOUT` per attempt, and `ttl_secs` as every push's `TTL`.
+    pub(crate) fn new(vapid_key: VapidKey, vapid_subject: &str, ttl_secs: u32) -> Self {
         Self {
             vapid_key,
             vapid_subject: vapid_subject.into(),
+            ttl_secs,
             per_attempt_timeout: PUSH_SEND_TIMEOUT,
             revalidate_endpoint: true,
         }
@@ -124,6 +166,7 @@ impl Pusher {
         Self {
             vapid_key: tests::test_vapid_key(),
             vapid_subject: "mailto:test@example.com".into(),
+            ttl_secs: DEFAULT_PUSH_TTL_SECS,
             per_attempt_timeout,
             revalidate_endpoint: false,
         }
@@ -133,7 +176,15 @@ impl Pusher {
         &self,
         subscription: &PushSubscriptionRow,
         payload: &NotificationPayload,
+        class: PushClass,
     ) -> SendOutcome {
+        let options = DeliveryOptions {
+            ttl_secs: match class.ttl {
+                Ttl::Configured => self.ttl_secs,
+                Ttl::Fixed(ttl_secs) => ttl_secs,
+            },
+            urgency: class.urgency,
+        };
         if self.revalidate_endpoint {
             // Production: `new` always pairs this with `PUSH_SEND_TIMEOUT`,
             // which `send_to_subscription` applies itself.
@@ -142,6 +193,7 @@ impl Pusher {
                 &self.vapid_subject,
                 subscription,
                 payload,
+                options,
             )
             .await;
         }
@@ -150,6 +202,7 @@ impl Pusher {
             &self.vapid_subject,
             subscription,
             payload,
+            options,
             self.per_attempt_timeout,
         )
         .await
@@ -161,6 +214,7 @@ pub(crate) async fn send_to_subscription(
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
     payload: &NotificationPayload,
+    options: DeliveryOptions,
 ) -> SendOutcome {
     // L9 (2026-09-26 review): `crates/api::data::notifications::
     // validate_push_endpoint` only ever validates an `endpoint` once, at
@@ -196,6 +250,7 @@ pub(crate) async fn send_to_subscription(
         vapid_subject,
         subscription,
         payload,
+        options,
         PUSH_SEND_TIMEOUT,
     )
     .await
@@ -223,6 +278,7 @@ async fn send_to_subscription_with_timeout(
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
     payload: &NotificationPayload,
+    options: DeliveryOptions,
     per_attempt_timeout: Duration,
 ) -> SendOutcome {
     let subscription_info = SubscriptionInfo::new(
@@ -264,6 +320,8 @@ async fn send_to_subscription_with_timeout(
         let mut message_builder = WebPushMessageBuilder::new(&subscription_info);
         message_builder.set_payload(ContentEncoding::Aes128Gcm, &body);
         message_builder.set_vapid_signature(signature.clone());
+        message_builder.set_ttl(options.ttl_secs);
+        message_builder.set_urgency(options.urgency);
 
         let message = match message_builder.build() {
             Ok(message) => message,
@@ -572,6 +630,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             "mailto:test@example.com",
             &subscription,
             &payload,
+            test_options(),
             TEST_PER_ATTEMPT_TIMEOUT,
         )
         .await;
@@ -612,6 +671,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             "mailto:test@example.com",
             &subscription,
             &payload(),
+            test_options(),
             Duration::from_secs(5),
         )
         .await;
@@ -642,10 +702,117 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 "mailto:test@example.com",
                 &subscription,
                 &payload(),
+                test_options(),
                 Duration::from_secs(5),
             )
             .await;
             assert_eq!(outcome, expected, "status {status}");
+        }
+    }
+
+    fn test_options() -> DeliveryOptions {
+        DeliveryOptions {
+            ttl_secs: DEFAULT_PUSH_TTL_SECS,
+            urgency: Urgency::Normal,
+        }
+    }
+
+    /// Every push carries its `TTL` and `Urgency` headers (and no `Topic`),
+    /// so a push service drops it after the TTL instead of web-push's own
+    /// 28-day default.
+    #[tokio::test]
+    async fn a_push_carries_its_ttl_and_urgency_and_no_topic() {
+        for (options, ttl, urgency) in [
+            (test_options(), "3600", "normal"),
+            (
+                DeliveryOptions {
+                    ttl_secs: 600,
+                    urgency: Urgency::High,
+                },
+                "600",
+                "high",
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::header("ttl", ttl))
+                .and(wiremock::matchers::header("urgency", urgency))
+                .respond_with(wiremock::ResponseTemplate::new(201))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let subscription = PushSubscriptionRow {
+                id: 1,
+                endpoint: format!("{}/push-endpoint", server.uri()),
+                p256dh: TEST_P256DH.to_string(),
+                auth: TEST_AUTH.to_string(),
+            };
+            let outcome = send_to_subscription_with_timeout(
+                &test_vapid_key(),
+                "mailto:test@example.com",
+                &subscription,
+                &payload(),
+                options,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(outcome, SendOutcome::Sent, "{options:?}");
+            let requests = server
+                .received_requests()
+                .await
+                .expect("wiremock records requests");
+            assert!(
+                requests.iter().all(|r| !r.headers.contains_key("topic")),
+                "no Topic header until the leave-by phase adds one"
+            );
+        }
+    }
+
+    /// `Pusher` sends a `Ttl::Configured` class with its configured TTL
+    /// and a `Ttl::Fixed` one with the class's own.
+    #[tokio::test]
+    async fn the_pusher_sends_its_configured_ttl_unless_the_class_fixes_one() {
+        for (class, ttl, urgency) in [
+            (
+                PushClass {
+                    urgency: Urgency::High,
+                    ttl: Ttl::Configured,
+                },
+                "120",
+                "high",
+            ),
+            (
+                PushClass {
+                    urgency: Urgency::Normal,
+                    ttl: Ttl::Fixed(2_419_200),
+                },
+                "2419200",
+                "normal",
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::header("ttl", ttl))
+                .and(wiremock::matchers::header("urgency", urgency))
+                .respond_with(wiremock::ResponseTemplate::new(201))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let pusher = Pusher {
+                ttl_secs: 120,
+                ..Pusher::for_local_tests(Duration::from_secs(5))
+            };
+            let subscription = PushSubscriptionRow {
+                id: 1,
+                endpoint: format!("{}/push-endpoint", server.uri()),
+                p256dh: TEST_P256DH.to_string(),
+                auth: TEST_AUTH.to_string(),
+            };
+            assert_eq!(
+                pusher.send(&subscription, &payload(), class).await,
+                SendOutcome::Sent,
+                "{class:?}"
+            );
         }
     }
 
@@ -682,6 +849,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             "mailto:test@example.com",
             &subscription,
             &payload(),
+            test_options(),
         )
         .await;
 

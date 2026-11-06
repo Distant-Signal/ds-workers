@@ -122,7 +122,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::queries::{self, PushSubscriptionRow};
-use crate::send::{NotificationPayload, Pusher, SendOutcome};
+use crate::send::{NotificationPayload, PushClass, Pusher, SendOutcome, Ttl, Urgency};
 
 /// Upper bound on one subscription's share of a job, on top of `send.rs`'s
 /// own `PUSH_SEND_TIMEOUT` per attempt: it also covers the L9 send-time DNS
@@ -172,6 +172,13 @@ pub(crate) enum Delivered {
     },
 }
 
+/// The `TTL` of the account security notices (a new delegated grant or
+/// personal API token, see [`Delivered::push_class`]): 28 days, the most
+/// push services keep a push. They tell the user of access they did not
+/// give, so a phone that was offline for days must still show them; the
+/// configured `PUSH_TTL_SECS` is for train and line pushes that go stale.
+pub(crate) const SECURITY_NOTICE_TTL_SECS: u32 = 2_419_200;
+
 /// The trigger train's state a break notice records for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TriggerTrainState {
@@ -203,6 +210,44 @@ impl Delivered {
             Delivered::GrantCreated { grant_id } => Target::GrantCreated(*grant_id),
             Delivered::TokenCreated { token_id } => Target::TokenCreated(*token_id),
             Delivered::JourneyBreak { break_id, .. } => Target::JourneyBreak(*break_id),
+        }
+    }
+
+    /// How this push is sent: its `Urgency` header (RFC 8030 §5.3), how
+    /// hard the push service and the device should try to wake for it, and
+    /// its `TTL` (§5.2), how long the push service keeps it for a device
+    /// that is offline.
+    ///
+    /// | Push | Urgency | TTL | Why |
+    /// |---|---|---|---|
+    /// | Train delay, cancellation and its reason (`Train`) | `high` | `PUSH_TTL_SECS` | the user may need to act before they reach the station |
+    /// | Skipped stop (`SkippedStop`) | `high` | `PUSH_TTL_SECS` | the train no longer stops where they are going |
+    /// | Journey break notice (`JourneyBreak`) | `high` | `PUSH_TTL_SECS` | their journey no longer works as planned |
+    /// | Line status (`Line`) | `normal` | `PUSH_TTL_SECS` | worth knowing, not tied to a train they are on |
+    /// | Recurring journey attention and pick-a-train reminder (`Unmatched`) | `normal` | `PUSH_TTL_SECS` | a prompt to plan, not a disruption |
+    /// | App connected, API token created (`GrantCreated`, `TokenCreated`) | `normal` | [`SECURITY_NOTICE_TTL_SECS`] (28 days) | account notices: not urgent in the minute, but the user must see them however late |
+    ///
+    /// `high` lets an Android phone in Doze be woken at once; `normal` may
+    /// wait for its next maintenance window. Nothing is sent `low` or
+    /// `very-low`, so nothing depends on the device being on charge or Wi-Fi.
+    /// `PUSH_TTL_SECS` is 1 hour by default: past that a train or line push
+    /// is more likely wrong than useful.
+    pub(crate) fn push_class(&self) -> PushClass {
+        match self {
+            Delivered::Train { .. }
+            | Delivered::SkippedStop { .. }
+            | Delivered::JourneyBreak { .. } => PushClass {
+                urgency: Urgency::High,
+                ttl: Ttl::Configured,
+            },
+            Delivered::Line { .. } | Delivered::Unmatched { .. } => PushClass {
+                urgency: Urgency::Normal,
+                ttl: Ttl::Configured,
+            },
+            Delivered::GrantCreated { .. } | Delivered::TokenCreated { .. } => PushClass {
+                urgency: Urgency::Normal,
+                ttl: Ttl::Fixed(SECURITY_NOTICE_TTL_SECS),
+            },
         }
     }
 
@@ -288,6 +333,7 @@ pub(crate) trait PushBackend: Send + Sync + 'static {
         &self,
         subscription: &PushSubscriptionRow,
         payload: &NotificationPayload,
+        class: PushClass,
     ) -> impl Future<Output = SendOutcome> + Send;
     fn delete_subscription(&self, id: i64) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Stamps a subscription that a push was just delivered to (the device
@@ -325,8 +371,9 @@ impl PushBackend for PgBackend {
         &self,
         subscription: &PushSubscriptionRow,
         payload: &NotificationPayload,
+        class: PushClass,
     ) -> SendOutcome {
-        self.pusher.send(subscription, payload).await
+        self.pusher.send(subscription, payload, class).await
     }
 
     async fn delete_subscription(&self, id: i64) -> anyhow::Result<()> {
@@ -952,11 +999,12 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
     let result = if subscriptions.is_empty() {
         JobResult::NoSubscriptions
     } else {
+        let class = job.delivered.push_class();
         let outcomes =
             futures_util::future::join_all(subscriptions.iter().map(|subscription| async {
                 tokio::time::timeout(
                     SUBSCRIPTION_BUDGET,
-                    backend.send(subscription, &job.payload),
+                    backend.send(subscription, &job.payload, class),
                 )
                 .await
                 .unwrap_or(SendOutcome::TimedOut)
@@ -1096,6 +1144,8 @@ mod tests {
         /// Sends that have reached a `gate://` endpoint (hung or released).
         gated: AtomicUsize,
         scripted: Mutex<HashMap<i64, VecDeque<SendOutcome>>>,
+        /// The class of every send, by subscription id.
+        classes: Mutex<Vec<(i64, PushClass)>>,
     }
 
     impl FakeBackend {
@@ -1108,6 +1158,7 @@ mod tests {
                 gate: Arc::new(tokio::sync::Semaphore::new(0)),
                 gated: AtomicUsize::new(0),
                 scripted: Mutex::new(HashMap::new()),
+                classes: Mutex::new(Vec::new()),
             }
         }
 
@@ -1149,7 +1200,9 @@ mod tests {
             &self,
             subscription: &PushSubscriptionRow,
             payload: &NotificationPayload,
+            class: PushClass,
         ) -> SendOutcome {
+            lock(&self.classes).push((subscription.id, class));
             let scripted = lock(&self.scripted)
                 .get_mut(&subscription.id)
                 .and_then(VecDeque::pop_front);
@@ -1165,7 +1218,7 @@ mod tests {
                     .forget();
                 return SendOutcome::Sent;
             }
-            self.pusher.send(subscription, payload).await
+            self.pusher.send(subscription, payload, class).await
         }
 
         fn delete_subscription(&self, id: i64) -> impl Future<Output = anyhow::Result<()>> {
@@ -1392,6 +1445,117 @@ mod tests {
             },
             decided_at: Utc::now(),
         }
+    }
+
+    /// The mapping documented on [`Delivered::push_class`]: train
+    /// disruption is `high`, everything else `normal`; every push uses the
+    /// configured TTL except the account security notices, fixed at 28 days.
+    #[test]
+    fn each_push_class_has_its_urgency_and_ttl() {
+        let train = |status: &str| Delivered::Train {
+            tracked_train_id: 1,
+            status: status.to_string(),
+            delay_minutes: Some(20),
+            awaiting_reason: false,
+        };
+        let high = PushClass {
+            urgency: Urgency::High,
+            ttl: Ttl::Configured,
+        };
+        let normal = PushClass {
+            urgency: Urgency::Normal,
+            ttl: Ttl::Configured,
+        };
+        let security = PushClass {
+            urgency: Urgency::Normal,
+            ttl: Ttl::Fixed(2_419_200),
+        };
+        let cases = [
+            (train("delayed"), high),
+            (train("cancelled"), high),
+            (Delivered::SkippedStop { journey_leg_id: 1 }, high),
+            (
+                Delivered::JourneyBreak {
+                    break_id: 1,
+                    severity: 3,
+                    trigger: None,
+                },
+                high,
+            ),
+            (
+                Delivered::Line {
+                    line_id: "victoria".to_string(),
+                    rank: 3,
+                },
+                normal,
+            ),
+            (Delivered::Unmatched { journey_leg_id: 1 }, normal),
+            (Delivered::GrantCreated { grant_id: 1 }, security),
+            (Delivered::TokenCreated { token_id: 1 }, security),
+        ];
+        for (delivered, class) in cases {
+            assert_eq!(delivered.push_class(), class, "{delivered:?}");
+        }
+    }
+
+    /// The security notices' fixed TTL is the 28 days push services allow
+    /// at most (and web-push's own default), not the configured hour.
+    #[test]
+    fn security_notices_keep_for_twenty_eight_days() {
+        assert_eq!(SECURITY_NOTICE_TTL_SECS, 28 * 24 * 60 * 60);
+    }
+
+    /// A worker sends each job with its own class, to every one of the
+    /// user's subscriptions.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_sends_each_job_with_its_class() {
+        let backend = FakeBackend::new(Duration::from_secs(5))
+            .with_subscription("u", 1, "script://")
+            .with_subscription("u", 2, "script://");
+        lock(&backend.scripted).extend([
+            (1, VecDeque::from([SendOutcome::Sent, SendOutcome::Sent])),
+            (2, VecDeque::from([SendOutcome::Sent, SendOutcome::Sent])),
+        ]);
+        let queue = PushQueue::start(backend, config());
+        assert_eq!(queue.enqueue(train_job("u", 7)), EnqueueOutcome::Queued);
+        eventually("the train push is recorded", || recorded(&queue).len() == 1).await;
+        let token = PushJob {
+            delivered: Delivered::TokenCreated { token_id: 9 },
+            ..line_job("u", "L", 3)
+        };
+        assert_eq!(queue.enqueue(token), EnqueueOutcome::Queued);
+        eventually("the token notice is recorded", || {
+            recorded(&queue).len() == 2
+        })
+        .await;
+        let classes = lock(&queue.shared.backend.classes).clone();
+        let (train, token) = classes.split_at(2);
+        let train_ids: Vec<i64> = train.iter().map(|(id, _)| *id).collect();
+        let token_ids: Vec<i64> = token.iter().map(|(id, _)| *id).collect();
+        assert!(
+            train_ids.contains(&1) && train_ids.contains(&2),
+            "{classes:?}"
+        );
+        assert!(
+            token_ids.contains(&1) && token_ids.contains(&2),
+            "{classes:?}"
+        );
+        assert!(
+            train.iter().all(|(_, class)| *class
+                == PushClass {
+                    urgency: Urgency::High,
+                    ttl: Ttl::Configured,
+                }),
+            "{classes:?}"
+        );
+        assert!(
+            token.iter().all(|(_, class)| *class
+                == PushClass {
+                    urgency: Urgency::Normal,
+                    ttl: Ttl::Fixed(SECURITY_NOTICE_TTL_SECS),
+                }),
+            "{classes:?}"
+        );
     }
 
     /// One push per user per train (mid-journey changes spec §6.3): a break
