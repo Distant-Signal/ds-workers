@@ -196,6 +196,19 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 20)]
     pub push_shutdown_grace_secs: u64,
 
+    /// How long, in seconds, a push service keeps a push it could not
+    /// deliver yet before dropping it (the Web Push `TTL` header). Every
+    /// train, line and journey push uses it, cancellations included; the
+    /// account security notices keep a fixed 28 days instead. See
+    /// `send::DEFAULT_PUSH_TTL_SECS` for why 1 hour, and
+    /// `push_queue::Delivered::push_class` for each push's `Urgency` and
+    /// `TTL`. Must be
+    /// greater than zero: `0` asks the push service to drop any push it
+    /// cannot hand over at once, which loses most pushes to a phone in
+    /// Doze.
+    #[arg(long, env, default_value_t = crate::send::DEFAULT_PUSH_TTL_SECS)]
+    pub push_ttl_secs: u32,
+
     /// Port for this service's Prometheus `/metrics` listener (same default
     /// as aggregator/enricher; the chart sets it from `metrics.port`).
     #[arg(long, env, default_value_t = 9091)]
@@ -289,6 +302,10 @@ impl Config {
             "push_prune_after_timeouts (--push-prune-after-timeouts / \
              PUSH_PRUNE_AFTER_TIMEOUTS) must be greater than zero"
         );
+        anyhow::ensure!(
+            self.push_ttl_secs > 0,
+            "push_ttl_secs (--push-ttl-secs / PUSH_TTL_SECS) must be greater than zero"
+        );
         Ok(())
     }
 
@@ -343,6 +360,7 @@ mod tests {
             push_per_user_queued: 64,
             push_prune_after_timeouts: 3,
             push_shutdown_grace_secs: 20,
+            push_ttl_secs: 3600,
             metrics_port: 9091,
             metrics_enabled: true,
             journey_break_notices_enabled: false,
@@ -396,9 +414,53 @@ mod tests {
                 push_prune_after_timeouts: 0,
                 ..valid_config()
             },
+            Config {
+                push_ttl_secs: 0,
+                ..valid_config()
+            },
         ] {
             assert!(config.validate().is_err());
         }
+    }
+
+    /// The required args alone, for the parsing tests.
+    const REQUIRED_ARGS: [&str; 9] = [
+        "notifier",
+        "--database-url",
+        "postgres://x",
+        "--vapid-private-key",
+        "k",
+        "--vapid-public-key",
+        "k",
+        "--vapid-subject",
+        "mailto:x@example.invalid",
+    ];
+
+    /// Every push expires after an hour unless `PUSH_TTL_SECS` says
+    /// otherwise; a zero, negative or out-of-range TTL is refused.
+    #[test]
+    fn push_ttl_defaults_to_one_hour_and_parses_an_override() {
+        let parsed = Config::try_parse_from(REQUIRED_ARGS).expect("the required args parse");
+        assert_eq!(parsed.push_ttl_secs, 3600);
+        assert!(parsed.validate().is_ok());
+
+        let parsed =
+            Config::try_parse_from(REQUIRED_ARGS.into_iter().chain(["--push-ttl-secs", "600"]))
+                .expect("an explicit TTL parses");
+        assert_eq!(parsed.push_ttl_secs, 600);
+
+        for bad in ["-1", "4294967296", "an hour"] {
+            assert!(
+                Config::try_parse_from(REQUIRED_ARGS.into_iter().chain(["--push-ttl-secs", bad]))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let zero =
+            Config::try_parse_from(REQUIRED_ARGS.into_iter().chain(["--push-ttl-secs", "0"]))
+                .expect("0 parses");
+        let err = zero.validate().expect_err("a zero TTL is refused");
+        assert!(err.to_string().contains("PUSH_TTL_SECS"), "{err}");
     }
 
     #[test]
