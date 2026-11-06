@@ -436,6 +436,25 @@ pub(crate) fn decide_unmatched_notification(already_notified: bool) -> NotifyDec
     }
 }
 
+/// The service dates the template sweep mints for at `now`: London's
+/// today, and from `evening_hour` (London time) on, tomorrow too, so a
+/// regular journey shows under "Upcoming" the evening before (regular
+/// journeys design §4.3). `evening_hour` 24 or more never adds tomorrow.
+/// London's hour, not UTC's: on the clock-change days the hour still
+/// follows the wall clock.
+pub(crate) fn template_mint_dates(
+    now: DateTime<Utc>,
+    evening_hour: u32,
+) -> (chrono::NaiveDate, Option<chrono::NaiveDate>) {
+    use chrono::Timelike as _;
+    let london = now.with_timezone(&chrono_tz::Europe::London);
+    let today = london.date_naive();
+    let tomorrow = (london.hour() >= evening_hour)
+        .then(|| today.succ_opt())
+        .flatten();
+    (today, tomorrow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,6 +1025,89 @@ mod sweep_tests {
         assert_eq!(
             decide_template_reminder(at(7, 0), first, last, 120, true),
             NotifyDecision::Skip
+        );
+    }
+}
+
+#[cfg(test)]
+mod template_mint_date_tests {
+    use super::*;
+    use chrono::{NaiveDate, TimeZone as _};
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn before_the_evening_hour_only_today() {
+        // 17:59 GMT on 10 Nov 2026.
+        assert_eq!(
+            template_mint_dates(utc(2026, 11, 10, 17, 59), 18),
+            (date(2026, 11, 10), None)
+        );
+    }
+
+    #[test]
+    fn from_the_evening_hour_tomorrow_too() {
+        assert_eq!(
+            template_mint_dates(utc(2026, 11, 10, 18, 0), 18),
+            (date(2026, 11, 10), Some(date(2026, 11, 11)))
+        );
+        assert_eq!(
+            template_mint_dates(utc(2026, 11, 10, 23, 59), 18),
+            (date(2026, 11, 10), Some(date(2026, 11, 11)))
+        );
+    }
+
+    #[test]
+    fn the_hour_is_londons_in_summer_time() {
+        // 17:00 UTC is 18:00 BST on 10 Jun 2026.
+        assert_eq!(
+            template_mint_dates(utc(2026, 6, 10, 17, 0), 18),
+            (date(2026, 6, 10), Some(date(2026, 6, 11)))
+        );
+        assert_eq!(
+            template_mint_dates(utc(2026, 6, 10, 16, 59), 18),
+            (date(2026, 6, 10), None)
+        );
+        // 23:30 UTC is already tomorrow in London: 00:30 BST on 11 Jun.
+        assert_eq!(
+            template_mint_dates(utc(2026, 6, 10, 23, 30), 18),
+            (date(2026, 6, 11), None)
+        );
+    }
+
+    #[test]
+    fn the_clock_change_days_follow_the_wall_clock() {
+        // 29 Mar 2026, clocks go forward at 01:00 UTC: 17:00 UTC is 18:00 BST.
+        assert_eq!(
+            template_mint_dates(utc(2026, 3, 29, 16, 59), 18),
+            (date(2026, 3, 29), None)
+        );
+        assert_eq!(
+            template_mint_dates(utc(2026, 3, 29, 17, 0), 18),
+            (date(2026, 3, 29), Some(date(2026, 3, 30)))
+        );
+        // 25 Oct 2026, clocks go back at 01:00 UTC: 18:00 UTC is 18:00 GMT.
+        assert_eq!(
+            template_mint_dates(utc(2026, 10, 25, 17, 59), 18),
+            (date(2026, 10, 25), None)
+        );
+        assert_eq!(
+            template_mint_dates(utc(2026, 10, 25, 18, 0), 18),
+            (date(2026, 10, 25), Some(date(2026, 10, 26)))
+        );
+    }
+
+    #[test]
+    fn hour_24_turns_the_evening_mint_off() {
+        assert_eq!(
+            template_mint_dates(utc(2026, 11, 10, 23, 59), 24),
+            (date(2026, 11, 10), None)
         );
     }
 }

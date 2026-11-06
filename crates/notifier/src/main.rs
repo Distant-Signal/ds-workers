@@ -295,6 +295,7 @@ async fn run() -> anyhow::Result<()> {
                     &queue,
                     Utc::now(),
                     config.auto_commit_lead_minutes,
+                    config.template_mint_evening_hour,
                 )
                 .await;
                 if let Err(err) = &result {
@@ -1103,7 +1104,12 @@ async fn run_skip_check_cycle(
 /// spec §3.1-3.2). "Today" is a plain Europe/London calendar date (see
 /// this plan's Architecture section for why not a rail day) -- computed
 /// once per tick from `now` and used for all three stages (mint,
-/// auto-commit, manual reminder).
+/// auto-commit, manual reminder). From `evening_hour` (London) stage 1
+/// also mints tomorrow's occurrences, so a regular journey shows under
+/// "Upcoming" the evening before (regular journeys design §4.3); stages 2
+/// and 3 still only look at today, so tomorrow's legs commit and remind on
+/// the day. Today is minted on every tick as well, which catches a
+/// template made or resumed after the evening tick.
 ///
 /// `now` is INJECTED, not read from the clock inside here -- the same
 /// convention `api::data::reconciliation::retry_schedule_enrichment_for_nr_primary_trains`
@@ -1122,31 +1128,13 @@ async fn run_template_sweep_cycle(
     queue: &Queue,
     now: DateTime<Utc>,
     auto_commit_lead_minutes: i64,
+    evening_hour: u32,
 ) -> anyhow::Result<()> {
-    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
+    let (today, tomorrow) = decision::template_mint_dates(now, evening_hour);
 
-    // --- Stage 1: mint due occurrences ---
-    for template in queries::due_templates_for(pool, today).await? {
-        match queries::materialize_due_template_occurrence(
-            pool,
-            template.id,
-            &template.user_id,
-            today,
-        )
-        .await
-        {
-            Ok(Some(journey_id)) => {
-                tracing::info!(
-                    template_id = template.id,
-                    journey_id,
-                    "materialized today's occurrence"
-                );
-            }
-            Ok(None) => {} // already materialized this cycle or a prior one today
-            Err(err) => {
-                tracing::error!(error = ?err, template_id = template.id, "failed to materialize template occurrence; will retry next cycle");
-            }
-        }
+    // --- Stage 1: mint due occurrences (today, and tomorrow from the evening) ---
+    for date in std::iter::once(today).chain(tomorrow) {
+        mint_due_occurrences(pool, date).await?;
     }
 
     // --- Stage 2: commit-check due unmatched auto legs ---
@@ -1228,7 +1216,7 @@ async fn run_template_sweep_cycle(
                 continue;
             }
             let payload = NotificationPayload {
-                title: "Your recurring journey needs attention".to_string(),
+                title: "Your regular journey needs attention".to_string(),
                 body: format!(
                     "No {} service was found for today within your usual window.",
                     push_route(
@@ -1346,6 +1334,38 @@ async fn run_template_sweep_cycle(
     remind_manual_legs(pool, queue, now, today, auto_commit_lead_minutes).await
 }
 
+/// Stage 1 of [`run_template_sweep_cycle`] for one service date: mints
+/// every due template's occurrence. `materialize_due_template_occurrence`
+/// is the idempotency key (one occurrence per template and date) and
+/// honours the skip tombstones, so a second tick, or the same date minted
+/// in the evening and again the next morning, mints nothing new.
+async fn mint_due_occurrences(pool: &PgPool, date: chrono::NaiveDate) -> anyhow::Result<()> {
+    for template in queries::due_templates_for(pool, date).await? {
+        match queries::materialize_due_template_occurrence(
+            pool,
+            template.id,
+            &template.user_id,
+            date,
+        )
+        .await
+        {
+            Ok(Some(journey_id)) => {
+                tracing::info!(
+                    template_id = template.id,
+                    journey_id,
+                    service_date = %date,
+                    "materialized a template occurrence"
+                );
+            }
+            Ok(None) => {} // already materialized, skipped, or paused
+            Err(err) => {
+                tracing::error!(error = ?err, template_id = template.id, service_date = %date, "failed to materialize template occurrence; will retry next cycle");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Stage 3 of [`run_template_sweep_cycle`]: the "pick your train" reminder
 /// for today's unmatched legs of `'manual'` ("remind me, don't guess")
 /// templates (design doc §3.3 and §4.2, Phase D). One push per leg, from
@@ -1419,7 +1439,7 @@ async fn remind_manual_legs(
         let payload = NotificationPayload {
             title: "Pick today's train".to_string(),
             body: format!("Your {route} journey is coming up. Tap to choose a train."),
-            url: format!("/journeys/{}", leg.journey_id),
+            url: pick_reminder_url(leg.journey_id, leg.has_usual_itinerary),
             tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
         };
         enqueue_push(
@@ -1435,6 +1455,17 @@ async fn remind_manual_legs(
         .await?;
     }
     Ok(())
+}
+
+/// The pick reminder's link: the journey, with `?pick=usual` when its
+/// template has a usual itinerary, so the page puts the usual train first
+/// (regular journeys design §4.3).
+fn pick_reminder_url(journey_id: i64, has_usual_itinerary: bool) -> String {
+    if has_usual_itinerary {
+        format!("/journeys/{journey_id}?pick=usual")
+    } else {
+        format!("/journeys/{journey_id}")
+    }
 }
 
 /// Resolves a `service_date` + local wall-clock TIME to the UTC instant it
@@ -1538,13 +1569,26 @@ mod drain_support {
         result
     }
 
+    /// One template sweep with the evening mint off (hour 24), as before
+    /// it existed: these callers assert on today's occurrence alone.
     pub(crate) async fn sweep_and_drain(
         pool: &PgPool,
         now: DateTime<Utc>,
         auto_commit_lead_minutes: i64,
     ) -> anyhow::Result<()> {
+        sweep_with_evening_mint_and_drain(pool, now, auto_commit_lead_minutes, 24).await
+    }
+
+    pub(crate) async fn sweep_with_evening_mint_and_drain(
+        pool: &PgPool,
+        now: DateTime<Utc>,
+        auto_commit_lead_minutes: i64,
+        evening_hour: u32,
+    ) -> anyhow::Result<()> {
         let queue = test_queue(pool);
-        let result = run_template_sweep_cycle(pool, &queue, now, auto_commit_lead_minutes).await;
+        let result =
+            run_template_sweep_cycle(pool, &queue, now, auto_commit_lead_minutes, evening_hour)
+                .await;
         drain(queue).await;
         result
     }
@@ -2813,6 +2857,116 @@ mod sweep_cycle_tests {
         .await
         .expect("read reminder state")
         .flatten()
+    }
+
+    #[test]
+    fn the_pick_reminder_links_to_the_usual_train_when_there_is_one() {
+        assert_eq!(pick_reminder_url(42, false), "/journeys/42");
+        assert_eq!(pick_reminder_url(42, true), "/journeys/42?pick=usual");
+    }
+
+    /// The service dates of a template's minted occurrences, in order.
+    async fn minted_dates(pool: &PgPool, template_id: i64) -> Vec<chrono::NaiveDate> {
+        sqlx::query_scalar(
+            "SELECT jl.service_date FROM journeys j \
+             JOIN journey_legs jl ON jl.journey_id = j.id \
+             WHERE j.source_template_id = $1 ORDER BY 1",
+        )
+        .bind(template_id)
+        .fetch_all(pool)
+        .await
+        .expect("read minted dates")
+    }
+
+    /// The evening mint (regular journeys design §4.3): at 17:59 London only
+    /// today is minted; from 18:00 tomorrow too; a second tick mints
+    /// nothing; a skipped tomorrow stays unminted; hour 24 never mints
+    /// tomorrow. On 29 Mar 2026 (clocks forward) 18:00 is 17:00 UTC.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                the_evening_mint_adds_tomorrow_once_and_respects_skips \
+                -- --ignored --test-threads=1`"]
+    async fn the_evening_mint_adds_tomorrow_once_and_respects_skips() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-EVENING-USER";
+        seed_user(&pool, user_id).await;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).expect("date");
+        let next = day.succ_opt().expect("date");
+        let after = next.succ_opt().expect("date");
+        let template_id = seed_manual_template(
+            &pool,
+            user_id,
+            day,
+            chrono::NaiveTime::from_hms_opt(8, 0, 0),
+            chrono::NaiveTime::from_hms_opt(8, 10, 0),
+        )
+        .await;
+        sqlx::query("UPDATE journey_templates SET days_of_week = 127 WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .expect("due every day");
+
+        sweep_with_evening_mint_and_drain(&pool, london_now(day, 17, 59), 120, 18)
+            .await
+            .expect("sweep at 17:59");
+        assert_eq!(minted_dates(&pool, template_id).await, vec![day]);
+
+        sweep_with_evening_mint_and_drain(&pool, london_now(day, 18, 0), 120, 18)
+            .await
+            .expect("sweep at 18:00");
+        assert_eq!(minted_dates(&pool, template_id).await, vec![day, next]);
+
+        sweep_with_evening_mint_and_drain(&pool, london_now(day, 18, 15), 120, 18)
+            .await
+            .expect("sweep at 18:15");
+        assert_eq!(
+            minted_dates(&pool, template_id).await,
+            vec![day, next],
+            "a second tick mints nothing"
+        );
+
+        // The day after is skipped: tomorrow's evening tick leaves it.
+        sqlx::query(
+            "INSERT INTO journey_template_skipped_dates (template_id, service_date) VALUES ($1, $2)",
+        )
+        .bind(template_id)
+        .bind(after)
+        .execute(&pool)
+        .await
+        .expect("skip the day after");
+        sweep_with_evening_mint_and_drain(&pool, london_now(next, 18, 0), 120, 18)
+            .await
+            .expect("sweep the next evening");
+        assert_eq!(minted_dates(&pool, template_id).await, vec![day, next]);
+
+        // Hour 24: the evening mint is off.
+        sweep_with_evening_mint_and_drain(&pool, london_now(after, 23, 0), 120, 24)
+            .await
+            .expect("sweep with the evening mint off");
+        assert_eq!(minted_dates(&pool, template_id).await, vec![day, next]);
+
+        // The spring clock change: 17:00 UTC is 18:00 BST on 29 Mar 2026.
+        let spring = chrono::NaiveDate::from_ymd_opt(2026, 3, 29).expect("date");
+        let at = |h| spring.and_hms_opt(h, 59, 0).expect("time").and_utc();
+        sweep_with_evening_mint_and_drain(&pool, at(16), 120, 18)
+            .await
+            .expect("sweep at 17:59 BST");
+        assert!(
+            !minted_dates(&pool, template_id)
+                .await
+                .contains(&spring.succ_opt().expect("date"))
+        );
+        sweep_with_evening_mint_and_drain(&pool, at(17), 120, 18)
+            .await
+            .expect("sweep at 18:59 BST");
+        assert!(
+            minted_dates(&pool, template_id)
+                .await
+                .contains(&spring.succ_opt().expect("date"))
+        );
+
+        cleanup_template_fixture(&pool, user_id, template_id).await;
     }
 
     /// Phase D: a `'manual'` template's unmatched leg gets one "pick your

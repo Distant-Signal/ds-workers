@@ -1965,6 +1965,9 @@ pub(crate) struct CommitCheckLeg {
     /// found (`notification_preferences.template_attention`, DS-153; TRUE
     /// without a row). Off, the leg is still committed when a train is.
     pub notify_attention: bool,
+    /// The template has a usual itinerary (regular journeys, phase 1): the
+    /// pick reminder links to the journey with the usual train first.
+    pub has_usual_itinerary: bool,
 }
 
 /// [`unmatched_auto_legs_for_commit_check`]'s query, each leg end read
@@ -1980,7 +1983,8 @@ static COMMIT_CHECK_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
                 jl.service_date, jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before, \
-                COALESCE(np.template_attention, TRUE) AS notify_attention \
+                COALESCE(np.template_attention, TRUE) AS notify_attention, \
+                (jt.usual_itinerary IS NOT NULL) AS has_usual_itinerary \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN journey_templates jt ON jt.id = j.source_template_id \
