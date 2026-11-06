@@ -92,6 +92,14 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 3600)]
     pub template_sweep_poll_interval_secs: u64,
 
+    /// The London hour (0-23) from which the template sweep also mints
+    /// tomorrow's occurrences, so a regular journey shows under "Upcoming"
+    /// the evening before (regular journeys design §4.3, decision 3). 24
+    /// turns the evening mint off: only today's occurrence is minted, as
+    /// before. The sweep's cadence sets how soon after the hour it lands.
+    #[arg(long, env, default_value_t = 18)]
+    pub template_mint_evening_hour: u32,
+
     /// Cadence of the predicted-late-start check (DS-127): every tracked
     /// train within 3 hours of departure with no TRUST report yet is given
     /// a prediction from its previous working, and a high-confidence one at
@@ -274,6 +282,11 @@ impl Config {
              TEMPLATE_SWEEP_POLL_INTERVAL_SECS) must be greater than zero"
         );
         anyhow::ensure!(
+            self.template_mint_evening_hour <= 24,
+            "template_mint_evening_hour (--template-mint-evening-hour / \
+             TEMPLATE_MINT_EVENING_HOUR) must be 0 to 23, or 24 to turn the evening mint off"
+        );
+        anyhow::ensure!(
             self.journey_breaks_poll_interval_secs > 0,
             "journey_breaks_poll_interval_secs (--journey-breaks-poll-interval-secs / \
              JOURNEY_BREAKS_POLL_INTERVAL_SECS) must be greater than zero"
@@ -348,6 +361,7 @@ mod tests {
             forward_queue_poll_interval_secs: 15,
             skip_check_poll_interval_secs: 90,
             template_sweep_poll_interval_secs: 3600,
+            template_mint_evening_hour: 18,
             predicted_start_poll_interval_secs: 60,
             auto_commit_lead_minutes: 120,
             vapid_private_key: "test".into(),
@@ -525,6 +539,22 @@ mod tests {
     fn a_zero_skip_check_poll_interval_secs_is_rejected() {
         let config = Config {
             skip_check_poll_interval_secs: 0,
+            ..valid_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_evening_mint_hour_is_0_to_24() {
+        for hour in [0, 18, 23, 24] {
+            let config = Config {
+                template_mint_evening_hour: hour,
+                ..valid_config()
+            };
+            assert!(config.validate().is_ok(), "{hour}");
+        }
+        let config = Config {
+            template_mint_evening_hour: 25,
             ..valid_config()
         };
         assert!(config.validate().is_err());
