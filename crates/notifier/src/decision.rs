@@ -213,11 +213,13 @@ impl CommitCheckWindow {
 ///   `*_before`-only template MEANS, and this fix is not the place to make
 ///   it. The next upcoming train inside the window satisfies the constraint
 ///   the user actually wrote down.
-/// * No bound at all is [`CommitCheckWindow::Open`]: due whenever the sweep
-///   looks (there is nothing to wait for), and committed to the next
-///   UPCOMING candidate relative to that moment -- "the user wants any
-///   train from here on," evaluated against when we are actually looking
-///   rather than against midnight.
+/// * No bound at all is [`CommitCheckWindow::Open`], and is never
+///   auto-committed (DS-375). It used to be due whenever the sweep looked
+///   and committed to the next upcoming candidate, which at the first
+///   hourly tick of the day is the first train of the day: a guess no user
+///   asked for. The sweep now leaves such a leg unmatched, as if the
+///   template were `'manual'`, with no reminder either (there is no window
+///   to remind ahead of); the website asks the user to add a time.
 pub(crate) fn commit_check_window(
     depart_after: Option<chrono::NaiveTime>,
     depart_before: Option<chrono::NaiveTime>,
@@ -378,6 +380,49 @@ pub(crate) fn pick_next_upcoming_candidate(
         .filter(|(_, (day_offset, at))| candidate_secs(*day_offset, *at) >= now_secs)
         .min_by_key(|(_, (day_offset, at))| candidate_secs(*day_offset, *at))
         .map(|(i, _)| i)
+}
+
+/// The latest of a leg's stated times, whichever of the four bounds it is:
+/// past it, a reminder to pick a train for the leg is too late to help.
+/// `None` for a leg with no bound at all.
+pub(crate) fn latest_stated_time(
+    depart_after: Option<chrono::NaiveTime>,
+    depart_before: Option<chrono::NaiveTime>,
+    arrive_after: Option<chrono::NaiveTime>,
+    arrive_before: Option<chrono::NaiveTime>,
+) -> Option<chrono::NaiveTime> {
+    [depart_after, depart_before, arrive_after, arrive_before]
+        .into_iter()
+        .flatten()
+        .max()
+}
+
+/// The "pick your train" reminder for an unmatched leg of a `'manual'`
+/// ("remind me, don't guess") recurring template (design doc §3.3, §4.2;
+/// Phase D). Fires once per leg, from `lead_minutes` before the leg's own
+/// due bound (`first_bound_utc`, [`CommitCheckWindow::due_check_bound`],
+/// the same anchor and lead `'auto'` uses to commit) until its latest
+/// stated time (`last_bound_utc`, [`latest_stated_time`]); after that the
+/// window has passed and a reminder can't help. `already_notified` is the
+/// leg's `journey_leg_notification_state.last_notified_unmatched`, the
+/// same once-per-leg flag the `'auto'` "needs attention" push sets. A leg
+/// with no time at all has no window and is never reminded: the caller
+/// skips it before this is reached.
+pub(crate) fn decide_template_reminder(
+    now: DateTime<Utc>,
+    first_bound_utc: DateTime<Utc>,
+    last_bound_utc: DateTime<Utc>,
+    lead_minutes: i64,
+    already_notified: bool,
+) -> NotifyDecision {
+    if already_notified
+        || !is_due_for_commit_check(now, first_bound_utc, lead_minutes)
+        || now > last_bound_utc
+    {
+        NotifyDecision::Skip
+    } else {
+        NotifyDecision::NotifyNow
+    }
 }
 
 /// Fires once, the first time an `'auto'`-mode leg's commit-check finds
@@ -906,5 +951,61 @@ mod sweep_tests {
     #[test]
     fn decide_unmatched_notification_true_returns_skip() {
         assert_eq!(decide_unmatched_notification(true), NotifyDecision::Skip);
+    }
+
+    fn hm(hour: u32, minute: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
+    }
+
+    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
+        NaiveDate::from_ymd_opt(2026, 11, 6)
+            .unwrap()
+            .and_time(hm(hour, minute))
+            .and_utc()
+    }
+
+    #[test]
+    fn the_latest_stated_time_is_the_latest_of_any_bound() {
+        assert_eq!(latest_stated_time(None, None, None, None), None);
+        assert_eq!(
+            latest_stated_time(Some(hm(8, 0)), None, None, Some(hm(9, 0))),
+            Some(hm(9, 0))
+        );
+        assert_eq!(
+            latest_stated_time(Some(hm(8, 0)), Some(hm(8, 10)), None, None),
+            Some(hm(8, 10))
+        );
+    }
+
+    #[test]
+    fn a_reminder_waits_for_the_lead_window() {
+        // A leg from 08:00 to 08:10, with the two-hour lead.
+        let (first, last) = (at(8, 0), at(8, 10));
+        assert_eq!(
+            decide_template_reminder(at(5, 59), first, last, 120, false),
+            NotifyDecision::Skip
+        );
+        assert_eq!(
+            decide_template_reminder(at(6, 0), first, last, 120, false),
+            NotifyDecision::NotifyNow
+        );
+        assert_eq!(
+            decide_template_reminder(at(8, 10), first, last, 120, false),
+            NotifyDecision::NotifyNow,
+            "still useful at the last stated time"
+        );
+    }
+
+    #[test]
+    fn a_reminder_is_not_sent_once_the_window_has_passed_or_twice() {
+        let (first, last) = (at(8, 0), at(8, 10));
+        assert_eq!(
+            decide_template_reminder(at(8, 11), first, last, 120, false),
+            NotifyDecision::Skip
+        );
+        assert_eq!(
+            decide_template_reminder(at(7, 0), first, last, 120, true),
+            NotifyDecision::Skip
+        );
     }
 }
