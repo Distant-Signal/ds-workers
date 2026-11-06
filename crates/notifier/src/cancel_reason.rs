@@ -187,6 +187,7 @@ pub(crate) async fn run_reason_followup_cycle(
             None,
             journey_context.as_ref(),
             Some(&copy),
+            None,
         );
         tracing::info!(
             tracked_train_id = row.tracked_train_id,
