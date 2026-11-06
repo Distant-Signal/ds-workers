@@ -1888,6 +1888,13 @@ pub(crate) async fn materialize_due_template_occurrence(
 /// template, spec §2.2) is correctly excluded by the AND below (NULL &
 /// anything is NULL, never non-zero).
 ///
+/// Bank holidays (regular journeys design §8.3): a template with
+/// `skip_bank_holidays` is not due on a bank holiday of its owner's
+/// division, England and Wales when they haven't chosen one
+/// (`ds_store::bank_holidays::bank_holiday_skip_sql`, the rule the api's
+/// `nextDate` reads too). An empty `bank_holidays` (the api's sync off or
+/// not run yet) skips nothing: every date mints as before.
+///
 /// This struct and `due_templates_for` below are called from `main.rs`'s
 /// `run_template_sweep_cycle` (Task 5, stage 1) -- also exercised directly
 /// by this module's own `sweep_tests`.
@@ -1901,14 +1908,16 @@ pub(crate) async fn due_templates_for(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<DueTemplate>> {
-    let rows = sqlx::query_as::<_, DueTemplate>(
-        "SELECT id, user_id FROM journey_templates \
-         WHERE active \
-           AND days_of_week IS NOT NULL \
-           AND (days_of_week & (1 << (EXTRACT(ISODOW FROM $1::date)::int - 1))) != 0 \
-           AND $1::date >= COALESCE(starts_on, $1::date) \
-           AND $1::date <= COALESCE(ends_on, $1::date)",
-    )
+    let rows = sqlx::query_as::<_, DueTemplate>(&format!(
+        "SELECT jt.id, jt.user_id FROM journey_templates jt \
+         WHERE jt.active \
+           AND jt.days_of_week IS NOT NULL \
+           AND (jt.days_of_week & (1 << (EXTRACT(ISODOW FROM $1::date)::int - 1))) != 0 \
+           AND $1::date >= COALESCE(jt.starts_on, $1::date) \
+           AND $1::date <= COALESCE(jt.ends_on, $1::date) \
+           AND NOT {bank_holiday}",
+        bank_holiday = ds_store::bank_holidays::bank_holiday_skip_sql("jt", "$1::date"),
+    ))
     .bind(today)
     .fetch_all(pool)
     .await?;
@@ -6375,6 +6384,100 @@ mod sweep_tests {
                 .ok();
         }
         cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database (ds-core v0.9.0's bank_holidays); run with \
+                `DATABASE_URL=... cargo test -p notifier \
+                due_templates_for_skips_the_owners_bank_holidays -- --ignored --test-threads=1`"]
+    async fn due_templates_for_skips_the_owners_bank_holidays() {
+        let pool = connect().await;
+        let england = "TEST-SWEEP-BH-ENGLAND";
+        let scotland = "TEST-SWEEP-BH-SCOTLAND";
+        // Monday 13 April 2093, Easter Monday: a synthetic year, so no
+        // other test's template (dated in 2026) can see these rows.
+        let easter_monday: chrono::NaiveDate = "2093-04-13".parse().unwrap();
+        let clean = |pool: PgPool| async move {
+            sqlx::query("DELETE FROM bank_holidays WHERE holiday_date = '2093-04-13'")
+                .execute(&pool)
+                .await
+                .ok();
+            for user in [england, scotland] {
+                sqlx::query("DELETE FROM journey_templates WHERE user_id = $1")
+                    .bind(user)
+                    .execute(&pool)
+                    .await
+                    .ok();
+                cleanup_user(&pool, user).await;
+            }
+        };
+        clean(pool.clone()).await;
+        seed_user(&pool, england).await;
+        seed_user(&pool, scotland).await;
+        sqlx::query("UPDATE users SET bank_holiday_division = 'scotland' WHERE id = $1")
+            .bind(scotland)
+            .execute(&pool)
+            .await
+            .expect("set the division");
+        let template = |user: &'static str, skip: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO journey_templates (user_id, days_of_week, skip_bank_holidays) \
+                     VALUES ($1, 31, $2) RETURNING id",
+                )
+                .bind(user)
+                .bind(skip)
+                .fetch_one(&pool)
+                .await
+                .expect("seed template")
+            }
+        };
+        let skips = template(england, true).await;
+        let switched_off = template(england, false).await;
+        let in_scotland = template(scotland, true).await;
+        let due_ids = || {
+            let pool = pool.clone();
+            async move {
+                due_templates_for(&pool, easter_monday)
+                    .await
+                    .expect("due_templates_for")
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect::<Vec<i64>>()
+            }
+        };
+
+        // No holidays known (the sync hasn't run): every one mints.
+        let due = due_ids().await;
+        assert!(
+            [skips, switched_off, in_scotland]
+                .iter()
+                .all(|id| due.contains(id))
+        );
+
+        for division in ["england-and-wales", "northern-ireland"] {
+            sqlx::query(
+                "INSERT INTO bank_holidays (division, holiday_date, title, fetched_at) \
+                 VALUES ($1, $2, 'Easter Monday', now())",
+            )
+            .bind(division)
+            .bind(easter_monday)
+            .execute(&pool)
+            .await
+            .expect("seed holiday");
+        }
+        let due = due_ids().await;
+        assert!(!due.contains(&skips), "England and Wales by default");
+        assert!(due.contains(&switched_off), "the switch is off");
+        assert!(due.contains(&in_scotland), "not a holiday in Scotland");
+        // The next day is no holiday.
+        let tuesday = due_templates_for(&pool, easter_monday.succ_opt().unwrap())
+            .await
+            .expect("due_templates_for");
+        assert!(tuesday.iter().any(|t| t.id == skips));
+
+        clean(pool.clone()).await;
     }
 
     #[tokio::test]
