@@ -8,6 +8,7 @@ mod cancel_reason;
 mod config;
 mod decision;
 mod hold;
+mod leave_reminder;
 mod push_queue;
 mod queries;
 mod send;
@@ -74,6 +75,8 @@ const HELD_RELEASE_CYCLE: &str = "held_release";
 /// One follow-up with the reason for a cancellation push sent without it
 /// (`cancel_reason`), on the forward-queue cadence.
 const CANCEL_REASON_CYCLE: &str = "cancel_reason";
+/// Regular journeys' leave-by reminders and morning summary (§5.3).
+const LEAVE_REMINDER_CYCLE: &str = "leave_reminder";
 /// Users given a grant notice per cycle (one notice each).
 const GRANT_NOTICE_BATCH: i64 = 100;
 
@@ -184,9 +187,21 @@ async fn run() -> anyhow::Result<()> {
         JOURNEY_BREAKS_CYCLE,
         PREDICTED_START_CYCLE,
         CANCEL_REASON_CYCLE,
+        LEAVE_REMINDER_CYCLE,
     ] {
         ds_runtime::metrics::register_cycle("notifier", cycle);
     }
+    leave_reminder::register_metrics();
+    tracing::info!(
+        enabled = config.leave_reminders_enabled,
+        "leave-by reminders (LEAVE_REMINDERS_ENABLED)"
+    );
+    let leave_settings = leave_reminder::LeaveReminderSettings {
+        max_pushes: config.leave_reminders_max_pushes_per_occurrence,
+        move_threshold: chrono::Duration::minutes(config.leave_reminders_move_threshold_minutes),
+        ttl_cap_secs: config.leave_reminders_ttl_secs,
+        default_delay_threshold_minutes: config.train_delay_threshold_minutes,
+    };
     break_notices::set_enabled(config.journey_break_notices_enabled);
     break_notices::register_metrics();
     hold::register_metrics();
@@ -210,6 +225,8 @@ async fn run() -> anyhow::Result<()> {
     let predicted_start_enabled = config.predicted_start_poll_interval_secs > 0;
     let mut predicted_start_interval =
         poll_interval(config.predicted_start_poll_interval_secs.max(1));
+    let leave_reminders_enabled = config.leave_reminders_enabled;
+    let mut leave_reminder_interval = poll_interval(config.leave_reminders_poll_interval_secs);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -315,6 +332,19 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier journey-breaks cycle failed; will retry next interval");
                 }
                 ds_runtime::metrics::record_cycle("notifier", JOURNEY_BREAKS_CYCLE, result.is_ok());
+            }
+            _ = progress.idle(leave_reminder_interval.tick()), if leave_reminders_enabled => {
+                let result = leave_reminder::run_leave_reminder_cycle(
+                    &pool,
+                    &queue,
+                    Utc::now(),
+                    leave_settings,
+                )
+                .await;
+                if let Err(err) = &result {
+                    tracing::error!(error = ?err, "notifier leave-reminder cycle failed; will retry next interval");
+                }
+                ds_runtime::metrics::record_cycle("notifier", LEAVE_REMINDER_CYCLE, result.is_ok());
             }
             _ = progress.idle(predicted_start_interval.tick()), if predicted_start_enabled => {
                 let result = run_predicted_start_cycle(
@@ -465,6 +495,7 @@ async fn run_cycle(
                 body: format!("{} has a new status.", candidate.line_id),
                 url: line_url(&candidate.line_id),
                 tag: format!("line-{}", candidate.line_id),
+                renotify: false,
             };
             enqueue_push(
                 pool,
@@ -702,6 +733,7 @@ fn build_train_notification_payload(
             },
             url: format!("/train/by-id/{tracked_train_id}"),
             tag: format!("train-{tracked_train_id}"),
+            renotify: false,
         };
     };
 
@@ -743,6 +775,7 @@ fn build_train_notification_payload(
         body,
         url: format!("/journeys/{}", ctx.journey_id),
         tag: format!("train-{tracked_train_id}"), // unchanged -- still the same underlying tracked-train row
+        renotify: false,
     }
 }
 
@@ -843,6 +876,7 @@ fn build_predicted_start_payload(
             body: format!("It is {body_tail}"),
             url: format!("/track/{tracked_train_id}"),
             tag,
+            renotify: false,
         };
     };
     let journey_label = push_journey_label(ctx);
@@ -860,6 +894,7 @@ fn build_predicted_start_payload(
         },
         url: format!("/journeys/{}", ctx.journey_id),
         tag,
+        renotify: false,
     }
 }
 
@@ -963,6 +998,7 @@ fn grant_notice_payload(grant: &queries::NewGrantRow) -> NotificationPayload {
         ),
         url: "/account/connected-apps".to_string(),
         tag: format!("grant-created-{}", grant.id),
+        renotify: false,
     }
 }
 
@@ -979,6 +1015,7 @@ fn token_notice_payload(token: &queries::NewTokenRow) -> NotificationPayload {
         ),
         url: "/account/connected-apps".to_string(),
         tag: format!("token-created-{}", token.id),
+        renotify: false,
     }
 }
 
@@ -1082,6 +1119,7 @@ async fn run_skip_check_cycle(
             ),
             url: format!("/journeys/{}", leg.journey_id),
             tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
+            renotify: false,
         };
 
         enqueue_push(
@@ -1229,6 +1267,7 @@ async fn run_template_sweep_cycle(
                 ),
                 url: format!("/journeys/{}", leg.journey_id),
                 tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+                renotify: false,
             };
             enqueue_push(
                 pool,
@@ -1441,6 +1480,7 @@ async fn remind_manual_legs(
             body: format!("Your {route} journey is coming up. Tap to choose a train."),
             url: pick_reminder_url(leg.journey_id, leg.has_usual_itinerary),
             tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+            renotify: false,
         };
         enqueue_push(
             pool,

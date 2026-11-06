@@ -1805,8 +1805,12 @@ pub(crate) async fn materialize_due_template_occurrence(
     }
 
     let journey_id: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO journeys (user_id, custom_name, source_template_id) \
-         SELECT $1, $2, $3 \
+        // The occurrence keeps its own copy of the station buffer (regular
+        // journeys §5.1): a later change to the template doesn't move a
+        // day already minted, and one day can be changed on its own.
+        "INSERT INTO journeys (user_id, custom_name, source_template_id, station_buffer_minutes) \
+         SELECT $1, $2, $3, \
+                (SELECT station_buffer_minutes FROM journey_templates WHERE id = $3) \
          WHERE NOT EXISTS ( \
              SELECT 1 FROM journeys j JOIN journey_legs jl ON jl.journey_id = j.id \
              WHERE j.source_template_id = $3 AND jl.service_date = $4 \
@@ -5330,8 +5334,8 @@ mod sweep_tests {
         let tomorrow = today.succ_opt().expect("a next day exists");
 
         let template_id: i64 = sqlx::query_scalar(
-            "INSERT INTO journey_templates (user_id, custom_name) \
-             VALUES ($1, 'Test Skip Day Template') RETURNING id",
+            "INSERT INTO journey_templates (user_id, custom_name, station_buffer_minutes) \
+             VALUES ($1, 'Test Skip Day Template', 17) RETURNING id",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -5351,6 +5355,15 @@ mod sweep_tests {
             .await
             .expect("first materialize call")
             .expect("the first call must mint a journey");
+        // The occurrence keeps its own copy of the station buffer
+        // (regular journeys §5.1).
+        let buffer: Option<i16> =
+            sqlx::query_scalar("SELECT station_buffer_minutes FROM journeys WHERE id = $1")
+                .bind(journey_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the buffer");
+        assert_eq!(buffer, Some(17));
 
         // The user discards today's occurrence. This is exactly what
         // `journeys::delete_journey` does, in one transaction: tombstone the

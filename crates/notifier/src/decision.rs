@@ -1111,3 +1111,218 @@ mod template_mint_date_tests {
         );
     }
 }
+
+/// What [`decide_leave_reminder`] knows about one regular journey's day
+/// (regular journeys design §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaveReminderInput {
+    pub now: DateTime<Utc>,
+    /// The leave-by now (`ds_store::journeys::leave_by_sql`).
+    pub leave_by: DateTime<Utc>,
+    /// The departure it is timed from.
+    pub departure: DateTime<Utc>,
+    /// The user's lead (0 to 5 minutes early).
+    pub lead: Duration,
+    /// An open break on the journey, or one owning its first train.
+    pub break_owns: bool,
+    /// The leave-by the last delivered reminder named, if any.
+    pub sent: Option<DateTime<Utc>>,
+    /// Regular-journey pushes this day has had: leave-by reminders and
+    /// their moves, and the pick-your-train reminders.
+    pub pushes: i64,
+    pub max_pushes: i64,
+    /// How much earlier a leave-by must move to be sent again.
+    pub move_threshold: Duration,
+}
+
+/// [`decide_leave_reminder`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaveReminderDecision {
+    /// Send it; `moved` when it replaces an earlier one.
+    Send { moved: bool },
+    /// A break notice is this journey's push.
+    BreakOwns,
+    /// The day already had `max_pushes`.
+    Capped,
+    /// Not time yet.
+    NotYet,
+    /// Its window passed unsent: never sent late.
+    Stale,
+    /// Sent already, and the leave-by hasn't moved far enough earlier (or
+    /// moved later, which sends nothing).
+    AlreadySent,
+}
+
+impl LeaveReminderDecision {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            LeaveReminderDecision::Send { moved: false } => "sent",
+            LeaveReminderDecision::Send { moved: true } => "moved",
+            LeaveReminderDecision::BreakOwns => "break_owns",
+            LeaveReminderDecision::Capped => "capped",
+            LeaveReminderDecision::NotYet => "not_yet",
+            LeaveReminderDecision::Stale => "stale",
+            LeaveReminderDecision::AlreadySent => "already_sent",
+        }
+    }
+}
+
+/// The leave-by rule for one regular journey's day (§5.3). Pure.
+///
+/// 1. An open break on the journey or its first train owns it: nothing.
+/// 2. (A cancelled first train with nothing suggested has no leave-by at
+///    all, so never gets here.)
+/// 3. At the cap: nothing.
+/// 4. The first push goes once `now` reaches `leave_by - lead`, while it
+///    is before `leave_by + 5 min` and before the departure. Past that it
+///    is stale and never sent.
+/// 5. Once sent, a leave-by at least `move_threshold` earlier than the
+///    one sent is sent again, in its own window. A later one sends nothing.
+pub(crate) fn decide_leave_reminder(input: &LeaveReminderInput) -> LeaveReminderDecision {
+    if input.break_owns {
+        return LeaveReminderDecision::BreakOwns;
+    }
+    if input.pushes >= input.max_pushes {
+        return LeaveReminderDecision::Capped;
+    }
+    let moved = match input.sent {
+        None => false,
+        Some(sent) if input.leave_by <= sent - input.move_threshold => true,
+        Some(_) => return LeaveReminderDecision::AlreadySent,
+    };
+    if input.now < input.leave_by - input.lead {
+        return LeaveReminderDecision::NotYet;
+    }
+    if input.now >= input.leave_by + crate::push_queue::LEAVE_BY_GRACE
+        || input.now >= input.departure
+    {
+        return LeaveReminderDecision::Stale;
+    }
+    LeaveReminderDecision::Send { moved }
+}
+
+#[cfg(test)]
+mod leave_reminder_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    fn at(h: u32, m: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 9, h, m, 0).unwrap()
+    }
+
+    fn input() -> LeaveReminderInput {
+        LeaveReminderInput {
+            now: at(8, 20),
+            leave_by: at(8, 20),
+            departure: at(8, 42),
+            lead: Duration::zero(),
+            break_owns: false,
+            sent: None,
+            pushes: 0,
+            max_pushes: 3,
+            move_threshold: Duration::minutes(5),
+        }
+    }
+
+    fn decide(change: impl FnOnce(&mut LeaveReminderInput)) -> LeaveReminderDecision {
+        let mut input = input();
+        change(&mut input);
+        decide_leave_reminder(&input)
+    }
+
+    use LeaveReminderDecision::{AlreadySent, BreakOwns, Capped, NotYet, Send, Stale};
+
+    #[test]
+    fn the_first_push_comes_in_its_window_only() {
+        assert_eq!(decide(|i| i.now = at(8, 19)), NotYet);
+        assert_eq!(decide(|_| {}), Send { moved: false });
+        assert_eq!(decide(|i| i.now = at(8, 24)), Send { moved: false });
+        assert_eq!(decide(|i| i.now = at(8, 25)), Stale, "5 minutes past");
+        assert_eq!(decide(|i| i.now = at(9, 0)), Stale);
+        // Never at or after the departure, even inside the 5 minutes.
+        assert_eq!(
+            decide(|i| {
+                i.departure = at(8, 22);
+                i.now = at(8, 22);
+            }),
+            Stale
+        );
+    }
+
+    #[test]
+    fn the_lead_brings_it_forward() {
+        let lead = |i: &mut LeaveReminderInput| i.lead = Duration::minutes(3);
+        assert_eq!(
+            decide(|i| {
+                lead(i);
+                i.now = at(8, 16);
+            }),
+            NotYet
+        );
+        assert_eq!(
+            decide(|i| {
+                lead(i);
+                i.now = at(8, 17);
+            }),
+            Send { moved: false }
+        );
+    }
+
+    #[test]
+    fn a_leave_by_moved_five_minutes_earlier_is_sent_again() {
+        let sent = |i: &mut LeaveReminderInput| i.sent = Some(at(8, 20));
+        assert_eq!(decide(sent), AlreadySent, "unchanged");
+        assert_eq!(
+            decide(|i| {
+                sent(i);
+                i.leave_by = at(8, 16);
+                i.now = at(8, 16);
+            }),
+            AlreadySent,
+            "4 minutes earlier"
+        );
+        assert_eq!(
+            decide(|i| {
+                sent(i);
+                i.leave_by = at(8, 15);
+                i.now = at(8, 17);
+            }),
+            Send { moved: true },
+            "5 minutes earlier"
+        );
+        assert_eq!(
+            decide(|i| {
+                sent(i);
+                i.leave_by = at(8, 15);
+                i.now = at(8, 21);
+            }),
+            Stale,
+            "moved, but its own window has passed"
+        );
+        assert_eq!(
+            decide(|i| {
+                sent(i);
+                i.leave_by = at(8, 35);
+                i.now = at(8, 35);
+            }),
+            AlreadySent,
+            "later sends nothing"
+        );
+    }
+
+    #[test]
+    fn the_cap_and_a_break_stop_it() {
+        assert_eq!(decide(|i| i.pushes = 3), Capped);
+        assert_eq!(decide(|i| i.pushes = 2), Send { moved: false });
+        assert_eq!(
+            decide(|i| {
+                i.sent = Some(at(8, 30));
+                i.pushes = 3;
+            }),
+            Capped,
+            "a move past the cap"
+        );
+        assert_eq!(decide(|i| i.break_owns = true), BreakOwns);
+    }
+}

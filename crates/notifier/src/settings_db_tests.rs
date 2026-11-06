@@ -637,6 +637,7 @@ async fn quiet_hours_hold_a_line_push_and_skip_full_poll_pushes_until_they_end()
         body: "b".to_string(),
         url: "/u".to_string(),
         tag: "x".to_string(),
+        renotify: false,
     };
 
     let queue = crate::drain_support::test_queue(&pool);

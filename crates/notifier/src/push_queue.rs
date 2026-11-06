@@ -170,7 +170,34 @@ pub(crate) enum Delivered {
         severity: i16,
         trigger: Option<TriggerTrainState>,
     },
+    /// `regular_journey_push_state`: a regular journey's leave-by reminder
+    /// (regular journeys design §5.3) for leg `leg_id`, naming `leave_by`.
+    /// `moved` when it replaces an earlier one. With a trigger train (the
+    /// text names its delay at or over the user's threshold), also that
+    /// train's `train_notification_state`, so the leave-by is the train's
+    /// push: one push per user per train.
+    LeaveBy {
+        journey_id: i64,
+        leg_id: i64,
+        leave_by: DateTime<Utc>,
+        moved: bool,
+        /// The most `TTL` it is sent with (`LEAVE_REMINDERS_TTL_SECS`).
+        ttl_cap_secs: u32,
+        trigger: Option<TriggerTrainState>,
+    },
+    /// `regular_journey_summaries`: the morning summary for London day
+    /// `service_date`, sent before its first leave-by `first_leave_by`.
+    MorningSummary {
+        service_date: chrono::NaiveDate,
+        first_leave_by: DateTime<Utc>,
+    },
 }
+
+/// How long after its leave-by a leave-by reminder is still worth
+/// delivering: the decision refuses to send one later than this
+/// (`decision::decide_leave_reminder`), and the push service keeps it no
+/// longer either.
+pub(crate) const LEAVE_BY_GRACE: chrono::Duration = chrono::Duration::minutes(5);
 
 /// The `TTL` of the account security notices (a new delegated grant or
 /// personal API token, see [`Delivered::push_class`]): 28 days, the most
@@ -196,6 +223,8 @@ enum Target {
     GrantCreated(i64),
     TokenCreated(i64),
     JourneyBreak(i64),
+    LeaveBy(i64),
+    MorningSummary(chrono::NaiveDate),
 }
 
 impl Delivered {
@@ -210,6 +239,8 @@ impl Delivered {
             Delivered::GrantCreated { grant_id } => Target::GrantCreated(*grant_id),
             Delivered::TokenCreated { token_id } => Target::TokenCreated(*token_id),
             Delivered::JourneyBreak { break_id, .. } => Target::JourneyBreak(*break_id),
+            Delivered::LeaveBy { journey_id, .. } => Target::LeaveBy(*journey_id),
+            Delivered::MorningSummary { service_date, .. } => Target::MorningSummary(*service_date),
         }
     }
 
@@ -226,6 +257,8 @@ impl Delivered {
     /// | Line status (`Line`) | `normal` | `PUSH_TTL_SECS` | worth knowing, not tied to a train they are on |
     /// | Recurring journey attention and pick-a-train reminder (`Unmatched`) | `normal` | `PUSH_TTL_SECS` | a prompt to plan, not a disruption |
     /// | App connected, API token created (`GrantCreated`, `TokenCreated`) | `normal` | [`SECURITY_NOTICE_TTL_SECS`] (28 days) | account notices: not urgent in the minute, but the user must see them however late |
+    /// | Leave-by reminder (`LeaveBy`) | `high` | until 5 minutes past the leave-by, at most `LEAVE_REMINDERS_TTL_SECS` (900); `Topic` the tag | a late leave-by is worse than none, and a moved one replaces a stored one |
+    /// | Morning summary (`MorningSummary`) | `normal` | until the day's first leave-by, at most an hour; `Topic` the tag | a heads-up, useless once it is time to go |
     ///
     /// `high` lets an Android phone in Doze be woken at once; `normal` may
     /// wait for its next maintenance window. Nothing is sent `low` or
@@ -239,22 +272,50 @@ impl Delivered {
             | Delivered::JourneyBreak { .. } => PushClass {
                 urgency: Urgency::High,
                 ttl: Ttl::Configured,
+                topic: false,
             },
             Delivered::Line { .. } | Delivered::Unmatched { .. } => PushClass {
                 urgency: Urgency::Normal,
                 ttl: Ttl::Configured,
+                topic: false,
+            },
+            Delivered::LeaveBy {
+                leave_by,
+                ttl_cap_secs,
+                ..
+            } => PushClass {
+                urgency: Urgency::High,
+                ttl: Ttl::Until {
+                    deadline: *leave_by + LEAVE_BY_GRACE,
+                    max_secs: *ttl_cap_secs,
+                },
+                topic: true,
+            },
+            Delivered::MorningSummary { first_leave_by, .. } => PushClass {
+                urgency: Urgency::Normal,
+                ttl: Ttl::Until {
+                    deadline: *first_leave_by,
+                    max_secs: 3600,
+                },
+                topic: true,
             },
             Delivered::GrantCreated { .. } | Delivered::TokenCreated { .. } => PushClass {
                 urgency: Urgency::Normal,
                 ttl: Ttl::Fixed(SECURITY_NOTICE_TTL_SECS),
+                topic: false,
             },
         }
     }
 
-    /// The tracked train whose push this is, for a break notice.
-    fn break_trigger_train(&self) -> Option<i64> {
+    /// The tracked train whose push this is: a break notice's, or a
+    /// leave-by's that names the train's delay.
+    fn owned_train(&self) -> Option<i64> {
         match self {
             Delivered::JourneyBreak {
+                trigger: Some(trigger),
+                ..
+            }
+            | Delivered::LeaveBy {
                 trigger: Some(trigger),
                 ..
             } => Some(trigger.tracked_train_id),
@@ -458,6 +519,25 @@ impl PushBackend for PgBackend {
                 }
                 crate::break_notices::record_notified(&self.pool, *break_id, *severity, at).await
             }
+            Delivered::LeaveBy {
+                journey_id,
+                leg_id,
+                leave_by,
+                trigger,
+                ..
+            } => {
+                crate::leave_reminder::record_leave_by(
+                    &self.pool,
+                    user_id,
+                    (*journey_id, *leg_id, *leave_by),
+                    trigger.as_ref(),
+                    at,
+                )
+                .await
+            }
+            Delivered::MorningSummary { service_date, .. } => {
+                crate::leave_reminder::record_summary(&self.pool, user_id, *service_date, at).await
+            }
         }
     }
 }
@@ -608,11 +688,12 @@ impl<B: PushBackend> PushQueue<B> {
             }
         };
 
-        // One push per user per train (mid-journey changes spec §6.3): a
-        // break notice for a train replaces that train's queued plain
-        // push, and a plain push for a train whose break notice is queued
+        // One push per user per train (mid-journey changes spec §6.3,
+        // regular journeys §5.3): a break notice or a leave-by naming a
+        // train's delay replaces that train's queued plain push, and a
+        // plain push for a train whose break notice or leave-by is queued
         // or in flight adds nothing.
-        if let Some(train) = job.delivered.break_trigger_train() {
+        if let Some(train) = job.delivered.owned_train() {
             drop_queued_train_push(&mut st, &job.user_id, train);
         }
         if let Delivered::Train {
@@ -622,13 +703,12 @@ impl<B: PushBackend> PushQueue<B> {
                 *user == job.user_id
                     && match slot {
                         Slot::Queued(queued) => {
-                            queued.delivered.break_trigger_train() == Some(*tracked_train_id)
+                            queued.delivered.owned_train() == Some(*tracked_train_id)
                         }
                         Slot::InFlight { delivered, next } => {
-                            delivered.break_trigger_train() == Some(*tracked_train_id)
+                            delivered.owned_train() == Some(*tracked_train_id)
                                 || next.as_ref().is_some_and(|parked| {
-                                    parked.delivered.break_trigger_train()
-                                        == Some(*tracked_train_id)
+                                    parked.delivered.owned_train() == Some(*tracked_train_id)
                                 })
                         }
                     }
@@ -1258,6 +1338,7 @@ mod tests {
                 body: "b".to_string(),
                 url: "/".to_string(),
                 tag: format!("line-{line_id}"),
+                renotify: false,
             },
             delivered: Delivered::Line {
                 line_id: line_id.to_string(),
@@ -1414,6 +1495,7 @@ mod tests {
                 body: "b".to_string(),
                 url: "/".to_string(),
                 tag: format!("train-{tracked_train_id}"),
+                renotify: false,
             },
             delivered: Delivered::Train {
                 tracked_train_id,
@@ -1433,6 +1515,7 @@ mod tests {
                 body: "b".to_string(),
                 url: "/".to_string(),
                 tag: format!("train-{tracked_train_id}"),
+                renotify: false,
             },
             delivered: Delivered::JourneyBreak {
                 break_id,
@@ -1461,14 +1544,17 @@ mod tests {
         let high = PushClass {
             urgency: Urgency::High,
             ttl: Ttl::Configured,
+            topic: false,
         };
         let normal = PushClass {
             urgency: Urgency::Normal,
             ttl: Ttl::Configured,
+            topic: false,
         };
         let security = PushClass {
             urgency: Urgency::Normal,
             ttl: Ttl::Fixed(2_419_200),
+            topic: false,
         };
         let cases = [
             (train("delayed"), high),
@@ -1496,6 +1582,35 @@ mod tests {
         for (delivered, class) in cases {
             assert_eq!(delivered.push_class(), class, "{delivered:?}");
         }
+    }
+
+    /// A leave-by is `high`, kept until 5 minutes past its leave-by and at
+    /// most its cap, with a `Topic` (regular journeys §5.3).
+    #[test]
+    fn a_leave_by_is_high_urgency_with_a_short_ttl_and_a_topic() {
+        let leave_by = Utc::now() + chrono::Duration::minutes(3);
+        let class = leave_job_at("t", 9, None, leave_by).delivered.push_class();
+        assert_eq!(class.urgency, Urgency::High);
+        assert!(class.topic);
+        // 8 minutes to the deadline (3 + 5): 480 s, under the 900 s cap.
+        let now = leave_by - chrono::Duration::minutes(3);
+        assert_eq!(class.ttl.secs_at(3600, now), 480);
+        // Far ahead: the cap. Past the deadline: 0.
+        assert_eq!(
+            class.ttl.secs_at(3600, now - chrono::Duration::hours(1)),
+            900
+        );
+        assert_eq!(
+            class.ttl.secs_at(3600, now + chrono::Duration::minutes(9)),
+            0
+        );
+        let summary = Delivered::MorningSummary {
+            service_date: leave_by.date_naive(),
+            first_leave_by: leave_by,
+        }
+        .push_class();
+        assert_eq!(summary.urgency, Urgency::Normal);
+        assert!(summary.topic);
     }
 
     /// The security notices' fixed TTL is the 28 days push services allow
@@ -1545,6 +1660,7 @@ mod tests {
                 == PushClass {
                     urgency: Urgency::High,
                     ttl: Ttl::Configured,
+                    topic: false,
                 }),
             "{classes:?}"
         );
@@ -1553,6 +1669,7 @@ mod tests {
                 == PushClass {
                     urgency: Urgency::Normal,
                     ttl: Ttl::Fixed(SECURITY_NOTICE_TTL_SECS),
+                    topic: false,
                 }),
             "{classes:?}"
         );
@@ -1613,6 +1730,110 @@ mod tests {
             delivered
                 .iter()
                 .any(|(user, d)| user == "friend" && matches!(d, Delivered::Train { .. }))
+        );
+        queue.shutdown(Duration::from_secs(1)).await;
+    }
+
+    fn leave_job_at(
+        user_id: &str,
+        journey_id: i64,
+        trigger_train: Option<i64>,
+        leave_by: DateTime<Utc>,
+    ) -> PushJob {
+        PushJob {
+            user_id: user_id.to_string(),
+            payload: NotificationPayload {
+                title: "Leave by 08:20".to_string(),
+                body: "b".to_string(),
+                url: format!("/journeys/{journey_id}"),
+                tag: format!("journey-leg-leave-{journey_id}"),
+                renotify: false,
+            },
+            delivered: Delivered::LeaveBy {
+                journey_id,
+                leg_id: journey_id,
+                leave_by,
+                moved: false,
+                ttl_cap_secs: 900,
+                trigger: trigger_train.map(|tracked_train_id| TriggerTrainState {
+                    tracked_train_id,
+                    status: "en_route".to_string(),
+                    delay_minutes: Some(20),
+                }),
+            },
+            decided_at: Utc::now(),
+        }
+    }
+
+    fn leave_job(user_id: &str, journey_id: i64, trigger_train: Option<i64>) -> PushJob {
+        leave_job_at(user_id, journey_id, trigger_train, Utc::now())
+    }
+
+    /// One push per train (regular journeys §5.3): a leave-by naming a
+    /// train's delay replaces that train's queued plain push, and the
+    /// plain push adds nothing while it is queued. A leave-by that names no
+    /// delay leaves the train's push alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_leave_by_naming_a_delay_supersedes_the_trains_own_push() {
+        let backend =
+            FakeBackend::new(Duration::from_secs(5)).with_subscription("traveller", 1, "gate://t");
+        let gate = Arc::clone(&backend.gate);
+        let queue = PushQueue::start(backend, config());
+        queue.enqueue(line_job("traveller", "L1", 1));
+        queue.enqueue(line_job("traveller", "L2", 1));
+        eventually("the traveller at the in-flight cap", || {
+            queue.in_flight() == 2
+        })
+        .await;
+
+        assert_eq!(
+            queue.enqueue(train_job("traveller", 118)),
+            EnqueueOutcome::Queued
+        );
+        assert_eq!(
+            queue.enqueue(train_job("traveller", 119)),
+            EnqueueOutcome::Queued
+        );
+        assert_eq!(
+            queue.enqueue(leave_job("traveller", 7, Some(118))),
+            EnqueueOutcome::Queued
+        );
+        assert_eq!(
+            queue.enqueue(leave_job("traveller", 8, None)),
+            EnqueueOutcome::Queued
+        );
+        assert_eq!(queue.depth(), 3, "118's plain push is gone");
+        assert_eq!(
+            queue.enqueue(train_job("traveller", 118)),
+            EnqueueOutcome::Duplicate
+        );
+
+        gate.add_permits(100);
+        queue.wait_idle().await;
+        let delivered = recorded(&queue);
+        assert!(
+            !delivered.iter().any(|(_, d)| matches!(
+                d,
+                Delivered::Train {
+                    tracked_train_id: 118,
+                    ..
+                }
+            )),
+            "{delivered:?}"
+        );
+        assert!(delivered.iter().any(|(_, d)| matches!(
+            d,
+            Delivered::Train {
+                tracked_train_id: 119,
+                ..
+            }
+        )));
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|(_, d)| matches!(d, Delivered::LeaveBy { .. }))
+                .count(),
+            2
         );
         queue.shutdown(Duration::from_secs(1)).await;
     }

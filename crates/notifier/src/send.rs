@@ -63,12 +63,28 @@ const PUSH_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_PUSH_TTL_SECS: u32 = 3600;
 
 /// The Web Push delivery headers a push is sent with: `TTL` (RFC 8030
-/// §5.2) and `Urgency` (§5.3). No `Topic` (§5.4) yet: pushes already
-/// replace each other on the device by `NotificationPayload::tag`.
+/// §5.2), `Urgency` (§5.3) and, when `topic` is set, `Topic` (§5.4): the
+/// payload's `tag`, so a push service holding a push for an offline device
+/// replaces it with a newer one of the same tag rather than queueing both
+/// (the leave-by reminder and its moves). On the device, pushes replace
+/// each other by `NotificationPayload::tag` either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeliveryOptions {
     pub ttl_secs: u32,
     pub urgency: Urgency,
+    pub topic: bool,
+}
+
+/// A `Topic` header's value, if `tag` can be one: at most 32 characters
+/// of the URL-safe base64 alphabet (RFC 8030 §5.4). Anything else is sent
+/// without a topic rather than refused by the push service.
+pub(crate) fn topic_for(tag: &str) -> Option<String> {
+    (!tag.is_empty()
+        && tag.len() <= 32
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    .then(|| tag.to_string())
 }
 
 /// A push's `TTL`: the configured one (`PUSH_TTL_SECS`) or a fixed one for
@@ -77,6 +93,27 @@ pub(crate) struct DeliveryOptions {
 pub(crate) enum Ttl {
     Configured,
     Fixed(u32),
+    /// Until `deadline`, and at most `max_secs`: worked out when it is
+    /// sent, so time spent queued counts. A push past its deadline is sent
+    /// with a TTL of 0 (delivered only to a device that is online).
+    Until {
+        deadline: chrono::DateTime<chrono::Utc>,
+        max_secs: u32,
+    },
+}
+
+impl Ttl {
+    /// The `TTL` in seconds at `now`, `configured` for [`Ttl::Configured`].
+    pub(crate) fn secs_at(self, configured: u32, now: chrono::DateTime<chrono::Utc>) -> u32 {
+        match self {
+            Ttl::Configured => configured,
+            Ttl::Fixed(ttl_secs) => ttl_secs,
+            Ttl::Until { deadline, max_secs } => {
+                let left = (deadline - now).num_seconds().max(0);
+                u32::try_from(left).unwrap_or(u32::MAX).min(max_secs)
+            }
+        }
+    }
 }
 
 /// How one class of push is delivered (`push_queue::Delivered::push_class`
@@ -85,6 +122,8 @@ pub(crate) enum Ttl {
 pub(crate) struct PushClass {
     pub urgency: Urgency,
     pub ttl: Ttl,
+    /// Send the payload's `tag` as the `Topic` ([`DeliveryOptions::topic`]).
+    pub topic: bool,
 }
 
 /// Exactly the SW contract this plan's Global Constraints section fixes.
@@ -96,6 +135,11 @@ pub(crate) struct NotificationPayload {
     pub body: String,
     pub url: String,
     pub tag: String,
+    /// Alert again when this replaces a shown notification with the same
+    /// tag (`showNotification`'s `renotify`): a moved leave-by. Left out of
+    /// the JSON when false, so every other payload is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub renotify: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -179,11 +223,9 @@ impl Pusher {
         class: PushClass,
     ) -> SendOutcome {
         let options = DeliveryOptions {
-            ttl_secs: match class.ttl {
-                Ttl::Configured => self.ttl_secs,
-                Ttl::Fixed(ttl_secs) => ttl_secs,
-            },
+            ttl_secs: class.ttl.secs_at(self.ttl_secs, chrono::Utc::now()),
             urgency: class.urgency,
+            topic: class.topic,
         };
         if self.revalidate_endpoint {
             // Production: `new` always pairs this with `PUSH_SEND_TIMEOUT`,
@@ -322,6 +364,11 @@ async fn send_to_subscription_with_timeout(
         message_builder.set_vapid_signature(signature.clone());
         message_builder.set_ttl(options.ttl_secs);
         message_builder.set_urgency(options.urgency);
+        if options.topic
+            && let Some(topic) = topic_for(&payload.tag)
+        {
+            message_builder.set_topic(topic);
+        }
 
         let message = match message_builder.build() {
             Ok(message) => message,
@@ -623,6 +670,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             body: "body".to_string(),
             url: "/".to_string(),
             tag: "tag".to_string(),
+            renotify: false,
         };
 
         let outcome = send_to_subscription_with_timeout(
@@ -714,6 +762,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         DeliveryOptions {
             ttl_secs: DEFAULT_PUSH_TTL_SECS,
             urgency: Urgency::Normal,
+            topic: false,
         }
     }
 
@@ -728,6 +777,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 DeliveryOptions {
                     ttl_secs: 600,
                     urgency: Urgency::High,
+                    topic: false,
                 },
                 "600",
                 "high",
@@ -763,9 +813,92 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 .expect("wiremock records requests");
             assert!(
                 requests.iter().all(|r| !r.headers.contains_key("topic")),
-                "no Topic header until the leave-by phase adds one"
+                "no Topic header unless the class asks for one"
             );
         }
+    }
+
+    /// A leave-by's `Topic` is its tag, so a push service holding one for
+    /// an offline phone replaces it with the moved one; a tag that can't be
+    /// a topic is sent without one. `renotify` reaches the payload only
+    /// when set.
+    #[tokio::test]
+    async fn a_topic_class_sends_the_tag_as_its_topic() {
+        for (tag, topic) in [
+            ("journey-leg-leave-11", Some("journey-leg-leave-11")),
+            (
+                "regular-summary-2026-11-09",
+                Some("regular-summary-2026-11-09"),
+            ),
+            ("has a space", None),
+            ("a-tag-that-is-much-longer-than-thirty-two", None),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::header("ttl", "480"))
+                .and(wiremock::matchers::header("urgency", "high"))
+                .respond_with(wiremock::ResponseTemplate::new(201))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let subscription = PushSubscriptionRow {
+                id: 1,
+                endpoint: format!("{}/push-endpoint", server.uri()),
+                p256dh: TEST_P256DH.to_string(),
+                auth: TEST_AUTH.to_string(),
+            };
+            let payload = NotificationPayload {
+                tag: tag.to_string(),
+                ..payload()
+            };
+            let options = DeliveryOptions {
+                ttl_secs: 480,
+                urgency: Urgency::High,
+                topic: true,
+            };
+            let outcome = send_to_subscription_with_timeout(
+                &test_vapid_key(),
+                "mailto:test@example.com",
+                &subscription,
+                &payload,
+                options,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(outcome, SendOutcome::Sent, "{tag}");
+            let requests = server.received_requests().await.expect("requests");
+            let sent = requests[0]
+                .headers
+                .get("topic")
+                .map(|value| value.to_str().unwrap().to_string());
+            assert_eq!(sent.as_deref(), topic, "{tag}");
+        }
+    }
+
+    #[test]
+    fn renotify_is_in_the_payload_only_when_set() {
+        let plain = serde_json::to_value(payload()).unwrap();
+        assert!(plain.get("renotify").is_none());
+        let moved = serde_json::to_value(NotificationPayload {
+            renotify: true,
+            ..payload()
+        })
+        .unwrap();
+        assert_eq!(moved["renotify"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn an_until_ttl_counts_down_to_its_deadline_and_stops_at_its_cap() {
+        let now = chrono::Utc::now();
+        let until = Ttl::Until {
+            deadline: now + chrono::Duration::seconds(300),
+            max_secs: 900,
+        };
+        assert_eq!(until.secs_at(3600, now), 300);
+        assert_eq!(until.secs_at(3600, now - chrono::Duration::hours(1)), 900);
+        assert_eq!(until.secs_at(3600, now + chrono::Duration::hours(1)), 0);
+        assert_eq!(Ttl::Configured.secs_at(3600, now), 3600);
+        assert_eq!(Ttl::Fixed(60).secs_at(3600, now), 60);
     }
 
     /// `Pusher` sends a `Ttl::Configured` class with its configured TTL
@@ -777,6 +910,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 PushClass {
                     urgency: Urgency::High,
                     ttl: Ttl::Configured,
+                    topic: false,
                 },
                 "120",
                 "high",
@@ -785,6 +919,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 PushClass {
                     urgency: Urgency::Normal,
                     ttl: Ttl::Fixed(2_419_200),
+                    topic: false,
                 },
                 "2419200",
                 "normal",
@@ -822,6 +957,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             body: "body".to_string(),
             url: "https://example.com/".to_string(),
             tag: "tag".to_string(),
+            renotify: false,
         }
     }
 

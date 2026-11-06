@@ -235,6 +235,31 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
     pub journey_break_notices_enabled: bool,
 
+    /// Regular journeys' leave-by reminders and morning summary (regular
+    /// journeys design §5.3): the switch, off unless the chart's
+    /// `notifier.leaveReminders.enabled` turns it on.
+    #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
+    pub leave_reminders_enabled: bool,
+
+    /// How often the leave-by cycle looks at today's regular journeys.
+    #[arg(long, env, default_value_t = 60)]
+    pub leave_reminders_poll_interval_secs: u64,
+
+    /// The most regular-journey pushes one day of a regular journey gets:
+    /// the pick-your-train reminder, the leave-by and its moves.
+    #[arg(long, env, default_value_t = 3)]
+    pub leave_reminders_max_pushes_per_occurrence: i64,
+
+    /// How much earlier (minutes) a leave-by must move, after one was sent,
+    /// to be sent again.
+    #[arg(long, env, default_value_t = 5)]
+    pub leave_reminders_move_threshold_minutes: i64,
+
+    /// The most `TTL` a leave-by is sent with; it is also never kept past
+    /// 5 minutes after the leave-by.
+    #[arg(long, env, default_value_t = 900)]
+    pub leave_reminders_ttl_secs: u32,
+
     /// How often open breaks are checked for a notice (§6.3: 15 s).
     #[arg(long, env, default_value_t = 15)]
     pub journey_breaks_poll_interval_secs: u64,
@@ -285,6 +310,25 @@ impl Config {
             self.template_mint_evening_hour <= 24,
             "template_mint_evening_hour (--template-mint-evening-hour / \
              TEMPLATE_MINT_EVENING_HOUR) must be 0 to 23, or 24 to turn the evening mint off"
+        );
+        anyhow::ensure!(
+            self.leave_reminders_poll_interval_secs > 0,
+            "leave_reminders_poll_interval_secs (--leave-reminders-poll-interval-secs / \
+             LEAVE_REMINDERS_POLL_INTERVAL_SECS) must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.leave_reminders_max_pushes_per_occurrence > 0,
+            "leave_reminders_max_pushes_per_occurrence \
+             (LEAVE_REMINDERS_MAX_PUSHES_PER_OCCURRENCE) must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.leave_reminders_move_threshold_minutes > 0,
+            "leave_reminders_move_threshold_minutes (LEAVE_REMINDERS_MOVE_THRESHOLD_MINUTES) \
+             must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.leave_reminders_ttl_secs > 0,
+            "leave_reminders_ttl_secs (LEAVE_REMINDERS_TTL_SECS) must be greater than zero"
         );
         anyhow::ensure!(
             self.journey_breaks_poll_interval_secs > 0,
@@ -378,6 +422,11 @@ mod tests {
             metrics_port: 9091,
             metrics_enabled: true,
             journey_break_notices_enabled: false,
+            leave_reminders_enabled: false,
+            leave_reminders_poll_interval_secs: 60,
+            leave_reminders_max_pushes_per_occurrence: 3,
+            leave_reminders_move_threshold_minutes: 5,
+            leave_reminders_ttl_secs: 900,
             journey_breaks_poll_interval_secs: 15,
             health: ds_runtime::service_args::HealthArgs {
                 health_bind_url: "127.0.0.1:0".to_string(),

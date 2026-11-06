@@ -17,11 +17,11 @@ members = [
 # default features are off here, so a member that wants them lists
 # "default". To build against a local ds-core checkout, see README.md.
 [workspace.dependencies]
-common = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.5.0", default-features = false }
-ds-runtime = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.5.0", default-features = false }
-health-http = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.5.0" }
-ds-store = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.5.0" }
-ds-lines = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.5.0" }
+common = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.8.1", default-features = false }
+ds-runtime = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.8.1", default-features = false }
+health-http = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.8.1" }
+ds-store = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.8.1" }
+ds-lines = { git = "https://github.com/Distant-Signal/ds-core", tag = "v0.8.1" }
 
 [workspace.package]
 edition = "2024"

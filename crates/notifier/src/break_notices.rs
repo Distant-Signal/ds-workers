@@ -351,6 +351,7 @@ pub(crate) fn build_break_payload(row: &BreakNoticeRow) -> NotificationPayload {
             Some(tracked_train_id) => format!("train-{tracked_train_id}"),
             None => format!("journey-break-{}", row.journey_id),
         },
+        renotify: false,
     }
 }
 
