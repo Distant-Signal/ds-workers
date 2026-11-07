@@ -6331,6 +6331,105 @@ mod sweep_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a live database with ds-core v0.11.0's migrations; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                the_mint_skips_a_pause_and_time_away -- --ignored --test-threads=1`"]
+    async fn the_mint_skips_a_pause_and_time_away() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-AWAY-USER";
+        let other_user = "TEST-SWEEP-AWAY-OTHER";
+        seed_user(&pool, user_id).await;
+        seed_user(&pool, other_user).await;
+        // 2026-09-23 is a Wednesday.
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+        let tomorrow = today.succ_opt().unwrap();
+
+        let mut ids = Vec::new();
+        for (owner, paused_until) in [
+            (user_id, Some(tomorrow)),
+            (user_id, None),
+            (other_user, None),
+            (other_user, Some(today)),
+        ] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO journey_templates (user_id, custom_name, days_of_week, paused_until) \
+                 VALUES ($1, 'Away test', 127, $2) RETURNING id",
+            )
+            .bind(owner)
+            .bind(paused_until)
+            .fetch_one(&pool)
+            .await
+            .expect("seed template");
+            sqlx::query(
+                "INSERT INTO journey_template_legs \
+                    (template_id, leg_order, origin_crs, destination_crs, depart_after) \
+                 VALUES ($1, 1, 'RDG', 'WOK', '09:00:00')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("seed leg");
+            ids.push(id);
+        }
+        // The first user is away today and tomorrow: both their templates.
+        sqlx::query(
+            "INSERT INTO user_away_periods (user_id, starts_on, ends_on) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(today)
+        .bind(tomorrow)
+        .execute(&pool)
+        .await
+        .expect("seed time away");
+
+        let due: Vec<i64> = due_templates_for(&pool, today)
+            .await
+            .expect("due_templates_for")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(!due.contains(&ids[0]), "paused until tomorrow, and away");
+        assert!(!due.contains(&ids[1]), "away");
+        assert!(
+            due.contains(&ids[2]),
+            "someone else's time away doesn't apply"
+        );
+        // paused_until itself runs.
+        assert!(due.contains(&ids[3]), "paused until today runs today");
+        for id in [ids[0], ids[1]] {
+            let minted = materialize_due_template_occurrence(&pool, id, user_id, today)
+                .await
+                .expect("materialize");
+            assert_eq!(minted, None, "template {id} must not mint");
+        }
+        let minted = materialize_due_template_occurrence(&pool, ids[2], other_user, today)
+            .await
+            .expect("materialize");
+        assert!(minted.is_some());
+
+        for id in ids {
+            sqlx::query("DELETE FROM journeys WHERE source_template_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        for owner in [user_id, other_user] {
+            sqlx::query("DELETE FROM user_away_periods WHERE user_id = $1")
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .ok();
+            cleanup_user(&pool, owner).await;
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires a live database with every migration applied; \
                 run with `DATABASE_URL=... cargo test -p notifier \
                 the_mint_follows_the_shared_recurrence_rule -- --ignored --test-threads=1`"]
