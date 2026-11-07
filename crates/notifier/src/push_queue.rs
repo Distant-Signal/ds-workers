@@ -93,8 +93,8 @@
 //! * `queue_full`, `user_queue_full`, `shutting_down`: refused at enqueue.
 //! * `abandoned_on_shutdown`: still queued or in flight when the shutdown
 //!   grace ran out.
-//! * `send_failed`: sent, but no subscription accepted it (all timed out or
-//!   failed transiently).
+//! * `send_failed`: sent, but no subscription accepted it (all timed out,
+//!   ended with an unknown outcome or failed transiently).
 //! * `error`: the job could not run (loading subscriptions failed, or it
 //!   panicked).
 //!
@@ -257,14 +257,16 @@ impl Delivered {
     /// | Line status (`Line`) | `normal` | `PUSH_TTL_SECS` | worth knowing, not tied to a train they are on |
     /// | Recurring journey attention and pick-a-train reminder (`Unmatched`) | `normal` | `PUSH_TTL_SECS` | a prompt to plan, not a disruption |
     /// | App connected, API token created (`GrantCreated`, `TokenCreated`) | `normal` | [`SECURITY_NOTICE_TTL_SECS`] (28 days) | account notices: not urgent in the minute, but the user must see them however late |
-    /// | Leave-by reminder (`LeaveBy`) | `high` | until 5 minutes past the leave-by, at most `LEAVE_REMINDERS_TTL_SECS` (900); `Topic` the tag | a late leave-by is worse than none, and a moved one replaces a stored one |
-    /// | Morning summary (`MorningSummary`) | `normal` | until the day's first leave-by, at most an hour; `Topic` the tag | a heads-up, useless once it is time to go |
+    /// | Leave-by reminder (`LeaveBy`) | `high` | until 5 minutes past the leave-by, at most `LEAVE_REMINDERS_TTL_SECS` (900) | a late leave-by is worse than none, and a moved one replaces a stored one |
+    /// | Morning summary (`MorningSummary`) | `normal` | until the day's first leave-by, at most an hour | a heads-up, useless once it is time to go |
     ///
     /// `high` lets an Android phone in Doze be woken at once; `normal` may
     /// wait for its next maintenance window. Nothing is sent `low` or
     /// `very-low`, so nothing depends on the device being on charge or Wi-Fi.
     /// `PUSH_TTL_SECS` is 1 hour by default: past that a train or line push
-    /// is more likely wrong than useful.
+    /// is more likely wrong than useful. Every class sends its tag as its
+    /// `Topic`, so a push service holding one replaces it with a newer one
+    /// of the same tag, as the device would (`send::DeliveryOptions`).
     pub(crate) fn push_class(&self) -> PushClass {
         match self {
             Delivered::Train { .. }
@@ -272,12 +274,10 @@ impl Delivered {
             | Delivered::JourneyBreak { .. } => PushClass {
                 urgency: Urgency::High,
                 ttl: Ttl::Configured,
-                topic: false,
             },
             Delivered::Line { .. } | Delivered::Unmatched { .. } => PushClass {
                 urgency: Urgency::Normal,
                 ttl: Ttl::Configured,
-                topic: false,
             },
             Delivered::LeaveBy {
                 leave_by,
@@ -289,7 +289,6 @@ impl Delivered {
                     deadline: *leave_by + LEAVE_BY_GRACE,
                     max_secs: *ttl_cap_secs,
                 },
-                topic: true,
             },
             Delivered::MorningSummary { first_leave_by, .. } => PushClass {
                 urgency: Urgency::Normal,
@@ -297,12 +296,10 @@ impl Delivered {
                     deadline: *first_leave_by,
                     max_secs: 3600,
                 },
-                topic: true,
             },
             Delivered::GrantCreated { .. } | Delivered::TokenCreated { .. } => PushClass {
                 urgency: Urgency::Normal,
                 ttl: Ttl::Fixed(SECURITY_NOTICE_TTL_SECS),
-                topic: false,
             },
         }
     }
@@ -1092,12 +1089,7 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
             .await;
         let mut any_sent = false;
         for (subscription, outcome) in subscriptions.iter().zip(outcomes) {
-            let label = match outcome {
-                SendOutcome::Sent => "sent",
-                SendOutcome::Expired => "expired",
-                SendOutcome::TimedOut => "timeout",
-                SendOutcome::TransientFailure => "failed",
-            };
+            let label = outcome.label();
             metrics::counter!(metric("notifier_push_send_total"), "outcome" => label).increment(1);
             match outcome {
                 SendOutcome::Sent => {
@@ -1131,11 +1123,16 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
                         );
                     }
                 }
-                SendOutcome::TransientFailure => {
+                // `Unknown` is not a strike towards pruning: the endpoint
+                // answered the connection, so it is not a tarpit. Neither
+                // is delivered, so the notification is re-decided and
+                // resent with the same tag and Topic (`SendOutcome::Unknown`).
+                SendOutcome::Unknown | SendOutcome::TransientFailure => {
                     tracing::warn!(
                         user_id,
                         subscription_id = subscription.id,
-                        "transient push send failure"
+                        outcome = label,
+                        "push send not delivered"
                     );
                 }
             }
@@ -1544,17 +1541,14 @@ mod tests {
         let high = PushClass {
             urgency: Urgency::High,
             ttl: Ttl::Configured,
-            topic: false,
         };
         let normal = PushClass {
             urgency: Urgency::Normal,
             ttl: Ttl::Configured,
-            topic: false,
         };
         let security = PushClass {
             urgency: Urgency::Normal,
             ttl: Ttl::Fixed(2_419_200),
-            topic: false,
         };
         let cases = [
             (train("delayed"), high),
@@ -1585,13 +1579,12 @@ mod tests {
     }
 
     /// A leave-by is `high`, kept until 5 minutes past its leave-by and at
-    /// most its cap, with a `Topic` (regular journeys §5.3).
+    /// most its cap (regular journeys §5.3).
     #[test]
-    fn a_leave_by_is_high_urgency_with_a_short_ttl_and_a_topic() {
+    fn a_leave_by_is_high_urgency_with_a_short_ttl() {
         let leave_by = Utc::now() + chrono::Duration::minutes(3);
         let class = leave_job_at("t", 9, None, leave_by).delivered.push_class();
         assert_eq!(class.urgency, Urgency::High);
-        assert!(class.topic);
         // 8 minutes to the deadline (3 + 5): 480 s, under the 900 s cap.
         let now = leave_by - chrono::Duration::minutes(3);
         assert_eq!(class.ttl.secs_at(3600, now), 480);
@@ -1610,7 +1603,6 @@ mod tests {
         }
         .push_class();
         assert_eq!(summary.urgency, Urgency::Normal);
-        assert!(summary.topic);
     }
 
     /// The security notices' fixed TTL is the 28 days push services allow
@@ -1660,7 +1652,6 @@ mod tests {
                 == PushClass {
                     urgency: Urgency::High,
                     ttl: Ttl::Configured,
-                    topic: false,
                 }),
             "{classes:?}"
         );
@@ -1669,7 +1660,6 @@ mod tests {
                 == PushClass {
                     urgency: Urgency::Normal,
                     ttl: Ttl::Fixed(SECURITY_NOTICE_TTL_SECS),
-                    topic: false,
                 }),
             "{classes:?}"
         );
