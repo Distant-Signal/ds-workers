@@ -6381,6 +6381,98 @@ mod sweep_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a live database with ds-core v0.12.0's migrations; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                the_mint_follows_the_recurrence_patterns -- --ignored --test-threads=1`"]
+    async fn the_mint_follows_the_recurrence_patterns() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-PATTERN-USER";
+        seed_user(&pool, user_id).await;
+        // 2026-09-23 is a Wednesday, in the week of Monday 2026-09-21.
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let mut ids = Vec::new();
+        // (kind, days, interval, anchor, extra date today)
+        let cases: [(&str, i16, i16, Option<&str>, bool); 6] = [
+            ("weekly", 4, 2, Some("2026-09-21"), false), // this week runs
+            ("weekly", 4, 2, Some("2026-09-14"), false), // last week ran: not this one
+            ("weekly", 1, 1, None, true),                // Mondays, plus today
+            ("dates", 127, 1, None, true),               // only its dates: today
+            ("dates", 127, 1, None, false),              // only its dates: not today
+            ("cycle", 127, 1, None, true),               // unknown here: never
+        ];
+        for (kind, days, interval, anchor, extra) in cases {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO journey_templates \
+                    (user_id, custom_name, days_of_week, recurrence_kind, interval_weeks, anchor_week) \
+                 VALUES ($1, 'Pattern test', $2, $3, $4, $5::date) RETURNING id",
+            )
+            .bind(user_id)
+            .bind(days)
+            .bind(kind)
+            .bind(interval)
+            .bind(anchor)
+            .fetch_one(&pool)
+            .await
+            .expect("seed template");
+            sqlx::query(
+                "INSERT INTO journey_template_legs \
+                    (template_id, leg_order, origin_crs, destination_crs, depart_after) \
+                 VALUES ($1, 1, 'RDG', 'WOK', '09:00:00')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("seed leg");
+            if extra {
+                sqlx::query(
+                    "INSERT INTO journey_template_extra_dates (template_id, service_date) VALUES ($1, $2)",
+                )
+                .bind(id)
+                .bind(today)
+                .execute(&pool)
+                .await
+                .expect("seed extra date");
+            }
+            ids.push(id);
+        }
+
+        let due: Vec<i64> = due_templates_for(&pool, today)
+            .await
+            .expect("due_templates_for")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        let want = [true, false, true, true, false, false];
+        for (id, want) in ids.iter().zip(want) {
+            assert_eq!(due.contains(id), want, "template {id}");
+        }
+        // The mint refuses the unknown kind under the lock too.
+        let minted = materialize_due_template_occurrence(&pool, ids[5], user_id, today)
+            .await
+            .expect("materialize");
+        assert_eq!(minted, None, "a cycle template must never be minted");
+        let minted = materialize_due_template_occurrence(&pool, ids[3], user_id, today)
+            .await
+            .expect("materialize");
+        assert!(minted.is_some(), "a dates template mints on its date");
+
+        for id in ids {
+            sqlx::query("DELETE FROM journeys WHERE source_template_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
     #[ignore = "requires a live database with ds-core v0.11.0's migrations; \
                 run with `DATABASE_URL=... cargo test -p notifier \
                 the_mint_skips_a_pause_and_time_away -- --ignored --test-threads=1`"]
