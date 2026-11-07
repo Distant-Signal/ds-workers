@@ -1703,6 +1703,29 @@ async fn is_due_on(
     )
 }
 
+/// The legs a template's occurrence on `$2` (a `DATE`) is minted from
+/// (`$1` the template): that ISO weekday's variant legs when the template
+/// has a different time that day (regular journeys R3,
+/// `journey_template_legs.variant_weekday`), else its own legs (NULL
+/// `variant_weekday`). Never both: a build that ignored the column would
+/// mint the base legs and every weekday's variant legs into one journey,
+/// which is why this notifier ships before any api writes a variant leg.
+///
+/// The minted legs are numbered 1 up in `leg_order`'s order: until ds-core
+/// drops the old `(template_id, leg_order)` key, a weekday's variant legs
+/// sit at positions after the template's own.
+static TEMPLATE_LEGS_FOR_DATE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT (ROW_NUMBER() OVER (ORDER BY leg_order))::int AS leg_order, origin_crs, destination_crs, depart_after, depart_before, \
+                arrive_after, arrive_before \
+         FROM journey_template_legs \
+         WHERE template_id = $1 \
+           AND variant_weekday IS NOT DISTINCT FROM {} \
+         ORDER BY leg_order",
+        ds_store::recurrence::leg_variant_sql("$1", "$2::date")
+    )
+});
+
 /// One due template's `journeys`/`journey_legs` row(s), minted idempotently.
 /// Deliberately duplicates the shape of Phase B's own
 /// `crates/api/src/data/journey_templates.rs::materialize_template` --
@@ -1812,14 +1835,11 @@ pub(crate) async fn materialize_due_template_occurrence(
         Option<chrono::NaiveTime>,
         Option<chrono::NaiveTime>,
         Option<chrono::NaiveTime>,
-    )> = sqlx::query_as(
-        "SELECT leg_order, origin_crs, destination_crs, depart_after, depart_before, \
-                arrive_after, arrive_before \
-         FROM journey_template_legs WHERE template_id = $1 ORDER BY leg_order",
-    )
-    .bind(template_id)
-    .fetch_all(&mut *tx)
-    .await?;
+    )> = sqlx::query_as(TEMPLATE_LEGS_FOR_DATE_SQL.as_str())
+        .bind(template_id)
+        .bind(today)
+        .fetch_all(&mut *tx)
+        .await?;
     if legs.is_empty() {
         tx.rollback().await?;
         return Ok(None);
@@ -6161,6 +6181,120 @@ mod sweep_tests {
             .execute(&pool)
             .await
             .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// Regular journeys R3: a weekday with a different time mints that
+    /// weekday's variant legs and only those; every other day mints the
+    /// template's own legs and none of the variants. A notifier that read
+    /// every leg would mint both sets into one journey (the reason this
+    /// build ships before any api writes a variant leg). The variant legs
+    /// sit after the template's own while ds-core keeps the old
+    /// `(template_id, leg_order)` key, and are minted numbered from 1. The
+    /// Sundays are the 2026 and 2027 clock changes: the legs keep their
+    /// London clock times, and Sunday is ISO weekday 7.
+    #[tokio::test]
+    #[ignore = "requires a live database with ds-core v0.13.0's migrations; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                materialize_picks_the_weekdays_variant_legs -- --ignored --test-threads=1`"]
+    async fn materialize_picks_the_weekdays_variant_legs() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-DAY-OVERRIDES-USER";
+        seed_user(&pool, user_id).await;
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week) \
+             VALUES ($1, 'Test Day Overrides Template', 127) RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed journey_templates row");
+        let t = |s: &str| chrono::NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        // (variant, leg_order, origin, destination, depart_after)
+        let legs: [(Option<i16>, i32, &str, &str, &str); 5] = [
+            (None, 1, "GLD", "WOK", "08:00"),
+            (None, 2, "WOK", "WAT", "08:30"),
+            (Some(5), 3, "GLD", "WOK", "07:00"),
+            (Some(5), 4, "WOK", "WAT", "07:30"),
+            (Some(7), 5, "GLD", "WAT", "10:15"),
+        ];
+        for (variant, order, origin, destination, depart_after) in legs {
+            sqlx::query(
+                "INSERT INTO journey_template_legs \
+                    (template_id, leg_order, origin_crs, destination_crs, depart_after, variant_weekday) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(template_id)
+            .bind(order)
+            .bind(origin)
+            .bind(destination)
+            .bind(t(depart_after))
+            .bind(variant)
+            .execute(&pool)
+            .await
+            .expect("seed journey_template_legs row");
+        }
+
+        let base = vec![(1, "GLD", "WOK", t("08:00")), (2, "WOK", "WAT", t("08:30"))];
+        let cases = [
+            // A Friday: the Friday legs.
+            (
+                "2026-11-13",
+                vec![(1, "GLD", "WOK", t("07:00")), (2, "WOK", "WAT", t("07:30"))],
+            ),
+            // A Thursday and a Saturday: the template's own.
+            ("2026-11-12", base.clone()),
+            ("2026-11-14", base.clone()),
+            // The October 2026 and March 2027 clock changes, both Sundays.
+            ("2026-10-25", vec![(1, "GLD", "WAT", t("10:15"))]),
+            ("2027-03-28", vec![(1, "GLD", "WAT", t("10:15"))]),
+            // The Monday after: the template's own again.
+            ("2027-03-29", base.clone()),
+        ];
+        let mut minted = Vec::new();
+        for (date, want) in cases {
+            let date: chrono::NaiveDate = date.parse().unwrap();
+            let journey_id = materialize_due_template_occurrence(&pool, template_id, user_id, date)
+                .await
+                .expect("materialize call")
+                .expect("the call must mint a journey");
+            minted.push(journey_id);
+            let got: Vec<(i32, String, String, chrono::NaiveTime, chrono::NaiveDate)> =
+                sqlx::query_as(
+                    "SELECT leg_order, origin_crs, destination_crs, depart_after, service_date \
+                     FROM journey_legs WHERE journey_id = $1 ORDER BY leg_order",
+                )
+                .bind(journey_id)
+                .fetch_all(&pool)
+                .await
+                .expect("read back the minted legs");
+            let got: Vec<_> = got
+                .iter()
+                .map(|(order, origin, destination, depart_after, service_date)| {
+                    assert_eq!(*service_date, date);
+                    (*order, origin.as_str(), destination.as_str(), *depart_after)
+                })
+                .collect();
+            assert_eq!(got, want, "{date}");
+        }
+
+        for journey_id in minted {
+            sqlx::query("DELETE FROM journey_legs WHERE journey_id = $1")
+                .bind(journey_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM journeys WHERE id = $1")
+                .bind(journey_id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_template_legs
         cleanup_user(&pool, user_id).await;
     }
 
