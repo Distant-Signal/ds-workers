@@ -1688,6 +1688,21 @@ pub(crate) async fn upsert_skip_notification_state(
     Ok(())
 }
 
+/// Whether template `template_id` is due on `date` by
+/// `ds_store::recurrence`, read inside `tx`.
+async fn is_due_on(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    template_id: i64,
+    date: chrono::NaiveDate,
+) -> anyhow::Result<bool> {
+    Ok(
+        ds_store::recurrence::load(&mut **tx, &[template_id], date, date)
+            .await?
+            .get(&template_id)
+            .is_some_and(|s| s.rule.is_due(&s.exceptions, date)),
+    )
+}
+
 /// One due template's `journeys`/`journey_legs` row(s), minted idempotently.
 /// Deliberately duplicates the shape of Phase B's own
 /// `crates/api/src/data/journey_templates.rs::materialize_template` --
@@ -1778,6 +1793,12 @@ pub(crate) async fn materialize_due_template_occurrence(
         tx.rollback().await?;
         return Ok(None);
     };
+    // The rule again, under the lock: an edit, a pause or a skip that
+    // landed after `due_templates_for` read it wins.
+    if !is_due_on(&mut tx, template_id, today).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
 
     #[expect(
         clippy::type_complexity,
@@ -1880,25 +1901,28 @@ pub(crate) async fn materialize_due_template_occurrence(
     Ok(Some(journey_id))
 }
 
-/// Every active template due to materialize `today` -- active, today's
-/// weekday bit set, today within [`starts_on`, `ends_on`]. Does NOT itself
-/// check the idempotency guard (that's `materialize_due_template_occurrence`'s
-/// own job, per-template) -- this just narrows the sweep's per-tick
-/// candidate set. `days_of_week IS NULL` (a one-shot, non-recurring
-/// template, spec §2.2) is correctly excluded by the AND below (NULL &
-/// anything is NULL, never non-zero).
+/// Every template due to materialize `today`, decided by
+/// `ds_store::recurrence` (the rule the api's `nextDate` and
+/// `upcomingDates` also use): `recurrence::may_be_due_sql` narrows the scan
+/// to a superset, then each candidate's rule and exceptions (tombstones,
+/// bank holidays) are loaded and `Rule::is_due` decides. A template whose
+/// `recurrence_kind` this build doesn't know is never due.
+///
+/// Does NOT itself check the idempotency guard (that's
+/// `materialize_due_template_occurrence`'s own job, per-template, and it
+/// re-checks the rule under the template's row lock).
 ///
 /// Bank holidays (regular journeys design §8.3): a template with
 /// `skip_bank_holidays` is not due on a bank holiday of its owner's
 /// division, England and Wales when they haven't chosen one
-/// (`ds_store::bank_holidays::bank_holiday_skip_sql`, the rule the api's
-/// `nextDate` reads too). An empty `bank_holidays` (the api's sync off or
-/// not run yet) skips nothing: every date mints as before.
+/// (`recurrence::load` reads them, as for the api's `nextDate`). An empty
+/// `bank_holidays` (the api's sync off or not run yet) skips nothing:
+/// every date mints as before.
 ///
 /// This struct and `due_templates_for` below are called from `main.rs`'s
-/// `run_template_sweep_cycle` (Task 5, stage 1) -- also exercised directly
-/// by this module's own `sweep_tests`.
-#[derive(Debug, sqlx::FromRow)]
+/// `run_template_sweep_cycle` (stage 1), and exercised directly by this
+/// module's own `sweep_tests`.
+#[derive(Debug)]
 pub(crate) struct DueTemplate {
     pub id: i64,
     pub user_id: String,
@@ -1908,20 +1932,30 @@ pub(crate) async fn due_templates_for(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> anyhow::Result<Vec<DueTemplate>> {
-    let rows = sqlx::query_as::<_, DueTemplate>(&format!(
-        "SELECT jt.id, jt.user_id FROM journey_templates jt \
-         WHERE jt.active \
-           AND jt.days_of_week IS NOT NULL \
-           AND (jt.days_of_week & (1 << (EXTRACT(ISODOW FROM $1::date)::int - 1))) != 0 \
-           AND $1::date >= COALESCE(jt.starts_on, $1::date) \
-           AND $1::date <= COALESCE(jt.ends_on, $1::date) \
-           AND NOT {bank_holiday}",
-        bank_holiday = ds_store::bank_holidays::bank_holiday_skip_sql("jt", "$1::date"),
+    let candidates: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT jt.id FROM journey_templates jt WHERE {} ORDER BY jt.id",
+        ds_store::recurrence::may_be_due_sql("jt", "$1::date"),
     ))
     .bind(today)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schedules = ds_store::recurrence::load(pool, &candidates, today, today).await?;
+    Ok(candidates
+        .into_iter()
+        .filter_map(|id| {
+            let schedule = schedules.get(&id)?;
+            schedule
+                .rule
+                .is_due(&schedule.exceptions, today)
+                .then(|| DueTemplate {
+                    id,
+                    user_id: schedule.user_id.clone(),
+                })
+        })
+        .collect())
 }
 
 /// A leg eligible for this cycle's commit-check -- `'unmatched'`,
@@ -5343,8 +5377,8 @@ mod sweep_tests {
         let tomorrow = today.succ_opt().expect("a next day exists");
 
         let template_id: i64 = sqlx::query_scalar(
-            "INSERT INTO journey_templates (user_id, custom_name, station_buffer_minutes) \
-             VALUES ($1, 'Test Skip Day Template', 17) RETURNING id",
+            "INSERT INTO journey_templates (user_id, custom_name, station_buffer_minutes, days_of_week) \
+             VALUES ($1, 'Test Skip Day Template', 17, 127) RETURNING id",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -6004,8 +6038,8 @@ mod sweep_tests {
         let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
 
         let template_id: i64 = sqlx::query_scalar(
-            "INSERT INTO journey_templates (user_id, custom_name) \
-             VALUES ($1, 'Test Mint Template') RETURNING id",
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week) \
+             VALUES ($1, 'Test Mint Template', 127) RETURNING id",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -6104,8 +6138,8 @@ mod sweep_tests {
         let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
 
         let template_id: i64 = sqlx::query_scalar(
-            "INSERT INTO journey_templates (user_id, custom_name) \
-             VALUES ($1, 'Test Window Searched Template') RETURNING id",
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week) \
+             VALUES ($1, 'Test Window Searched Template', 127) RETURNING id",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -6187,8 +6221,8 @@ mod sweep_tests {
         let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
 
         let template_id: i64 = sqlx::query_scalar(
-            "INSERT INTO journey_templates (user_id, custom_name) \
-             VALUES ($1, 'Old Name') RETURNING id",
+            "INSERT INTO journey_templates (user_id, custom_name, days_of_week) \
+             VALUES ($1, 'Old Name', 127) RETURNING id",
         )
         .bind(user_id)
         .fetch_one(&pool)
@@ -6293,6 +6327,79 @@ mod sweep_tests {
             .execute(&pool)
             .await
             .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live database with every migration applied; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                the_mint_follows_the_shared_recurrence_rule -- --ignored --test-threads=1`"]
+    async fn the_mint_follows_the_shared_recurrence_rule() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-RECURRENCE-USER";
+        seed_user(&pool, user_id).await;
+        // 2026-09-23 is a Wednesday.
+        let today: chrono::NaiveDate = "2026-09-23".parse().unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["Tombstoned", "WrongDay"] {
+            let days: i16 = if name == "WrongDay" { 1 } else { 4 };
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO journey_templates (user_id, custom_name, days_of_week) \
+                 VALUES ($1, $2, $3) RETURNING id",
+            )
+            .bind(user_id)
+            .bind(name)
+            .bind(days)
+            .fetch_one(&pool)
+            .await
+            .expect("seed template");
+            sqlx::query(
+                "INSERT INTO journey_template_legs \
+                    (template_id, leg_order, origin_crs, destination_crs, depart_after) \
+                 VALUES ($1, 1, 'RDG', 'WOK', '09:00:00')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("seed leg");
+            ids.push(id);
+        }
+        let (tombstoned, wrong_day) = (ids[0], ids[1]);
+        sqlx::query(
+            "INSERT INTO journey_template_skipped_dates (template_id, service_date) VALUES ($1, $2)",
+        )
+        .bind(tombstoned)
+        .bind(today)
+        .execute(&pool)
+        .await
+        .expect("seed tombstone");
+
+        let due: Vec<i64> = due_templates_for(&pool, today)
+            .await
+            .expect("due_templates_for")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(!due.contains(&tombstoned), "a tombstoned date is not due");
+        assert!(!due.contains(&wrong_day));
+
+        // Called directly for a date its rule doesn't include, the mint
+        // refuses under the lock.
+        for id in [tombstoned, wrong_day] {
+            let minted = materialize_due_template_occurrence(&pool, id, user_id, today)
+                .await
+                .expect("materialize");
+            assert_eq!(minted, None, "template {id} must not mint");
+        }
+
+        for id in ids {
+            sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .ok();
+        }
         cleanup_user(&pool, user_id).await;
     }
 
