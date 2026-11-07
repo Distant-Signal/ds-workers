@@ -2033,7 +2033,10 @@ pub(crate) struct CommitCheckLeg {
     /// without a row). Off, the leg is still committed when a train is.
     pub notify_attention: bool,
     /// The template has a usual itinerary (regular journeys, phase 1): the
-    /// pick reminder links to the journey with the usual train first.
+    /// pick reminder links to the journey with the usual train first. On a
+    /// weekday with a different time (R3, `journey_template_day_overrides`)
+    /// that day's own usual itinerary decides, not the template's: the
+    /// template's usual train is at the other time.
     pub has_usual_itinerary: bool,
     /// The api's plan sweep's view of the journey (regular journeys phase
     /// 3, `journeys.regular_plan_status`): `pending`, `suggested`,
@@ -2078,12 +2081,16 @@ fn commit_check_legs_sql(filter: &str) -> String {
                 so.name AS origin_name, sd.name AS destination_name, \
                 jl.service_date, jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before, \
                 COALESCE(np.template_attention, TRUE) AS notify_attention, \
-                (jt.usual_itinerary IS NOT NULL) AS has_usual_itinerary, \
+                (CASE WHEN dov.template_id IS NOT NULL THEN dov.usual_itinerary IS NOT NULL \
+                      ELSE jt.usual_itinerary IS NOT NULL END) AS has_usual_itinerary, \
                 j.regular_plan_status, j.regular_plan->>'reason' AS plan_reason, \
                 (j.regular_plan->'choice'->>'departure')::timestamptz AS plan_departure \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN journey_templates jt ON jt.id = j.source_template_id \
+         LEFT JOIN journey_template_day_overrides dov \
+                ON dov.template_id = jt.id \
+               AND dov.weekday = EXTRACT(ISODOW FROM jl.service_date)::smallint \
          LEFT JOIN notification_preferences np ON np.user_id = j.user_id \
          LEFT JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
          LEFT JOIN trains tr ON tr.id = ts.trains_id \
@@ -7064,6 +7071,100 @@ mod sweep_tests {
             .execute(&pool)
             .await
             .ok();
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// Regular journeys R3: on a weekday with a different time, the pick
+    /// reminder's "usual train" link follows that day's own usual
+    /// itinerary, not the template's (whose usual train is at the other
+    /// time). Other days follow the template's.
+    #[tokio::test]
+    #[ignore = "requires a live database with ds-core v0.14.0's migrations; \
+                run with `DATABASE_URL=... cargo test -p notifier \
+                the_reminder_reads_a_different_time_days_usual_itinerary -- --ignored --test-threads=1`"]
+    async fn the_reminder_reads_a_different_time_days_usual_itinerary() {
+        let pool = connect().await;
+        let user_id = "TEST-SWEEP-DAY-OVERRIDE-REMINDER-USER";
+        seed_user(&pool, user_id).await;
+        let template_id: i64 = sqlx::query_scalar(
+            "INSERT INTO journey_templates \
+                (user_id, custom_name, default_match_mode, origin_crs, destination_crs, \
+                 target_kind, target_time, usual_itinerary) \
+             VALUES ($1, 'Day Override Reminder Template', 'manual', 'GLD', 'WAT', \
+                     'depart_after', '08:00', '{}') RETURNING id",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed template");
+        // Fridays have their own time and no usual train yet; Saturdays
+        // their own time and usual train.
+        for (weekday, itinerary) in [(5_i16, None), (6, Some("{}"))] {
+            sqlx::query(
+                "INSERT INTO journey_template_day_overrides \
+                    (template_id, weekday, target_kind, target_time, usual_itinerary) \
+                 VALUES ($1, $2, 'depart_after', '07:00', $3::jsonb)",
+            )
+            .bind(template_id)
+            .bind(weekday)
+            .bind(itinerary)
+            .execute(&pool)
+            .await
+            .expect("seed day override");
+        }
+        // Thursday, Friday, Saturday.
+        for (date, want) in [
+            ("2026-11-12", true),
+            ("2026-11-13", false),
+            ("2026-11-14", true),
+        ] {
+            let date: chrono::NaiveDate = date.parse().unwrap();
+            let journey_id: i64 = sqlx::query_scalar(
+                "INSERT INTO journeys (user_id, source_template_id) VALUES ($1, $2) RETURNING id",
+            )
+            .bind(user_id)
+            .bind(template_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seed journey");
+            let leg_id: i64 = sqlx::query_scalar(
+                "INSERT INTO journey_legs \
+                    (journey_id, leg_order, origin_crs, destination_crs, service_date, match_mode) \
+                 VALUES ($1, 1, 'GLD', 'WAT', $2, 'unmatched') RETURNING id",
+            )
+            .bind(journey_id)
+            .bind(date)
+            .fetch_one(&pool)
+            .await
+            .expect("seed leg");
+            let legs = unmatched_manual_legs_for_reminder(&pool, date)
+                .await
+                .expect("unmatched_manual_legs_for_reminder");
+            let leg = legs
+                .iter()
+                .find(|l| l.journey_leg_id == leg_id)
+                .expect("the seeded leg is a reminder candidate");
+            assert_eq!(leg.has_usual_itinerary, want, "{date}");
+        }
+
+        sqlx::query(
+            "DELETE FROM journey_legs WHERE journey_id IN \
+                (SELECT id FROM journeys WHERE source_template_id = $1)",
+        )
+        .bind(template_id)
+        .execute(&pool)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM journeys WHERE source_template_id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM journey_templates WHERE id = $1")
+            .bind(template_id)
+            .execute(&pool)
+            .await
+            .ok(); // cascades journey_template_day_overrides
         cleanup_user(&pool, user_id).await;
     }
 
