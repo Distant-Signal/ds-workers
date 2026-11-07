@@ -63,16 +63,26 @@ const PUSH_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_PUSH_TTL_SECS: u32 = 3600;
 
 /// The Web Push delivery headers a push is sent with: `TTL` (RFC 8030
-/// §5.2), `Urgency` (§5.3) and, when `topic` is set, `Topic` (§5.4): the
-/// payload's `tag`, so a push service holding a push for an offline device
-/// replaces it with a newer one of the same tag rather than queueing both
-/// (the leave-by reminder and its moves). On the device, pushes replace
-/// each other by `NotificationPayload::tag` either way.
+/// §5.2), `Urgency` (§5.3) and, whenever the payload's `tag` can be one
+/// ([`topic_for`]), `Topic` (§5.4).
+///
+/// Every class sends its tag as its `Topic` (DS-386): a push service holding
+/// a push for an offline device replaces it with a newer one of the same
+/// topic rather than queueing both. On the device, pushes already replace
+/// each other by `NotificationPayload::tag` (the service worker's
+/// `showNotification` tag), so a topic only ever replaces what the device
+/// would have replaced anyway; it never hides a push the device would have
+/// kept. That is what makes a resend safe: a push whose first send ended in
+/// [`SendOutcome::Unknown`] or [`SendOutcome::TimedOut`] is re-decided and
+/// sent again with the same tag, and whether the first copy is still held
+/// by the push service or already shown, the second replaces it instead of
+/// appearing beside it. Tags are per target (`train-<id>`, `line-<id>`,
+/// `journey-leg-leave-<id>`, ...), so the leave-by's topic, the first class
+/// to send one, collides with no other class's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeliveryOptions {
     pub ttl_secs: u32,
     pub urgency: Urgency,
-    pub topic: bool,
 }
 
 /// A `Topic` header's value, if `tag` can be one: at most 32 characters
@@ -117,13 +127,12 @@ impl Ttl {
 }
 
 /// How one class of push is delivered (`push_queue::Delivered::push_class`
-/// has the mapping): its `Urgency` and its `TTL`.
+/// has the mapping): its `Urgency` and its `TTL`. Every class sends its tag
+/// as its `Topic` ([`DeliveryOptions`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PushClass {
     pub urgency: Urgency,
     pub ttl: Ttl,
-    /// Send the payload's `tag` as the `Topic` ([`DeliveryOptions::topic`]).
-    pub topic: bool,
 }
 
 /// Exactly the SW contract this plan's Global Constraints section fixes.
@@ -153,18 +162,45 @@ pub(crate) enum SendOutcome {
     /// signature of a dead or deliberately tarpitting endpoint: `push_queue`
     /// counts consecutive timeouts per subscription and prunes the
     /// subscription after `push_prune_after_timeouts` of them (SVC-02).
+    /// Like [`SendOutcome::Unknown`], the push service may have accepted
+    /// it, so it is not retried here.
     TimedOut,
-    /// Anything else (5xx, connect refused, a refused send-time endpoint
-    /// re-validation, a local signing error) -- caller logs and moves on;
-    /// the notification is re-decided only if its source row is polled
-    /// again (see `push_queue`'s module doc for the delivery semantics).
+    /// The request may have reached the push service, but no answer came
+    /// back: the connection failed after the request was handed to it
+    /// (reset, or closed before a response). Not retried (DS-386): if the
+    /// service had accepted it, a second copy would be a duplicate push.
+    /// `push_queue` does not record it as delivered, so the notification
+    /// is re-decided on its next read and sent again with the same tag and
+    /// `Topic`, which replaces the first copy instead of showing beside it
+    /// ([`DeliveryOptions`]). Counted as `outcome="unknown"`.
+    Unknown,
+    /// The push service certainly did not take it: a 5xx or 429 on every
+    /// attempt, a connect failure on every attempt, another 4xx, a refused
+    /// send-time endpoint re-validation or a local signing error. The
+    /// caller logs and moves on; the notification is re-decided only if
+    /// its source row is polled again (see `push_queue`'s module doc for
+    /// the delivery semantics).
     TransientFailure,
 }
 
+impl SendOutcome {
+    /// The `outcome` label of `notifier_push_send_total`.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            SendOutcome::Sent => "sent",
+            SendOutcome::Expired => "expired",
+            SendOutcome::TimedOut => "timeout",
+            SendOutcome::Unknown => "unknown",
+            SendOutcome::TransientFailure => "failed",
+        }
+    }
+}
+
 /// The configured sender every production push goes through: the VAPID
-/// credentials (the private key parsed once at startup, see `vapid_key`)
-/// plus the per-attempt timeout. `Clone` is cheap (two `Arc`s), so each
-/// `push_queue` worker can hold one.
+/// credentials (the private key parsed once at startup, see `vapid_key`),
+/// the HTTP client and the per-attempt timeout. `Clone` is cheap (`Arc`s),
+/// so each `push_queue` worker can hold one; clones share the client's
+/// connection pool.
 #[derive(Clone)]
 pub(crate) struct Pusher {
     vapid_key: VapidKey,
@@ -175,6 +211,13 @@ pub(crate) struct Pusher {
     /// `false` only for tests that target a local `http://127.0.0.1` mock,
     /// which the L9 send-time re-validation would (correctly) refuse.
     revalidate_endpoint: bool,
+    /// Built per `Pusher` rather than shared process-wide (DS-386): a
+    /// pooled connection is driven by a task on the runtime that opened it,
+    /// and each `#[tokio::test]` has its own runtime, so a static client
+    /// handed one test a connection whose runtime had just shut down
+    /// ("runtime dropped the dispatch task"). Production has one runtime
+    /// and one `Pusher`, so it is the same one pool either way.
+    client: reqwest::Client,
 }
 
 impl std::fmt::Debug for Pusher {
@@ -185,7 +228,7 @@ impl std::fmt::Debug for Pusher {
             .field("ttl_secs", &self.ttl_secs)
             .field("per_attempt_timeout", &self.per_attempt_timeout)
             .field("revalidate_endpoint", &self.revalidate_endpoint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -199,6 +242,7 @@ impl Pusher {
             ttl_secs,
             per_attempt_timeout: PUSH_SEND_TIMEOUT,
             revalidate_endpoint: true,
+            client: push_http_client(),
         }
     }
 
@@ -213,6 +257,7 @@ impl Pusher {
             ttl_secs: DEFAULT_PUSH_TTL_SECS,
             per_attempt_timeout,
             revalidate_endpoint: false,
+            client: push_http_client(),
         }
     }
 
@@ -225,12 +270,12 @@ impl Pusher {
         let options = DeliveryOptions {
             ttl_secs: class.ttl.secs_at(self.ttl_secs, chrono::Utc::now()),
             urgency: class.urgency,
-            topic: class.topic,
         };
         if self.revalidate_endpoint {
             // Production: `new` always pairs this with `PUSH_SEND_TIMEOUT`,
             // which `send_to_subscription` applies itself.
             return send_to_subscription(
+                &self.client,
                 &self.vapid_key,
                 &self.vapid_subject,
                 subscription,
@@ -240,6 +285,7 @@ impl Pusher {
             .await;
         }
         send_to_subscription_with_timeout(
+            &self.client,
             &self.vapid_key,
             &self.vapid_subject,
             subscription,
@@ -252,6 +298,7 @@ impl Pusher {
 }
 
 pub(crate) async fn send_to_subscription(
+    client: &reqwest::Client,
     vapid_key: &VapidKey,
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
@@ -288,6 +335,7 @@ pub(crate) async fn send_to_subscription(
     }
 
     send_to_subscription_with_timeout(
+        client,
         vapid_key,
         vapid_subject,
         subscription,
@@ -311,11 +359,8 @@ pub(crate) async fn send_to_subscription(
 /// real network IO against a local mock server, and paused time
 /// auto-advances while the runtime waits on that real TCP connect, so the
 /// timeout could fire before any request ever reached the mock.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
-)]
 async fn send_to_subscription_with_timeout(
+    client: &reqwest::Client,
     vapid_key: &VapidKey,
     vapid_subject: &str,
     subscription: &PushSubscriptionRow,
@@ -323,6 +368,62 @@ async fn send_to_subscription_with_timeout(
     options: DeliveryOptions,
     per_attempt_timeout: Duration,
 ) -> SendOutcome {
+    send_with_retries(
+        client,
+        vapid_key,
+        vapid_subject,
+        subscription,
+        payload,
+        options,
+        per_attempt_timeout,
+    )
+    .await
+    .0
+}
+
+/// Attempts per send: the first plus two retries, per the spec's Error
+/// handling section.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// [`send_to_subscription_with_timeout`], also returning how many attempts
+/// were made (for the retry tests).
+///
+/// # Retries (DS-386)
+///
+/// A send is retried only when the push service certainly did not take
+/// it, so a retry can never deliver a second copy:
+///
+/// * the connection was never made (resolution, TCP connect or TLS
+///   handshake failed), so the request was never sent;
+/// * the service answered 5xx or 429. RFC 8030 §5 makes `201 Created` the
+///   only "accepted"; a 5xx or 429 is an explicit "not now". A
+///   `Retry-After` is not waited for: the retries are immediate and the
+///   whole send is bounded by `push_queue`'s per-subscription budget, so a
+///   service that is still refusing leaves it to the next re-decision.
+///
+/// Everything else stops at once. A timeout and a connection that failed
+/// after the request was handed to it are [`SendOutcome::TimedOut`] and
+/// [`SendOutcome::Unknown`]: the service may have accepted it, and
+/// retrying there is exactly how a slow push service that did accept the
+/// first copy received a second. The trade-off is that a push the service
+/// did NOT accept waits for its re-decision (the next read of its source
+/// row) instead of an immediate retry; that resend carries the same tag
+/// and `Topic` ([`DeliveryOptions`]), so if the first copy did arrive the
+/// second replaces it rather than showing twice. Another 4xx would fail
+/// the same way again, so it is not retried either.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "these durations are seconds to hours, far below u64::MAX milliseconds"
+)]
+async fn send_with_retries(
+    client: &reqwest::Client,
+    vapid_key: &VapidKey,
+    vapid_subject: &str,
+    subscription: &PushSubscriptionRow,
+    payload: &NotificationPayload,
+    options: DeliveryOptions,
+    per_attempt_timeout: Duration,
+) -> (SendOutcome, u32) {
     let subscription_info = SubscriptionInfo::new(
         subscription.endpoint.clone(),
         subscription.p256dh.clone(),
@@ -337,7 +438,7 @@ async fn send_to_subscription_with_timeout(
         Ok(sig) => sig,
         Err(err) => {
             tracing::error!(error = ?err, "failed to build VAPID signature");
-            return SendOutcome::TransientFailure;
+            return (SendOutcome::TransientFailure, 0);
         }
     };
 
@@ -345,28 +446,21 @@ async fn send_to_subscription_with_timeout(
         Ok(body) => body,
         Err(err) => {
             tracing::error!(error = ?err, "failed to serialize notification payload");
-            return SendOutcome::TransientFailure;
+            return (SendOutcome::TransientFailure, 0);
         }
     };
 
-    let client = push_http_client();
-    // Two bounded retries on a transient failure, per the spec's Error
-    // handling section -- no dead-letter queue, no retry-after-restart
-    // mechanism; a genuinely persistent change is picked up again next
-    // cycle since notification_state is only updated on send success.
     // `WebPushMessage` isn't `Clone` (see this module's doc comment), so
     // each attempt rebuilds a fresh message from the same payload bytes
     // and a cloned `VapidSignature` (which IS `Clone`) rather than reusing
     // one built message across attempts.
-    for attempt in 0..3 {
+    for attempt in 1..=MAX_ATTEMPTS {
         let mut message_builder = WebPushMessageBuilder::new(&subscription_info);
         message_builder.set_payload(ContentEncoding::Aes128Gcm, &body);
         message_builder.set_vapid_signature(signature.clone());
         message_builder.set_ttl(options.ttl_secs);
         message_builder.set_urgency(options.urgency);
-        if options.topic
-            && let Some(topic) = topic_for(&payload.tag)
-        {
+        if let Some(topic) = topic_for(&payload.tag) {
             message_builder.set_topic(topic);
         }
 
@@ -374,87 +468,139 @@ async fn send_to_subscription_with_timeout(
             Ok(message) => message,
             Err(err) => {
                 tracing::error!(error = ?err, "failed to build web push message");
-                return SendOutcome::TransientFailure;
+                return (SendOutcome::TransientFailure, attempt - 1);
             }
         };
 
         // Wrapped in `tokio::time::timeout` (see `PUSH_SEND_TIMEOUT`'s own
-        // doc comment for the tarpit-endpoint bug this closes). A timed-out
-        // attempt carries no `WebPushError` to classify, so it is folded
-        // into the exact same "log and retry" branch an ordinary
-        // `TransientFailure` already takes below -- not a new outcome or a
-        // new branch -- since a timeout is already documented as one of
-        // `SendOutcome::TransientFailure`'s own cases ("5xx, timeout,
-        // etc.").
-        match tokio::time::timeout(per_attempt_timeout, send_message(client, message)).await {
-            Ok(Ok(())) => return SendOutcome::Sent,
-            Ok(Err(PushSendError::Push(err))) => {
-                if classify_web_push_error(&err) == SendOutcome::Expired {
-                    return SendOutcome::Expired;
+        // doc comment for the tarpit-endpoint bug this closes).
+        let err =
+            match tokio::time::timeout(per_attempt_timeout, send_message(client, message)).await {
+                Ok(Ok(())) => return (SendOutcome::Sent, attempt),
+                Ok(Err(err)) => err,
+                // A timed-out attempt is NOT retried (M2 follow-up, 2026-09-27):
+                // an endpoint that sat silent for the whole timeout is either
+                // down or a deliberate tarpit, and retrying it only tripled the
+                // time one subscription could hold up the notification cycle
+                // (3 x PUSH_SEND_TIMEOUT = 45s per subscription). It may also
+                // have accepted the push and only been slow to say so, and a
+                // retry would then deliver it twice (DS-386).
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        attempt,
+                        timeout_ms = per_attempt_timeout.as_millis() as u64,
+                        "web push send timed out; not retrying"
+                    );
+                    return (SendOutcome::TimedOut, attempt);
                 }
-                tracing::warn!(error = ?err, attempt, "web push send failed, retrying");
+            };
+        match after_failure(&err) {
+            AfterFailure::Stop(outcome) => {
+                tracing::warn!(error = ?err.error(), attempt, ?outcome, "web push send failed");
+                return (outcome, attempt);
             }
-            Ok(Err(PushSendError::Transport(err))) => {
-                tracing::warn!(error = ?err, attempt, "web push send failed, retrying");
+            AfterFailure::Retry(reason) if attempt < MAX_ATTEMPTS => {
+                tracing::warn!(error = ?err.error(), attempt, reason, "web push send failed, retrying");
+                metrics::counter!(
+                    ds_runtime::metrics::metric_name("notifier_push_send_retry_total"),
+                    "reason" => reason
+                )
+                .increment(1);
             }
-            // A timed-out attempt is NOT retried (M2 follow-up, 2026-09-27):
-            // an endpoint that sat silent for the whole timeout is either
-            // down or a deliberate tarpit, and retrying it only tripled the
-            // time one subscription could hold up the notification cycle
-            // (3 x PUSH_SEND_TIMEOUT = 45s per subscription). Fast failures
-            // (5xx, connection refused) still get the bounded retries.
-            Err(_elapsed) => {
-                tracing::warn!(
-                    attempt,
-                    timeout_ms = per_attempt_timeout.as_millis() as u64,
-                    "web push send timed out; not retrying"
-                );
-                return SendOutcome::TimedOut;
+            AfterFailure::Retry(reason) => {
+                tracing::warn!(error = ?err.error(), attempt, reason, "web push send failed, giving up");
             }
         }
     }
-    SendOutcome::TransientFailure
+    (SendOutcome::TransientFailure, MAX_ATTEMPTS)
 }
 
-/// The HTTP client every push send goes through (L9 follow-up,
-/// 2026-09-27): `ds_runtime::outbound_endpoint_guard::public_only_client_builder`,
+/// What a failed attempt leads to (see [`send_with_retries`]'s Retries).
+#[derive(Debug, PartialEq, Eq)]
+enum AfterFailure {
+    /// The service certainly did not take it: try again. The reason is the
+    /// `reason` label of `notifier_push_send_retry_total`.
+    Retry(&'static str),
+    /// Stop with this outcome.
+    Stop(SendOutcome),
+}
+
+fn after_failure(err: &PushSendError) -> AfterFailure {
+    match err {
+        PushSendError::Connect(_) => AfterFailure::Retry("connect"),
+        PushSendError::Unanswered(_) => AfterFailure::Stop(SendOutcome::Unknown),
+        PushSendError::Local(_) => AfterFailure::Stop(SendOutcome::TransientFailure),
+        PushSendError::Rejected { status, error } => {
+            if classify_web_push_error(error) == SendOutcome::Expired {
+                AfterFailure::Stop(SendOutcome::Expired)
+            } else if status.is_server_error() {
+                AfterFailure::Retry("server_error")
+            } else if *status == http::StatusCode::TOO_MANY_REQUESTS {
+                AfterFailure::Retry("too_many_requests")
+            } else {
+                AfterFailure::Stop(SendOutcome::TransientFailure)
+            }
+        }
+    }
+}
+
+/// The HTTP client push sends go through (L9 follow-up, 2026-09-27):
+/// `ds_runtime::outbound_endpoint_guard::public_only_client_builder`,
 /// i.e. a resolver that refuses private/internal/loopback answers at
 /// CONNECT time, plus no redirects. This replaces
 /// `web_push::HyperWebPushClient`, whose connector resolves the endpoint's
 /// name a second time after [`send_to_subscription`]'s own
 /// `validate_outbound_url` check -- and a 0-TTL rebinding name can answer
 /// differently the second time, so that check alone never constrained
-/// where the POST actually went. Built once and reused (connection pool).
+/// where the POST actually went. Built once per [`Pusher`] and reused
+/// (connection pool). It has no retry policy beyond reqwest's default,
+/// which for HTTP/1 retries nothing that was sent.
 #[expect(
     clippy::expect_used,
     reason = "a client builder with static settings fails only if TLS init does, which is fatal"
 )]
-fn push_http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        ds_runtime::outbound_endpoint_guard::public_only_client_builder()
-            .build()
-            .expect("the push HTTP client's static configuration is always valid")
-    })
+fn push_http_client() -> reqwest::Client {
+    ds_runtime::outbound_endpoint_guard::public_only_client_builder()
+        .build()
+        .expect("the push HTTP client's static configuration is always valid")
 }
 
-/// Largest push-service response body read back, same bound
+/// Most of a push service's error body read back for the log, same bound
 /// `web_push::HyperWebPushClient` applied (`MAX_RESPONSE_SIZE`, 64 KiB).
 const MAX_PUSH_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 enum PushSendError {
     /// Resolution (including a [`ds_runtime::outbound_endpoint_guard::PublicOnlyResolver`]
-    /// refusal), connect, TLS or body-read failure -- always transient.
-    Transport(reqwest::Error),
-    /// The push service answered with a non-success status (or an
-    /// oversized body), classified by `web_push`'s own `parse_response`.
-    Push(web_push::WebPushError),
+    /// refusal), TCP connect or TLS handshake failed: the request was never
+    /// sent. Retried.
+    Connect(reqwest::Error),
+    /// The connection failed after the request was handed to it: the push
+    /// service may have it. [`SendOutcome::Unknown`], not retried.
+    Unanswered(reqwest::Error),
+    /// The request could not be built: it would fail the same way again.
+    Local(reqwest::Error),
+    /// The push service answered with a non-success status, classified by
+    /// `web_push`'s own `parse_response`.
+    Rejected {
+        status: http::StatusCode,
+        error: web_push::WebPushError,
+    },
+}
+
+impl PushSendError {
+    /// The underlying error, for the log.
+    fn error(&self) -> &dyn std::fmt::Debug {
+        match self {
+            Self::Connect(err) | Self::Unanswered(err) | Self::Local(err) => err,
+            Self::Rejected { error, .. } => error,
+        }
+    }
 }
 
 /// One push POST: `web_push`'s own `build_request` (headers, encrypted
-/// body) sent through [`push_http_client`], and its own `parse_response`
-/// on the result -- the same two halves `HyperWebPushClient::send` used,
+/// body) sent through the [`Pusher`]'s client, and its own `parse_response`
+/// on a failure -- the same two halves `HyperWebPushClient::send` used,
 /// with only the transport swapped.
 async fn send_message(
     client: &reqwest::Client,
@@ -466,30 +612,39 @@ async fn send_message(
     for (name, value) in &parts.headers {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    let mut response = builder
-        .body(body)
-        .send()
-        .await
-        .map_err(PushSendError::Transport)?;
+    let mut response = builder.body(body).send().await.map_err(|err| {
+        if err.is_connect() {
+            PushSendError::Connect(err)
+        } else if err.is_builder() {
+            PushSendError::Local(err)
+        } else {
+            PushSendError::Unanswered(err)
+        }
+    })?;
     let status = http::StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+    if status.is_success() {
+        // Accepted. Its body is not used, so failing to read one must not
+        // turn an accepted push into a failure (and a resend).
+        return Ok(());
+    }
+    // Best effort: the status alone decides what happens next; the body
+    // only adds the push service's error text to the log.
     let mut response_body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(PushSendError::Transport)? {
-        response_body.extend_from_slice(&chunk);
-        if response_body.len() > MAX_PUSH_RESPONSE_BYTES {
-            return Err(PushSendError::Push(
-                web_push::WebPushError::ResponseTooLarge,
-            ));
+    while response_body.len() < MAX_PUSH_RESPONSE_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => response_body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
         }
     }
-    web_push::request_builder::parse_response(status, response_body).map_err(PushSendError::Push)
+    response_body.truncate(MAX_PUSH_RESPONSE_BYTES);
+    web_push::request_builder::parse_response(status, response_body)
+        .map_err(|error| PushSendError::Rejected { status, error })
 }
-
 /// Whether a single push attempt's `WebPushError` means this SUBSCRIPTION
 /// itself can never be delivered to again (prune it), or merely that this
-/// one attempt failed for a reason that might not recur (retry it, same as
-/// any other transient failure -- see this module's own "no dead-letter
-/// queue" doc comment on [`send_to_subscription`]).
+/// one attempt failed for a reason that might not recur (a transient
+/// failure; whether it is retried at once is [`after_failure`]'s call).
 ///
 /// **The bug this closes.** Before this function existed,
 /// `send_to_subscription` only recognised `EndpointNotValid`/
@@ -526,6 +681,8 @@ fn classify_web_push_error(err: &web_push::WebPushError) -> SendOutcome {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     /// A real `WebPushError` for `status`, straight from `web-push`'s own
@@ -625,59 +782,27 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
     /// `PUSH_SEND_TIMEOUT`'s own doc comment) hung this call forever,
     /// stalling the whole notification cycle for every user behind it.
     ///
-    /// Runs in REAL time with a short injected per-attempt timeout
-    /// (`TEST_PER_ATTEMPT_TIMEOUT`) against a mock whose response delay is
-    /// far longer, via `send_to_subscription_with_timeout` -- the same code
-    /// path production runs, just with a different bound (production's
-    /// `send_to_subscription` always passes `PUSH_SEND_TIMEOUT`). An
-    /// earlier version used a paused tokio clock with the real 15s
-    /// timeout and was flaky: this test does real TCP IO to the wiremock
-    /// server, and paused time auto-advances while the runtime waits on
-    /// that IO, so under load the timeout could fire before any request
-    /// reached the mock ("matched 0").
+    /// Runs in REAL time with a short injected per-attempt timeout against
+    /// a local server that reads the request and never answers. An earlier
+    /// version used a paused tokio clock with the real 15s timeout and was
+    /// flaky: this test does real TCP IO, and paused time auto-advances
+    /// while the runtime waits on that IO.
     ///
-    /// If the timeout did NOT cut the attempt off, the mock's 201 would
-    /// eventually arrive and the outcome would be `Sent` -- so
-    /// `TimedOut` plus `.expect(1)` together prove the attempt
-    /// reached the endpoint, was ended by the timeout, and was not retried
-    /// (a timed-out attempt is not retried; see the `Err(_elapsed)` arm).
+    /// The timed-out attempt is not retried (DS-386): the push service may
+    /// have accepted it. The attempt count proves that whatever the
+    /// timing; the server's count of requests may be 0 on a loaded machine
+    /// (the timeout fired before the request arrived) but never 2.
     #[tokio::test]
-    async fn a_hanging_push_endpoint_times_out_instead_of_stalling_forever() {
-        // Long enough that a request always reaches the local mock even on
-        // a heavily loaded machine; far shorter than the mock's delay.
+    async fn a_hanging_push_endpoint_times_out_and_is_not_retried() {
         const TEST_PER_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(201).set_delay(Duration::from_secs(10)))
-            // Exactly one attempt must REACH the endpoint (verified on
-            // drop): proves the key material above got this test past
-            // signing/encryption to the real network call, so the
-            // `TimedOut` below comes from the timeout and not from
-            // an earlier build failure, and that the timed-out attempt was
-            // not retried.
-            .expect(1)
-            .mount(&server)
-            .await;
+        let server = SilentServer::start(Silence::Hang).await;
 
-        let subscription = PushSubscriptionRow {
-            id: 1,
-            endpoint: format!("{}/push-endpoint", server.uri()),
-            p256dh: TEST_P256DH.to_string(),
-            auth: TEST_AUTH.to_string(),
-        };
-        let payload = NotificationPayload {
-            title: "title".to_string(),
-            body: "body".to_string(),
-            url: "/".to_string(),
-            tag: "tag".to_string(),
-            renotify: false,
-        };
-
-        let outcome = send_to_subscription_with_timeout(
+        let (outcome, attempts) = send_with_retries(
+            &push_http_client(),
             &test_vapid_key(),
             "mailto:test@example.com",
-            &subscription,
-            &payload,
+            &server.subscription(),
+            &payload(),
             test_options(),
             TEST_PER_ATTEMPT_TIMEOUT,
         )
@@ -689,6 +814,197 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             "a send whose response never arrives must time out -- reported as TimedOut so \
              push_queue can count it towards pruning -- not hang this call forever"
         );
+        assert_eq!(attempts, 1, "a timed-out attempt is not retried");
+        assert!(server.requests() <= 1, "{} requests", server.requests());
+    }
+
+    /// A connection that fails after the request was sent (the server read
+    /// it and hung up without answering) is `Unknown` and not retried: the
+    /// push service may have accepted it, so a retry could deliver it
+    /// twice (DS-386). Deterministic: the server always reads the whole
+    /// request before closing, so exactly one arrives.
+    #[tokio::test]
+    async fn a_connection_lost_after_the_request_is_unknown_and_not_retried() {
+        let server = SilentServer::start(Silence::HangUp).await;
+
+        let (outcome, attempts) = send_with_retries(
+            &push_http_client(),
+            &test_vapid_key(),
+            "mailto:test@example.com",
+            &server.subscription(),
+            &payload(),
+            test_options(),
+            TEST_GENEROUS_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(outcome, SendOutcome::Unknown);
+        assert_eq!(attempts, 1);
+        assert_eq!(server.requests(), 1);
+    }
+
+    /// A connect failure never sent the request, so it is retried, up to
+    /// `MAX_ATTEMPTS` in all. The port is one nothing listens on: bound,
+    /// then closed.
+    #[tokio::test]
+    async fn a_connect_failure_is_retried() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let subscription = PushSubscriptionRow {
+            id: 1,
+            endpoint: format!("http://127.0.0.1:{port}/push-endpoint"),
+            p256dh: TEST_P256DH.to_string(),
+            auth: TEST_AUTH.to_string(),
+        };
+
+        let (outcome, attempts) = send_with_retries(
+            &push_http_client(),
+            &test_vapid_key(),
+            "mailto:test@example.com",
+            &subscription,
+            &payload(),
+            test_options(),
+            TEST_GENEROUS_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(outcome, SendOutcome::TransientFailure);
+        assert_eq!(attempts, MAX_ATTEMPTS);
+    }
+
+    /// A 5xx or 429 is the push service saying it did not take the push,
+    /// so it is retried; another 4xx would only fail again, so it is not.
+    /// A 201 needs no body read to count as sent.
+    #[tokio::test]
+    async fn only_a_server_error_or_429_is_retried() {
+        for (status, outcome, attempts) in [
+            (503, SendOutcome::TransientFailure, MAX_ATTEMPTS),
+            (500, SendOutcome::TransientFailure, MAX_ATTEMPTS),
+            (429, SendOutcome::TransientFailure, MAX_ATTEMPTS),
+            (400, SendOutcome::TransientFailure, 1),
+            (413, SendOutcome::TransientFailure, 1),
+            (410, SendOutcome::Expired, 1),
+            (201, SendOutcome::Sent, 1),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .expect(u64::from(attempts))
+                .mount(&server)
+                .await;
+            let subscription = PushSubscriptionRow {
+                id: 1,
+                endpoint: format!("{}/push-endpoint", server.uri()),
+                p256dh: TEST_P256DH.to_string(),
+                auth: TEST_AUTH.to_string(),
+            };
+            let sent = send_with_retries(
+                &push_http_client(),
+                &test_vapid_key(),
+                "mailto:test@example.com",
+                &subscription,
+                &payload(),
+                test_options(),
+                TEST_GENEROUS_TIMEOUT,
+            )
+            .await;
+            assert_eq!(sent, (outcome, attempts), "status {status}");
+        }
+    }
+
+    /// Per-attempt timeout for tests that are not about the timeout: far
+    /// beyond anything a local server needs, so a loaded CI runner can't
+    /// turn a slow attempt into a `TimedOut`.
+    const TEST_GENEROUS_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// What a [`SilentServer`] does after reading a request.
+    #[derive(Clone, Copy)]
+    enum Silence {
+        /// Keep the connection open and never answer.
+        Hang,
+        /// Close the connection without answering.
+        HangUp,
+    }
+
+    /// A local HTTP/1 server that reads whole requests and never answers
+    /// them, counting the requests it read.
+    struct SilentServer {
+        port: u16,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl SilentServer {
+        async fn start(silence: Silence) -> Self {
+            use tokio::io::AsyncReadExt as _;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&requests);
+            let task = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 4096];
+                    while !whole_request(&request) {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if whole_request(&request) {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    match silence {
+                        Silence::Hang => held.push(stream),
+                        Silence::HangUp => drop(stream),
+                    }
+                }
+            });
+            Self {
+                port,
+                requests,
+                task,
+            }
+        }
+
+        fn subscription(&self) -> PushSubscriptionRow {
+            PushSubscriptionRow {
+                id: 1,
+                endpoint: format!("http://127.0.0.1:{}/push-endpoint", self.port),
+                p256dh: TEST_P256DH.to_string(),
+                auth: TEST_AUTH.to_string(),
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for SilentServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Whether `request` holds a whole HTTP/1 request: its headers and a
+    /// `content-length` body.
+    fn whole_request(request: &[u8]) -> bool {
+        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        request.len() >= end + 4 + length
     }
 
     /// L9 follow-up: the send path's OWN connector refuses a name that
@@ -715,12 +1031,13 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         };
 
         let outcome = send_to_subscription_with_timeout(
+            &push_http_client(),
             &test_vapid_key(),
             "mailto:test@example.com",
             &subscription,
             &payload(),
             test_options(),
-            Duration::from_secs(5),
+            TEST_GENEROUS_TIMEOUT,
         )
         .await;
 
@@ -746,12 +1063,13 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 auth: TEST_AUTH.to_string(),
             };
             let outcome = send_to_subscription_with_timeout(
+                &push_http_client(),
                 &test_vapid_key(),
                 "mailto:test@example.com",
                 &subscription,
                 &payload(),
                 test_options(),
-                Duration::from_secs(5),
+                TEST_GENEROUS_TIMEOUT,
             )
             .await;
             assert_eq!(outcome, expected, "status {status}");
@@ -762,22 +1080,20 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         DeliveryOptions {
             ttl_secs: DEFAULT_PUSH_TTL_SECS,
             urgency: Urgency::Normal,
-            topic: false,
         }
     }
 
-    /// Every push carries its `TTL` and `Urgency` headers (and no `Topic`),
-    /// so a push service drops it after the TTL instead of web-push's own
-    /// 28-day default.
+    /// Every push carries its `TTL` and `Urgency` headers, so a push
+    /// service drops it after the TTL instead of web-push's own 28-day
+    /// default.
     #[tokio::test]
-    async fn a_push_carries_its_ttl_and_urgency_and_no_topic() {
+    async fn a_push_carries_its_ttl_and_urgency() {
         for (options, ttl, urgency) in [
             (test_options(), "3600", "normal"),
             (
                 DeliveryOptions {
                     ttl_secs: 600,
                     urgency: Urgency::High,
-                    topic: false,
                 },
                 "600",
                 "high",
@@ -798,34 +1114,28 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 auth: TEST_AUTH.to_string(),
             };
             let outcome = send_to_subscription_with_timeout(
+                &push_http_client(),
                 &test_vapid_key(),
                 "mailto:test@example.com",
                 &subscription,
                 &payload(),
                 options,
-                Duration::from_secs(5),
+                TEST_GENEROUS_TIMEOUT,
             )
             .await;
             assert_eq!(outcome, SendOutcome::Sent, "{options:?}");
-            let requests = server
-                .received_requests()
-                .await
-                .expect("wiremock records requests");
-            assert!(
-                requests.iter().all(|r| !r.headers.contains_key("topic")),
-                "no Topic header unless the class asks for one"
-            );
         }
     }
 
-    /// A leave-by's `Topic` is its tag, so a push service holding one for
-    /// an offline phone replaces it with the moved one; a tag that can't be
-    /// a topic is sent without one. `renotify` reaches the payload only
-    /// when set.
+    /// Every push's `Topic` is its tag, so a push service holding one for
+    /// an offline phone replaces it with a newer one (a moved leave-by, a
+    /// resend after an unknown outcome); a tag that can't be a topic is sent
+    /// without one.
     #[tokio::test]
-    async fn a_topic_class_sends_the_tag_as_its_topic() {
+    async fn every_push_sends_its_tag_as_its_topic() {
         for (tag, topic) in [
             ("journey-leg-leave-11", Some("journey-leg-leave-11")),
+            ("train-42", Some("train-42")),
             (
                 "regular-summary-2026-11-09",
                 Some("regular-summary-2026-11-09"),
@@ -854,15 +1164,15 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
             let options = DeliveryOptions {
                 ttl_secs: 480,
                 urgency: Urgency::High,
-                topic: true,
             };
             let outcome = send_to_subscription_with_timeout(
+                &push_http_client(),
                 &test_vapid_key(),
                 "mailto:test@example.com",
                 &subscription,
                 &payload,
                 options,
-                Duration::from_secs(5),
+                TEST_GENEROUS_TIMEOUT,
             )
             .await;
             assert_eq!(outcome, SendOutcome::Sent, "{tag}");
@@ -910,7 +1220,6 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 PushClass {
                     urgency: Urgency::High,
                     ttl: Ttl::Configured,
-                    topic: false,
                 },
                 "120",
                 "high",
@@ -919,7 +1228,6 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 PushClass {
                     urgency: Urgency::Normal,
                     ttl: Ttl::Fixed(2_419_200),
-                    topic: false,
                 },
                 "2419200",
                 "normal",
@@ -935,7 +1243,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 .await;
             let pusher = Pusher {
                 ttl_secs: 120,
-                ..Pusher::for_local_tests(Duration::from_secs(5))
+                ..Pusher::for_local_tests(TEST_GENEROUS_TIMEOUT)
             };
             let subscription = PushSubscriptionRow {
                 id: 1,
@@ -981,6 +1289,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         };
 
         let outcome = send_to_subscription(
+            &push_http_client(),
             &test_vapid_key(),
             "mailto:test@example.com",
             &subscription,
