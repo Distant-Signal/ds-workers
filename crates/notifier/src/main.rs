@@ -80,6 +80,33 @@ const LEAVE_REMINDER_CYCLE: &str = "leave_reminder";
 /// Users given a grant notice per cycle (one notice each).
 const GRANT_NOTICE_BATCH: i64 = 100;
 
+/// The cycles whose `notifier_cycles_total` and
+/// `notifier_last_success_timestamp_seconds` series this process exports:
+/// every cycle that runs. A switched-off cycle is left out, since
+/// registering one sets a last-success time nothing would ever refresh.
+fn exported_cycles(
+    leave_reminders_enabled: bool,
+    predicted_start_enabled: bool,
+) -> Vec<&'static str> {
+    let mut cycles = vec![
+        LINE_STATUS_CYCLE,
+        HELD_RELEASE_CYCLE,
+        FORWARD_QUEUE_CYCLE,
+        SKIP_CHECK_CYCLE,
+        TEMPLATE_SWEEP_CYCLE,
+        GRANT_NOTICE_CYCLE,
+        JOURNEY_BREAKS_CYCLE,
+        CANCEL_REASON_CYCLE,
+    ];
+    if predicted_start_enabled {
+        cycles.push(PREDICTED_START_CYCLE);
+    }
+    if leave_reminders_enabled {
+        cycles.push(LEAVE_REMINDER_CYCLE);
+    }
+    cycles
+}
+
 /// The Postgres pool size when `DATABASE_MAX_CONNECTIONS` is unset.
 const DB_POOL_SIZE: u32 = 5;
 
@@ -177,18 +204,12 @@ async fn run() -> anyhow::Result<()> {
     // notifier_cycles_total{cycle,result} and
     // notifier_last_success_timestamp_seconds{cycle}, read by the chart's
     // DistantSignalNotifierCycleFailing (see ds_runtime::metrics::register_cycle).
-    for cycle in [
-        LINE_STATUS_CYCLE,
-        HELD_RELEASE_CYCLE,
-        FORWARD_QUEUE_CYCLE,
-        SKIP_CHECK_CYCLE,
-        TEMPLATE_SWEEP_CYCLE,
-        GRANT_NOTICE_CYCLE,
-        JOURNEY_BREAKS_CYCLE,
-        PREDICTED_START_CYCLE,
-        CANCEL_REASON_CYCLE,
-        LEAVE_REMINDER_CYCLE,
-    ] {
+    // A switched-off cycle never runs, so it exports nothing: registering
+    // it would leave its startup timestamp to go stale and fire the alert.
+    let leave_reminders_enabled = config.leave_reminders_enabled;
+    // 0 turns the predicted-late-start check off (its arm never runs).
+    let predicted_start_enabled = config.predicted_start_poll_interval_secs > 0;
+    for cycle in exported_cycles(leave_reminders_enabled, predicted_start_enabled) {
         ds_runtime::metrics::register_cycle("notifier", cycle);
     }
     leave_reminder::register_metrics();
@@ -221,11 +242,8 @@ async fn run() -> anyhow::Result<()> {
     let mut skip_check_interval = poll_interval(config.skip_check_poll_interval_secs);
     let mut template_sweep_interval = poll_interval(config.template_sweep_poll_interval_secs);
     let mut journey_breaks_interval = poll_interval(config.journey_breaks_poll_interval_secs);
-    // 0 turns the predicted-late-start check off (its arm never runs).
-    let predicted_start_enabled = config.predicted_start_poll_interval_secs > 0;
     let mut predicted_start_interval =
         poll_interval(config.predicted_start_poll_interval_secs.max(1));
-    let leave_reminders_enabled = config.leave_reminders_enabled;
     let mut leave_reminder_interval = poll_interval(config.leave_reminders_poll_interval_secs);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -4203,5 +4221,50 @@ mod grant_notice_tests {
             "{}",
             alone.body
         );
+    }
+}
+
+#[cfg(test)]
+mod exported_cycles_tests {
+    use super::*;
+
+    #[test]
+    fn a_switched_off_cycle_exports_no_series() {
+        let cycles = exported_cycles(false, false);
+        assert!(!cycles.contains(&LEAVE_REMINDER_CYCLE), "{cycles:?}");
+        assert!(!cycles.contains(&PREDICTED_START_CYCLE), "{cycles:?}");
+        assert!(cycles.contains(&LINE_STATUS_CYCLE), "{cycles:?}");
+    }
+
+    #[test]
+    fn an_enabled_cycle_exports_its_series() {
+        let cycles = exported_cycles(true, true);
+        assert!(cycles.contains(&LEAVE_REMINDER_CYCLE), "{cycles:?}");
+        assert!(cycles.contains(&PREDICTED_START_CYCLE), "{cycles:?}");
+        assert_eq!(cycles.len(), 10);
+    }
+
+    /// The exported series themselves: with leave reminders off, the
+    /// rendered scrape has no `leave_reminder` last-success gauge for the
+    /// chart's `DistantSignalNotifierCycleFailing` to see go stale.
+    #[test]
+    fn registering_with_leave_reminders_off_exports_no_leave_reminder_gauge() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for cycle in exported_cycles(false, true) {
+                ds_runtime::metrics::register_cycle("notifier", cycle);
+            }
+        });
+        let scrape = handle.render();
+        assert!(
+            scrape.contains("notifier_last_success_timestamp_seconds{cycle=\"line_status\"}"),
+            "{scrape}"
+        );
+        assert!(
+            scrape.contains("notifier_last_success_timestamp_seconds{cycle=\"predicted_start\"}"),
+            "{scrape}"
+        );
+        assert!(!scrape.contains("cycle=\"leave_reminder\""), "{scrape}");
     }
 }
