@@ -205,3 +205,55 @@ async fn an_opaque_401_is_authentication_failed() {
         "http_error"
     );
 }
+
+/// A failed refresh at half-life serves the cached Claude token and backs
+/// off without fetching Authentik tokens; the retry after the backoff, like
+/// every exchange, presents a FRESH Authentik token (no `jti` reused).
+#[tokio::test]
+async fn a_backed_off_retry_still_presents_a_fresh_authentik_token() {
+    let server = MockServer::start().await;
+    let file = token_file(K8S_TOKEN);
+    mount_authentik(&server).await;
+    for (n, response) in [
+        (1, claude_token("sk-ant-oat01-a", 3600)),
+        (2, ResponseTemplate::new(503)),
+        (3, claude_token("sk-ant-oat01-b", 3600)),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .and(body_json(exchange_body(
+                &format!("authentik.jwt-{n}"),
+                None,
+            )))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let clock = Clock::default();
+    let source =
+        FederatedTokenSource::with_clock(config(&server, file.path(), None), clock.clone())
+            .unwrap();
+    let authentik_calls = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/application/o/token/")
+            .count()
+    };
+    assert_eq!(source.bearer().await.unwrap().expose(), "sk-ant-oat01-a");
+    // Half-life: the refresh fails, the cached token is served.
+    clock.advance(Duration::from_secs(1800));
+    assert_eq!(source.bearer().await.unwrap().expose(), "sk-ant-oat01-a");
+    assert_eq!(authentik_calls().await, 2);
+    // Inside the 15 s backoff: nothing is fetched.
+    clock.advance(Duration::from_secs(10));
+    assert_eq!(source.bearer().await.unwrap().expose(), "sk-ant-oat01-a");
+    assert_eq!(authentik_calls().await, 2);
+    // After it: a new Authentik token, and a new Claude token.
+    clock.advance(Duration::from_secs(6));
+    assert_eq!(source.bearer().await.unwrap().expose(), "sk-ant-oat01-b");
+    assert_eq!(authentik_calls().await, 3);
+}

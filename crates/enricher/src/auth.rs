@@ -23,9 +23,12 @@
 //! 8693 token exchange) and the Claude one both return a bearer token
 //! lasting at most an hour (Claude: the rule's lifetime, capped at twice
 //! the presented JWT's remaining life), with no refresh token: renewing is
-//! exchanging again. Tokens are cached
-//! until shortly before they expire, refreshed single-flight, and never
-//! logged (every one is a [`Secret`], whose `Debug` prints no value).
+//! exchanging again. Tokens are cached and refreshed single-flight from
+//! half their lifetime on, so an Authentik or exchange outage has the
+//! other half to clear: while a refresh keeps failing the cached token is
+//! served until it (nearly) expires, with failed refreshes backed off
+//! ([`refresh_backoff`]) and counted ([`FALLBACK_METRIC`]). Tokens are
+//! never logged (every one is a [`Secret`], whose `Debug` prints no value).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +45,10 @@ pub(crate) const EXCHANGE_METRIC: &str = "enricher_llm_token_exchange_total";
 /// `enricher_llm_token_remaining_seconds`: the cached `OpenAI` token's
 /// remaining lifetime, set on every exchange and every LLM call.
 pub(crate) const REMAINING_METRIC: &str = "enricher_llm_token_remaining_seconds";
+/// `enricher_llm_token_refresh_fallback_total{stage}`: refreshes that
+/// failed at `stage` while the cached token was still valid, so it was
+/// served instead. Registered at 0 for every stage of the mode.
+pub(crate) const FALLBACK_METRIC: &str = "enricher_llm_token_refresh_fallback_total";
 
 /// Every `outcome` label of [`EXCHANGE_METRIC`]; registered at 0 so an
 /// alert's `increase()` sees the first failure. `authentication_failed` is
@@ -74,6 +81,15 @@ const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A token this close to expiry is not handed out even as a fallback.
 const MIN_REMAINING: Duration = Duration::from_secs(5);
+
+/// The first wait after a failed refresh that fell back to the cached
+/// token; doubled per consecutive failure up to [`REFRESH_BACKOFF_CAP`].
+const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(15);
+/// The longest wait between failed refreshes.
+const REFRESH_BACKOFF_CAP: Duration = Duration::from_secs(300);
+/// With this little of the cached token's life left, failed refreshes are
+/// retried every [`REFRESH_BACKOFF_BASE`], and no backoff waits past it.
+const EAGER_RETRY_REMAINING: Duration = Duration::from_secs(120);
 
 /// A federated token creates an `OpenAI` batch only with at least this
 /// share of its lifetime left (`SUBMISSION_FRESH_NUM / _DEN`, 80%); else
@@ -192,7 +208,7 @@ pub(crate) struct FederationConfig {
     /// `anthropic-wif-authentik`).
     pub authentik: Option<AuthentikConfig>,
     /// Lower bound of the refresh margin (`LLM_TOKEN_REFRESH_SKEW_SECS`); the
-    /// margin is the larger of this and 10% of the token's lifetime.
+    /// margin is the larger of this and half the token's lifetime.
     pub refresh_skew: Duration,
     /// Per-request timeout of each token-endpoint POST ([`EXCHANGE_TIMEOUT`];
     /// tests shorten it).
@@ -431,6 +447,12 @@ impl ExchangeFailure {
 /// State only touched under the refresh lock.
 #[derive(Default)]
 struct RefreshState {
+    /// Consecutive failed refreshes since the last success.
+    failures: u32,
+    /// While the cached token is still valid, [`FederatedTokenSource::bearer`]
+    /// serves it without refreshing until this instant: the backoff after a
+    /// failed refresh.
+    retry_at: Option<Instant>,
     /// The Authentik access token (authentik mode), cached by its own
     /// `expires_in`.
     authentik: Option<CachedToken>,
@@ -517,7 +539,9 @@ fn exchange_outcome(stage: Stage, status: u16, body: &ExchangeErrorBody) -> &'st
 /// When to refresh a token issued in a request started at `t0`, and when it
 /// expires: lifetime = `min(expires_in, expires_at - now)` (`expires_in`
 /// counts from issuance, so measuring it from `t0` is conservative), and
-/// the margin is the larger of `skew` and 10% of the lifetime.
+/// the margin is the larger of `skew` and half the lifetime: refreshing
+/// at half-life leaves the other half for an outage of the token endpoints
+/// to clear while the cached token is still served.
 fn deadlines(
     t0: Instant,
     unix_now: u64,
@@ -532,9 +556,36 @@ fn deadlines(
         (None, None) => FALLBACK_LIFETIME,
     }
     .min(MAX_LIFETIME);
-    let margin = skew.max(lifetime / 10);
+    let margin = skew.max(lifetime / 2);
     let refresh_at = t0 + lifetime.saturating_sub(margin);
     (refresh_at, t0 + lifetime)
+}
+
+/// How long to serve the cached token after the `failures`th consecutive
+/// failed refresh before trying again, given its `remaining` life:
+/// [`REFRESH_BACKOFF_BASE`] doubled per failure, at most
+/// [`REFRESH_BACKOFF_CAP`], and never past the point where only
+/// [`EAGER_RETRY_REMAINING`] is left; inside that window, the base delay.
+fn refresh_backoff(failures: u32, remaining: Duration) -> Duration {
+    let Some(before_eager) = remaining
+        .checked_sub(EAGER_RETRY_REMAINING)
+        .filter(|d| !d.is_zero())
+    else {
+        return REFRESH_BACKOFF_BASE;
+    };
+    let doublings = failures.saturating_sub(1).min(16);
+    REFRESH_BACKOFF_BASE
+        .saturating_mul(1 << doublings)
+        .min(REFRESH_BACKOFF_CAP)
+        .min(before_eager)
+}
+
+fn record_fallback(stage: Stage, increment: u64) {
+    metrics::counter!(
+        ds_runtime::metrics::metric_name(FALLBACK_METRIC),
+        "stage" => stage.label()
+    )
+    .increment(increment);
 }
 
 fn record_exchange(stage: Stage, outcome: &'static str) {
@@ -585,6 +636,7 @@ impl FederatedTokenSource {
             &with_authentik[1..]
         };
         for stage in stages {
+            record_fallback(*stage, 0);
             for outcome in EXCHANGE_OUTCOMES {
                 metrics::counter!(
                     ds_runtime::metrics::metric_name(EXCHANGE_METRIC),
@@ -614,23 +666,67 @@ impl FederatedTokenSource {
         Some(token.token.clone())
     }
 
-    /// The cached token if it has not yet (nearly) expired: the fallback
-    /// when a refresh fails inside the refresh margin.
-    fn unexpired_token(&self) -> Option<Secret> {
+    /// The cached token if it has not yet (nearly) expired, with its
+    /// remaining life: the fallback when a refresh fails inside the refresh
+    /// margin.
+    fn unexpired_token(&self) -> Option<(Secret, Duration)> {
         let now = self.clock.now();
         let cached = self.lock_cached();
         let token = cached
             .as_ref()
             .filter(|t| now + MIN_REMAINING < t.expires_at)?;
-        Some(token.token.clone())
+        let remaining = token.expires_at.saturating_duration_since(now);
+        record_remaining(remaining);
+        Some((token.token.clone(), remaining))
     }
 
+    /// A refresh failed with `failure`. While the cached token is still
+    /// valid, the next one waits for [`refresh_backoff`]; returns that token,
+    /// its remaining life and the wait.
+    fn note_failure(
+        &self,
+        state: &mut RefreshState,
+        failure: ExchangeFailure,
+    ) -> Option<(Secret, Duration, Duration)> {
+        let now = self.clock.now();
+        state.last_failure = Some((now, failure));
+        state.failures = state.failures.saturating_add(1);
+        let Some((token, remaining)) = self.unexpired_token() else {
+            state.retry_at = None;
+            return None;
+        };
+        let wait = refresh_backoff(state.failures, remaining);
+        state.retry_at = Some(now + wait);
+        Some((token, remaining, wait))
+    }
+
+    fn note_success(state: &mut RefreshState) {
+        state.last_failure = None;
+        state.failures = 0;
+        state.retry_at = None;
+    }
+
+    /// The token for the next LLM call: the cached one before its refresh
+    /// deadline, else a refresh. Past the deadline the cached token is
+    /// served without waiting while it is still valid and either another
+    /// caller is refreshing or a failed refresh's backoff has not elapsed;
+    /// a refresh that fails falls back to it too. Only with no valid token
+    /// left does a failure reach the caller.
     pub(crate) async fn bearer(&self) -> Result<Secret, LlmCallError> {
         if let Some(token) = self.fresh_token() {
             return Ok(token);
         }
         let waiting_since = self.clock.now();
-        let mut state = self.refresh.lock().await;
+        let mut state = if let Ok(state) = self.refresh.try_lock() {
+            state
+        } else {
+            // A refresh is in flight (up to two 10 s requests during an
+            // outage): don't wait for it while the cached token is valid.
+            if let Some((token, _)) = self.unexpired_token() {
+                return Ok(token);
+            }
+            self.refresh.lock().await
+        };
         // Another caller may have refreshed (or failed to) while this one
         // waited for the lock.
         if let Some(token) = self.fresh_token() {
@@ -641,27 +737,34 @@ impl FederatedTokenSource {
         {
             return self
                 .unexpired_token()
+                .map(|(token, _)| token)
                 .ok_or_else(|| failure.into_call_error());
+        }
+        if state.retry_at.is_some_and(|at| self.clock.now() < at)
+            && let Some((token, _)) = self.unexpired_token()
+        {
+            return Ok(token);
         }
         match self.refresh_locked(&mut state).await {
             Ok(token) => {
-                state.last_failure = None;
+                Self::note_success(&mut state);
                 Ok(token)
             }
-            Err(failure) => {
-                state.last_failure = Some((self.clock.now(), failure));
-                match self.unexpired_token() {
-                    Some(token) => {
-                        tracing::warn!(
-                            stage = failure.stage.label(),
-                            outcome = failure.outcome,
-                            "LLM token refresh failed; using the cached token until it expires"
-                        );
-                        Ok(token)
-                    }
-                    None => Err(failure.into_call_error()),
+            Err(failure) => match self.note_failure(&mut state, failure) {
+                Some((token, remaining, wait)) => {
+                    record_fallback(failure.stage, 1);
+                    tracing::warn!(
+                        stage = failure.stage.label(),
+                        outcome = failure.outcome,
+                        remaining_secs = remaining.as_secs(),
+                        consecutive_failures = state.failures,
+                        retry_in_secs = wait.as_secs(),
+                        "LLM token refresh failed; using the cached token until it expires"
+                    );
+                    Ok(token)
                 }
-            }
+                None => Err(failure.into_call_error()),
+            },
         }
     }
 
@@ -700,7 +803,7 @@ impl FederatedTokenSource {
         state.authentik = None;
         match self.refresh_locked(&mut state).await {
             Ok(token) => {
-                state.last_failure = None;
+                Self::note_success(&mut state);
                 let now = self.clock.now();
                 let remaining = self
                     .lock_cached()
@@ -712,7 +815,9 @@ impl FederatedTokenSource {
                 Ok((token, remaining))
             }
             Err(failure) => {
-                state.last_failure = Some((self.clock.now(), failure));
+                // No fallback here, but the outage still backs off
+                // `bearer`'s refreshes of the cached token.
+                self.note_failure(&mut state, failure);
                 Err(failure.into_call_error())
             }
         }
@@ -1201,8 +1306,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Refreshed before the deadline: a 3600 s token with the default 60 s
-    /// skew refreshes after 3240 s (the 10% margin is larger), not before.
+    /// Refreshed at half-life: a 3600 s token with the default 60 s skew
+    /// refreshes after 1800 s (half the lifetime is the larger margin), not
+    /// before.
     #[tokio::test]
     async fn refreshes_inside_the_margin_and_not_before() {
         let server = MockServer::start().await;
@@ -1222,9 +1328,9 @@ pub(crate) mod tests {
             .await;
         let (source, clock) = new_source(kubernetes_config(&server, file.path()));
         assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
-        clock.advance(Duration::from_secs(3200));
+        clock.advance(Duration::from_secs(1790));
         assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
-        clock.advance(Duration::from_secs(60));
+        clock.advance(Duration::from_secs(20));
         assert_eq!(source.bearer().await.unwrap().expose(), "oai-2");
     }
 
@@ -1263,8 +1369,8 @@ pub(crate) mod tests {
             .await;
         let (source, clock) = new_source(authentik_config(&server, file.path()));
         assert_eq!(source.bearer().await.unwrap().expose(), "oai-short");
-        // Past the OpenAI token's refresh (120 - 60 s), inside Authentik's
-        // (900 - 90 s): one more OpenAI exchange, no Authentik request.
+        // Past the OpenAI token's refresh (120 / 2 s), inside Authentik's
+        // (900 / 2 s): one more OpenAI exchange, no Authentik request.
         clock.advance(Duration::from_secs(100));
         assert_eq!(source.bearer().await.unwrap().expose(), "oai-short");
         // Past Authentik's refresh too.
@@ -1346,6 +1452,248 @@ pub(crate) mod tests {
                 kind: "http_error"
             })
         ));
+    }
+
+    /// The `/oauth/token` and Authentik requests the server has seen.
+    async fn requests_to(server: &MockServer, to: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == to)
+            .count()
+    }
+
+    /// An `OpenAI` token endpoint that answers 503 while `down` is set, and
+    /// `oai-<n>` (`expires_in` 3600) for its nth success otherwise.
+    struct Switchable {
+        down: Arc<std::sync::atomic::AtomicBool>,
+        issued: AtomicU64,
+    }
+
+    impl wiremock::Respond for Switchable {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if self.down.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(503);
+            }
+            let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
+            // No `expires_at`: it is wall time, and the test clock moves.
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": format!("oai-{n}"),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }))
+        }
+    }
+
+    async fn switchable(server: &MockServer) -> Arc<std::sync::atomic::AtomicBool> {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(Switchable {
+                down: Arc::clone(&down),
+                issued: AtomicU64::new(0),
+            })
+            .mount(server)
+            .await;
+        down
+    }
+
+    /// 15 s doubled per failure, capped at 5 minutes, never waiting into
+    /// the last 2 minutes of the token's life, and 15 s inside them.
+    #[test]
+    fn refresh_backoff_grows_caps_and_shortens_near_expiry() {
+        let hour = Duration::from_secs(3600);
+        let waits: Vec<u64> = (1..=8)
+            .map(|n| refresh_backoff(n, hour).as_secs())
+            .collect();
+        assert_eq!(waits, [15, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(refresh_backoff(u32::MAX, hour), REFRESH_BACKOFF_CAP);
+        // 200 s left: wait at most until 120 s are left.
+        assert_eq!(refresh_backoff(5, Duration::from_secs(200)).as_secs(), 80);
+        assert_eq!(refresh_backoff(1, Duration::from_secs(200)).as_secs(), 15);
+        // Inside the last 2 minutes: the base delay, whatever the count.
+        for remaining in [120, 60, 6] {
+            assert_eq!(
+                refresh_backoff(9, Duration::from_secs(remaining)),
+                REFRESH_BACKOFF_BASE
+            );
+        }
+    }
+
+    /// During an outage inside the refresh window the cached token is
+    /// served, and the endpoint is hit again only once the backoff (15 s,
+    /// then 30 s, ...) has elapsed, not on every call. Each failure that
+    /// fell back is counted.
+    #[tokio::test]
+    async fn a_failed_refresh_backs_off_before_trying_again() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let server = MockServer::start().await;
+        let file = token_file(K8S_TOKEN);
+        let down = switchable(&server).await;
+        let (source, clock) = new_source(kubernetes_config(&server, file.path()));
+        let fallback = "distant_signal_enricher_llm_token_refresh_fallback_total{stage=\"openai\"}";
+        assert!(
+            handle.render().contains(&format!("{fallback} 0")),
+            "{}",
+            handle.render()
+        );
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        down.store(true, Ordering::SeqCst);
+        clock.advance(Duration::from_secs(1800));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 2);
+        // Inside the first 15 s backoff: no request, however many calls.
+        for _ in 0..5 {
+            assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        }
+        clock.advance(Duration::from_secs(14));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 2);
+        // 15 s on: one retry, which fails and doubles the wait to 30 s.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 3);
+        clock.advance(Duration::from_secs(29));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 3);
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 4);
+        let rendered = handle.render();
+        assert!(rendered.contains(&format!("{fallback} 3")), "{rendered}");
+        assert!(
+            rendered.contains(
+                r#"distant_signal_enricher_llm_token_exchange_total{stage="openai",outcome="http_error"} 3"#
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// A refresh that succeeds after an outage resets the backoff: the next
+    /// outage starts again at 15 s, not where the last one left off.
+    #[tokio::test]
+    async fn a_successful_refresh_resets_the_backoff() {
+        let server = MockServer::start().await;
+        let file = token_file(K8S_TOKEN);
+        let down = switchable(&server).await;
+        let (source, clock) = new_source(kubernetes_config(&server, file.path()));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        down.store(true, Ordering::SeqCst);
+        clock.advance(Duration::from_secs(1800));
+        // Three failures: 15 s, 30 s, then a 60 s wait.
+        for wait in [0, 15, 30] {
+            clock.advance(Duration::from_secs(wait));
+            assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        }
+        assert_eq!(requests_to(&server, "/oauth/token").await, 4);
+        down.store(false, Ordering::SeqCst);
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-2");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 5);
+        // oai-2's refresh window, and a new outage: 15 s again.
+        down.store(true, Ordering::SeqCst);
+        clock.advance(Duration::from_secs(1800));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-2");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 6);
+        clock.advance(Duration::from_secs(16));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-2");
+        assert_eq!(requests_to(&server, "/oauth/token").await, 7);
+    }
+
+    /// Authentik down for the rest of the token's life: the cached token is
+    /// served (counted on `stage="authentik"`) until it nearly expires, then
+    /// the failure surfaces, the backoff notwithstanding.
+    #[tokio::test]
+    async fn authentik_down_until_expiry_returns_the_error() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let server = MockServer::start().await;
+        let file = token_file(K8S_TOKEN);
+        Mock::given(method("POST"))
+            .and(path("/application/o/token/"))
+            .respond_with(authentik_response(AUTHENTIK_TOKEN, 3600))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/application/o/token/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(openai_token("oai-1", 3600))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (source, clock) = new_source(authentik_config(&server, file.path()));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        clock.advance(Duration::from_secs(1800));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        let rendered = handle.render();
+        for (stage, count) in [("authentik", 1), ("openai", 0)] {
+            let line = format!(
+                "distant_signal_enricher_llm_token_refresh_fallback_total{{stage=\"{stage}\"}} {count}"
+            );
+            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+        }
+        // 2 s before expiry (inside MIN_REMAINING) and inside a backoff.
+        clock.advance(Duration::from_secs(1790));
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        let before = requests_to(&server, "/application/o/token/").await;
+        clock.advance(Duration::from_secs(8));
+        assert!(matches!(
+            source.bearer().await,
+            Err(LlmCallError::CredentialUnavailable {
+                stage: "authentik",
+                kind: "http_error"
+            })
+        ));
+        assert_eq!(
+            requests_to(&server, "/application/o/token/").await,
+            before + 1
+        );
+    }
+
+    /// While one caller's refresh waits on a slow endpoint, others are
+    /// served the still-valid cached token instead of queueing behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn callers_do_not_wait_for_an_in_flight_refresh() {
+        let server = MockServer::start().await;
+        let file = token_file(K8S_TOKEN);
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(openai_token("oai-1", 3600))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(openai_token("oai-2", 3600).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let (source, clock) = new_source(kubernetes_config(&server, file.path()));
+        let source = Arc::new(source);
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        clock.advance(Duration::from_secs(1800));
+        let refreshing = {
+            let source = Arc::clone(&source);
+            tokio::spawn(async move { source.bearer().await.unwrap() })
+        };
+        while requests_to(&server, "/oauth/token").await < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-1");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(refreshing.await.unwrap().expose(), "oai-2");
+        assert_eq!(source.bearer().await.unwrap().expose(), "oai-2");
     }
 
     #[tokio::test]
@@ -1503,10 +1851,13 @@ pub(crate) mod tests {
         // expires_at sooner than expires_in (a subject token about to expire).
         let (refresh, expires) = deadlines(t0, 1_000, Some(3600), Some(1_000 + 600), skew);
         assert_eq!(expires - t0, Duration::from_secs(600));
-        assert_eq!(refresh - t0, Duration::from_secs(540));
-        // 10% of an hour (360 s) beats the 60 s skew.
+        assert_eq!(refresh - t0, Duration::from_secs(300));
+        // Half an hour beats the 60 s skew: refresh at half-life.
         let (refresh, _) = deadlines(t0, 0, Some(3600), None, skew);
-        assert_eq!(refresh - t0, Duration::from_secs(3240));
+        assert_eq!(refresh - t0, Duration::from_secs(1800));
+        // A skew above half the lifetime wins.
+        let (refresh, _) = deadlines(t0, 0, Some(100), None, skew);
+        assert_eq!(refresh - t0, Duration::from_secs(40));
         // A lifetime shorter than the margin refreshes at once.
         let (refresh, _) = deadlines(t0, 0, Some(30), None, skew);
         assert_eq!(refresh, t0);

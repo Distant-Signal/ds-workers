@@ -1123,14 +1123,20 @@ and <https://platform.claude.com/docs/en/manage-claude/wif-reference>.
 carries a `jti` only once per issuer; a second exchange with it fails
 (`jti_reused`). So this mode never caches the Authentik token: every Claude
 exchange, including the one after a 401 and every refresh, first fetches a
-fresh one. The Claude token itself is cached and refreshed before expiry
-with the usual margin (the larger of `LLM_TOKEN_REFRESH_SKEW_SECS`, 60 s,
-and 10% of its life).
+fresh one. The Claude token itself is cached and refreshed from half its
+life on (the margin is the larger of `LLM_TOKEN_REFRESH_SKEW_SECS`, 60 s,
+and half its life). A failed refresh keeps serving the cached Claude token
+until it is 5 s from expiry, backing off between attempts (15 s, doubling,
+at most 5 minutes, every 15 s in its last 2 minutes) and counting
+`enricher_llm_token_refresh_fallback_total{stage}`, so an Authentik outage
+of up to half an hour does not stop enrichment; every retry still fetches
+a fresh Authentik token (docs/enricher-openai.md, "How the enricher
+handles tokens").
 
 **Lifetime.** The minted token lives min(the rule's token lifetime, 2 × the
 presented JWT's remaining life). With the rule at 3600 s and a fresh
 Authentik token of 30 minutes, that is the full hour, so the enricher
-exchanges about once an hour.
+exchanges about every half hour.
 
 **Batches.** Batches belong to the workspace, not the credential: batch ids
 submitted under an API key stay valid after switching to keyless auth in

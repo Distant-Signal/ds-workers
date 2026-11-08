@@ -217,13 +217,24 @@ in the fallback, at most what is left of the projected token.
 
 - It caches the OpenAI token, and in the primary mode the Authentik token
   (by its own `expires_in`). It refreshes one at
-  `t0 + min(expires_in, expires_at - now) - max(LLM_TOKEN_REFRESH_SKEW_SECS, 10% of the lifetime)`,
-  where `t0` is when the request started (skew default 60 s).
-- Refreshes are single-flight: concurrent calls wait for one exchange, and
-  share its failure too. Each token request has its own 10 s timeout.
+  `t0 + min(expires_in, expires_at - now) - max(LLM_TOKEN_REFRESH_SKEW_SECS, half the lifetime)`,
+  where `t0` is when the request started (skew default 60 s): at half-life,
+  so an outage of Authentik or the exchange has the other half of the
+  token's life to clear before enrichment stops.
+- Refreshes are single-flight: concurrent calls on an empty cache wait for
+  one exchange, and share its failure too. While the cached token is still
+  valid, calls that arrive during a refresh use it rather than wait. Each
+  token request has its own 10 s timeout.
 - It re-reads the token file on every exchange, since the kubelet rotates it.
 - If a refresh fails while the cached token is still valid, it keeps using
-  that token until it expires (and logs a warning).
+  that token until it is 5 s from expiry, and backs off before the next
+  refresh: 15 s, doubled per consecutive failure, at most 5 minutes, never
+  waiting into the token's last 2 minutes, and every 15 s inside them. Each
+  such failure logs a warning (`stage`, `outcome`, `remaining_secs`,
+  `consecutive_failures`, `retry_in_secs`) and counts in
+  `enricher_llm_token_refresh_fallback_total{stage}`. A successful refresh
+  resets the backoff. Only once no valid token is left does a failure reach
+  LLM calls (`auth_error`).
 - Creating a batch is the exception: it mints a fresh token (with a fresh
   Authentik token in the primary mode) unless the cached one has at least
   80% of its lifetime left, and never falls back to an older one. See
@@ -240,8 +251,11 @@ in the fallback, at most what is left of the projected token.
   replaced by `[redacted]`).
 - Metrics: `enricher_llm_token_exchange_total{stage=authentik|openai, outcome}`
   (`success`, `token_file_error`, `invalid_grant`, `invalid_client`,
-  `invalid_subject_token`, `http_error`, `timeout`, `error`) and
-  `enricher_llm_token_remaining_seconds`. The alert is
+  `invalid_subject_token`, `http_error`, `timeout`, `error`),
+  `enricher_llm_token_refresh_fallback_total{stage}` (failed refreshes that
+  fell back to the cached token, so a non-zero rate means an outage that
+  has not yet hit enrichment) and `enricher_llm_token_remaining_seconds`.
+  The alert is
   [DistantSignalEnricherTokenExchangeFailing](https://github.com/Distant-Signal/ds-deploy/blob/main/docs/alerts.md#distantsignalenrichertokenexchangefailing).
 - At startup, a WIF mode with a missing ID or URL, with `LLM_API_KEY` set, or
   with an unreadable or empty token file is an error, and the pod does not

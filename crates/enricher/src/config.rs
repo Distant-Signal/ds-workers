@@ -638,7 +638,7 @@ pub(crate) struct LlmAuthConfig {
     #[arg(long, env)]
     pub llm_authentik_scope: Option<String>,
     /// Refresh a token at least this long before it expires (the margin is
-    /// the larger of this and 10% of the token's lifetime).
+    /// the larger of this and half the token's lifetime).
     #[arg(long, env, default_value_t = 60)]
     pub llm_token_refresh_skew_secs: u64,
 }
