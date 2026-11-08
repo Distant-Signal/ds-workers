@@ -704,8 +704,9 @@ async fn a_submission_mints_a_fresh_token_for_upload_and_create() {
     );
     // A poll (any ordinary call) caches tok-1.
     client.poll_batch("batch_1").await.unwrap();
-    // 11 minutes on: tok-1 is still valid (refresh at 810 s), 4 minutes left.
-    clock.advance(std::time::Duration::from_secs(660));
+    // 400 s on: tok-1 is still valid and cached (refresh at half-life,
+    // 450 s), with well under 80% of its life left.
+    clock.advance(std::time::Duration::from_secs(400));
     client.poll_batch("batch_1").await.unwrap();
     assert_eq!(
         requests_to(&server, "POST", "/oauth/token").await.len(),

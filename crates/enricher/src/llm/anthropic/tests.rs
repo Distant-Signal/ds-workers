@@ -781,9 +781,9 @@ async fn a_federated_token_is_a_bearer_with_no_api_key() {
     assert_eq!(messages.len(), 1);
     assert!(messages[0].headers.get("x-api-key").is_none());
 
-    // 50 minutes on (under 20% of the hour-long token left, before its
-    // refresh at 54 minutes): the batch still goes out with it.
-    clock.advance(std::time::Duration::from_secs(3000));
+    // 25 minutes on (under 80% of the hour-long token left, before its
+    // refresh at half-life, 30 minutes): the batch still goes out with it.
+    clock.advance(std::time::Duration::from_secs(1500));
     let requests = vec![
         BatchRequest::new(
             "p-0".into(),
