@@ -281,7 +281,10 @@ mod tests {
 
         // Delivery records the rank it named: never twice for that rank.
         set_state(&pool, i16::from(good), now).await;
-        assert!(due(&pool, now + Duration::minutes(30)).await.is_empty());
+        assert!(
+            due(&pool, now + Duration::minutes(30)).await.is_empty(),
+            "a rank already delivered is not decided again"
+        );
 
         // An escalation is never this pass's: the line got worse than the
         // stored rank.
