@@ -356,11 +356,17 @@ fn retryable_status(status: u16) -> bool {
     status == 408 || status == 429 || status >= 500
 }
 
-/// The reason shown for a failed attempt. Never includes the URL or any
-/// response body: the settings page shows it to the user, but it also lands
-/// in logs.
+/// The reason shown for a failed attempt. Never includes the URL, any
+/// response body or the status code: the settings page shows it to the
+/// user as it is (a sentence with its full stop), and it also lands in
+/// logs.
 fn status_reason(status: u16) -> String {
-    format!("The server answered {status}")
+    match status {
+        429 => "The destination is limiting how often we can send.",
+        408 | 500.. => "The destination had a problem receiving it.",
+        _ => "The destination refused it. Check the address and any token.",
+    }
+    .to_string()
 }
 
 pub(crate) struct WebhookSender {
@@ -413,7 +419,7 @@ impl WebhookSender {
         {
             return WebhookOutcome::Failed(reason);
         }
-        let mut last = WebhookOutcome::Failed("The request failed".into());
+        let mut last = WebhookOutcome::Failed("The message couldn't be sent.".into());
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(BACKOFF[attempt - 1]).await;
@@ -422,22 +428,24 @@ impl WebhookSender {
             let request = match build_request(dest, event, self.site_url.as_deref(), Utc::now()) {
                 Ok(request) => request,
                 Err(BuildError::UnknownKind) => {
-                    return WebhookOutcome::Failed("Unknown destination type".into());
+                    return WebhookOutcome::Failed(
+                        "This kind of destination isn't supported.".into(),
+                    );
                 }
                 Err(BuildError::MissingSecret) => {
-                    return WebhookOutcome::Failed("The destination has no secret".into());
+                    return WebhookOutcome::Failed("The destination is missing its token.".into());
                 }
                 Err(BuildError::Encode) => {
-                    return WebhookOutcome::Failed("The message could not be built".into());
+                    return WebhookOutcome::Failed("Couldn't build the message.".into());
                 }
                 Err(BuildError::BadUrl) => {
-                    return WebhookOutcome::Failed("The address is not valid".into());
+                    return WebhookOutcome::Failed("The address isn't valid.".into());
                 }
             };
             let mut builder = self.client.post(&request.url).body(request.body);
             for (name, value) in request.headers {
                 let Ok(value) = reqwest::header::HeaderValue::from_bytes(&value) else {
-                    return WebhookOutcome::Failed("The message could not be built".into());
+                    return WebhookOutcome::Failed("Couldn't build the message.".into());
                 };
                 builder = builder.header(name, value);
             }
@@ -453,15 +461,15 @@ impl WebhookSender {
                     }
                 }
                 Err(err) if err.is_timeout() => {
-                    last = WebhookOutcome::Failed("The server did not answer in time".into());
+                    last = WebhookOutcome::Failed("The destination didn't answer in time.".into());
                 }
                 Err(err) if err.is_connect() => {
                     last = WebhookOutcome::Failed(
-                        "Couldn't connect, or the address is not a public one".into(),
+                        "Couldn't connect. The address may not be a public one.".into(),
                     );
                 }
                 Err(_) => {
-                    last = WebhookOutcome::Failed("The request failed".into());
+                    last = WebhookOutcome::Failed("The message couldn't be sent.".into());
                 }
             }
         }
@@ -533,6 +541,19 @@ mod tests {
             signature,
             format!("v1={}", hex::encode(mac.finalize().into_bytes()))
         );
+    }
+
+    /// The reason is shown to the user as it is: a sentence with its full
+    /// stop, and never a status code.
+    #[test]
+    fn failure_reasons_are_sentences_without_status_codes() {
+        for status in [400, 401, 403, 404, 408, 429, 500, 502, 503] {
+            let reason = status_reason(status);
+            assert!(reason.ends_with('.'), "{reason}");
+            assert!(!reason.chars().any(|c| c.is_ascii_digit()), "{reason}");
+        }
+        assert!(status_reason(401).contains("refused"));
+        assert!(status_reason(503).contains("problem receiving"));
     }
 
     #[test]
@@ -708,6 +729,7 @@ mod tests {
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
                 webhook -- --ignored`"]
     async fn repeated_failures_turn_a_destination_off() {
+        const FAILURE: &str = "The destination had a problem receiving it.";
         use crate::queries;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -760,10 +782,10 @@ mod tests {
             "a key ring without the key reads no destination"
         );
 
-        queries::record_webhook_result(&pool, id, Some("The server answered 500"), 3)
+        queries::record_webhook_result(&pool, id, Some(FAILURE), 3)
             .await
             .unwrap();
-        queries::record_webhook_result(&pool, id, Some("The server answered 500"), 3)
+        queries::record_webhook_result(&pool, id, Some(FAILURE), 3)
             .await
             .unwrap();
         queries::record_webhook_result(&pool, id, None, 3)
@@ -777,7 +799,7 @@ mod tests {
             1
         );
         for _ in 0..3 {
-            queries::record_webhook_result(&pool, id, Some("The server answered 500"), 3)
+            queries::record_webhook_result(&pool, id, Some(FAILURE), 3)
                 .await
                 .unwrap();
         }

@@ -421,7 +421,9 @@ pub(crate) trait PushBackend: Send + Sync + 'static {
         _destination: &WebhookDestination,
         _event: &WebhookEvent,
     ) -> impl Future<Output = WebhookOutcome> + Send {
-        async { WebhookOutcome::Failed("Webhooks are not enabled".into()) }
+        async {
+            WebhookOutcome::Failed("Sending to destinations isn't available right now.".into())
+        }
     }
 }
 
@@ -489,7 +491,9 @@ impl PushBackend for PgBackend {
         event: &WebhookEvent,
     ) -> WebhookOutcome {
         let Some(delivery) = &self.webhooks else {
-            return WebhookOutcome::Failed("Webhooks are not enabled".into());
+            return WebhookOutcome::Failed(
+                "Sending to destinations isn't available right now.".into(),
+            );
         };
         let outcome = delivery.sender.send(destination, event).await;
         let failure = match &outcome {
@@ -1282,7 +1286,7 @@ async fn send_webhooks<B: PushBackend>(
             backend.send_webhook(destination, event),
         )
         .await
-        .unwrap_or_else(|_| WebhookOutcome::Failed("The server did not answer in time".into()))
+        .unwrap_or_else(|_| WebhookOutcome::Failed("The destination didn't answer in time.".into()))
     }))
     .await;
     let mut any = false;
@@ -1489,7 +1493,7 @@ mod tests {
         ) -> impl Future<Output = WebhookOutcome> {
             lock(&self.webhook_sent).push((destination.id, event.event));
             std::future::ready(if lock(&self.failing_webhooks).contains(&destination.id) {
-                WebhookOutcome::Failed("The server answered 500".into())
+                WebhookOutcome::Failed("The destination had a problem receiving it.".into())
             } else {
                 WebhookOutcome::Delivered
             })
