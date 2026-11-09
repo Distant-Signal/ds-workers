@@ -9,6 +9,7 @@ mod config;
 mod decision;
 mod hold;
 mod leave_reminder;
+mod line_recheck;
 mod push_queue;
 mod queries;
 mod send;
@@ -538,6 +539,8 @@ async fn run_cycle(
         cursor_grace,
     )
     .await?;
+    // A de-escalation the cooldown held back, now that it has passed.
+    line_recheck::recheck_deferred_deescalations(pool, queue, now, cooldown).await?;
 
     // --- Trains (Decision 4) ---
     let train_cursor = queries::read_cursor(pool, "train_movement_events").await?;

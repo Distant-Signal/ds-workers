@@ -326,6 +326,18 @@ fn line_rank(line_id: &str, statuses: &[LineStatus]) -> u8 {
     }
 }
 
+/// The rank of a line's stored `statuses` JSON (`line_rank`), or `None` when
+/// it doesn't decode (logged: a bad row is skipped, as in the poll).
+pub(crate) fn rank_of_statuses_json(line_id: &str, statuses: serde_json::Value) -> Option<u8> {
+    match serde_json::from_value::<Vec<LineStatus>>(statuses) {
+        Ok(statuses) => Some(line_rank(line_id, &statuses)),
+        Err(err) => {
+            tracing::error!(error = ?err, line_id, "skipping an undecodable line status");
+            None
+        }
+    }
+}
+
 /// Decodes one polled `line_status_history` row into a candidate, or
 /// `None` for "this row is not a candidate" -- which now deliberately
 /// covers BOTH "no severity transition here" and "this row's own JSON does
