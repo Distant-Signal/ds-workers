@@ -2112,6 +2112,14 @@ pub(crate) struct CommitCheckLeg {
     pub plan_reason: Option<String>,
     /// The suggestion's first departure.
     pub plan_departure: Option<DateTime<Utc>>,
+    /// When to leave for the suggested train and the departure it is timed
+    /// from (the timetable's, so a retime the plan hasn't caught up with is
+    /// in it): `ds_store::journeys::leave_by_sql`, the same one the leave-by
+    /// push and the journey page use. `None` without a buffer, for a
+    /// suggestion that isn't the usual train or the usual operator's
+    /// nearest, or once a train is picked.
+    pub plan_leave_by: Option<DateTime<Utc>>,
+    pub plan_leave_by_departure: Option<DateTime<Utc>>,
 }
 
 /// [`unmatched_auto_legs_for_commit_check`]'s query, each leg end read
@@ -2149,9 +2157,11 @@ fn commit_check_legs_sql(filter: &str) -> String {
                 (CASE WHEN dov.template_id IS NOT NULL THEN dov.usual_itinerary IS NOT NULL \
                       ELSE jt.usual_itinerary IS NOT NULL END) AS has_usual_itinerary, \
                 j.regular_plan_status, j.regular_plan->>'reason' AS plan_reason, \
-                (j.regular_plan->'choice'->>'departure')::timestamptz AS plan_departure \
+                (j.regular_plan->'choice'->>'departure')::timestamptz AS plan_departure, \
+                plb.leave_by_at AS plan_leave_by, plb.departure AS plan_leave_by_departure \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
+         LEFT JOIN LATERAL ({leave_by}) plb ON TRUE \
          JOIN journey_templates jt ON jt.id = j.source_template_id \
          LEFT JOIN journey_template_day_overrides dov \
                 ON dov.template_id = jt.id \
@@ -2167,7 +2177,8 @@ fn commit_check_legs_sql(filter: &str) -> String {
            AND jt.active \
            AND {origin} IS NOT NULL \
            AND {destination} IS NOT NULL \
-           {filter}"
+           {filter}",
+        leave_by = ds_store::journeys::leave_by_sql("j"),
     )
 }
 
@@ -7236,7 +7247,7 @@ mod sweep_tests {
     /// itinerary, not the template's (whose usual train is at the other
     /// time). Other days follow the template's.
     #[tokio::test]
-    #[ignore = "requires a live database with ds-core v0.14.0's migrations; \
+    #[ignore = "requires a live database with ds-core v0.14.2's migrations; \
                 run with `DATABASE_URL=... cargo test -p notifier \
                 the_reminder_reads_a_different_time_days_usual_itinerary -- --ignored --test-threads=1`"]
     async fn the_reminder_reads_a_different_time_days_usual_itinerary() {
