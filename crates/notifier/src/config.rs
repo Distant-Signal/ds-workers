@@ -5,6 +5,10 @@ use ds_runtime::secret::Secret;
 /// `Debug` is safe to log: every credential is a [`ds_runtime::secret::Secret`]
 /// (SVC-12).
 #[derive(Debug, Parser)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent switches, each read from its own environment variable"
+)]
 pub(crate) struct Config {
     #[arg(long, env, hide_env_values = true)]
     pub database_url: Secret,
@@ -241,6 +245,15 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
     pub leave_reminders_enabled: bool,
 
+    /// Leave-by reminders for a remind-me regular journey whose train nobody
+    /// has picked yet (DS-425): from the api plan sweep's suggestion, the
+    /// usual train or the usual operator's nearest one (basis `usual` or
+    /// `closest`). Off unless the chart's
+    /// `notifier.leaveReminders.usualTrain.enabled` turns it on, and only
+    /// with `leave_reminders_enabled`.
+    #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
+    pub leave_reminders_usual_train_enabled: bool,
+
     /// How often the leave-by cycle looks at today's regular journeys.
     #[arg(long, env, default_value_t = 60)]
     pub leave_reminders_poll_interval_secs: u64,
@@ -423,6 +436,7 @@ mod tests {
             metrics_enabled: true,
             journey_break_notices_enabled: false,
             leave_reminders_enabled: false,
+            leave_reminders_usual_train_enabled: false,
             leave_reminders_poll_interval_secs: 60,
             leave_reminders_max_pushes_per_occurrence: 3,
             leave_reminders_move_threshold_minutes: 5,

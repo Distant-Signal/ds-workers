@@ -216,13 +216,15 @@ async fn run() -> anyhow::Result<()> {
     leave_reminder::register_metrics();
     tracing::info!(
         enabled = config.leave_reminders_enabled,
-        "leave-by reminders (LEAVE_REMINDERS_ENABLED)"
+        usual_train = config.leave_reminders_usual_train_enabled,
+        "leave-by reminders (LEAVE_REMINDERS_ENABLED, LEAVE_REMINDERS_USUAL_TRAIN_ENABLED)"
     );
     let leave_settings = leave_reminder::LeaveReminderSettings {
         max_pushes: config.leave_reminders_max_pushes_per_occurrence,
         move_threshold: chrono::Duration::minutes(config.leave_reminders_move_threshold_minutes),
         ttl_cap_secs: config.leave_reminders_ttl_secs,
         default_delay_threshold_minutes: config.train_delay_threshold_minutes,
+        usual_train: config.leave_reminders_usual_train_enabled,
     };
     break_notices::set_enabled(config.journey_break_notices_enabled);
     break_notices::register_metrics();
@@ -1594,9 +1596,16 @@ async fn remind_manual_legs(
 }
 
 /// The pick reminder's text (regular journeys §6.5). With the api's plan
-/// sweep's suggestion it names the train: "Pick your train for Woking to
-/// London Waterloo. Your usual 08:12 is running.", or, when the usual
-/// train doesn't run that day, the closest one. Otherwise, as before.
+/// sweep's suggestion it names the train, honestly by why it was chosen:
+/// "Pick your train for Woking to London Waterloo. Your usual 08:12 is
+/// running. Leave by 07:57 for it.", "The 08:14 is the closest to your
+/// usual." when the usual operator's nearest train is not the usual one
+/// (a retime with a new UID), or, when the usual train doesn't run that
+/// day, "Your usual train isn't running today, so the 08:40 is the
+/// closest." The leave-by comes from the shared leave-by SQL (the station
+/// buffer, the timetable's departure), and is left out when there is none:
+/// no buffer, or the day's best train, which has no leave-by. Otherwise,
+/// as before.
 fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
     let suggested = (leg.regular_plan_status.as_deref() == Some("suggested"))
         .then_some(leg.plan_departure)
@@ -1604,16 +1613,32 @@ fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
     let Some(departure) = suggested else {
         return format!("Your {route} journey is coming up. Tap to choose a train.");
     };
-    let time = departure
-        .with_timezone(&chrono_tz::Europe::London)
-        .format("%H:%M");
-    if leg.plan_reason.as_deref() == Some("best") {
-        format!(
-            "Pick your train for {route}. Your usual train isn't running today, so the {time} \
-             is the closest."
-        )
-    } else {
-        format!("Pick your train for {route}. Your usual {time} is running.")
+    let clock = |at: DateTime<Utc>| {
+        at.with_timezone(&chrono_tz::Europe::London)
+            .format("%H:%M")
+            .to_string()
+    };
+    match leg.plan_reason.as_deref() {
+        Some("best") => format!(
+            "Pick your train for {route}. Your usual train isn't running today, so the {} \
+             is the closest.",
+            clock(departure)
+        ),
+        reason => {
+            let time = clock(leg.plan_leave_by_departure.unwrap_or(departure));
+            let which = if reason == Some("same_operator") {
+                format!("The {time} is the closest to your usual.")
+            } else {
+                format!("Your usual {time} is running.")
+            };
+            match leg.plan_leave_by {
+                Some(leave_by) => format!(
+                    "Pick your train for {route}. {which} Leave by {} for it.",
+                    clock(leave_by)
+                ),
+                None => format!("Pick your train for {route}. {which}"),
+            }
+        }
     }
 }
 
@@ -3042,6 +3067,21 @@ mod sweep_cycle_tests {
             regular_plan_status: status.map(str::to_string),
             plan_reason: reason.map(str::to_string),
             plan_departure: departure.map(|d| d.parse().unwrap()),
+            plan_leave_by: None,
+            plan_leave_by_departure: None,
+        }
+    }
+
+    /// `leg` with the leave-by the shared SQL gave it, timed from `from`.
+    fn with_leave_by(
+        leg: queries::CommitCheckLeg,
+        leave_by: &str,
+        from: &str,
+    ) -> queries::CommitCheckLeg {
+        queries::CommitCheckLeg {
+            plan_leave_by: Some(leave_by.parse().unwrap()),
+            plan_leave_by_departure: Some(from.parse().unwrap()),
+            ..leg
         }
     }
 
@@ -3064,7 +3104,11 @@ mod sweep_cycle_tests {
             Some("same_operator"),
             Some("2026-11-10T08:14:00Z"),
         );
-        assert!(pick_reminder_body(route, &renamed).ends_with("Your usual 08:14 is running."));
+        assert_eq!(
+            pick_reminder_body(route, &renamed),
+            "Pick your train for Woking to London Waterloo. The 08:14 is the closest to your \
+             usual."
+        );
         let closest = reminder_leg(
             Some("suggested"),
             Some("best"),
@@ -3090,6 +3134,82 @@ mod sweep_cycle_tests {
             );
         }
         for leg in [usual, renamed, closest] {
+            let body = pick_reminder_body(route, &leg);
+            assert!(
+                !body.contains(['\u{2014}', '\u{2013}', '\u{2026}', '\u{2192}']),
+                "{body}"
+            );
+        }
+    }
+
+    /// The leave-by joins the pick reminder when the shared SQL computed
+    /// one, from the timetable's departure (a retime the plan hasn't caught
+    /// up with is in it), and never for the day's best or a missing buffer.
+    #[test]
+    fn the_pick_reminder_names_the_leave_by_when_there_is_one() {
+        let route = "Woking to London Waterloo";
+        let usual = with_leave_by(
+            reminder_leg(
+                Some("suggested"),
+                Some("usual"),
+                Some("2026-11-10T07:50:00Z"),
+            ),
+            "2026-11-10T07:35:00Z",
+            "2026-11-10T07:50:00Z",
+        );
+        assert_eq!(
+            pick_reminder_body(route, &usual),
+            "Pick your train for Woking to London Waterloo. Your usual 07:50 is running. \
+             Leave by 07:35 for it."
+        );
+        // Retimed to 07:53 since the plan was made: the time and the
+        // leave-by are the timetable's.
+        let retimed = with_leave_by(
+            reminder_leg(
+                Some("suggested"),
+                Some("usual"),
+                Some("2026-11-10T07:50:00Z"),
+            ),
+            "2026-11-10T07:38:00Z",
+            "2026-11-10T07:53:00Z",
+        );
+        assert_eq!(
+            pick_reminder_body(route, &retimed),
+            "Pick your train for Woking to London Waterloo. Your usual 07:53 is running. \
+             Leave by 07:38 for it."
+        );
+        let closest = with_leave_by(
+            reminder_leg(
+                Some("suggested"),
+                Some("same_operator"),
+                Some("2026-11-10T07:54:00Z"),
+            ),
+            "2026-11-10T07:39:00Z",
+            "2026-11-10T07:54:00Z",
+        );
+        assert_eq!(
+            pick_reminder_body(route, &closest),
+            "Pick your train for Woking to London Waterloo. The 07:54 is the closest to your \
+             usual. Leave by 07:39 for it."
+        );
+        // The day's best has no leave-by (the SQL gives none); no buffer
+        // gives none either: the text stays as it was.
+        let best = reminder_leg(
+            Some("suggested"),
+            Some("best"),
+            Some("2026-11-10T08:40:00Z"),
+        );
+        assert!(!pick_reminder_body(route, &best).contains("Leave by"));
+        let unbuffered = reminder_leg(
+            Some("suggested"),
+            Some("usual"),
+            Some("2026-11-10T07:50:00Z"),
+        );
+        assert_eq!(
+            pick_reminder_body(route, &unbuffered),
+            "Pick your train for Woking to London Waterloo. Your usual 07:50 is running."
+        );
+        for leg in [usual, retimed, closest] {
             let body = pick_reminder_body(route, &leg);
             assert!(
                 !body.contains(['\u{2014}', '\u{2013}', '\u{2026}', '\u{2192}']),
