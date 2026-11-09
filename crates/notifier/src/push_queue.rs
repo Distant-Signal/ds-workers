@@ -123,6 +123,7 @@ use tokio::task::JoinHandle;
 
 use crate::queries::{self, PushSubscriptionRow};
 use crate::send::{NotificationPayload, PushClass, Pusher, SendOutcome, Ttl, Urgency};
+use crate::webhook::{WebhookDestination, WebhookEvent, WebhookOutcome};
 
 /// Upper bound on one subscription's share of a job, on top of `send.rs`'s
 /// own `PUSH_SEND_TIMEOUT` per attempt: it also covers the L9 send-time DNS
@@ -405,6 +406,32 @@ pub(crate) trait PushBackend: Send + Sync + 'static {
         delivered: &Delivered,
         at: DateTime<Utc>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// The user's enabled webhook destinations (DS-415). None by default,
+    /// and none when webhooks are switched off.
+    fn webhooks(
+        &self,
+        _user_id: &str,
+    ) -> impl Future<Output = anyhow::Result<Vec<WebhookDestination>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Delivers one notification to one webhook destination, bounded and
+    /// retried by the sender, and records the outcome against it.
+    fn send_webhook(
+        &self,
+        _destination: &WebhookDestination,
+        _event: &WebhookEvent,
+    ) -> impl Future<Output = WebhookOutcome> + Send {
+        async { WebhookOutcome::Failed("Webhooks are not enabled".into()) }
+    }
+}
+
+/// What the webhook channel needs beyond the database: the sender and the
+/// failure count that turns a destination off.
+pub(crate) struct WebhookDelivery {
+    pub sender: crate::webhook::WebhookSender,
+    pub disable_after_failures: i32,
+    /// Decrypts the destinations' stored secrets.
+    pub keys: ds_runtime::secret_box::KeyRing,
 }
 
 /// Production backend: Postgres for subscriptions and bookkeeping, and
@@ -412,11 +439,22 @@ pub(crate) trait PushBackend: Send + Sync + 'static {
 pub(crate) struct PgBackend {
     pool: sqlx::PgPool,
     pusher: Pusher,
+    webhooks: Option<WebhookDelivery>,
 }
 
 impl PgBackend {
     pub(crate) fn new(pool: sqlx::PgPool, pusher: Pusher) -> Self {
-        Self { pool, pusher }
+        Self {
+            pool,
+            pusher,
+            webhooks: None,
+        }
+    }
+
+    /// Switches the webhook channel on (`WEBHOOKS_ENABLED`).
+    pub(crate) fn with_webhooks(mut self, webhooks: Option<WebhookDelivery>) -> Self {
+        self.webhooks = webhooks;
+        self
     }
 }
 
@@ -436,6 +474,39 @@ impl PushBackend for PgBackend {
 
     async fn delete_subscription(&self, id: i64) -> anyhow::Result<()> {
         queries::delete_push_subscription(&self.pool, id).await
+    }
+
+    async fn webhooks(&self, user_id: &str) -> anyhow::Result<Vec<WebhookDestination>> {
+        let Some(delivery) = &self.webhooks else {
+            return Ok(Vec::new());
+        };
+        queries::webhook_destinations_for_user(&self.pool, user_id, &delivery.keys).await
+    }
+
+    async fn send_webhook(
+        &self,
+        destination: &WebhookDestination,
+        event: &WebhookEvent,
+    ) -> WebhookOutcome {
+        let Some(delivery) = &self.webhooks else {
+            return WebhookOutcome::Failed("Webhooks are not enabled".into());
+        };
+        let outcome = delivery.sender.send(destination, event).await;
+        let failure = match &outcome {
+            WebhookOutcome::Delivered => None,
+            WebhookOutcome::Failed(reason) => Some(reason.as_str()),
+        };
+        if let Err(err) = queries::record_webhook_result(
+            &self.pool,
+            destination.id,
+            failure,
+            delivery.disable_after_failures,
+        )
+        .await
+        {
+            tracing::warn!(error = ?err, webhook_id = destination.id, "could not record a webhook result");
+        }
+        outcome
     }
 
     async fn mark_pushed(&self, id: i64) -> anyhow::Result<()> {
@@ -1062,6 +1133,10 @@ async fn run_job<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> JobResult
     result
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "long but linear; the push and webhook fan-outs share one result"
+)]
 async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> JobResult {
     let backend = &shared.backend;
     let user_id = job.user_id.as_str();
@@ -1073,8 +1148,36 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
         }
     };
 
+    // Webhook destinations (DS-415) are a second channel for the same job.
+    // They are sent alongside the push fan-out, and a delivery to any of
+    // them counts as the notification being delivered. The sender retries a
+    // delivery on its own and turns a dead destination off, so a failed
+    // webhook never blocks a push or makes one repeat; only a job nothing
+    // at all delivered is Failed, as for a push alone.
+    let webhook_event = WebhookEvent::from_job(&job.delivered, &job.payload, job.decided_at);
+    let destinations = match (&webhook_event, backend.webhooks(user_id).await) {
+        (Some(_), Ok(destinations)) => destinations,
+        (Some(_), Err(err)) => {
+            tracing::warn!(error = ?err, user_id, "failed to load webhook destinations");
+            Vec::new()
+        }
+        (None, _) => Vec::new(),
+    };
+    let webhooks_delivered = match &webhook_event {
+        Some(event) if !destinations.is_empty() => {
+            send_webhooks(backend, &destinations, event, user_id).await
+        }
+        _ => false,
+    };
+
     let result = if subscriptions.is_empty() {
-        JobResult::NoSubscriptions
+        if destinations.is_empty() {
+            JobResult::NoSubscriptions
+        } else if webhooks_delivered {
+            JobResult::Delivered
+        } else {
+            return JobResult::Failed;
+        }
     } else {
         let class = job.delivered.push_class();
         let outcomes =
@@ -1137,7 +1240,7 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
                 }
             }
         }
-        if !any_sent {
+        if !any_sent && !webhooks_delivered {
             return JobResult::Failed;
         }
         JobResult::Delivered
@@ -1163,6 +1266,44 @@ async fn run_job_inner<B: PushBackend>(shared: &Shared<B>, job: &PushJob) -> Job
         }
     }
     JobResult::BookkeepingFailed
+}
+
+/// Sends `event` to every destination at once, each bounded by
+/// [`SUBSCRIPTION_BUDGET`]; whether any was accepted.
+async fn send_webhooks<B: PushBackend>(
+    backend: &B,
+    destinations: &[WebhookDestination],
+    event: &WebhookEvent,
+    user_id: &str,
+) -> bool {
+    let outcomes = futures_util::future::join_all(destinations.iter().map(|destination| async {
+        tokio::time::timeout(
+            SUBSCRIPTION_BUDGET,
+            backend.send_webhook(destination, event),
+        )
+        .await
+        .unwrap_or_else(|_| WebhookOutcome::Failed("The server did not answer in time".into()))
+    }))
+    .await;
+    let mut any = false;
+    for (destination, outcome) in destinations.iter().zip(outcomes) {
+        let label = match &outcome {
+            WebhookOutcome::Delivered => {
+                any = true;
+                "delivered"
+            }
+            WebhookOutcome::Failed(_) => {
+                tracing::warn!(
+                    user_id,
+                    webhook_id = destination.id,
+                    "webhook not delivered"
+                );
+                "failed"
+            }
+        };
+        metrics::counter!(metric("notifier_webhook_send_total"), "outcome" => label).increment(1);
+    }
+    any
 }
 
 /// [`PushBackend::mark_pushed`], logging a failure: it only feeds the
@@ -1223,6 +1364,12 @@ mod tests {
         scripted: Mutex<HashMap<i64, VecDeque<SendOutcome>>>,
         /// The class of every send, by subscription id.
         classes: Mutex<Vec<(i64, PushClass)>>,
+        /// Webhook destinations by user, and every event sent to one
+        /// (destination id, event name); a destination answers `Failed`
+        /// when its id is in `failing_webhooks`.
+        webhooks: Mutex<HashMap<String, Vec<WebhookDestination>>>,
+        webhook_sent: Mutex<Vec<(i64, &'static str)>>,
+        failing_webhooks: Mutex<Vec<i64>>,
     }
 
     impl FakeBackend {
@@ -1236,7 +1383,26 @@ mod tests {
                 gated: AtomicUsize::new(0),
                 scripted: Mutex::new(HashMap::new()),
                 classes: Mutex::new(Vec::new()),
+                webhooks: Mutex::new(HashMap::new()),
+                webhook_sent: Mutex::new(Vec::new()),
+                failing_webhooks: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_webhook(self, user_id: &str, id: i64, failing: bool) -> Self {
+            lock(&self.webhooks)
+                .entry(user_id.to_string())
+                .or_default()
+                .push(WebhookDestination {
+                    id,
+                    kind: "generic".into(),
+                    url: "https://hooks.example/x".into(),
+                    secret: Some("s".into()),
+                });
+            if failing {
+                lock(&self.failing_webhooks).push(id);
+            }
+            self
         }
 
         fn with_subscription(self, user_id: &str, id: i64, endpoint: &str) -> Self {
@@ -1304,6 +1470,29 @@ mod tests {
                 subs.retain(|s| s.id != id);
             }
             std::future::ready(Ok(()))
+        }
+
+        fn webhooks(
+            &self,
+            user_id: &str,
+        ) -> impl Future<Output = anyhow::Result<Vec<WebhookDestination>>> {
+            std::future::ready(Ok(lock(&self.webhooks)
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default()))
+        }
+
+        fn send_webhook(
+            &self,
+            destination: &WebhookDestination,
+            event: &WebhookEvent,
+        ) -> impl Future<Output = WebhookOutcome> {
+            lock(&self.webhook_sent).push((destination.id, event.event));
+            std::future::ready(if lock(&self.failing_webhooks).contains(&destination.id) {
+                WebhookOutcome::Failed("The server answered 500".into())
+            } else {
+                WebhookOutcome::Delivered
+            })
         }
 
         fn record_delivered(
@@ -1610,6 +1799,65 @@ mod tests {
     #[test]
     fn security_notices_keep_for_twenty_eight_days() {
         assert_eq!(SECURITY_NOTICE_TTL_SECS, 28 * 24 * 60 * 60);
+    }
+
+    /// A user with only a webhook destination: the job is delivered to it and
+    /// recorded, so the notification is handled as it would be by a push.
+    #[tokio::test(start_paused = true)]
+    async fn a_webhook_only_user_is_delivered_and_recorded() {
+        let backend = FakeBackend::new(Duration::from_secs(5)).with_webhook("u", 5, false);
+        let queue = PushQueue::start(backend, config());
+        assert_eq!(queue.enqueue(train_job("u", 7)), EnqueueOutcome::Queued);
+        eventually("recorded", || recorded(&queue).len() == 1).await;
+        assert_eq!(
+            lock(&queue.shared.backend.webhook_sent).clone(),
+            vec![(5, "train_update")]
+        );
+    }
+
+    /// A failing webhook beside a push that is delivered neither blocks the
+    /// bookkeeping nor is re-sent: the push counts.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_webhook_does_not_block_a_delivered_push() {
+        let backend = FakeBackend::new(Duration::from_secs(5))
+            .with_subscription("u", 1, "script://")
+            .with_webhook("u", 5, true);
+        lock(&backend.scripted).insert(1, VecDeque::from([SendOutcome::Sent]));
+        let queue = PushQueue::start(backend, config());
+        assert_eq!(queue.enqueue(train_job("u", 7)), EnqueueOutcome::Queued);
+        eventually("recorded", || recorded(&queue).len() == 1).await;
+    }
+
+    /// Nothing delivered anywhere (a failing webhook, no push): not recorded,
+    /// so it is re-decided like a failed push.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_webhook_alone_is_not_recorded() {
+        let backend = FakeBackend::new(Duration::from_secs(5)).with_webhook("u", 5, true);
+        let queue = PushQueue::start(backend, config());
+        assert_eq!(queue.enqueue(train_job("u", 7)), EnqueueOutcome::Queued);
+        eventually("sent", || {
+            !lock(&queue.shared.backend.webhook_sent).is_empty()
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert!(
+            recorded(&queue).is_empty(),
+            "nothing is recorded for a delivery that has not run"
+        );
+    }
+
+    /// The account security notices go to push only.
+    #[tokio::test(start_paused = true)]
+    async fn security_notices_are_not_sent_to_webhooks() {
+        let backend = FakeBackend::new(Duration::from_secs(5)).with_webhook("u", 5, false);
+        let queue = PushQueue::start(backend, config());
+        let token = PushJob {
+            delivered: Delivered::TokenCreated { token_id: 9 },
+            ..line_job("u", "L", 3)
+        };
+        assert_eq!(queue.enqueue(token), EnqueueOutcome::Queued);
+        eventually("recorded", || recorded(&queue).len() == 1).await;
+        assert!(lock(&queue.shared.backend.webhook_sent).is_empty());
     }
 
     /// A worker sends each job with its own class, to every one of the

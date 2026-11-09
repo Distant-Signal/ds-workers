@@ -17,6 +17,14 @@ mod send;
 mod settings_db_tests;
 mod skip_check;
 mod vapid_key;
+mod webhook;
+#[cfg(all(test, feature = "insecure-test-egress"))]
+mod webhook_e2e_tests;
+
+// The test-only seam that lets a webhook reach 127.0.0.1 over http
+// (`WebhookSender::unguarded_for_tests`) can never be in a release build.
+#[cfg(all(feature = "insecure-test-egress", not(debug_assertions)))]
+compile_error!("the insecure-test-egress feature is for debug test builds only");
 
 use std::time::Duration;
 
@@ -196,7 +204,8 @@ async fn run() -> anyhow::Result<()> {
         PgBackend::new(
             pool.clone(),
             Pusher::new(vapid_key, &config.vapid_subject, config.push_ttl_secs),
-        ),
+        )
+        .with_webhooks(config.webhook_delivery()?),
         config.push_queue_config(),
     );
 
