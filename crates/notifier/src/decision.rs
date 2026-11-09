@@ -62,6 +62,33 @@ pub(crate) fn decide_user_notification(
     }
 }
 
+/// A de-escalation that [`decide_user_notification`] skipped inside the
+/// user's cooldown, decided again (`line_recheck`, DS-425). `last_rank` and
+/// `last_notified_at` are the user's stored state, `current_rank` the
+/// line's newest. Only a de-escalation (`current_rank < last_rank`) past the
+/// cooldown notifies; a line that is back at the rank the user was told, or
+/// worse (an escalation is `decide_user_notification`'s, at once), does not,
+/// so a rank is never notified twice.
+pub(crate) fn decide_deferred_deescalation(
+    last_rank: u8,
+    current_rank: u8,
+    last_notified_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    cooldown: Duration,
+) -> NotifyDecision {
+    if current_rank >= last_rank {
+        return NotifyDecision::Skip;
+    }
+    decide_user_notification(
+        last_rank,
+        current_rank,
+        Some(last_rank),
+        Some(last_notified_at),
+        now,
+        cooldown,
+    )
+}
+
 /// Maps a tracked train's derived state onto the same rank shape lines
 /// use. Cancellation always outranks any delay reading.
 pub(crate) fn train_severity_rank(
@@ -492,6 +519,47 @@ mod tests {
         let decision =
             decide_user_notification(4, 0, Some(4), last_notified_at, now, Duration::minutes(20));
         assert_eq!(decision, NotifyDecision::Skip);
+    }
+
+    #[test]
+    fn a_deferred_deescalation_waits_for_the_cooldown_then_notifies_once() {
+        let now = Utc::now();
+        let cooldown = Duration::minutes(20);
+        let decide = |last, current, ago: i64| {
+            decide_deferred_deescalation(last, current, now - Duration::minutes(ago), now, cooldown)
+        };
+        // Severe (rank 4 here) told 5 minutes ago, line now good: wait.
+        assert_eq!(decide(4, 0, 5), NotifyDecision::Skip);
+        assert_eq!(decide(4, 0, 19), NotifyDecision::Skip);
+        // Cooldown over: send it.
+        assert_eq!(decide(4, 0, 20), NotifyDecision::NotifyNow);
+        assert_eq!(decide(4, 2, 25), NotifyDecision::NotifyNow);
+        // Same rank as told: never twice for the same rank.
+        assert_eq!(decide(4, 4, 25), NotifyDecision::Skip);
+        // Worse than told is an escalation, run_cycle's, not this pass's.
+        assert_eq!(decide(1, 4, 25), NotifyDecision::Skip);
+    }
+
+    /// Ranks come from `severity_rank`: `Severity`'s own `Ord` puts
+    /// `Diverted` and `PartClosed` below `MinorDelays`, so a rank taken from
+    /// it would call a drop from a part closure to minor delays a rise.
+    #[test]
+    fn a_deferred_deescalation_uses_severity_rank_not_severity_ord() {
+        use common::{Severity, severity_rank};
+        let now = Utc::now();
+        let cooldown = Duration::minutes(20);
+        let old = now - Duration::minutes(30);
+        let closed = severity_rank(Severity::PartClosed);
+        let minor = severity_rank(Severity::MinorDelays);
+        assert!(closed > minor, "the rank the notifier compares on");
+        assert_eq!(
+            decide_deferred_deescalation(closed, minor, old, now, cooldown),
+            NotifyDecision::NotifyNow
+        );
+        assert_eq!(
+            decide_deferred_deescalation(minor, closed, old, now, cooldown),
+            NotifyDecision::Skip
+        );
     }
 
     #[test]
