@@ -299,6 +299,7 @@ async fn run() -> anyhow::Result<()> {
                     tracing::error!(error = ?err, "notifier forward-queue cycle failed; will retry next interval");
                 }
                 ds_runtime::metrics::record_cycle("notifier", FORWARD_QUEUE_CYCLE, result.is_ok());
+                prune_forward_queue(&pool, Utc::now()).await;
                 sample_forward_queue(&pool, Utc::now()).await;
                 let result =
                     cancel_reason::run_reason_followup_cycle(&pool, &queue, Utc::now()).await;
@@ -953,7 +954,18 @@ async fn run_forward_queue_cycle(
     Ok(())
 }
 
-/// Samples `notifier_forward_queue`'s size and oldest row into
+/// Deletes the consumed forward-queue rows older than
+/// [`queries::FORWARD_QUEUE_CONSUMED_KEEP`] after a cycle. A failure only
+/// logs: the rows wait for the next cycle, and nothing depends on it.
+async fn prune_forward_queue(pool: &PgPool, now: DateTime<Utc>) {
+    if let Err(err) =
+        queries::prune_consumed_forward_queue(pool, now, queries::FORWARD_QUEUE_CONSUMED_KEEP).await
+    {
+        tracing::warn!(error = ?err, "could not prune notifier_forward_queue's consumed rows");
+    }
+}
+
+/// Samples `notifier_forward_queue`'s size and oldest unconsumed row into
 /// `notifier_forward_queue_rows` / `notifier_forward_queue_oldest_age_seconds`
 /// (see [`queries::FORWARD_QUEUE_ROWS_METRIC`]) after every forward-queue
 /// cycle, whatever its result. A failed read only logs and leaves the

@@ -1087,22 +1087,40 @@ pub(crate) async fn poll_forward_queue(
     ))
 }
 
-/// `notifier_forward_queue_rows`: rows in `notifier_forward_queue`, read
-/// after every forward-queue cycle. Nothing deletes a row once the notifier
-/// has read it; it goes only when the aggregator prunes its `trains` row
-/// (`ON DELETE CASCADE`), and it is not archived (decision 2026-10-08). So
-/// the table holds about `trainsRetentionDays` of signals, and this gauge
-/// growing past that is the chart's `DistantSignalNotifierForwardQueueLarge`.
+/// `notifier_forward_queue_rows`: the rows in `notifier_forward_queue` the
+/// notifier has not consumed yet (above its `notifier_forward_queue` cursor),
+/// read after every forward-queue cycle. A consumed row stays for
+/// [`FORWARD_QUEUE_CONSUMED_KEEP`] and is then deleted by
+/// [`prune_consumed_forward_queue`] (DS-425; before it, nothing deleted a row
+/// once read, so the table held about `trainsRetentionDays` of consumed
+/// signals and these gauges counted them). It also goes when the aggregator
+/// prunes its `trains` row (`ON DELETE CASCADE`); it is not archived
+/// (decision 2026-10-08). Growing past the chart's threshold is
+/// `DistantSignalNotifierForwardQueueLarge`: the notifier is not keeping up.
 pub(crate) const FORWARD_QUEUE_ROWS_METRIC: &str = "notifier_forward_queue_rows";
-/// `notifier_forward_queue_oldest_age_seconds`: the age of the oldest row
-/// (`created_at`), 0 while the table is empty. Past the trains retention
-/// window, the prune that should have removed it is not running; the
-/// chart's `DistantSignalNotifierForwardQueueRetentionOverdue`.
+/// `notifier_forward_queue_oldest_age_seconds`: the age of the oldest
+/// unconsumed row (`created_at`), 0 while there is none. Long past the
+/// trains retention window it means the forward-queue cycle has been stuck
+/// (or its cursor lost) for that long; the chart's
+/// `DistantSignalNotifierForwardQueueRetentionOverdue`.
 pub(crate) const FORWARD_QUEUE_OLDEST_AGE_METRIC: &str =
     "notifier_forward_queue_oldest_age_seconds";
+/// `notifier_forward_queue_pruned_total`: consumed rows deleted by
+/// [`prune_consumed_forward_queue`].
+pub(crate) const FORWARD_QUEUE_PRUNED_METRIC: &str = "notifier_forward_queue_pruned_total";
 
-/// Size and oldest row of `notifier_forward_queue`; see
-/// [`FORWARD_QUEUE_ROWS_METRIC`].
+/// How long a consumed forward-queue row is kept before the notifier deletes
+/// it: long enough to look at what a train's last signals were when a push
+/// looks wrong, short enough that the table holds a day, not a month.
+pub(crate) const FORWARD_QUEUE_CONSUMED_KEEP: chrono::Duration = chrono::Duration::hours(24);
+
+/// At most this many rows one [`prune_consumed_forward_queue`] call deletes,
+/// so a first run over a month of consumed rows is a few short statements,
+/// not one long one.
+const FORWARD_QUEUE_PRUNE_BATCH: i64 = 5_000;
+
+/// Size and oldest row of the unconsumed part of `notifier_forward_queue`;
+/// see [`FORWARD_QUEUE_ROWS_METRIC`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ForwardQueueStats {
     pub rows: i64,
@@ -1118,19 +1136,50 @@ impl ForwardQueueStats {
     }
 }
 
-/// One scan of the whole queue. It holds a few hundred rows in production
-/// (2026-10-09: 315 rows, 216 kB, all for tracked trains), so a count every
-/// cycle is cheap; at `DistantSignalNotifierForwardQueueLarge`'s default
-/// threshold it is still a few milliseconds.
+/// One scan of the unconsumed rows (above the forward-queue cursor, which
+/// is `0` before it has ever advanced): a few hundred at most, so a count
+/// every cycle is cheap.
 pub(crate) async fn forward_queue_stats(pool: &PgPool) -> anyhow::Result<ForwardQueueStats> {
-    let (rows, oldest_created_at): (i64, Option<DateTime<Utc>>) =
-        sqlx::query_as("SELECT count(*), min(created_at) FROM notifier_forward_queue")
-            .fetch_one(pool)
-            .await?;
+    let (rows, oldest_created_at): (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT count(*), min(created_at) FROM notifier_forward_queue \
+         WHERE id > COALESCE((SELECT last_processed_id FROM notifier_cursor \
+                              WHERE name = 'notifier_forward_queue'), 0)",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(ForwardQueueStats {
         rows,
         oldest_created_at,
     })
+}
+
+/// Deletes the forward-queue rows the notifier has consumed (at or below its
+/// cursor, which only moves past rows it has read and acted on) that are
+/// older than `keep` by their `created_at`, at most
+/// [`FORWARD_QUEUE_PRUNE_BATCH`] of them. Returns how many went. An
+/// unconsumed row is never deleted here, however old.
+pub(crate) async fn prune_consumed_forward_queue(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    keep: chrono::Duration,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM notifier_forward_queue WHERE id IN ( \
+             SELECT q.id FROM notifier_forward_queue q \
+             WHERE q.id <= COALESCE((SELECT last_processed_id FROM notifier_cursor \
+                                     WHERE name = 'notifier_forward_queue'), 0) \
+               AND q.created_at < $1 \
+             ORDER BY q.id LIMIT $2)",
+    )
+    .bind(now - keep)
+    .bind(FORWARD_QUEUE_PRUNE_BATCH)
+    .execute(pool)
+    .await?;
+    metrics::counter!(ds_runtime::metrics::metric_name(
+        FORWARD_QUEUE_PRUNED_METRIC
+    ))
+    .increment(result.rows_affected());
+    Ok(result.rows_affected())
 }
 
 /// Sets both forward-queue gauges from `stats`.
@@ -1147,9 +1196,13 @@ pub(crate) fn publish_forward_queue_stats(stats: &ForwardQueueStats, now: DateTi
     .set(stats.oldest_age_seconds(now) as f64);
 }
 
-/// Registers both forward-queue gauges at 0, so the series exist from
-/// startup.
+/// Registers both forward-queue gauges and the pruned counter at 0, so the
+/// series exist from startup.
 pub(crate) fn register_forward_queue_metrics() {
+    metrics::counter!(ds_runtime::metrics::metric_name(
+        FORWARD_QUEUE_PRUNED_METRIC
+    ))
+    .increment(0);
     publish_forward_queue_stats(
         &ForwardQueueStats {
             rows: 0,
@@ -5115,6 +5168,98 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    /// DS-425: the gauges count only what the cursor has not passed, and
+    /// the prune deletes only consumed rows past the retention window.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p notifier \
+                forward_queue_prune -- --ignored --test-threads=1`"]
+    async fn forward_queue_prune_deletes_only_old_consumed_rows_and_the_stats_skip_them() {
+        let pool = connect().await;
+        let trains_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-FWDQ-PRUNE-UID', '2026-08-31') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed trains row");
+        let now: DateTime<Utc> = "2026-11-10T12:00:00Z".parse().unwrap();
+        let mut ids = Vec::new();
+        // old+consumed, new+consumed, old+unconsumed.
+        for created in [
+            "2026-10-10T12:00:00Z",
+            "2026-11-10T11:00:00Z",
+            "2026-10-11T12:00:00Z",
+        ] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO notifier_forward_queue (trains_id, event_summary, created_at) \
+                 VALUES ($1, 'x', $2) RETURNING id",
+            )
+            .bind(trains_id)
+            .bind(created.parse::<DateTime<Utc>>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("seed a forward-queue row");
+            ids.push(id);
+        }
+        let saved: Option<i64> = sqlx::query_scalar(
+            "SELECT last_processed_id FROM notifier_cursor WHERE name = 'notifier_forward_queue'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO notifier_cursor (name, last_processed_id) VALUES ('notifier_forward_queue', $1) \
+             ON CONFLICT (name) DO UPDATE SET last_processed_id = EXCLUDED.last_processed_id",
+        )
+        .bind(ids[1])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stats = forward_queue_stats(&pool).await.unwrap();
+        let pruned = prune_consumed_forward_queue(&pool, now, FORWARD_QUEUE_CONSUMED_KEEP)
+            .await
+            .unwrap();
+        let left: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM notifier_forward_queue WHERE trains_id = $1 ORDER BY id",
+        )
+        .bind(trains_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        match saved {
+            Some(id) => {
+                sqlx::query("UPDATE notifier_cursor SET last_processed_id = $1 WHERE name = 'notifier_forward_queue'")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            None => {
+                sqlx::query("DELETE FROM notifier_cursor WHERE name = 'notifier_forward_queue'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        sqlx::query("DELETE FROM trains WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(stats.rows >= 1, "the unconsumed row counts");
+        assert_eq!(
+            stats
+                .oldest_created_at
+                .map(|t| t <= "2026-10-11T12:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+            Some(true),
+            "the oldest unconsumed row, not the consumed one from 2026-10-10"
+        );
+        assert!(pruned >= 1);
+        assert_eq!(left, vec![ids[1], ids[2]], "only the old consumed row went");
     }
 
     #[test]
