@@ -21,6 +21,12 @@ dotenvy = "0.15.7"
 # The schema gate (`ds_store::schema::wait_for_schema`, plan 1B.3).
 ds-store = { workspace = true }
 futures-util = "0.3"
+# Outbound webhooks (`webhook`): the generic preset's HMAC-SHA256 signature
+# and delivery id. Same versions Cargo.lock already holds.
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+url = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sqlx = { version = "0.8.6", features = ["chrono", "json", "macros", "postgres", "runtime-tokio", "tls-native-tls"] }
@@ -58,6 +64,13 @@ tracing-subscriber = "0.3.23"
 # The stale line-history counter's test (ingest plan 3c.4) reads a local
 # recorder. Already in Cargo.lock, at the version the other crates use.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+[features]
+# Test-only (DS-415): `webhook::WebhookSender::unguarded_for_tests`, a sender
+# without the public-address guard, so `webhook_e2e_tests` can reach real
+# ntfy and Gotify servers on 127.0.0.1. Off by default, and a release build
+# with it fails to compile (main.rs), so no image can ship it.
+insecure-test-egress = []
 
 [lints]
 workspace = true

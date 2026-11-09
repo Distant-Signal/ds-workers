@@ -1564,6 +1564,115 @@ pub(crate) async fn push_subscriptions_for_user(
     Ok(rows)
 }
 
+#[derive(sqlx::FromRow)]
+struct WebhookRow {
+    id: i64,
+    kind: String,
+    url: String,
+    secret_ciphertext: Option<Vec<u8>>,
+    secret_nonce: Option<Vec<u8>>,
+    secret_key_id: Option<String>,
+}
+
+/// The user's enabled webhook destinations (DS-415), their secrets
+/// decrypted with `keys`. A destination whose secret can't be decrypted (a
+/// retired key is missing from the ring, or the value was altered) is left
+/// out with an error in the log and a count in
+/// `notifier_webhook_send_total{outcome="undecryptable"}`: that is the
+/// operator's problem, not the destination's, so it is not counted towards
+/// turning the destination off.
+pub(crate) async fn webhook_destinations_for_user(
+    pool: &PgPool,
+    user_id: &str,
+    keys: &ds_runtime::secret_box::KeyRing,
+) -> anyhow::Result<Vec<crate::webhook::WebhookDestination>> {
+    let rows = sqlx::query_as::<_, WebhookRow>(
+        "SELECT id, kind, url, secret_ciphertext, secret_nonce, secret_key_id \
+         FROM webhook_destinations WHERE user_id = $1 AND enabled ORDER BY id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let secret = match (row.secret_ciphertext, row.secret_nonce, row.secret_key_id) {
+            (Some(ciphertext), Some(nonce), Some(key_id)) => {
+                let sealed = ds_runtime::secret_box::Sealed {
+                    ciphertext,
+                    nonce,
+                    key_id,
+                };
+                match keys.open(&sealed) {
+                    Ok(secret) => Some(secret),
+                    Err(err) => {
+                        tracing::error!(
+                            webhook_id = row.id,
+                            key_id = %sealed.key_id,
+                            error = %err,
+                            "a webhook secret could not be decrypted; skipping the destination"
+                        );
+                        metrics::counter!(
+                            ds_runtime::metrics::metric_name("notifier_webhook_send_total"),
+                            "outcome" => "undecryptable"
+                        )
+                        .increment(1);
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
+        out.push(crate::webhook::WebhookDestination {
+            id: row.id,
+            kind: row.kind,
+            url: row.url,
+            secret,
+        });
+    }
+    Ok(out)
+}
+
+/// Records how a webhook delivery ended. A success clears the failure run;
+/// a failure extends it and, at `disable_after` in a row, turns the
+/// destination off with a reason for the settings page.
+pub(crate) async fn record_webhook_result(
+    pool: &PgPool,
+    id: i64,
+    failure: Option<&str>,
+    disable_after: i32,
+) -> anyhow::Result<()> {
+    match failure {
+        None => {
+            sqlx::query(
+                "UPDATE webhook_destinations SET consecutive_failures = 0, \
+                 last_success_at = now(), last_error = NULL WHERE id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+        Some(reason) => {
+            let reason: String = reason.chars().take(150).collect();
+            sqlx::query(
+                "UPDATE webhook_destinations SET \
+                   consecutive_failures = consecutive_failures + 1, \
+                   last_failure_at = now(), last_error = $2, \
+                   enabled = (consecutive_failures + 1 < $3), \
+                   disabled_reason = CASE WHEN consecutive_failures + 1 >= $3 \
+                     THEN left('Turned off after repeated failures. Last error: ' || $2, 200) \
+                     ELSE disabled_reason END \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(reason)
+            .bind(disable_after)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Stamps `last_pushed_at` on a subscription a push was delivered to: the
 /// Notifications page shows it as the device's "last used" (DS-153).
 pub(crate) async fn mark_push_subscription_pushed(pool: &PgPool, id: i64) -> anyhow::Result<()> {

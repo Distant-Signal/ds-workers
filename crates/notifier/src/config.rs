@@ -171,6 +171,33 @@ pub(crate) struct Config {
     #[arg(long, env, default_value = "info")]
     pub log_level: String,
 
+    /// Outbound webhooks (DS-415): also deliver each notification to the
+    /// user's own webhook destinations (generic, ntfy, Gotify). Off by
+    /// default: destinations are stored and shown by the api either way, but
+    /// nothing is sent to them until this is on (and the chart's egress
+    /// policy lets the notifier reach them).
+    #[arg(long, env, default_value_t = false)]
+    pub webhooks_enabled: bool,
+
+    /// The key ring that decrypts webhook destinations' stored secrets:
+    /// `<id>:<base64 of 32 bytes>[,<id>:<base64>...]`, shared with the api,
+    /// which encrypts with the first key (`ds_runtime::secret_box`). With
+    /// `webhooks_enabled` but no usable key ring, webhooks stay off and the
+    /// log says so.
+    #[arg(long, env, hide_env_values = true, default_value = "")]
+    pub webhook_secret_keys: Secret,
+
+    /// The site's public origin (`https://example.org`), put in front of a
+    /// notification's path to make the link a webhook carries. Unset: webhooks
+    /// carry no clickable link.
+    #[arg(long, env)]
+    pub webhook_site_url: Option<String>,
+
+    /// A webhook destination that fails this many deliveries in a row (each
+    /// is three attempts) is turned off and its reason shown to the user.
+    #[arg(long, env, default_value_t = 8)]
+    pub webhook_disable_after_failures: i32,
+
     /// Push worker pool size (SVC-02): how many notifications are being
     /// sent at once. Each one fans out to all of its user's subscriptions
     /// concurrently. See `push_queue`'s module doc.
@@ -349,6 +376,11 @@ impl Config {
              JOURNEY_BREAKS_POLL_INTERVAL_SECS) must be greater than zero"
         );
         anyhow::ensure!(
+            self.webhook_disable_after_failures > 0,
+            "webhook_disable_after_failures (WEBHOOK_DISABLE_AFTER_FAILURES) must be greater \
+             than zero"
+        );
+        anyhow::ensure!(
             self.push_workers > 0,
             "push_workers (--push-workers / PUSH_WORKERS) must be greater than zero"
         );
@@ -390,6 +422,31 @@ impl Config {
         })
     }
 
+    /// The webhook sender, when webhooks are switched on.
+    pub(crate) fn webhook_delivery(
+        &self,
+    ) -> anyhow::Result<Option<crate::push_queue::WebhookDelivery>> {
+        if !self.webhooks_enabled {
+            return Ok(None);
+        }
+        let keys = match ds_runtime::secret_box::KeyRing::parse(self.webhook_secret_keys.expose()) {
+            Ok(keys) => keys,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "WEBHOOKS_ENABLED is on but WEBHOOK_SECRET_KEYS is not usable; webhooks stay disabled"
+                );
+                return Ok(None);
+            }
+        };
+        tracing::info!(key_ids = ?keys, "webhook secret keys loaded");
+        Ok(Some(crate::push_queue::WebhookDelivery {
+            sender: crate::webhook::WebhookSender::new(self.webhook_site_url.clone())?,
+            disable_after_failures: self.webhook_disable_after_failures,
+            keys,
+        }))
+    }
+
     pub(crate) fn push_queue_config(&self) -> crate::push_queue::PushQueueConfig {
         crate::push_queue::PushQueueConfig {
             workers: self.push_workers,
@@ -425,6 +482,10 @@ mod tests {
             vapid_public_key: "test".to_string(),
             vapid_subject: "mailto:test@example.invalid".to_string(),
             log_level: "info".to_string(),
+            webhooks_enabled: false,
+            webhook_secret_keys: Secret::default(),
+            webhook_site_url: None,
+            webhook_disable_after_failures: 8,
             push_workers: 8,
             push_queue_capacity: 1024,
             push_per_user_in_flight: 2,
@@ -447,6 +508,22 @@ mod tests {
                 progress_stall_secs: 900,
             },
         }
+    }
+
+    /// Webhooks enabled without a usable key ring stay off (the log says
+    /// so); with one they turn on. Never an error, so the pod still starts.
+    #[tokio::test]
+    async fn webhooks_need_a_key_ring() {
+        let on = |keys: &str| Config {
+            webhooks_enabled: true,
+            webhook_secret_keys: Secret::new(keys),
+            ..valid_config()
+        };
+        assert!(on("").webhook_delivery().unwrap().is_none());
+        assert!(on("bad").webhook_delivery().unwrap().is_none());
+        let key = format!("k1:{}=", "A".repeat(43));
+        assert!(on(&key).webhook_delivery().unwrap().is_some());
+        assert!(valid_config().webhook_delivery().unwrap().is_none());
     }
 
     /// SVC-12: `Debug` on the config must not print the database password
