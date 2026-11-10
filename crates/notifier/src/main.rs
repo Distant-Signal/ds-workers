@@ -1606,12 +1606,13 @@ async fn remind_manual_legs(
 
 /// The pick reminder's text (regular journeys §6.5). With the api's plan
 /// sweep's suggestion it names the train, honestly by why it was chosen:
-/// "Pick your train for Woking to London Waterloo. Your usual 08:12 is
-/// running. Leave by 07:57 for it.", "The 08:14 is the closest to your
-/// usual." when the usual operator's nearest train is not the usual one
-/// (a retime with a new UID), or, when the usual train doesn't run that
-/// day, "Your usual train isn't running today, so the 08:40 is the
-/// closest." The leave-by comes from the shared leave-by SQL (the station
+/// "Pick your train for Woking to London Waterloo. Your usual 08:12 is on
+/// today's timetable. Leave by 07:57 for it.", "The 08:14 is by your usual
+/// train company, within 5 minutes of your usual." when the usual
+/// operator's nearest train is not the usual one (a retime with a new
+/// UID), or, when no usual train was found that day, "We couldn't find
+/// your usual train today, so the 08:40 looks the best fit." ("closest"
+/// means only the first of these, everywhere). The leave-by comes from the shared leave-by SQL (the station
 /// buffer, the timetable's departure), and is left out when there is none:
 /// no buffer, or the day's best train, which has no leave-by. Otherwise,
 /// as before.
@@ -1620,7 +1621,7 @@ fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
         .then_some(leg.plan_departure)
         .flatten();
     let Some(departure) = suggested else {
-        return format!("Your {route} journey is coming up. Tap to choose a train.");
+        return format!("Your {route} journey is coming up. Tap to pick your train.");
     };
     let clock = |at: DateTime<Utc>| {
         at.with_timezone(&chrono_tz::Europe::London)
@@ -1629,16 +1630,18 @@ fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
     };
     match leg.plan_reason.as_deref() {
         Some("best") => format!(
-            "Pick your train for {route}. Your usual train isn't running today, so the {} \
-             is the closest.",
+            "Pick your train for {route}. We couldn't find your usual train today, so the {} \
+             looks the best fit.",
             clock(departure)
         ),
         reason => {
             let time = clock(leg.plan_leave_by_departure.unwrap_or(departure));
             let which = if reason == Some("same_operator") {
-                format!("The {time} is the closest to your usual.")
+                format!(
+                    "The {time} is by your usual train company, within 5 minutes of your usual."
+                )
             } else {
-                format!("Your usual {time} is running.")
+                format!("Your usual {time} is on today's timetable.")
             };
             match leg.plan_leave_by {
                 Some(leave_by) => format!(
@@ -3106,7 +3109,7 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &usual),
-            "Pick your train for Woking to London Waterloo. Your usual 08:12 is running."
+            "Pick your train for Woking to London Waterloo. Your usual 08:12 is on today's timetable."
         );
         let renamed = reminder_leg(
             Some("suggested"),
@@ -3115,8 +3118,8 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &renamed),
-            "Pick your train for Woking to London Waterloo. The 08:14 is the closest to your \
-             usual."
+            "Pick your train for Woking to London Waterloo. The 08:14 is by your usual \
+             train company, within 5 minutes of your usual."
         );
         let closest = reminder_leg(
             Some("suggested"),
@@ -3125,8 +3128,8 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &closest),
-            "Pick your train for Woking to London Waterloo. Your usual train isn't running \
-             today, so the 08:40 is the closest."
+            "Pick your train for Woking to London Waterloo. We couldn't find your usual train \
+             today, so the 08:40 looks the best fit."
         );
         for leg in [
             reminder_leg(None, None, None),
@@ -3139,7 +3142,7 @@ mod sweep_cycle_tests {
         ] {
             assert_eq!(
                 pick_reminder_body(route, &leg),
-                "Your Woking to London Waterloo journey is coming up. Tap to choose a train."
+                "Your Woking to London Waterloo journey is coming up. Tap to pick your train."
             );
         }
         for leg in [usual, renamed, closest] {
@@ -3168,7 +3171,7 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &usual),
-            "Pick your train for Woking to London Waterloo. Your usual 07:50 is running. \
+            "Pick your train for Woking to London Waterloo. Your usual 07:50 is on today's timetable. \
              Leave by 07:35 for it."
         );
         // Retimed to 07:53 since the plan was made: the time and the
@@ -3184,7 +3187,7 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &retimed),
-            "Pick your train for Woking to London Waterloo. Your usual 07:53 is running. \
+            "Pick your train for Woking to London Waterloo. Your usual 07:53 is on today's timetable. \
              Leave by 07:38 for it."
         );
         let closest = with_leave_by(
@@ -3198,8 +3201,8 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &closest),
-            "Pick your train for Woking to London Waterloo. The 07:54 is the closest to your \
-             usual. Leave by 07:39 for it."
+            "Pick your train for Woking to London Waterloo. The 07:54 is by your usual \
+             train company, within 5 minutes of your usual. Leave by 07:39 for it."
         );
         // The day's best has no leave-by (the SQL gives none); no buffer
         // gives none either: the text stays as it was.
@@ -3216,7 +3219,7 @@ mod sweep_cycle_tests {
         );
         assert_eq!(
             pick_reminder_body(route, &unbuffered),
-            "Pick your train for Woking to London Waterloo. Your usual 07:50 is running."
+            "Pick your train for Woking to London Waterloo. Your usual 07:50 is on today's timetable."
         );
         for leg in [usual, retimed, closest] {
             let body = pick_reminder_body(route, &leg);

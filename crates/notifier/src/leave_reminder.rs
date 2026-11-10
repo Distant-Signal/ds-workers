@@ -17,7 +17,7 @@
 //!   leave-by then comes from the api plan sweep's suggestion (basis
 //!   `usual`, or `closest` for the usual operator's nearest train; none for
 //!   the day's best). Off unless `LEAVE_REMINDERS_USUAL_TRAIN_ENABLED`. The
-//!   text says "your usual" or "the closest to your usual train" and that
+//!   text says "your usual" or "by your usual train company, within 5 minutes of your usual" and that
 //!   it still needs picking, never that the train is tracked. The pick
 //!   reminder (`pick_reminder_body`) names the same leave-by two hours
 //!   earlier, at a different moment and with different words; both count
@@ -236,7 +236,7 @@ pub(crate) fn build_leave_by_payload(row: &LeaveRow, moved: bool) -> Notificatio
             (
                 format!("Leave by {leave}"),
                 format!(
-                    "For the {time}{route}, the closest to your usual train. Tap to pick your train."
+                    "For the {time}{route}, by your usual train company, within 5 minutes of your usual. Tap to pick your train."
                 ),
             )
         }
@@ -1186,8 +1186,8 @@ mod tests {
             text(&closest),
             (
                 "Leave by 07:35".into(),
-                "For the 07:50 Woking to London Waterloo, the closest to your usual train. Tap \
-                 to pick your train."
+                "For the 07:50 Woking to London Waterloo, by your usual train company, within 5 \
+                 minutes of your usual. Tap to pick your train."
                     .into()
             )
         );
