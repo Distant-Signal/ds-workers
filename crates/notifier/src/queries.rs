@@ -1659,7 +1659,7 @@ pub(crate) async fn record_webhook_result(
                    last_failure_at = now(), last_error = $2, \
                    enabled = (consecutive_failures + 1 < $3), \
                    disabled_reason = CASE WHEN consecutive_failures + 1 >= $3 \
-                     THEN left('Turned off after repeated failures. Last error: ' || $2, 200) \
+                     THEN left('Turned off after repeated failures. Last problem: ' || $2, 200) \
                      ELSE disabled_reason END \
                  WHERE id = $1",
             )

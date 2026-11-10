@@ -116,7 +116,7 @@ async fn the_presets_deliver_to_real_servers() {
     );
     assert!(matches!(
         sender.send(&wrong, &event("x", "must not arrive", false)).await,
-        WebhookOutcome::Failed(reason) if reason.contains("401") || reason.contains("403")
+        WebhookOutcome::Failed(reason) if reason.contains("refused")
     ));
     let anonymous = dest(3, "ntfy", &ntfy_url, None);
     assert!(matches!(
@@ -139,7 +139,7 @@ async fn the_presets_deliver_to_real_servers() {
     let wrong = dest(5, "gotify", &gotify_url, Some("Awrongwrongwrong"));
     assert!(matches!(
         sender.send(&wrong, &event("x", "must not arrive", false)).await,
-        WebhookOutcome::Failed(reason) if reason.contains("401") || reason.contains("403")
+        WebhookOutcome::Failed(reason) if reason.contains("refused")
     ));
 
     // Generic: capture the raw request for scripts/webhook-e2e.py to verify
