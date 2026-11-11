@@ -7356,7 +7356,7 @@ mod sweep_tests {
     /// itinerary, not the template's (whose usual train is at the other
     /// time). Other days follow the template's.
     #[tokio::test]
-    #[ignore = "requires a live database with ds-core v0.14.2's migrations; \
+    #[ignore = "requires a live database with ds-core v0.14.3's migrations; \
                 run with `DATABASE_URL=... cargo test -p notifier \
                 the_reminder_reads_a_different_time_days_usual_itinerary -- --ignored --test-threads=1`"]
     async fn the_reminder_reads_a_different_time_days_usual_itinerary() {

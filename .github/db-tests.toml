@@ -31,25 +31,28 @@ uv run --no-sync scripts/db-tests.py run superuser --archive-file "${DB_TESTS_AR
 '''
 
 # The Postgres role split (ds-core's docs/postgres-app-role.md): the suites
-# as the DML-only app role on a database migrated as the superuser (today's
-# production), MIGRATION_DATABASE_URL the schema owner. --check-setup-job
+# with DATABASE_URL and MIGRATION_DATABASE_URL as the schema owner, on a
+# database migrated as the superuser (today's production). The shared app
+# role was dropped in release E; each service's own role is the per-service
+# pass below. --check-app-retirement recreates the retired app role as the
+# old script left it to prove the setup script drops it. --check-setup-job
 # also runs the pinned release's roles setup through the setup Job's
 # entrypoint behind an ACCESS SHARE reader. (`new`, the roles first, runs in
 # ds-core: it tests the migrations.)
 [[pass]]
-id = "app-role"
-name = "DB tests as the app role (existing cluster)"
+id = "role-split"
+name = "DB tests as the schema owner (existing cluster)"
 run = '''
 CORE="$(uv run --no-sync scripts/core-checkout.py)"
-echo "== DB-backed tests as the non-superuser app role (existing cluster)"
-uv run --no-sync python "${CORE}/scripts/test-postgres-roles.py" --mode existing --check-setup-job -- \
+echo "== DB-backed tests as the non-superuser owner role (existing cluster)"
+uv run --no-sync python "${CORE}/scripts/test-postgres-roles.py" --mode existing --check-app-retirement --check-setup-job -- \
   uv run --no-sync scripts/db-tests.py run existing --archive-file "${DB_TESTS_ARCHIVE}" --extract-to "${GITHUB_WORKSPACE}"
 '''
 
 # Each suite as its own service's role (Stage 0b), from the pinned
 # release's access/postgres-grants.sql. The api, aggregator, enricher and
-# notifier roles are `--observe`d (members of app again) until their
-# fixtures move to the owner pool; see the monorepo's db-tests.toml history
+# notifier roles are `--observe`d (a test-only table-wide DML grant, since
+# the app role is gone) until their fixtures move to the owner pool; see the monorepo's db-tests.toml history
 # for each role's story.
 [[pass]]
 id = "per-service"
