@@ -67,7 +67,7 @@ The chart refuses to render, and the aggregator refuses to start, with the
 archive enabled and neither set. The expiry age is a licensing decision,
 not a technical one: the archived rows are derived from TRUST (Network
 Rail's movement feed, via the Rail Data Marketplace), so pick an age your
-review of that licence allows. On mine-bringer it is 730 days (decided
+review of that licence allows. In production it is 730 days (decided
 2026-09-30).
 
 ### Client-side expiry
@@ -83,7 +83,7 @@ archive:
     retentionDays: 730        # the floor of 90 is fixed in code
     intervalSecs: 86400
     maxDeletesPerRun: 20000
-    protectedPrefixes: [mine-bringer/backups/, mine-bringer/pgbackrest/]
+    protectedPrefixes: [prod-cluster/backups/, prod-cluster/pgbackrest/]
 ```
 
 A task in the aggregator, separate from the retention prunes, runs at
@@ -110,7 +110,7 @@ oldest date first, and sends one single-object `DELETE` per object (bulk
 failed DELETEs a run stops, and the next run retries.
 
 The archive's S3 key may be able to delete other things in the same bucket
-(on mine-bringer, the backups). So, at startup, the aggregator refuses to
+(in production, the backups). So, at startup, the aggregator refuses to
 run expiry if `archive.s3.prefix` is empty, has fewer than two path
 segments, or equals, contains or sits inside any `protectedPrefixes` entry.
 
@@ -225,7 +225,7 @@ example in docker-compose: `ARCHIVE_ENABLED`, `ARCHIVE_TABLES`
 The aggregator needs egress to the S3 endpoint. The chart renders no
 egress policy for the aggregator, so on a cluster with default-deny egress
 add one yourself. The endpoint is often at a private or tailnet address
-that a generic "public internet" allow excludes (on mine-bringer,
+that a generic "public internet" allow excludes (in production,
 `allow-egress-internet` excludes `100.64.0.0/10`, where Thoth lives). A
 narrow rule, for example:
 

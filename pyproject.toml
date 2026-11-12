@@ -1,6 +1,6 @@
 # Tooling config for the repo's scripts (scripts/*.py, every *.sh, and the
-# workflow run: blocks), managed with uv (Ranma-Config new-service guidance
-# 3.3a). CI: the `scripts-lint` job in .github/workflows/ci.yml, which runs
+# workflow run: blocks), managed with uv and a locked
+# lockfile. CI: the `scripts-lint` job in .github/workflows/ci.yml, which runs
 # Distant-Signal/ci's scripts/lint-scripts.py in this project; locally,
 # `uv run python ../ci/scripts/lint-scripts.py` (with a checkout of
 # Distant-Signal/ci beside this one) runs the same checks.

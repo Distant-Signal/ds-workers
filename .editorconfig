@@ -1,5 +1,5 @@
 # EditorConfig: https://editorconfig.org
-# Baseline from the "Strict Config Starting Points" guide. shfmt reads the
+# Strict baseline. shfmt reads the
 # [*.sh] section (when run without formatting flags), so this is the single
 # source of truth for shell formatting: equivalent to `shfmt -i 4 -ci -bn`.
 root = true
