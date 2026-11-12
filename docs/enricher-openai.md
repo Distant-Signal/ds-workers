@@ -181,7 +181,7 @@ Authentik's side: <https://docs.goauthentik.io/add-secure-apps/providers/oauth2/
    `workloadIdentity.tokenAudience` (default: the Authentik client ID). It
    is valid for an hour and rotated by the kubelet.
 2. The enricher POSTs it, form-encoded, to Authentik's token endpoint
-   (`LLM_AUTHENTIK_TOKEN_URL`, e.g. `https://sso.cursed.solutions/application/o/token/`):
+   (`LLM_AUTHENTIK_TOKEN_URL`, e.g. `https://sso.example.com/application/o/token/`):
    `grant_type=client_credentials`, `client_id=<client ID>`,
    `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`,
    `client_assertion=<k8s token>` (and `scope`, if set). This is Authentik's
@@ -309,7 +309,7 @@ None of these is a secret, but keep real values out of this repo.
    The issuer need not be reachable from the internet: neither Authentik
    nor OpenAI fetches it; both get the uploaded JWKS.
 
-**Authentik (`https://sso.cursed.solutions`):**
+**Authentik (`https://sso.example.com`):**
 
 1. A **Generic OAuth Source** (Directory > Federation and Social login >
    Create > OpenID OAuth Source) named e.g. `k3s-service-accounts`, holding
@@ -318,7 +318,7 @@ None of these is a secret, but keep real values out of this repo.
    interactive login. Any field the form requires but this flow never uses
    (URLs, consumer key) gets an inert value.
 2. A dedicated **OAuth2/OpenID provider**, e.g. `ds-openai-enricher`:
-   - issuer mode: per-provider (`https://sso.cursed.solutions/application/o/<app-slug>/`);
+   - issuer mode: per-provider (`https://sso.example.com/application/o/<app-slug>/`);
    - signing key: an RSA certificate-keypair, so its tokens are RS256;
    - access token validity: short, e.g. `minutes=15`;
    - **Federated OIDC Sources**: the source from step 1;
@@ -364,7 +364,7 @@ None of these is a secret, but keep real values out of this repo.
      key, delete it.
 2. A **Workload Identity Provider** (Organization settings > Security >
    Workload Identity Provider), type **OIDC**:
-   - OIDC Issuer URL: `https://sso.cursed.solutions/application/o/<app-slug>/`
+   - OIDC Issuer URL: `https://sso.example.com/application/o/<app-slug>/`
      (the Authentik provider's issuer; a trailing slash is ignored);
    - Audience: `<client-id>` (what Authentik puts in `aud`);
    - standard OIDC discovery: no custom discovery URL, no uploaded JWKS;
@@ -417,7 +417,7 @@ enricher:
       # tokenAudience: ""                               # default: authentik.clientId
       # tokenExchangeUrl: https://auth.openai.com/oauth/token
       authentik:
-        tokenUrl: https://sso.cursed.solutions/application/o/token/
+        tokenUrl: https://sso.example.com/application/o/token/
         clientId: <client-id>
         scope: profile
   llmRequestTimeoutSecs: 120
@@ -460,7 +460,7 @@ claims() { python3 -c 'import base64,json,sys; p=sys.argv[1].split(".")[1]; prin
 claims "$K8S"      # iss = <k3s-issuer>, sub = system:serviceaccount:<ns>:<enricher-sa>, aud = [<client-id>]
 
 # 2. Primary only: Authentik.
-AK=$(curl -sS https://sso.cursed.solutions/application/o/token/ \
+AK=$(curl -sS https://sso.example.com/application/o/token/ \
   -d grant_type=client_credentials -d client_id=<client-id> \
   -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
   --data-urlencode "client_assertion=$K8S" -d scope=profile | jq -r .access_token)
@@ -1033,7 +1033,7 @@ read 2026-10; re-check before switching):
 
 ### Legal follow-up before switching
 
-The UK legal review (`ds-review/uk-legal-compliance-2026-09-27.md`) and the
+The UK legal review and the
 privacy notice (`frontend/app/privacy/page.tsx`: "we use a self-hosted AI
 model") both assume the LLM is self-hosted. Switching makes OpenAI a US
 processor of the incident text. Before the switch:

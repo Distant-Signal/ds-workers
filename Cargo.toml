@@ -36,7 +36,7 @@ publish = false
 # it with `license.workspace = true`.
 license = "AGPL-3.0-or-later"
 
-# Strict baseline from the "Strict Config Starting Points" guide. Every crate
+# Strict baseline. Every crate
 # opts in with `[lints] workspace = true`. Lints stay at "warn" here and CI
 # fails on them with `-D warnings`, so a new toolchain's lints don't break a
 # local build. Opt out per item with `#[expect(lint, reason = "...")]`.

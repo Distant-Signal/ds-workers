@@ -6,7 +6,7 @@
 //! lists and matches the archive and reports what it *would* delete, but
 //! never deletes.
 //!
-//! Some S3-compatible servers (Thoth on mine-bringer among them) have no
+//! Some S3-compatible servers (Thoth in production among them) have no
 //! lifecycle API, so a bucket expiration rule cannot age archived objects
 //! out. This task does it from the aggregator instead, because the
 //! aggregator is what writes the archive and knows its key layout. Design:
@@ -16,7 +16,7 @@
 //! # What may be deleted
 //!
 //! The archive credentials may be able to delete much more than the archive
-//! (on mine-bringer one Thoth key also covers the backups), so an object is
+//! (in production one Thoth key also covers the backups), so an object is
 //! deleted only if ALL of these hold:
 //!
 //! - its key matches exactly
@@ -104,7 +104,7 @@ pub(crate) struct ExpiryArgs {
     pub archive_expiry_max_deletes_per_run: u64,
 
     /// Comma-separated key prefixes the archive prefix must never equal,
-    /// contain or sit inside, e.g. `mine-bringer/backups/,mine-bringer/pgbackrest/`.
+    /// contain or sit inside, e.g. `prod-cluster/backups/,prod-cluster/pgbackrest/`.
     #[arg(long, env, value_delimiter = ',')]
     pub archive_protected_prefixes: Vec<String>,
 }

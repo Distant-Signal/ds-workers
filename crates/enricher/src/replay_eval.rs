@@ -1,5 +1,4 @@
-//! Offline replay harness for the enricher's churn measurement
-//! (docs: /home/coder/ds-review/diff-aware-enricher-research.md). Test-only,
+//! Offline replay harness for the enricher's churn measurement. Test-only,
 //! every test `#[ignore]`d; reads a JSONL export of `incident_history`
 //! produced by `scripts/export-incident-history-for-replay.sql` (read-only).
 //! Writes nothing anywhere except stdout/stderr.

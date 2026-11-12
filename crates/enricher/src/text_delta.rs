@@ -1,6 +1,5 @@
 //! Classifies the change between the text an incident's stored extraction
-//! was computed from and its current text (research:
-//! /home/coder/ds-review/diff-aware-enricher-research.md), so the enricher
+//! was computed from and its current text, so the enricher
 //! can (a) label the churn metrics by edit class
 //! (`enricher_extraction_churn_total{edit_class}` -- measurement, always on)
 //! and (b) behind `CARRY_FORWARD_SEMANTIC_NOOPS` (default on), skip the LLM

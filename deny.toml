@@ -2,7 +2,7 @@
 # (ci.yml) runs `cargo deny --locked check bans licenses sources` as a
 # blocking check, `cargo deny --locked fetch` as a blocking step, and
 # `check advisories` as a non-blocking check that only warns.
-# Baseline: the "Strict Config Starting Points" guide's deny.toml.
+# Baseline: a strict deny.toml.
 
 [graph]
 all-features = true
@@ -78,7 +78,7 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# crates.io only. The guide's Forgejo registry entry is dropped: this repo
+# crates.io only: this repo
 # has no .cargo/config.toml registries and no crate comes from elsewhere.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The core crates (repo split spec §5.2): git dependencies on the public
