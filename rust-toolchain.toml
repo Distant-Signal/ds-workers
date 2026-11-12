@@ -1,0 +1,12 @@
+# The toolchain contributors and forks get from rustup. CI installs a pinned
+# stable (the `toolchain:` input of Distant-Signal/ci's rust-ci.yml, which
+# Renovate moves with the Docker builder image), so this follows `stable`
+# instead of repeating that pin. The minimum supported Rust is
+# `rust-version` in Cargo.toml (1.88), checked separately by CI's MSRV job
+# with an explicit `cargo +1.88.0`, which takes precedence over this file.
+# rustfmt.toml uses stable options only, so stable rustfmt is right.
+
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
