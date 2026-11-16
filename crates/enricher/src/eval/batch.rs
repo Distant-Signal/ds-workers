@@ -621,6 +621,8 @@ async fn poll_stage(
             let id = run.stage(stage)[index].id.clone();
             let poll = match client.poll_batch(&id).await {
                 Ok(BatchPoll::Pending) => {
+                    // `max_poll_failures` counts consecutive failures.
+                    failures.remove(&index);
                     still_open.push(index);
                     continue;
                 }
@@ -883,15 +885,20 @@ pub(crate) async fn run_batch(
     }
     let mut meta = BatchRunMeta::new(&state, &records, &opts.state_path, resumed);
 
-    // Optional: re-run what the batches couldn't, synchronously.
+    // Optional: re-run what the batches couldn't, synchronously. A record
+    // re-run whole has had its echo retry already (`run_pipeline`).
+    let mut rerun_whole = vec![false; records.len()];
     if opts.retry_failed_sync {
-        for (record, (job, case_index)) in records.iter_mut().zip(&jobs) {
+        for ((record, (job, case_index)), rerun) in
+            records.iter_mut().zip(&jobs).zip(&mut rerun_whole)
+        {
             if !record.calls.iter().any(batch_failed) {
                 continue;
             }
             let case = &cases[*case_index];
             if batch_failed(&record.calls[0]) {
                 *record = pipeline::run_pipeline(client, label, case, record.repetition).await;
+                *rerun = true;
             } else if let Some(periods) = periods_by_job.get(&job.index) {
                 for call in &mut record.calls {
                     if batch_failed(call) {
@@ -906,7 +913,10 @@ pub(crate) async fn run_batch(
     // The service's echo retry (`main.rs::realign_adversarial`): an
     // adversarial verdict list that doesn't echo the primary periods is
     // asked again once, synchronously, as the service's batch path does.
-    for (record, (_, case_index)) in records.iter_mut().zip(&jobs) {
+    for ((record, (_, case_index)), rerun) in records.iter_mut().zip(&jobs).zip(rerun_whole) {
+        if rerun {
+            continue;
+        }
         let retried = pipeline::retry_echo_mismatches(client, &cases[*case_index], record).await;
         if retried > 0 {
             eprintln!(
