@@ -1650,13 +1650,13 @@ fn classify(counts: ClassifyCounts, thresholds: &Defaults) -> (Severity, String)
     };
 
     match (delay_severity, skip_severity) {
-        (Some(d), Some(s)) if d == s => (
+        (Some(d), Some(s)) if delay_vs_skip(d, s) == std::cmp::Ordering::Equal => (
             d,
             format!(
                 "{delayed} of {total} sampled services delayed, {skipped} of {total} sampled services skipping a scheduled stop."
             ),
         ),
-        (Some(d), Some(s)) if d < s => {
+        (Some(d), Some(s)) if delay_vs_skip(d, s) == std::cmp::Ordering::Greater => {
             (d, format!("{delayed} of {total} sampled services delayed."))
         }
         (Some(_), Some(s)) => (
@@ -1670,6 +1670,15 @@ fn classify(counts: ClassifyCounts, thresholds: &Defaults) -> (Severity, String)
         ),
         (None, None) => (Severity::GoodService, "Good Service".to_string()),
     }
+}
+
+/// How the delay candidate's severity compares with the skip candidate's in
+/// [`classify`], on the `common::severity_rank` scale (never `Severity`'s
+/// discriminant order, which runs the other way and does not follow
+/// severity at all for some pairs: Reduced Service sorts before Bus
+/// Service yet is the milder). `Greater`: the delay is the more severe.
+fn delay_vs_skip(delay: Severity, skip: Severity) -> std::cmp::Ordering {
+    severity_rank(delay).cmp(&severity_rank(skip))
 }
 
 /// Lets live LDBWS sample stats (average delay, cancellation rate) escalate
@@ -3041,6 +3050,31 @@ mod tests {
         let stats = status.sample_stats.expect("stats");
         assert_eq!(stats.skipped, 0);
         assert_eq!(stats.cancelled, 1);
+    }
+
+    #[test]
+    fn delay_vs_skip_compares_by_severity_rank_not_discriminant() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            delay_vs_skip(Severity::SevereDelays, Severity::MinorDelays),
+            Ordering::Greater
+        );
+        assert_eq!(
+            delay_vs_skip(Severity::MinorDelays, Severity::SevereDelays),
+            Ordering::Less
+        );
+        // Discriminant order would call Reduced Service (7) the more
+        // severe of the two; its rank is the milder.
+        assert!(Severity::ReducedService < Severity::BusService);
+        assert_eq!(
+            delay_vs_skip(Severity::ReducedService, Severity::BusService),
+            Ordering::Less
+        );
+        // Same rank, different variants: a tie, not a pick.
+        assert_eq!(
+            delay_vs_skip(Severity::MinorDelays, Severity::ReducedService),
+            Ordering::Equal
+        );
     }
 
     #[test]
