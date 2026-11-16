@@ -297,6 +297,16 @@ impl Pusher {
     }
 }
 
+/// A push endpoint's host, for logs. The full endpoint is a capability URL
+/// (whoever holds it can push to the device), so it is never logged
+/// (review finding N5).
+fn endpoint_host(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "(unparseable)".to_string())
+}
+
 pub(crate) async fn send_to_subscription(
     client: &reqwest::Client,
     vapid_key: &VapidKey,
@@ -322,7 +332,7 @@ pub(crate) async fn send_to_subscription(
         ds_runtime::outbound_endpoint_guard::validate_outbound_url(&subscription.endpoint).await
     {
         tracing::error!(
-            endpoint = %subscription.endpoint,
+            endpoint_host = %endpoint_host(&subscription.endpoint),
             error = %err,
             "push endpoint failed send-time re-validation -- it passed registration-time \
              validation but now resolves to a disallowed (private/internal/loopback) address; \
@@ -684,6 +694,15 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn an_endpoint_is_logged_by_its_host_only() {
+        assert_eq!(
+            endpoint_host("https://push.example.com/wpush/v2/gAAAA-secret-token"),
+            "push.example.com"
+        );
+        assert_eq!(endpoint_host("not a url"), "(unparseable)");
+    }
 
     /// A real `WebPushError` for `status`, straight from `web-push`'s own
     /// status-code classifier (`web_push::request_builder::parse_response`)
