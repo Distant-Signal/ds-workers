@@ -142,6 +142,7 @@ model returns is the same shape, and the parsers did not change.
 | 200 with null/empty content | `empty_content` | No | Yes |
 | Keyless auth only: no access token could be minted (token file, Authentik or OpenAI token endpoint) | `auth_error` | No (nothing was sent) | No |
 | Keyless auth only: 401 to a freshly exchanged token (the first 401 is resent once with a new token, spending no retry budget) | `unauthorized` | No | No |
+| No response: connection refused or reset, DNS or TLS failure, a body cut off mid-read | `connect_error` | No | No: a provider or proxy outage. Reclaim keeps retrying at its normal cadence, so incidents catch up as soon as it recovers. |
 
 Every failed call is logged with the response's `x-request-id`
 (`request_id` field), plus `error.code`/`error.type` from the body. Give

@@ -679,6 +679,10 @@ pub(crate) enum LlmCallError {
     /// freshly exchanged one. Provider-side (the mapping, the project or
     /// the service account), not the text's fault.
     Unauthorized,
+    /// The request never got an HTTP response, or its body was cut off: a
+    /// refused or reset connection, a DNS failure, a TLS handshake error.
+    /// A provider or proxy outage, not the text's fault.
+    Connect(anyhow::Error),
     Other(anyhow::Error),
 }
 
@@ -730,6 +734,7 @@ impl std::fmt::Display for LlmCallError {
                 "LLM endpoint rejected a freshly exchanged access token (401 twice); check the \
                  service account, its project or workspace and the federation mapping or rule"
             ),
+            Self::Connect(err) => write!(f, "couldn't reach the LLM endpoint: {err:#}"),
             Self::Other(err) => write!(f, "{err}"),
         }
     }
@@ -750,7 +755,23 @@ impl LlmCallError {
             Self::Refused { .. } => "refused",
             Self::CredentialUnavailable { .. } => "auth_error",
             Self::Unauthorized => "unauthorized",
+            Self::Connect(_) => "connect_error",
             Self::Other(_) => "error",
+        }
+    }
+
+    /// Classifies a `reqwest` error from sending a request or reading its
+    /// body: a client timeout, a transport failure ([`Self::Connect`]:
+    /// connect, DNS, TLS, reset, truncated body), or anything else
+    /// ([`Self::Other`]: a request we built wrong, or a body that isn't
+    /// JSON).
+    pub(crate) fn from_reqwest(err: reqwest::Error) -> Self {
+        if err.is_timeout() {
+            Self::ClientTimeout
+        } else if err.is_connect() || err.is_request() || err.is_body() {
+            Self::Connect(err.into())
+        } else {
+            Self::Other(err.into())
         }
     }
 }
@@ -1548,6 +1569,9 @@ impl LlmClient {
     /// - A refusal is the model's answer to this text: not transient.
     /// - A credential failure (no federated token, or a 401 to a fresh one)
     ///   is the deployment's problem: transient.
+    /// - A transport failure (connect, DNS, TLS, reset) is a provider or
+    ///   proxy outage: transient, so an outage doesn't leave every incident
+    ///   it touched backing off for hours after the provider recovers.
     #[expect(
         clippy::match_same_arms,
         reason = "separate arms document distinct cases"
@@ -1556,6 +1580,7 @@ impl LlmClient {
         match err.downcast_ref::<LlmCallError>() {
             Some(LlmCallError::RateLimited { .. } | LlmCallError::QuotaExhausted { .. }) => true,
             Some(LlmCallError::CredentialUnavailable { .. } | LlmCallError::Unauthorized) => true,
+            Some(LlmCallError::Connect(_)) => true,
             Some(
                 LlmCallError::GatewayUnavailable { status: 504, .. } | LlmCallError::ClientTimeout,
             ) => self.policy.max_gateway_retries > 0,
@@ -1802,13 +1827,10 @@ impl LlmClient {
             );
             err
         };
-        let body: serde_json::Value = response.json().await.map_err(|err| {
-            failed(if err.is_timeout() {
-                LlmCallError::ClientTimeout
-            } else {
-                LlmCallError::Other(err.into())
-            })
-        })?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|err| failed(LlmCallError::from_reqwest(err)))?;
         let (usage, content) = match request {
             WireRequest::Chat(_) => chat_completion_content(body),
             WireRequest::Messages { .. } => anthropic::completion_from_message(&body),
@@ -1852,13 +1874,7 @@ impl LlmClient {
                 req = credential.apply(req);
             }
 
-            let response = req.send().await.map_err(|err| {
-                if err.is_timeout() {
-                    LlmCallError::ClientTimeout
-                } else {
-                    LlmCallError::Other(err.into())
-                }
-            })?;
+            let response = req.send().await.map_err(LlmCallError::from_reqwest)?;
             if response.status() != reqwest::StatusCode::UNAUTHORIZED || !self.auth.is_federated() {
                 return Ok(response);
             }
@@ -3719,6 +3735,90 @@ mod tests {
         assert!(retrying_client.is_provider_transient(&err), "{err:?}");
     }
 
+    /// A refused connection (the provider or a proxy down) is typed as
+    /// `Connect` and is provider-transient under the default policy, so an
+    /// outage never pushes the incident into the per-text backoff.
+    #[tokio::test]
+    async fn connection_refused_is_typed_and_transient() {
+        // Bind then drop a listener: its port now refuses connections.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let client = LlmClient::new(
+            format!("http://{addr}"),
+            None,
+            "m".into(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Connect(_))
+            ),
+            "{err:?}"
+        );
+        assert!(client.is_provider_transient(&err), "{err:?}");
+        assert_eq!(llm_outcome_label(&err), "connect_error");
+    }
+
+    /// A DNS failure is a transport failure too.
+    #[tokio::test]
+    async fn dns_failure_is_typed_and_transient() {
+        let client = LlmClient::new(
+            "http://ds-enricher-test.invalid".into(),
+            None,
+            "m".into(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Connect(_))
+            ),
+            "{err:?}"
+        );
+        assert!(client.is_provider_transient(&err), "{err:?}");
+    }
+
+    /// A 200 whose body isn't JSON is not a transport failure: it stays
+    /// `Other`, which feeds the per-text backoff as before.
+    #[tokio::test]
+    async fn malformed_body_is_not_a_connect_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), None, "m".into(), DEFAULT_REQUEST_TIMEOUT);
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Other(_))
+            ),
+            "{err:?}"
+        );
+        assert!(!client.is_provider_transient(&err), "{err:?}");
+    }
+
+    fn llm_outcome_label(err: &anyhow::Error) -> &'static str {
+        err.downcast_ref::<LlmCallError>()
+            .map_or("error", LlmCallError::outcome_label)
+    }
+
     #[tokio::test]
     async fn client_timeout_is_typed_and_only_transient_when_gateway_retries_are_on() {
         let server = MockServer::start().await;
@@ -3826,6 +3926,7 @@ mod tests {
             }
             .outcome_label(),
             LlmCallError::Unauthorized.outcome_label(),
+            LlmCallError::Connect(anyhow::anyhow!("x")).outcome_label(),
             LlmCallError::Other(anyhow::anyhow!("x")).outcome_label(),
         ];
         assert_eq!(
@@ -3840,6 +3941,7 @@ mod tests {
                 "refused",
                 "auth_error",
                 "unauthorized",
+                "connect_error",
                 "error"
             ]
         );

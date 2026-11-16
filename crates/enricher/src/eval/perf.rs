@@ -139,8 +139,12 @@ pub(crate) fn call_stats<'a>(calls: impl Iterator<Item = &'a pipeline::CallRecor
             if attempt.outcome == "success" {
                 send.push(attempt.send_ms);
             }
-            // `auth_error`: no token, so nothing reached the endpoint.
-            if !matches!(attempt.outcome.as_str(), "timeout" | "error" | "auth_error") {
+            // `auth_error`: no token, so nothing reached the endpoint;
+            // `connect_error`: no response.
+            if !matches!(
+                attempt.outcome.as_str(),
+                "timeout" | "error" | "auth_error" | "connect_error"
+            ) {
                 responded.push(attempt.send_ms);
             }
         }

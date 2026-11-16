@@ -139,7 +139,7 @@ pub(crate) struct CallRecord {
     /// `success`, or `main.rs::llm_outcome`'s label for the error
     /// (`timeout`, `gateway_error`, `rate_limited`, `quota_exhausted`,
     /// `http_error`, `empty_content`, `refused`, `auth_error`,
-    /// `unauthorized`, `error`). The *final*
+    /// `unauthorized`, `connect_error`, `error`). The *final*
     /// outcome: an attempt that
     /// timed out and was retried successfully shows only in `attempts`.
     pub outcome: String,

@@ -504,13 +504,7 @@ impl LlmClient {
         {
             request = credential.apply(request);
         }
-        let response = request.send().await.map_err(|err| {
-            if err.is_timeout() {
-                LlmCallError::ClientTimeout
-            } else {
-                LlmCallError::Other(err.into())
-            }
-        })?;
+        let response = request.send().await.map_err(LlmCallError::from_reqwest)?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
