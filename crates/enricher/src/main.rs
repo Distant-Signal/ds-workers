@@ -588,7 +588,25 @@ impl InFlight {
             incident_id: incident_id.to_string(),
         })
     }
+
+    /// [`Self::try_claim`], retried every [`CLAIM_POLL`] for up to `wait`
+    /// while another loop holds the incident.
+    async fn claim_within(&self, incident_id: &str, wait: Duration) -> Option<InFlightClaim<'_>> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(claim) = self.try_claim(incident_id) {
+                return Some(claim);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(CLAIM_POLL).await;
+        }
+    }
 }
+
+/// How often [`InFlight::claim_within`] retries a held claim.
+const CLAIM_POLL: Duration = Duration::from_millis(50);
 
 /// Releases its incident on drop -- including when the owning future is
 /// dropped mid-extraction.
@@ -2099,6 +2117,43 @@ mod tests {
         assert!(in_flight.try_claim("A").is_some(), "released on drop");
         drop(other);
         assert!(in_flight.ids.lock().unwrap().is_empty());
+    }
+
+    /// `claim_within` gets a claim released while it waits, and gives up
+    /// once `wait` has passed.
+    #[tokio::test]
+    async fn claim_within_waits_for_a_short_holder() {
+        let in_flight = Arc::new(InFlight::default());
+        let held = Arc::new(tokio::sync::Notify::new());
+        let holder = {
+            let in_flight = Arc::clone(&in_flight);
+            let held = Arc::clone(&held);
+            tokio::spawn(async move {
+                let _claim = in_flight.try_claim("A").unwrap();
+                held.notify_one();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            })
+        };
+        held.notified().await;
+        assert!(in_flight.try_claim("A").is_none());
+        assert!(
+            in_flight
+                .claim_within("A", Duration::from_secs(10))
+                .await
+                .is_some(),
+            "claimed once the holder let go"
+        );
+        holder.await.unwrap();
+
+        let _claim = in_flight.try_claim("B").unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(
+            in_flight
+                .claim_within("B", Duration::from_millis(150))
+                .await
+                .is_none()
+        );
+        assert!(start.elapsed() >= Duration::from_millis(150));
     }
 
     #[tokio::test]

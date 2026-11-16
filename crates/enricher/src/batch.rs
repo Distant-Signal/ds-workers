@@ -1114,6 +1114,10 @@ fn adversarial_requests(
     Ok(requests)
 }
 
+/// How long [`finish_adversarial_stage`] waits for another loop's claim on
+/// an incident before leaving it to that loop.
+const CLAIM_WAIT: Duration = Duration::from_secs(10);
+
 /// How many incidents of an adversarial batch are combined and written at
 /// a time: their parsed outputs are all that is held besides the
 /// remaining results.
@@ -1137,8 +1141,18 @@ async fn finish_adversarial_stage(
         let plan = plan_adversarial(chunk, &mut results);
         for ready in plan.ready {
             let prepared = ready.item.prepared();
-            // Another loop extracting it right now wins; its own write is fresh.
-            let Some(_claim) = enricher.in_flight.try_claim(&prepared.incident_id) else {
+            // In batch modes the holder is a preflight (a sweep's or the
+            // stream loop's), which only reads the DB and never extracts:
+            // skipping would delete this paid result with the row and
+            // wait for a whole new primary and adversarial cycle, so wait
+            // for it briefly. A holder still there after that is a
+            // synchronous extraction (`normal` mode): it wins, and its own
+            // write is fresh.
+            let Some(_claim) = enricher
+                .in_flight
+                .claim_within(&prepared.incident_id, CLAIM_WAIT)
+                .await
+            else {
                 crate::record_in_flight_skip("batch", &prepared.incident_id);
                 continue;
             };
