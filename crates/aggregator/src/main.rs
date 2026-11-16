@@ -648,7 +648,7 @@ async fn run_cycle(
         }
         tx.commit().await?;
     }
-    dedup_ledger.prune_before(today);
+    dedup_ledger.prune_for_day(today);
 
     // The full-coverage sibling of the dedup/daily-stats pass above. Unlike
     // that pass, this one is fed each status's raw `full_coverage_stats`
