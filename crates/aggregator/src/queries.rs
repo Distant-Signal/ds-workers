@@ -154,6 +154,12 @@ fn incident_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadedIncident> {
 /// (`source_removed_at IS NULL`). An incident the feed stopped listing
 /// without clearing it is "ended", not live (2026-10-06,
 /// docs/superpowers/specs/2026-10-06-incident-source-removal-design.md).
+///
+/// In a fixed order (incident id, byte-wise): a line's incident statuses
+/// follow it, and `write_line_status` compares (and carries "since"
+/// forward) position by position, so an unordered scan could reorder a
+/// line's statuses between cycles, writing a history row for nothing and
+/// flipping their order on the page.
 pub(crate) async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>> {
     let rows = sqlx::query(
         "SELECT incident_id, summary, description, operators, affected_stations, \
@@ -161,7 +167,8 @@ pub(crate) async fn load_incidents(pool: &PgPool) -> Result<Vec<LoadedIncident>>
                 COALESCE(active_since, first_seen_at) AS active_since, \
                 source_text_hash, extracted_periods \
          FROM incidents \
-         WHERE NOT is_cleared AND source_removed_at IS NULL",
+         WHERE NOT is_cleared AND source_removed_at IS NULL \
+         ORDER BY incident_id COLLATE \"C\"",
     )
     .fetch_all(pool)
     .await?;
@@ -1994,6 +2001,10 @@ mod tests {
         assert!(
             ids.contains(&"TEST-ACTIVE"),
             "non-cleared incident should be loaded"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] <= w[1]),
+            "incidents load in incident id order: {ids:?}"
         );
         assert!(
             !ids.contains(&"TEST-CLEARED"),
