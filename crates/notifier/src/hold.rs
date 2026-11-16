@@ -248,8 +248,10 @@ async fn quiet_hours_for(pool: &PgPool, user_id: &str) -> anyhow::Result<(QuietH
 }
 
 /// Hands one decided push on: to the queue, to `notification_holds`, or
-/// nowhere while the user's quiet hours last ([`gate`]). A push that goes
-/// to the queue deletes its target's hold: it is newer.
+/// nowhere while the user's quiet hours last ([`gate`]). A push the queue
+/// accepts deletes its target's hold: it is newer. One the queue refuses
+/// leaves the hold alone, so the older push still has its chance at release
+/// (review finding N6).
 pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyhow::Result<()> {
     let (quiet, leave_by_quiet_hours) = if is_account_security_notice(&job.delivered) {
         (Quiet::No, true)
@@ -266,14 +268,18 @@ pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyh
                     "cancellation_through"
                 });
             }
-            if let Some(target) = hold_target(&job.delivered) {
+            let user_id = job.user_id.clone();
+            let target = hold_target(&job.delivered);
+            let outcome = queue.enqueue(job);
+            if let Some(target) = target
+                && replaces_hold(outcome)
+            {
                 sqlx::query("DELETE FROM notification_holds WHERE user_id = $1 AND target = $2")
-                    .bind(&job.user_id)
+                    .bind(&user_id)
                     .bind(&target)
                     .execute(pool)
                     .await?;
             }
-            queue.enqueue(job);
         }
         Gate::Hold => {
             store_hold(pool, &job).await?;
@@ -289,6 +295,12 @@ pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyh
         }
     }
     Ok(())
+}
+
+/// Whether a push the queue took (or refused) replaces its target's hold:
+/// only one it accepted.
+fn replaces_hold(outcome: EnqueueOutcome) -> bool {
+    !matches!(outcome, EnqueueOutcome::Dropped(_))
 }
 
 async fn store_hold(pool: &PgPool, job: &PushJob) -> anyhow::Result<()> {
@@ -643,6 +655,23 @@ mod tests {
     #[test]
     fn no_quiet_hours_never_holds() {
         assert!(!in_quiet_hours(&QuietHours::default(), utc(3, 0)));
+    }
+
+    /// Review finding N6: a push the queue refuses must not take the
+    /// target's hold with it.
+    #[test]
+    fn only_an_accepted_push_replaces_its_hold() {
+        use crate::push_queue::DropReason;
+        assert!(replaces_hold(EnqueueOutcome::Queued));
+        assert!(replaces_hold(EnqueueOutcome::Superseded));
+        assert!(replaces_hold(EnqueueOutcome::Duplicate));
+        for reason in [
+            DropReason::QueueFull,
+            DropReason::UserQueueFull,
+            DropReason::ShuttingDown,
+        ] {
+            assert!(!replaces_hold(EnqueueOutcome::Dropped(reason)));
+        }
     }
 
     #[test]
