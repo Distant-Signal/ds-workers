@@ -46,6 +46,79 @@ pub(crate) fn merge_custom_lines(
     merged
 }
 
+/// Whether `line` is a user's custom line (`merge_custom_lines`: the
+/// `From<CustomLine>` conversion marks every one `category = "custom"`, a
+/// category no catalogue file uses).
+fn is_custom_line(line: &LineDefinition) -> bool {
+    line.category == "custom"
+}
+
+/// The line sets one incident is matched against, kept apart so a user's
+/// custom line never changes how an incident matches anyone else's lines.
+///
+/// The matcher (`common::matcher::lines_affected_by`) judges each line
+/// against every other line in the set it is handed: a place the incident
+/// names counts only when some line in the set holds it, and a place
+/// named, or a more precise match on another line of the same operator,
+/// drops the operator-wide matches. Matched as one merged set, a custom
+/// line holding a station no catalogue line holds made that station a
+/// known place, and the operator-wide match vanished from every catalogue
+/// line, changing the public `line_status` (and one user's line changed
+/// another's the same way). So the catalogue is matched alone, and each
+/// custom line beside the catalogue (the context its own matching always
+/// had) keeping only its own matches.
+///
+/// Each custom line costs one more matcher pass per incident;
+/// `crates/api`'s `custom_lines::MAX_CUSTOM_LINES_PER_USER` bounds how many
+/// there are.
+struct MatchSets {
+    catalogue: HashMap<String, LineDefinition>,
+    /// Each custom line's id, and the catalogue plus that line alone.
+    custom: Vec<(String, HashMap<String, LineDefinition>)>,
+}
+
+impl MatchSets {
+    fn new(lines: &HashMap<String, LineDefinition>) -> Self {
+        let catalogue: HashMap<String, LineDefinition> = lines
+            .iter()
+            .filter(|(_, line)| !is_custom_line(line))
+            .map(|(id, line)| (id.clone(), line.clone()))
+            .collect();
+        let mut custom: Vec<(String, HashMap<String, LineDefinition>)> = lines
+            .iter()
+            .filter(|(_, line)| is_custom_line(line))
+            .map(|(id, line)| {
+                let mut set = catalogue.clone();
+                set.insert(id.clone(), line.clone());
+                (id.clone(), set)
+            })
+            .collect();
+        custom.sort_by(|a, b| a.0.cmp(&b.0));
+        Self { catalogue, custom }
+    }
+
+    /// Every line `incident` affects: the catalogue's matches, then each
+    /// custom line's own. `registry` may be built over the merged lines: a
+    /// custom line has no segments (`From<CustomLine>`), so it is the
+    /// catalogue's registry.
+    fn matches<'a>(
+        &'a self,
+        incident: &IncidentMessage,
+        registry: &SegmentRegistry,
+        station_names: &StationGazetteer,
+    ) -> Vec<Match<'a>> {
+        let mut out = lines_affected_by(incident, &self.catalogue, registry, station_names);
+        for (id, set) in &self.custom {
+            out.extend(
+                lines_affected_by(incident, set, registry, station_names)
+                    .into_iter()
+                    .filter(|m| m.line.id == *id),
+            );
+        }
+        out
+    }
+}
+
 /// [`aggregate_at`] at the current instant: every incident and status in
 /// one pass is judged against the same `now`.
 pub(crate) fn aggregate(
@@ -97,6 +170,7 @@ pub(crate) fn aggregate_at(
         })
         .collect();
 
+    let match_sets = MatchSets::new(lines);
     // Layer 1: incidents. Filtered through `keep_reason` first -- a
     // temporally-expired, purely-future, or stale-past-the-rail-day-cutoff
     // incident never reaches the matcher, so its line falls through to
@@ -105,7 +179,7 @@ pub(crate) fn aggregate_at(
         let Some(keep) = keep_reason(loaded, now) else {
             continue;
         };
-        for m in lines_affected_by(&loaded.message, lines, registry, station_names) {
+        for m in match_sets.matches(&loaded.message, registry, station_names) {
             let status = status_from_incident(&m, loaded, now, station_names, keep);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
         }
@@ -183,6 +257,7 @@ pub(crate) fn upcoming_by_line(
     station_names: &StationGazetteer,
     now: DateTime<Utc>,
 ) -> HashMap<String, Vec<common::UpcomingDisruption>> {
+    let match_sets = MatchSets::new(lines);
     let mut out: HashMap<String, Vec<common::UpcomingDisruption>> = HashMap::new();
     for loaded in incidents {
         let incident = &loaded.message;
@@ -218,7 +293,7 @@ pub(crate) fn upcoming_by_line(
         }
         notes.sort_by_key(|note| note.from);
         notes.dedup_by(|a, b| a.from == b.from && a.to == b.to);
-        for m in lines_affected_by(incident, lines, registry, station_names) {
+        for m in match_sets.matches(incident, registry, station_names) {
             out.entry(m.line.id.clone())
                 .or_default()
                 .extend(notes.iter().cloned());
@@ -3517,6 +3592,58 @@ mod tests {
             Severity::PartSuspended,
             "good live sample data must never demote a more severe incident-reported status"
         );
+    }
+
+    /// The review's case: a custom line holding a station no catalogue line
+    /// holds must not turn an incident naming that station into a local
+    /// one for the catalogue, dropping its operator-wide matches. The
+    /// custom line still matches the station.
+    #[test]
+    fn a_custom_line_never_changes_the_catalogues_matches() {
+        let catalogue = load_all_lines();
+        let names = StationGazetteer::new([("ZZZ", "Zedtown"), ("WOK", "Woking")]);
+        let custom = |id: &str, stations: &[&str]| CustomLine {
+            id: id.to_string(),
+            name: id.to_string(),
+            operators: vec!["SW".to_string()],
+            stations: stations.iter().map(ToString::to_string).collect(),
+            headcode_prefixes: vec![],
+            destination_crs_filter: vec![],
+        };
+        let merged = merge_custom_lines(
+            &catalogue,
+            vec![
+                custom("custom-zedtown", &["WOK", "ZZZ"]),
+                custom("custom-other", &["WOK"]),
+            ],
+        );
+        let inc = incident("OP-Z", "Disruption at Zedtown", "", &["SW"], &[]);
+
+        let alone = aggregate_with_names(&catalogue, std::slice::from_ref(&inc), &names);
+        let with_custom = aggregate_with_names(&merged, &[inc], &names);
+        assert!(
+            has_kb_status(&alone, "swr-alton"),
+            "the catalogue alone keeps the operator-wide match"
+        );
+        for (id, report) in &alone {
+            assert_eq!(
+                report.worst_severity(),
+                with_custom[id].worst_severity(),
+                "{id}"
+            );
+            assert_eq!(
+                has_kb_status(&alone, id),
+                has_kb_status(&with_custom, id),
+                "{id}"
+            );
+        }
+        assert!(
+            has_kb_status(&with_custom, "custom-zedtown"),
+            "the custom line holding the named station matches it"
+        );
+        // Another user's custom line is not changed by it either: it
+        // reads like the catalogue's lines.
+        assert!(has_kb_status(&with_custom, "custom-other"));
     }
 
     #[test]
