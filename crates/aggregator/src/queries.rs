@@ -493,13 +493,31 @@ fn normalize_entry_for_diff(entry: &serde_json::Value) -> serde_json::Value {
         obj.remove("full_coverage_stats");
         obj.remove("full_coverage_availability");
     }
-    if let Some(reason) = entry.get_mut("reason")
-        && let Some(text) = reason.as_str()
+    if let Some(reason) = entry.get_mut("reason") {
+        normalize_text_for_diff(reason);
+    }
+    // An inferred status repeats its `reason` as its disruption's
+    // `description` (`infer_from_samples`, and the window verdict's own
+    // status in `full_coverage_window::apply_windows`), counts and all, so
+    // the description churns exactly like the reason does.
+    if let Some(description) = entry
+        .get_mut("disruption")
+        .and_then(|d| d.get_mut("description"))
     {
-        let normalized = normalize_sample_counts(strip_live_sample_annotation(text));
-        *reason = serde_json::Value::String(normalized);
+        normalize_text_for_diff(description);
     }
     entry
+}
+
+/// The live-count normalisation `normalize_entry_for_diff` applies to a
+/// status's `reason` and its disruption's `description`: the trailing live
+/// annotations stripped, then the sampled and train-running counts masked.
+fn normalize_text_for_diff(value: &mut serde_json::Value) {
+    if let Some(text) = value.as_str() {
+        let normalized =
+            normalize_window_counts(&normalize_sample_counts(strip_live_annotations(text)));
+        *value = serde_json::Value::String(normalized);
+    }
 }
 
 /// The `DataQuality` values affected by the `Utc::now()`-every-cycle bug
@@ -605,6 +623,83 @@ fn strip_live_sample_annotation(reason: &str) -> &str {
         Some(idx) if reason.ends_with(')') => &reason[..idx],
         _ => reason,
     }
+}
+
+/// The trailing annotation windowed full coverage appends to an incident's
+/// `reason` when its verdict escalates the status
+/// (`full_coverage_window::apply_windows`): `" (train-running data shows: 7
+/// of 12 trains due in the last hour were late.)"`. Its counts move with
+/// every window, like the live-samples annotation's.
+const TRAIN_RUNNING_MARKER: &str = " (train-running data shows: ";
+
+/// Strips every trailing live annotation from a status `reason`: the
+/// live-samples one ([`strip_live_sample_annotation`]) and the
+/// train-running one ([`TRAIN_RUNNING_MARKER`]), in whichever order they
+/// were appended (the window verdict's comes after the samples').
+fn strip_live_annotations(reason: &str) -> &str {
+    let mut text = reason;
+    loop {
+        let stripped = strip_live_sample_annotation(text);
+        let stripped = match stripped.rfind(TRAIN_RUNNING_MARKER) {
+            Some(idx) if stripped.ends_with(')') => &stripped[..idx],
+            _ => stripped,
+        };
+        if stripped.len() == text.len() {
+            return text;
+        }
+        text = stripped;
+    }
+}
+
+/// Masks the counts in windowed full coverage's verdict text
+/// (`common::full_coverage_window`): `"7 of 12 trains due in the last hour
+/// were late."`, `"All 3 trains due in the last 45 minutes were
+/// cancelled."` and `"... were cancelled (1 more not seen at all)."` become
+/// `"N of M trains due ..."`, `"All M trains due in the last N minutes
+/// ..."` and `"(N more not seen at all)"`. A train-running status (the
+/// window verdict replacing an inferred status, or added beside a notice)
+/// carries this text as its whole `reason`, so without this every window
+/// would write a history row and restart the status's "since" clock.
+///
+/// Word-based (split on single spaces, so joining back reproduces the text
+/// exactly), and only in those phrases: any other number in an incident's
+/// own text ("delays of up to 20 minutes") is real information.
+fn normalize_window_counts(reason: &str) -> String {
+    fn is_count(word: &str) -> bool {
+        !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit())
+    }
+    let mut words: Vec<String> = reason.split(' ').map(str::to_string).collect();
+    for i in 0..words.len() {
+        // "<a> of <b> trains due" and "All <n> trains due".
+        if i >= 1
+            && words[i] == "trains"
+            && words.get(i + 1).is_some_and(|w| w == "due")
+            && is_count(&words[i - 1])
+        {
+            words[i - 1] = "M".to_string();
+            if i >= 3 && words[i - 2] == "of" && is_count(&words[i - 3]) {
+                words[i - 3] = "N".to_string();
+            }
+        }
+        // "in the last <n> minutes".
+        if i >= 2
+            && words[i - 2] == "the"
+            && words[i - 1] == "last"
+            && is_count(&words[i])
+            && words.get(i + 1).is_some_and(|w| w.starts_with("minutes"))
+        {
+            words[i] = "N".to_string();
+        }
+        // "(<n> more not seen at all)".
+        if words[i].strip_prefix('(').is_some_and(is_count)
+            && words.get(i + 1).is_some_and(|w| w == "more")
+            && words.get(i + 2).is_some_and(|w| w == "not")
+            && words.get(i + 3).is_some_and(|w| w == "seen")
+        {
+            words[i] = "(N".to_string();
+        }
+    }
+    words.join(" ")
 }
 
 /// Replaces the fluctuating live counts `classify()` (aggregation.rs) bakes
@@ -3247,6 +3342,130 @@ mod tests {
         ]);
 
         assert_ne!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    #[test]
+    fn normalize_window_counts_masks_every_verdict_form() {
+        for (text, want) in [
+            (
+                "7 of 12 trains due in the last hour were late.",
+                "N of M trains due in the last hour were late.",
+            ),
+            (
+                "5 of 12 trains due in the last hour were cancelled (1 more not seen at all).",
+                "N of M trains due in the last hour were cancelled (N more not seen at all).",
+            ),
+            (
+                "All 3 trains due in the last 45 minutes were cancelled (cancelled in advance).",
+                "All M trains due in the last N minutes were cancelled (cancelled in advance).",
+            ),
+            (
+                "2 of 9 trains due so far today skipped part of the line.",
+                "N of M trains due so far today skipped part of the line.",
+            ),
+            // Any other number is the incident's own and stays.
+            (
+                "Delays of up to 20 minutes between 2 stations.",
+                "Delays of up to 20 minutes between 2 stations.",
+            ),
+            ("Platforms 1–3 of 5 closed", "Platforms 1–3 of 5 closed"),
+        ] {
+            assert_eq!(normalize_window_counts(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn strip_live_annotations_removes_both_trailing_annotations() {
+        assert_eq!(
+            strip_live_annotations(
+                "Signalling problems. (train-running data shows: 7 of 12 trains due in the last hour were late.)"
+            ),
+            "Signalling problems."
+        );
+        assert_eq!(
+            strip_live_annotations(
+                "Signalling problems. (live samples show: 5 of 9 sampled services delayed.) \
+                 (train-running data shows: 7 of 12 trains due in the last hour were late.)"
+            ),
+            "Signalling problems."
+        );
+        assert_eq!(strip_live_annotations("Landslip."), "Landslip.");
+    }
+
+    /// The review's regression: full-coverage counts moving from one
+    /// window to the next must not read as a change, for an annotated
+    /// incident or for a train-running status (whose disruption repeats
+    /// the reason).
+    #[test]
+    fn normalize_entry_for_diff_ignores_train_running_count_churn() {
+        let status = |reason: &str, from: &str, quality: &str| {
+            serde_json::json!([{
+                "severity": "minor-delays",
+                "reason": reason,
+                "validity": {"from_date": from, "to_date": null, "is_now": true},
+                "data_quality": quality,
+                "disruption": {
+                    "category": "RealTime",
+                    "description": reason,
+                    "affected_stops": [],
+                    "affected_routes": [],
+                    "source": "full-coverage-window"
+                }
+            }])
+        };
+        let a = status(
+            "7 of 12 trains due in the last hour were late.",
+            "2026-11-16T10:00:00Z",
+            "trust-inferred",
+        );
+        let b = status(
+            "9 of 13 trains due in the last hour were late.",
+            "2026-11-16T10:01:00Z",
+            "trust-inferred",
+        );
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+        // The "since" stamp is carried forward, not reset.
+        let carried = carry_forward_ldbws_from_date(&a, &b);
+        assert_eq!(
+            carried[0]["validity"]["from_date"],
+            serde_json::json!("2026-11-16T10:00:00Z")
+        );
+        // A different kind of trouble is still a change.
+        let c = status(
+            "9 of 13 trains due in the last hour were cancelled.",
+            "2026-11-16T10:01:00Z",
+            "trust-inferred",
+        );
+        assert_ne!(normalize_for_diff(&a), normalize_for_diff(&c));
+
+        let a = status(
+            "Signalling problems. (train-running data shows: 7 of 12 trains due in the last hour were late.)",
+            "2026-11-16T09:00:00Z",
+            "knowledgebase",
+        );
+        let b = status(
+            "Signalling problems. (train-running data shows: 8 of 12 trains due in the last hour were late.)",
+            "2026-11-16T09:00:00Z",
+            "knowledgebase",
+        );
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
+    }
+
+    /// An LDBWS-inferred status's disruption repeats its sampled counts,
+    /// which used to defeat the reason's own normalisation.
+    #[test]
+    fn normalize_entry_for_diff_ignores_count_churn_in_the_disruption_description() {
+        let a = ldbws_status(
+            "2026-08-30T06:00:00Z",
+            "minor-delays",
+            "3 of 10 sampled services delayed.",
+        );
+        let b = ldbws_status(
+            "2026-08-30T06:05:00Z",
+            "minor-delays",
+            "4 of 11 sampled services delayed.",
+        );
+        assert_eq!(normalize_for_diff(&a), normalize_for_diff(&b));
     }
 
     // --- carry_forward_ldbws_from_date ---
