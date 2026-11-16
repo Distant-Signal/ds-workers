@@ -375,12 +375,14 @@ fn count_once(key: (i64, i64), result: &'static str) {
 
 /// Whether the reminder for `row` is owned by a break: an open break on
 /// the journey, or one owning its first train's push.
-async fn break_owns(pool: &PgPool, row: &LeaveRow) -> anyhow::Result<bool> {
+async fn break_owns(pool: &PgPool, row: &LeaveRow, now: DateTime<Utc>) -> anyhow::Result<bool> {
     if row.open_break {
         return Ok(true);
     }
     match row.tracked_train_id {
-        Some(train) => crate::break_notices::break_owns_train(pool, &row.user_id, train).await,
+        Some(train) => {
+            crate::break_notices::break_covers_train(pool, &row.user_id, train, now).await
+        }
         None => Ok(false),
     }
 }
@@ -400,7 +402,7 @@ pub(crate) async fn run_leave_reminder_cycle(
             leave_by: row.leave_by_at,
             departure: row.departure,
             lead: Duration::minutes(i64::from(row.lead_minutes)),
-            break_owns: break_owns(pool, &row).await?,
+            break_owns: break_owns(pool, &row, now).await?,
             sent: row.leave_by_sent,
             pushes: row.pushes,
             max_pushes: settings.max_pushes,

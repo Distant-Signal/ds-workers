@@ -559,7 +559,8 @@ pub(crate) async fn run_release_cycle(
         if release == Release::Send
             && let Some(tracked_train_id) = hold.tracked_train_id
             && crate::break_notices::enabled()
-            && crate::break_notices::break_owns_train(pool, &hold.user_id, tracked_train_id).await?
+            && crate::break_notices::break_owns_train(pool, &hold.user_id, tracked_train_id, now)
+                .await?
         {
             release = Release::Drop("break_owns_train");
         }

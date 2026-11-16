@@ -619,8 +619,13 @@ async fn notify_train_candidates(
         // One push per user per train (mid-journey changes spec §6.3): an
         // open break on a journey using this train owns its push.
         if break_notices::enabled()
-            && break_notices::break_owns_train(pool, &candidate.user_id, candidate.tracked_train_id)
-                .await?
+            && break_notices::break_owns_train(
+                pool,
+                &candidate.user_id,
+                candidate.tracked_train_id,
+                now,
+            )
+            .await?
         {
             tracing::info!(
                 tracked_train_id = candidate.tracked_train_id,
@@ -878,8 +883,13 @@ async fn predicted_start_pushes(
     }
     let mut pushes = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if break_notices::break_owns_train(pool, &candidate.user_id, candidate.tracked_train_id)
-            .await?
+        if break_notices::break_owns_train(
+            pool,
+            &candidate.user_id,
+            candidate.tracked_train_id,
+            now,
+        )
+        .await?
         {
             tracing::info!(
                 tracked_train_id = candidate.tracked_train_id,

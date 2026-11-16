@@ -24,8 +24,9 @@
 //! - **one push per user per train** (§6.3): the notice is that train's
 //!   push. Its delivery writes the train's `train_notification_state` at
 //!   the equivalent rank, the train path (delay and cancel pushes, and
-//!   DS-127's predicted late starts) defers to an open break on the
-//!   train ([`break_owns_train`]), and the queue drops a queued plain push
+//!   DS-127's predicted late starts) defers to an open break triggered by
+//!   the train whose notice is due ([`break_owns_train`]), and the queue
+//!   drops a queued plain push
 //!   for the train (`push_queue`'s supersede). Its `tag` is the train's, so
 //!   a plain push that raced it is replaced on the phone.
 
@@ -71,11 +72,10 @@ pub(crate) struct BreakNoticeRow {
     pub delay_threshold_minutes: Option<i16>,
 }
 
-/// Open breaks with suggestions ready that are not yet notified at their
-/// severity, oldest first.
-pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakNoticeRow>> {
-    Ok(sqlx::query_as(
-        "SELECT b.id, b.journey_id, b.user_id, b.cause, b.severity, b.notified_severity, \
+/// The [`BreakNoticeRow`] columns and joins over open breaks with
+/// suggestions ready (`b`), shared by [`breaks_to_notify`] and
+/// [`train_break_state`] so both decide on the same row.
+const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, b.user_id, b.cause, b.severity, b.notified_severity, \
                 b.opened_at, b.confirmations, b.suggestions, j.suggestions_muted, \
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
@@ -89,45 +89,124 @@ pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakN
          LEFT JOIN journey_legs jl ON jl.id = b.trigger_leg_id \
          LEFT JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
          LEFT JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
-         WHERE b.status = 'open' AND b.suggestions IS NOT NULL AND b.cause <> 'user_missed' \
+         WHERE b.status = 'open' AND b.suggestions IS NOT NULL AND b.cause <> 'user_missed' ";
+
+/// Open breaks with suggestions ready that are not yet notified at their
+/// severity, oldest first.
+pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakNoticeRow>> {
+    Ok(sqlx::query_as(&format!(
+        "{BREAK_ROWS_SQL} \
            AND (b.notified_severity IS NULL OR b.severity > b.notified_severity) \
          ORDER BY b.detected_at, b.id \
-         LIMIT 200",
-    )
+         LIMIT 200"
+    ))
     .fetch_all(pool)
     .await?)
 }
 
-/// Whether an open, notifiable break owns tracked train
-/// `tracked_train_id`'s push: one of the user's journeys has a leg on that
-/// subscription and an open break, with suggestions planned, whose push is
-/// not opted out (nor its trigger train's pushes turned off, DS-153). The
-/// train path then stays quiet; the break notice says more (§6.3). A break the api could not plan for yet owns nothing, so a
+/// What the user's open breaks say about one tracked train's pushes (§6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrainBreak {
+    /// No break speaks for the train: its own pushes go out.
+    None,
+    /// A break the train triggered has a notice due (decided `Send`, or
+    /// waiting one sweep for its confirmation): the notice will be the
+    /// train's push.
+    Due,
+    /// A break the train triggered was notified at its severity. Its
+    /// delivery wrote the train's state at the equivalent rank, so a plain
+    /// push past that rank is news the notice did not carry.
+    Notified { cause: String },
+}
+
+/// [`TrainBreak`] for a user's open breaks triggered by one train (`rows`),
+/// each decided by [`decide_break_notice`] at `now`. Pure. A break whose
+/// notice is suppressed for any other reason (opt-out, mute, the train's
+/// own pushes off, opened in the app) owns nothing, so a break that will
+/// not push never silences the train (review finding N4).
+pub(crate) fn classify_train_break(rows: &[BreakNoticeRow], now: DateTime<Utc>) -> TrainBreak {
+    let mut state = TrainBreak::None;
+    for row in rows {
+        match decide_break_notice(row, now) {
+            BreakDecision::Send | BreakDecision::SuppressUnconfirmed => return TrainBreak::Due,
+            BreakDecision::SuppressNotWorse => {
+                state = TrainBreak::Notified {
+                    cause: row.cause.clone(),
+                };
+            }
+            BreakDecision::SuppressOptOut
+            | BreakDecision::SuppressMuted
+            | BreakDecision::SuppressTrainOff
+            | BreakDecision::SuppressActed
+            | BreakDecision::SuppressInApp => {}
+        }
+    }
+    state
+}
+
+/// [`classify_train_break`] over the user's open breaks whose trigger leg
+/// is on tracked train `tracked_train_id`. Only the trigger leg's train: a
+/// break raised by leg 1 says nothing about leg 2's train, which keeps its
+/// own pushes. A break the api could not plan for yet is not listed, so a
 /// planning failure never silences the train.
+pub(crate) async fn train_break_state(
+    pool: &PgPool,
+    user_id: &str,
+    tracked_train_id: i64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<TrainBreak> {
+    let rows: Vec<BreakNoticeRow> = sqlx::query_as(&format!(
+        "{BREAK_ROWS_SQL} AND b.user_id = $1 AND jl.train_subscription_id = $2 \
+         ORDER BY b.id"
+    ))
+    .bind(user_id)
+    .bind(tracked_train_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(classify_train_break(&rows, now))
+}
+
+/// Whether a break owns tracked train `tracked_train_id`'s next plain push
+/// (a delay, a cancellation, a predicted late start, a held push): a break
+/// the train triggered has its notice due, and the notice says more
+/// (§6.3). The train path then stays quiet.
 pub(crate) async fn break_owns_train(
     pool: &PgPool,
     user_id: &str,
     tracked_train_id: i64,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let (owned,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM journey_breaks b \
-             JOIN journeys j ON j.id = b.journey_id \
-             JOIN journey_legs jl ON jl.journey_id = b.journey_id \
-             LEFT JOIN notification_preferences p ON p.user_id = b.user_id \
-             LEFT JOIN journey_legs tl ON tl.id = b.trigger_leg_id \
-             LEFT JOIN train_subscriptions tts ON tts.id = tl.train_subscription_id \
-             WHERE b.user_id = $1 AND b.status = 'open' AND b.cause <> 'user_missed' \
-               AND b.suggestions IS NOT NULL \
-               AND jl.train_subscription_id = $2 \
-               AND NOT j.suggestions_muted AND COALESCE(p.journey_suggestions, TRUE) \
-               AND COALESCE(tts.notifications_enabled, TRUE))",
-    )
-    .bind(user_id)
-    .bind(tracked_train_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(owned)
+    Ok(train_break_state(pool, user_id, tracked_train_id, now).await? == TrainBreak::Due)
+}
+
+/// Whether a break speaks for the train at all: its notice is due or was
+/// sent. For pushes that only add to what the train's own push said (a
+/// cancellation's reason follow-up, a leave-by naming the train), which
+/// the break notice replaces.
+pub(crate) async fn break_covers_train(
+    pool: &PgPool,
+    user_id: &str,
+    tracked_train_id: i64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    Ok(train_break_state(pool, user_id, tracked_train_id, now).await? != TrainBreak::None)
+}
+
+/// Whether a break already says the train no longer stops where planned:
+/// its notice is due, or was sent for a cancellation, a part-cancellation
+/// or a skipped stop. The skipped-stop push then adds nothing (review
+/// finding N3).
+pub(crate) fn break_covers_skipped_stop(state: &TrainBreak) -> bool {
+    match state {
+        TrainBreak::None => false,
+        TrainBreak::Due => true,
+        TrainBreak::Notified { cause } => {
+            matches!(
+                cause.as_str(),
+                "cancelled" | "part_cancelled" | "skipped_stop"
+            )
+        }
+    }
 }
 
 /// Records a delivered notice: the break's push bookkeeping.
@@ -704,6 +783,83 @@ mod tests {
         }
     }
 
+    /// Review finding N4: a break owns its train's plain push only while
+    /// its notice is due; one that will not push owns nothing.
+    #[test]
+    fn a_break_owns_its_train_only_while_its_notice_is_due() {
+        let now = at(9, 30);
+        assert_eq!(classify_train_break(&[], now), TrainBreak::None);
+        assert_eq!(
+            classify_train_break(&[row("cancelled")], now),
+            TrainBreak::Due
+        );
+        // Waiting one sweep for its confirmation: due next cycle.
+        let unconfirmed = BreakNoticeRow {
+            confirmations: 1,
+            ..row("connection_missed")
+        };
+        assert_eq!(classify_train_break(&[unconfirmed], now), TrainBreak::Due);
+        // Already notified at its severity: the notice carried the train
+        // up to its equivalent rank, so a plain push past it goes out.
+        let notified = BreakNoticeRow {
+            notified_severity: Some(1),
+            ..row("connection_missed")
+        };
+        assert_eq!(
+            classify_train_break(std::slice::from_ref(&notified), now),
+            TrainBreak::Notified {
+                cause: "connection_missed".into()
+            }
+        );
+        // A break that will not push never silences the train.
+        for silent in [
+            BreakNoticeRow {
+                journey_suggestions: false,
+                ..row("cancelled")
+            },
+            BreakNoticeRow {
+                suggestions_muted: true,
+                ..row("cancelled")
+            },
+            BreakNoticeRow {
+                trigger_pushes_on: false,
+                ..row("cancelled")
+            },
+            BreakNoticeRow {
+                opened_at: Some(now - Duration::minutes(2)),
+                ..row("connection_missed")
+            },
+        ] {
+            assert_eq!(
+                classify_train_break(std::slice::from_ref(&silent), now),
+                TrainBreak::None,
+                "{silent:?}"
+            );
+        }
+        // A due notice wins over a notified one.
+        assert_eq!(
+            classify_train_break(&[notified, row("cancelled")], now),
+            TrainBreak::Due
+        );
+    }
+
+    /// Review finding N3: the skipped-stop push defers to a break that
+    /// says the train no longer stops where planned.
+    #[test]
+    fn a_skipped_stop_defers_to_a_break_that_already_says_so() {
+        assert!(!break_covers_skipped_stop(&TrainBreak::None));
+        assert!(break_covers_skipped_stop(&TrainBreak::Due));
+        for cause in ["skipped_stop", "part_cancelled", "cancelled"] {
+            assert!(break_covers_skipped_stop(&TrainBreak::Notified {
+                cause: cause.into()
+            }));
+        }
+        // A missed connection's notice said nothing about the stop.
+        assert!(!break_covers_skipped_stop(&TrainBreak::Notified {
+            cause: "connection_missed".into()
+        }));
+    }
+
     #[test]
     fn the_notice_writes_the_trains_state_at_the_equivalent_rank() {
         assert_eq!(
@@ -830,7 +986,7 @@ mod db_tests {
         assert!(row.journey_suggestions && !row.suggestions_muted);
         assert_eq!(decide_break_notice(row, Utc::now()), BreakDecision::Send);
         assert!(
-            break_owns_train(&pool, USER, tracked_train_id)
+            break_owns_train(&pool, USER, tracked_train_id, Utc::now())
                 .await
                 .expect("owns")
         );
@@ -842,7 +998,7 @@ mod db_tests {
             .await
             .expect("mute");
         assert!(
-            !break_owns_train(&pool, USER, tracked_train_id)
+            !break_owns_train(&pool, USER, tracked_train_id, Utc::now())
                 .await
                 .expect("owns")
         );
@@ -853,6 +1009,86 @@ mod db_tests {
             .expect("record");
         let rows = breaks_to_notify(&pool).await.expect("breaks");
         assert!(rows.iter().all(|row| row.id != break_id));
+        cleanup(&pool).await;
+    }
+
+    /// Review finding N4: a break owns only its trigger leg's train, and
+    /// only while its notice is due.
+    #[tokio::test]
+    #[ignore = "requires a live database: DATABASE_URL"]
+    async fn a_break_owns_only_its_trigger_train_and_only_while_due() {
+        let pool = connect().await;
+        cleanup(&pool).await;
+        let (journey_id, break_id, tracked_train_id) = seed(&pool).await;
+        // A second leg on another train of the same journey.
+        let (other_trains_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO trains (train_uid, service_date) VALUES ('TEST-BREAK-NOTICE-2', '2099-06-01') \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("train");
+        let (other_tracked,): (i64,) = sqlx::query_as(
+            "INSERT INTO train_subscriptions (user_id, service_date, trains_id, resolution_status) \
+             VALUES ($1, '2099-06-01', $2, 'resolved') RETURNING id",
+        )
+        .bind(USER)
+        .bind(other_trains_id)
+        .fetch_one(&pool)
+        .await
+        .expect("subscription");
+        sqlx::query(
+            "INSERT INTO journey_legs (journey_id, leg_order, origin_crs, destination_crs, \
+                 service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 2, 'YRK', 'EDB', '2099-06-01', $2, 'manual')",
+        )
+        .bind(journey_id)
+        .bind(other_tracked)
+        .execute(&pool)
+        .await
+        .expect("leg 2");
+        let now = Utc::now();
+
+        assert!(
+            break_owns_train(&pool, USER, tracked_train_id, now)
+                .await
+                .expect("owns")
+        );
+        assert!(
+            !break_owns_train(&pool, USER, other_tracked, now)
+                .await
+                .expect("owns"),
+            "leg 2's train keeps its own pushes"
+        );
+        assert_eq!(
+            train_break_state(&pool, USER, other_tracked, now)
+                .await
+                .expect("state"),
+            TrainBreak::None
+        );
+
+        // Notified: the trigger train's next plain push is news past it.
+        record_notified(&pool, break_id, 3, now)
+            .await
+            .expect("record");
+        assert!(
+            !break_owns_train(&pool, USER, tracked_train_id, now)
+                .await
+                .expect("owns")
+        );
+        assert!(
+            break_covers_train(&pool, USER, tracked_train_id, now)
+                .await
+                .expect("covers")
+        );
+        assert_eq!(
+            train_break_state(&pool, USER, tracked_train_id, now)
+                .await
+                .expect("state"),
+            TrainBreak::Notified {
+                cause: "cancelled".into()
+            }
+        );
         cleanup(&pool).await;
     }
 
@@ -881,7 +1117,7 @@ mod db_tests {
             BreakDecision::SuppressTrainOff
         );
         assert!(
-            !break_owns_train(&pool, USER, tracked_train_id)
+            !break_owns_train(&pool, USER, tracked_train_id, Utc::now())
                 .await
                 .expect("owns"),
             "a silenced break owns no push"

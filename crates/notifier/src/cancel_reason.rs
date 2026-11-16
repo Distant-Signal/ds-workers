@@ -169,8 +169,13 @@ pub(crate) async fn run_reason_followup_cycle(
     .await?;
     for row in rows {
         if crate::break_notices::enabled()
-            && crate::break_notices::break_owns_train(pool, &row.user_id, row.tracked_train_id)
-                .await?
+            && crate::break_notices::break_covers_train(
+                pool,
+                &row.user_id,
+                row.tracked_train_id,
+                now,
+            )
+            .await?
         {
             continue;
         }
