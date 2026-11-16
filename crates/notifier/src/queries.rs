@@ -247,6 +247,7 @@ pub(crate) async fn advance_cursor_with_grace_bounded(
     Ok(new_last)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LineCandidate {
     pub id: i64,
     pub line_id: String,
@@ -257,6 +258,33 @@ pub(crate) struct LineCandidate {
     /// `None` case) -- `u8`, not `Option<u8>`, so callers never need to
     /// unwrap an invariant that's already been proven true.
     pub previous_rank: u8,
+}
+
+/// Keeps only each line's newest candidate (highest id), in id order.
+///
+/// A poll re-reads every row in the cursor's grace window, so one cycle can
+/// see several transitions of a line (A: 0 to 4, then B: 4 to 2), and a
+/// later cycle sees them again. Deciding each against the user's state on
+/// its own let an older row notify a rank the line has since left: B was
+/// delivered (the user's state at 2), then the re-read A looked like an
+/// escalation from 2 to 4, and a rank-4 push went out for a line at 2. Only
+/// the newest transition says where the line is now, so only it may notify;
+/// [`crate::decision::decide_user_notification`] compares it with what the
+/// user was last told, so a change the older rows carried is not lost.
+pub(crate) fn newest_candidate_per_line(candidates: Vec<LineCandidate>) -> Vec<LineCandidate> {
+    let mut newest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for candidate in &candidates {
+        let id = newest
+            .entry(candidate.line_id.clone())
+            .or_insert(candidate.id);
+        *id = (*id).max(candidate.id);
+    }
+    let mut kept: Vec<LineCandidate> = candidates
+        .into_iter()
+        .filter(|candidate| newest.get(&candidate.line_id) == Some(&candidate.id))
+        .collect();
+    kept.sort_by_key(|candidate| candidate.id);
+    kept
 }
 
 /// Raw columns of one `poll_line_candidates` row, before the
@@ -8233,5 +8261,36 @@ mod line_rank_tests {
             transition(TRANSIT_LINE, &[MinorDelays], &[NoReportedDisruption]),
             Some((minor, 0))
         );
+    }
+
+    fn candidate(id: i64, line_id: &str, previous_rank: u8, new_rank: u8) -> LineCandidate {
+        LineCandidate {
+            id,
+            line_id: line_id.into(),
+            new_rank,
+            previous_rank,
+        }
+    }
+
+    /// Review finding N2: a re-read older row must not notify a rank the
+    /// line has since left.
+    #[test]
+    fn only_each_lines_newest_candidate_is_kept() {
+        let kept = newest_candidate_per_line(vec![
+            candidate(1, "central", 0, 4),
+            candidate(2, "victoria", 0, 2),
+            candidate(3, "central", 4, 2),
+            candidate(4, "jubilee", 1, 0),
+            candidate(5, "victoria", 2, 3),
+        ]);
+        assert_eq!(
+            kept,
+            vec![
+                candidate(3, "central", 4, 2),
+                candidate(4, "jubilee", 1, 0),
+                candidate(5, "victoria", 2, 3),
+            ]
+        );
+        assert_eq!(newest_candidate_per_line(Vec::new()), Vec::new());
     }
 }

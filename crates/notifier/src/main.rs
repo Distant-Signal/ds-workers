@@ -486,6 +486,8 @@ async fn run_cycle(
         line_history_max_age,
     )
     .await?;
+    // Only a line's newest transition may notify (`newest_candidate_per_line`).
+    let line_candidates = queries::newest_candidate_per_line(line_candidates);
 
     for candidate in &line_candidates {
         // Mirrors `notify_train_candidates`'s own per-candidate log, and is
