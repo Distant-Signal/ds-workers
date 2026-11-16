@@ -1763,6 +1763,9 @@ pub(crate) struct CommittedLeg {
     pub origin_name: Option<String>,
     pub destination_name: Option<String>,
     pub trains_id: i64,
+    /// The leg's train subscription (`train_subscription_id`), for the
+    /// break check (one push per user per train).
+    pub tracked_train_id: i64,
     pub pin_destination_crs: Option<String>,
     pub next_calling_point: Option<String>,
     pub train_origin_crs: Option<String>,
@@ -1798,7 +1801,8 @@ static COMMITTED_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
         "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
-                ts.trains_id, ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
+                ts.trains_id, jl.train_subscription_id AS tracked_train_id, \
+                ts.pin_destination_crs, cs.next_calling_point, tr.origin_crs AS train_origin_crs \
          FROM journey_legs jl \
          JOIN journeys j ON j.id = jl.journey_id \
          JOIN train_subscriptions ts ON ts.id = jl.train_subscription_id \
@@ -1842,6 +1846,7 @@ pub(crate) async fn list_committed_legs_for_today(
                 origin_name: row.try_get("origin_name")?,
                 destination_name: row.try_get("destination_name")?,
                 trains_id: row.try_get("trains_id")?,
+                tracked_train_id: row.try_get("tracked_train_id")?,
                 pin_destination_crs: row.try_get("pin_destination_crs")?,
                 next_calling_point: row.try_get("next_calling_point")?,
                 train_origin_crs: row.try_get("train_origin_crs")?,
