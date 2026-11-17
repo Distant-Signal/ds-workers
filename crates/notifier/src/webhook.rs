@@ -108,7 +108,9 @@ pub(crate) struct WebhookEvent {
     pub event: &'static str,
     pub title: String,
     pub body: String,
-    /// The path the push opens (`/journeys/j_` and 32 hex digits).
+    /// The path the push opens (`/journeys/j_` and 32 hex digits, or
+    /// `/train/by-id/t_` and 32 hex digits): public ids, never numeric ones
+    /// (DS-534).
     pub path: String,
     pub tag: String,
     pub urgent: bool,
@@ -499,8 +501,8 @@ mod tests {
             event: "train_update",
             title: "Delayed \u{2013} 09:15 to Leeds".into(),
             body: "About 20 minutes late.".into(),
-            path: "/track/7".into(),
-            tag: "train-7".into(),
+            path: "/train/by-id/t_0123456789abcdef0123456789abcdef".into(),
+            tag: "train-t_0123456789abcdef0123456789abcdef".into(),
             urgent,
             decided_at: DateTime::parse_from_rfc3339("2026-11-09T09:00:00Z")
                 .unwrap()
@@ -582,7 +584,11 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["schema_version"], 1);
         assert_eq!(body["event"], "train_update");
-        assert_eq!(body["url"], "https://ds.example/track/7");
+        assert_eq!(
+            body["url"],
+            "https://ds.example/train/by-id/t_0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(body["tag"], "train-t_0123456789abcdef0123456789abcdef");
         assert_eq!(body["urgent"], true);
         assert_eq!(body["occurred_at"], "2026-11-09T09:00:00Z");
         assert_eq!(body["attribution"]["url"], "https://ds.example/attribution");
@@ -611,6 +617,57 @@ mod tests {
                 .as_bytes()
         );
         assert_eq!(header(&request, "x-ds-timestamp").unwrap(), b"1800000000");
+    }
+
+    /// DS-534: a webhook carries the push's own URL and tag, so a train
+    /// push reaches the receiver with the public id and never a numeric one.
+    #[test]
+    fn a_train_webhook_carries_the_public_id_url_and_tag() {
+        let train = "t_0123456789abcdef0123456789abcdef";
+        let payload = NotificationPayload {
+            title: "t".into(),
+            body: "b".into(),
+            url: crate::push_ids::train_url(train),
+            tag: crate::push_ids::train_tag(train),
+            renotify: false,
+        };
+        let delivered = Delivered::Train {
+            tracked_train_id: 7,
+            status: "en_route".into(),
+            delay_minutes: Some(20),
+            awaiting_reason: false,
+        };
+        let event = WebhookEvent::from_job(&delivered, &payload, Utc::now()).expect("an event");
+        let request = build_request(
+            &dest("generic", "https://hooks.example/x", Some("s3cret")),
+            &event,
+            Some("https://ds.example"),
+            Utc::now(),
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body["url"],
+            "https://ds.example/train/by-id/t_0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(body["tag"], "train-t_0123456789abcdef0123456789abcdef");
+        assert_eq!(body["schema_version"], 1);
+        let text = String::from_utf8(request.body).unwrap();
+        assert!(
+            !text.contains("/track/") && !text.contains("train-7"),
+            "{text}"
+        );
+    }
+
+    /// The delivery id hashes the tag, so a retry that spans the switch
+    /// from numeric to public-id tags gets a new id.
+    #[test]
+    fn delivery_id_changes_with_the_tag() {
+        let old = WebhookEvent {
+            tag: "train-7".into(),
+            ..event(false)
+        };
+        assert_ne!(delivery_id(1, &old), delivery_id(1, &event(false)));
     }
 
     #[test]
@@ -646,7 +703,7 @@ mod tests {
         assert_eq!(header(&request, "tags").unwrap(), b"train");
         assert_eq!(
             header(&request, "click").unwrap(),
-            b"https://ds.example/track/7"
+            b"https://ds.example/train/by-id/t_0123456789abcdef0123456789abcdef"
         );
         assert_eq!(header(&request, "authorization").unwrap(), b"Bearer tk_abc");
         // A non-ASCII title is RFC 2047 encoded, not sent as raw bytes.
@@ -684,7 +741,7 @@ mod tests {
         assert_eq!(body["priority"], 5);
         assert_eq!(
             body["extras"]["client::notification"]["click"]["url"],
-            "https://ds.example/track/7"
+            "https://ds.example/train/by-id/t_0123456789abcdef0123456789abcdef"
         );
     }
 

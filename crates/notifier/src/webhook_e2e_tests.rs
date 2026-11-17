@@ -36,8 +36,8 @@ fn event(title: &str, body: &str, urgent: bool) -> WebhookEvent {
         event: "train_update",
         title: title.to_string(),
         body: body.to_string(),
-        path: "/track/42".to_string(),
-        tag: "train-42".to_string(),
+        path: "/train/by-id/t_00000000000000000000000000000042".to_string(),
+        tag: "train-t_00000000000000000000000000000042".to_string(),
         urgent,
         decided_at: DateTime::parse_from_rfc3339("2026-11-09T09:00:00Z")
             .expect("a date")
