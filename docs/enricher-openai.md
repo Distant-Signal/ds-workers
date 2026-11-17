@@ -221,7 +221,10 @@ in the fallback, at most what is left of the projected token.
   `t0 + min(expires_in, expires_at - now) - max(LLM_TOKEN_REFRESH_SKEW_SECS, half the lifetime)`,
   where `t0` is when the request started (skew default 60 s): at half-life,
   so an outage of Authentik or the exchange has the other half of the
-  token's life to clear before enrichment stops.
+  token's life to clear before enrichment stops. The margin never leaves
+  less than a quarter of the lifetime (and 5 s) before the refresh, so a
+  token no longer than the skew is still reused; one lasting under 5 s
+  (e.g. `expires_in: 0`) is refused as `short_lifetime`.
 - Refreshes are single-flight: concurrent calls on an empty cache wait for
   one exchange, and share its failure too. While the cached token is still
   valid, calls that arrive during a refresh use it rather than wait. Each
@@ -252,7 +255,8 @@ in the fallback, at most what is left of the projected token.
   replaced by `[redacted]`).
 - Metrics: `enricher_llm_token_exchange_total{stage=authentik|openai, outcome}`
   (`success`, `token_file_error`, `invalid_grant`, `invalid_client`,
-  `invalid_subject_token`, `http_error`, `timeout`, `error`),
+  `invalid_subject_token`, `http_error`, `timeout`, `short_lifetime`,
+  `error`),
   `enricher_llm_token_refresh_fallback_total{stage}` (failed refreshes that
   fell back to the cached token, so a non-zero rate means an outage that
   has not yet hit enrichment) and `enricher_llm_token_remaining_seconds`.
