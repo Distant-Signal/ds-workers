@@ -867,7 +867,7 @@ impl FederatedTokenSource {
             return self.anthropic_exchange(&assertion?).await;
         }
         let subject = match &self.config.authentik {
-            None => self.read_identity_token(Stage::Openai)?,
+            None => self.read_identity_token(Stage::Openai).await?,
             Some(authentik) => self.authentik_token(authentik, state).await?,
         };
         let result = self.openai_exchange(&subject).await;
@@ -881,8 +881,9 @@ impl FederatedTokenSource {
     }
 
     /// The projected service-account token, re-read every time (the kubelet
-    /// rotates it). `stage` is the endpoint it is about to be sent to.
-    fn read_identity_token(&self, stage: Stage) -> Result<Secret, ExchangeFailure> {
+    /// rotates it). `stage` is the endpoint it is about to be sent to. Read
+    /// on the blocking pool, off the async worker threads.
+    async fn read_identity_token(&self, stage: Stage) -> Result<Secret, ExchangeFailure> {
         let failure = |reason: &str| {
             tracing::warn!(
                 stage = stage.label(),
@@ -896,10 +897,12 @@ impl FederatedTokenSource {
                 outcome: "token_file_error",
             }
         };
-        match std::fs::read_to_string(&self.config.identity_token_file) {
-            Ok(raw) if !raw.trim().is_empty() => Ok(Secret::new(raw.trim())),
-            Ok(_) => Err(failure("the file is empty")),
-            Err(err) => Err(failure(&err.to_string())),
+        let path = self.config.identity_token_file.clone();
+        match tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await {
+            Ok(Ok(raw)) if !raw.trim().is_empty() => Ok(Secret::new(raw.trim())),
+            Ok(Ok(_)) => Err(failure("the file is empty")),
+            Ok(Err(err)) => Err(failure(&err.to_string())),
+            Err(err) => Err(failure(&format!("the read task failed: {err}"))),
         }
     }
 
@@ -914,7 +917,7 @@ impl FederatedTokenSource {
             return Ok(cached.token.clone());
         }
         state.authentik = None;
-        let assertion = self.read_identity_token(Stage::Authentik)?;
+        let assertion = self.read_identity_token(Stage::Authentik).await?;
         let mut form = vec![
             ("grant_type", "client_credentials"),
             ("client_id", authentik.client_id.as_str()),
