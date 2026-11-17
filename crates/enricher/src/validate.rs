@@ -13,7 +13,7 @@
 //! - [`resolution_status`] and [`apparent_severity`]: the closed sets the
 //!   schema lists.
 //! - [`impact_type`]: the closed set, else `None`.
-//! - [`schedule_window_is_valid`]: weekdays 1-7 and strict `HH:MM` times.
+//! - [`schedule_window_is_valid`]: weekdays 1-7 and `H:MM`/`HH:MM` times.
 //!
 //! (`category` has its own folding, `category.rs`; dates parse as RFC 3339 or
 //! degrade to `None`, `llm::deserialize_lenient_date`.) There is no URL or
@@ -26,9 +26,12 @@ use regex::Regex;
 use crate::llm::ScheduleWindow;
 
 /// The longest `scope_description` kept, in characters. Real ones are a
-/// short phrase ("Between Upminster and Grays", "platform 3 closed, calls
-/// at platform 4"); a longer one is far likelier to be smuggled text.
-pub(crate) const MAX_SCOPE_DESCRIPTION_CHARS: usize = 160;
+/// phrase ("Between Upminster and Grays", "platform 3 closed, calls at
+/// platform 4"), but a period covering several route legs lists them all:
+/// of the distinct values stored in production (about 2,700) the median is
+/// 91 characters, the 99th percentile 239 and the longest 342, so 160 would
+/// have dropped 9% of them. 300 drops under 0.2%.
+pub(crate) const MAX_SCOPE_DESCRIPTION_CHARS: usize = 300;
 
 /// `resolution_status` values.
 pub(crate) const RESOLUTION_STATUSES: [&str; 3] = ["ongoing", "residual", "resolved"];
@@ -176,10 +179,11 @@ pub(crate) fn impact_type(value: &str) -> Option<&'static str> {
     reason = "a static pattern that fails to compile is a programming error caught by the tests"
 )]
 static CLOCK_TIME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$").expect("static regex"));
+    LazyLock::new(|| Regex::new(r"^(?:[01]?[0-9]|2[0-3]):[0-5][0-9]$").expect("static regex"));
 
 /// Whether `window` is a well-formed weekly window: a non-empty set of ISO
-/// weekdays 1-7 and `HH:MM` 24-hour start and end times. The aggregator
+/// weekdays 1-7 and `H:MM` or `HH:MM` 24-hour start and end times (what the
+/// aggregator's `%H:%M` parse accepts; seconds are not). The aggregator
 /// quotes the times in a passenger-facing annotation.
 pub(crate) fn schedule_window_is_valid(window: &ScheduleWindow) -> bool {
     !window.days_of_week.is_empty()
@@ -295,7 +299,12 @@ mod tests {
         assert!(!schedule_window_is_valid(&window(&[0], "23:00", "05:00")));
         assert!(!schedule_window_is_valid(&window(&[8], "23:00", "05:00")));
         assert!(!schedule_window_is_valid(&window(&[1], "24:00", "05:00")));
-        assert!(!schedule_window_is_valid(&window(&[1], "9:00", "05:00")));
+        assert!(schedule_window_is_valid(&window(&[1], "9:00", "05:00")));
+        assert!(!schedule_window_is_valid(&window(
+            &[1],
+            "09:00:00",
+            "05:00"
+        )));
         assert!(!schedule_window_is_valid(&window(
             &[1],
             "23:00",
