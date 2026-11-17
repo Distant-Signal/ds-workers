@@ -409,12 +409,13 @@ async fn breaks_for_reminder(pool: &PgPool, row: &LeaveRow) -> anyhow::Result<Ve
 /// be at `now` ([`crate::hold::gate`], `quiet` the user's quiet hours or
 /// snooze):
 ///
-/// - a notice already sent at the break's severity owns the reminder: it
-///   told the user the journey changed;
+/// - a break whose notice was already sent (`notified_severity`, at its
+///   severity or a lower one it has since passed) owns the reminder: it
+///   told the user the journey changed, whatever the switches say now;
 /// - a notice due (sent this cycle, waiting one sweep for its confirmation,
 ///   or opened in the app in the last few minutes and sent after) owns it
-///   only if it would go out now: in quiet hours only a cancellation does,
-///   and a snooze stops it;
+///   only if it would go out now: in quiet hours or a snooze only a
+///   cancellation does;
 /// - a notice the user turned off (`journey_suggestions`), muted for the
 ///   journey (`suggestions_muted`) or silenced with its train's own pushes
 ///   owns nothing: the reminder goes as if there were no break.
@@ -426,38 +427,39 @@ pub(crate) fn break_notice_owns(
     quiet: Quiet,
     default_delay_threshold_minutes: i32,
 ) -> bool {
-    breaks
-        .iter()
-        .any(|row| match decide_break_notice(row, now) {
-            BreakDecision::SuppressNotWorse => true,
-            BreakDecision::Send
-            | BreakDecision::SuppressUnconfirmed
-            | BreakDecision::SuppressActed => {
-                let trigger = row.trigger_tracked_train_id.map(|tracked_train_id| {
-                    let threshold = crate::queries::user_delay_threshold(
-                        row.delay_threshold_minutes,
-                        default_delay_threshold_minutes,
-                    );
-                    let (status, delay_minutes) =
-                        crate::break_notices::equivalent_train_state(row, threshold);
-                    TriggerTrainState {
-                        tracked_train_id,
-                        status,
-                        delay_minutes,
-                    }
-                });
-                let notice = Delivered::JourneyBreak {
-                    break_id: row.id,
-                    severity: row.severity,
-                    trigger,
-                };
-                crate::hold::gate(&notice, quiet, true) == crate::hold::Gate::Send
+    breaks.iter().any(|row| {
+        row.notified_severity.is_some()
+            || match decide_break_notice(row, now) {
+                BreakDecision::SuppressNotWorse => true,
+                BreakDecision::Send
+                | BreakDecision::SuppressUnconfirmed
+                | BreakDecision::SuppressActed => {
+                    let trigger = row.trigger_tracked_train_id.map(|tracked_train_id| {
+                        let threshold = crate::queries::user_delay_threshold(
+                            row.delay_threshold_minutes,
+                            default_delay_threshold_minutes,
+                        );
+                        let (status, delay_minutes) =
+                            crate::break_notices::equivalent_train_state(row, threshold);
+                        TriggerTrainState {
+                            tracked_train_id,
+                            status,
+                            delay_minutes,
+                        }
+                    });
+                    let notice = Delivered::JourneyBreak {
+                        break_id: row.id,
+                        severity: row.severity,
+                        trigger,
+                    };
+                    crate::hold::gate(&notice, quiet, true) == crate::hold::Gate::Send
+                }
+                BreakDecision::SuppressOptOut
+                | BreakDecision::SuppressMuted
+                | BreakDecision::SuppressTrainOff
+                | BreakDecision::SuppressInApp => false,
             }
-            BreakDecision::SuppressOptOut
-            | BreakDecision::SuppressMuted
-            | BreakDecision::SuppressTrainOff
-            | BreakDecision::SuppressInApp => false,
-        })
+    })
 }
 
 /// Whether the reminder for `row` is owned by a break: a break notice sent
@@ -956,26 +958,49 @@ mod tests {
     }
 
     /// DS-534: a notice that quiet hours or a snooze keep back is not sent
-    /// now, so it owns nothing. In quiet hours a cancellation's notice
-    /// still goes (`hold::gate`) and owns the reminder; a snooze stops it
-    /// too (and the reminder, at dispatch).
+    /// now, so it owns nothing (a snooze then stops the reminder too, at
+    /// dispatch). A cancellation's notice goes through both (`hold::gate`)
+    /// and owns the reminder.
     #[test]
     fn a_break_notice_held_back_leaves_the_reminder() {
-        assert_eq!(
-            reminder(&[open_break("connection_missed")], Quiet::Hours),
-            SENT
-        );
-        assert_eq!(
-            reminder(&[open_break("cancelled")], Quiet::Hours),
-            LeaveReminderDecision::BreakOwns
-        );
-        for cause in ["connection_missed", "cancelled"] {
+        for quiet in [Quiet::Hours, Quiet::Snoozed] {
             assert_eq!(
-                reminder(&[open_break(cause)], Quiet::Snoozed),
+                reminder(&[open_break("connection_missed")], quiet),
                 SENT,
-                "{cause}"
+                "{quiet:?}"
+            );
+            assert_eq!(
+                reminder(&[open_break("cancelled")], quiet),
+                LeaveReminderDecision::BreakOwns,
+                "{quiet:?}"
             );
         }
+    }
+
+    /// A break whose notice went at a lower severity and that got worse in
+    /// quiet hours: the worse notice waits, but the user was already told,
+    /// so the reminder stays quiet.
+    #[test]
+    fn a_break_notified_before_it_got_worse_owns_the_reminder() {
+        let worse = BreakNoticeRow {
+            severity: 2,
+            notified_severity: Some(1),
+            ..open_break("connection_missed")
+        };
+        assert_eq!(
+            reminder(std::slice::from_ref(&worse), Quiet::Hours),
+            LeaveReminderDecision::BreakOwns
+        );
+        assert_eq!(
+            reminder(
+                &[BreakNoticeRow {
+                    journey_suggestions: false,
+                    ..worse
+                }],
+                Quiet::No
+            ),
+            LeaveReminderDecision::BreakOwns
+        );
     }
 
     #[test]
