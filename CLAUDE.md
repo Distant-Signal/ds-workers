@@ -76,6 +76,14 @@ python3 scripts/release-order.py labels      # the image version labels
 
 **aggregator.** Matches incidents to lines (`common::matcher`, the same
 matcher the ingest uses) and writes `line_status` and its history.
+A match on a shared segment adds "Also affects other lines on this route."
+to the reason, so a catalogue change that moves a station from an exclusive
+to a shared segment (ds-core v0.15.0, `lines/segment-sharing-baseline.txt`)
+changes that line's passenger-facing wording, not which lines match. The
+enricher's `scope_description` is quoted into annotations only if it passes
+`crates/scope-text` (the one validation the enricher also applies on write),
+because rows stored before that validation were never checked; text that
+fails it is shown as no scope, and is never rewritten in the database.
 
 **enricher.** Sends changed incident text to an LLM (Anthropic or OpenAI,
 keyless auth, batch mode; `docs/enricher-*.md`) and stores the result.

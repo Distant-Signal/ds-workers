@@ -24,6 +24,8 @@ ds-store = { workspace = true }
 metrics = "0.24"
 # The output checks' text patterns (`src/checks.rs`).
 regex = "1"
+# `scope_description` validation, shared with the aggregator.
+scope-text = { path = "../scope-text" }
 redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "multipart", "native-tls", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
