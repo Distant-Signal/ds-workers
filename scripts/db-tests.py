@@ -241,6 +241,11 @@ PASSES: Mapping[str, tuple[Step, ...]] = {
             exact=True,
         ),
         per_service("aggregator", "aggregator", filters=("archive::tests::",)),
+        # The notifier's schema gate as its narrowed role (no --observe): the
+        # role holds every privilege the pinned ds-core's db-grants.yaml
+        # gives it. The rest of its suite seeds through its own pool, which
+        # needs --observe; scripts/check-notifier-grants.py covers its SQL.
+        per_service("notifier", "notifier", test_target="schema_gate"),
     ),
 }
 
