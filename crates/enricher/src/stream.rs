@@ -288,16 +288,25 @@ async fn recreate_group_on<C: ConnectionLike + Send + Sync>(
     };
     let target = shared.restore_target();
     let start_id = recreate_start_id(target.as_deref(), last_generated.as_deref());
-    if start_id == "0" {
-        // A stream that is gone or newer than everything this process read:
-        // the ids it holds belong to a stream that no longer exists, so none
-        // can be finished and none may be restored to (a target past the
-        // new stream's ids would skip its entries).
+    // A stream that is gone or newer than everything this process read: the
+    // ids the cursor holds belong to a stream that no longer exists, so none
+    // can be finished and none may be restored to (a target past the new
+    // stream's ids would skip its entries).
+    let new_stream = start_id == "0";
+    // The snapshot the restore works from (see the doc above): empty for a
+    // new stream, so an existing group on it is never moved to an old id.
+    let snapshot = if new_stream {
+        GroupCursor::new()
+    } else {
+        shared.lock().clone()
+    };
+    let created = ensure_group_at(conn, stream, &start_id).await?;
+    if new_stream {
+        // Dropped only once the group exists: if the call above failed, the
+        // next attempt must still see a target past the new stream's ids and
+        // start at `0` again, not at `$` (which skips what `api` has written).
         *shared.lock() = GroupCursor::new();
     }
-    // The snapshot the restore works from; see the doc above.
-    let snapshot = shared.lock().clone();
-    let created = ensure_group_at(conn, stream, &start_id).await?;
     if !created
         && let GroupPosition::Restored { was } =
             ds_runtime::redis_group::restore_group_cursor(conn, stream, GROUP, &snapshot).await?
@@ -649,6 +658,8 @@ mod cursor_tests {
     const S: &str = "s";
     /// The id just below `200-0`.
     const BELOW_200: &str = "199-18446744073709551615";
+    /// The id just below `500-0`.
+    const BELOW_500: &str = "499-18446744073709551615";
 
     fn bulk(text: &str) -> Value {
         Value::BulkString(text.as_bytes().to_vec())
@@ -855,6 +866,38 @@ mod cursor_tests {
         recreate_group_on(&mut conn, S, &cursor).await.unwrap();
         assert_eq!(setid_target(&conn), None);
         assert_eq!(cursor.restore_target().as_deref(), Some("50-0"));
+    }
+
+    /// The group could not be created for a new stream: the cursor keeps
+    /// its ids, so the retry starts at `0` again rather than at the tail.
+    #[tokio::test]
+    async fn a_failed_recreate_on_a_new_stream_keeps_the_cursor_for_the_retry() {
+        let cursor = cursor_after(&["500-0"], &[]);
+        let mut conn = FakeConn::new([
+            exists(),
+            stream_info("100-0"),
+            Err(redis::RedisError::from((
+                redis::ErrorKind::Io,
+                "connection reset",
+            ))),
+        ]);
+        recreate_group_on(&mut conn, S, &cursor)
+            .await
+            .expect_err("the create failed");
+        assert_eq!(cursor.restore_target().as_deref(), Some(BELOW_500));
+
+        let mut conn = FakeConn::new([
+            exists(),
+            stream_info("100-0"),
+            Ok(Value::Okay),
+            groups("0-0"),
+        ]);
+        recreate_group_on(&mut conn, S, &cursor).await.unwrap();
+        assert_eq!(
+            conn.sent[2],
+            ["XGROUP", "CREATE", S, GROUP, "0", "MKSTREAM"],
+            "the retry still reads the new stream from its start"
+        );
     }
 
     /// A group already past the target is left alone and not adopted: the
