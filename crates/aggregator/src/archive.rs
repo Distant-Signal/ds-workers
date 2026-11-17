@@ -543,11 +543,19 @@ const TRAINS_GROUP_EXPORTS: &[TableExport] = &[
 /// migrated schema, so a new child table cannot be pruned unarchived by
 /// accident.
 #[cfg_attr(not(test), expect(dead_code, reason = "read by the schema test only"))]
-const TRAINS_CASCADE_NOT_ARCHIVED: &[(&str, &str)] = &[(
-    "notifier_forward_queue",
-    "a transient push-forwarding signal for notifier (consumed within seconds), \
-     not history; its content is derived from the archived movement events",
-)];
+const TRAINS_CASCADE_NOT_ARCHIVED: &[(&str, &str)] = &[
+    (
+        "notifier_forward_queue",
+        "a transient push-forwarding signal for notifier (consumed within seconds), \
+         not history; its content is derived from the archived movement events",
+    ),
+    (
+        "train_service_labels",
+        "an internal-only label (ds-core v0.15.0, DS-513) for reporting on current \
+         data: `service_class` is derived from the train id's headcode, which the \
+         archived `trains` row keeps; `toc_id` is not archived",
+    ),
+];
 
 /// Outcome of one [`archive_and_prune_trains`] run.
 #[derive(Debug, Default, PartialEq, Eq)]
