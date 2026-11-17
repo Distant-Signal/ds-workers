@@ -837,6 +837,41 @@ mod tests {
         }
     }
 
+    /// DS-534: a hold stored before the public-id switch carries the old
+    /// numeric URL and tag. Its key is the numeric `train:<id>` either way,
+    /// so a new push for the same train replaces it (one hold per train, no
+    /// second notification), and a released old hold is sent as stored.
+    #[test]
+    fn a_hold_stored_with_numeric_ids_keeps_its_key_and_is_released_as_stored() {
+        let mut old = train_hold("en_route", Some(20));
+        old.url = "/train/by-id/1".into();
+        old.tag = "train-1".into();
+        let delivered = delivered_of(&old).expect("a train hold");
+        assert!(matches!(
+            delivered,
+            Delivered::Train {
+                tracked_train_id: 1,
+                ..
+            }
+        ));
+        assert_eq!(hold_target(&delivered).as_deref(), Some("train:1"));
+        assert_eq!(
+            hold_target(&delivered).as_deref(),
+            Some(old.target.as_str())
+        );
+        assert_eq!(decide_release(&old, utc(7, 0), 15), Release::Send);
+
+        // The push built now for the same train has the opaque URL and tag
+        // and the same key.
+        let current = Delivered::Train {
+            tracked_train_id: 1,
+            status: "en_route".into(),
+            delay_minutes: Some(20),
+            awaiting_reason: false,
+        };
+        assert_eq!(hold_target(&current), hold_target(&delivered));
+    }
+
     #[test]
     fn a_hold_waits_out_quiet_hours_then_goes_if_still_news() {
         let hold = train_hold("en_route", Some(20));

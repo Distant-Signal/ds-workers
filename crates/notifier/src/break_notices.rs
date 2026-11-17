@@ -58,6 +58,9 @@ pub(crate) struct BreakNoticeRow {
     pub journey_suggestions: bool,
     /// The trigger leg's subscription (the train whose push this replaces).
     pub trigger_tracked_train_id: Option<i64>,
+    /// `train_subscriptions.public_id` of that subscription (DS-534): the
+    /// notice's tag when a train triggered it.
+    pub trigger_tracked_train_public_id: Option<String>,
     /// That train's current status, for its `train_notification_state`.
     pub trigger_status: Option<String>,
     pub trigger_delay_minutes: Option<i32>,
@@ -81,6 +84,7 @@ pub(crate) const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, j.public_id 
                 b.opened_at, b.confirmations, b.suggestions, j.suggestions_muted, \
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
+                ts.public_id AS trigger_tracked_train_public_id, \
                 cs.status AS trigger_status, cs.delay_minutes AS trigger_delay_minutes, \
                 COALESCE(ts.notifications_enabled, TRUE) AS trigger_pushes_on, \
                 ts.trains_id AS trigger_trains_id, \
@@ -433,9 +437,9 @@ pub(crate) fn build_break_payload(row: &BreakNoticeRow) -> NotificationPayload {
             "/journeys/{}?break={}&src=push#break",
             row.journey_public_id, row.id
         ),
-        tag: match row.trigger_tracked_train_id {
-            Some(tracked_train_id) => format!("train-{tracked_train_id}"),
-            None => format!("journey-break-{}", row.journey_id),
+        tag: match &row.trigger_tracked_train_public_id {
+            Some(train_public_id) => crate::push_ids::train_tag(train_public_id),
+            None => crate::push_ids::journey_break_tag(&row.journey_public_id),
         },
         renotify: false,
     }
@@ -632,6 +636,7 @@ mod tests {
             suggestions_muted: false,
             journey_suggestions: true,
             trigger_tracked_train_id: Some(118),
+            trigger_tracked_train_public_id: Some("t_00000000000000000000000000000118".to_string()),
             trigger_status: Some("en_route".to_string()),
             trigger_delay_minutes: Some(9),
             trigger_pushes_on: true,
@@ -653,7 +658,7 @@ mod tests {
             payload.url,
             "/journeys/j_00000000000000000000000000000042?break=7&src=push#break"
         );
-        assert_eq!(payload.tag, "train-118");
+        assert_eq!(payload.tag, "train-t_00000000000000000000000000000118");
     }
 
     #[test]
@@ -686,10 +691,14 @@ mod tests {
         let mut r = row("cancelled");
         r.suggestions.as_mut().unwrap()["suggestions"] = serde_json::json!([]);
         r.trigger_tracked_train_id = None;
+        r.trigger_tracked_train_public_id = None;
         let payload = build_break_payload(&r);
         assert_eq!(payload.title, "No more trains to Charing Cross today");
         assert_eq!(payload.body, "Tap to see your options.");
-        assert_eq!(payload.tag, "journey-break-42");
+        assert_eq!(
+            payload.tag,
+            "journey-break-j_00000000000000000000000000000042"
+        );
     }
 
     #[test]
@@ -1010,6 +1019,20 @@ mod db_tests {
             .find(|row| row.id == break_id)
             .expect("the open break is listed");
         assert_eq!(row.trigger_tracked_train_id, Some(tracked_train_id));
+        let public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM train_subscriptions WHERE id = $1")
+                .bind(tracked_train_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read train_subscriptions.public_id");
+        assert_eq!(
+            row.trigger_tracked_train_public_id.as_deref(),
+            Some(public_id.as_str())
+        );
+        assert!(
+            public_id.starts_with("t_") && public_id.len() == 34,
+            "{public_id}"
+        );
         assert_eq!(row.trigger_status.as_deref(), Some("cancelled"));
         assert!(row.journey_suggestions && !row.suggestions_muted);
         assert_eq!(decide_break_notice(row, Utc::now()), BreakDecision::Send);

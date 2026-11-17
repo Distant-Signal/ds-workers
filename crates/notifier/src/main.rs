@@ -10,6 +10,7 @@ mod decision;
 mod hold;
 mod leave_reminder;
 mod line_recheck;
+mod push_ids;
 mod push_queue;
 mod queries;
 mod send;
@@ -644,7 +645,7 @@ async fn notify_train_candidates(
         };
         let from_station = queries::irish_from_station(pool, candidate.tracked_train_id).await?;
         let payload = build_train_notification_payload(
-            candidate.tracked_train_id,
+            &candidate.tracked_train_public_id,
             &status,
             delay_minutes,
             journey_context.as_ref(),
@@ -741,7 +742,7 @@ fn push_journey_label(ctx: &queries::JourneyLegContext) -> String {
 /// from Dublin Connolly is delayed", since the train has no GB route to
 /// name it by. `None` for every GB train.
 fn build_train_notification_payload(
-    tracked_train_id: i64,
+    tracked_train_public_id: &str,
     status: &str,
     delay_minutes: Option<i32>,
     journey_context: Option<&queries::JourneyLegContext>,
@@ -771,8 +772,8 @@ fn build_train_notification_payload(
                     .filter(|_| is_cancelled)
                     .unwrap_or_else(|| "Check the latest status.".to_string()),
             },
-            url: format!("/train/by-id/{tracked_train_id}"),
-            tag: format!("train-{tracked_train_id}"),
+            url: push_ids::train_url(tracked_train_public_id),
+            tag: push_ids::train_tag(tracked_train_public_id),
             renotify: false,
         };
     };
@@ -814,7 +815,7 @@ fn build_train_notification_payload(
         title,
         body,
         url: format!("/journeys/{}", ctx.journey_public_id),
-        tag: format!("train-{tracked_train_id}"), // unchanged -- still the same underlying tracked-train row
+        tag: push_ids::train_tag(tracked_train_public_id), // still the same underlying tracked-train row
         renotify: false,
     }
 }
@@ -844,7 +845,7 @@ async fn run_predicted_start_cycle(
         let journey_context =
             queries::journey_leg_for_train_subscription(pool, candidate.tracked_train_id).await?;
         let payload = build_predicted_start_payload(
-            candidate.tracked_train_id,
+            &candidate.tracked_train_public_id,
             candidate.late_minutes,
             journey_context.as_ref(),
         );
@@ -907,19 +908,19 @@ async fn predicted_start_pushes(
 /// and tag as the delay push, so a later delay or cancellation push
 /// replaces it on the device.
 fn build_predicted_start_payload(
-    tracked_train_id: i64,
+    tracked_train_public_id: &str,
     late_minutes: i32,
     journey_context: Option<&queries::JourneyLegContext>,
 ) -> NotificationPayload {
     let body_tail = format!(
         "expected to start about {late_minutes} minutes late: the incoming train is running late."
     );
-    let tag = format!("train-{tracked_train_id}");
+    let tag = push_ids::train_tag(tracked_train_public_id);
     let Some(ctx) = journey_context.filter(|ctx| ctx.total_legs > 1) else {
         return NotificationPayload {
             title: "Your train may start late".to_string(),
             body: format!("It is {body_tail}"),
-            url: format!("/track/{tracked_train_id}"),
+            url: push_ids::train_url(tracked_train_public_id),
             tag,
             renotify: false,
         };
@@ -1201,7 +1202,7 @@ async fn run_skip_check_cycle(
                 push_station(&leg.destination_crs, leg.destination_name.as_deref())
             ),
             url: format!("/journeys/{}", leg.journey_public_id),
-            tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
+            tag: push_ids::leg_skip_tag(&leg.journey_leg_public_id),
             renotify: false,
         };
 
@@ -1455,7 +1456,7 @@ async fn enqueue_needs_attention(
             .unwrap_or_default()
         ),
         url: format!("/journeys/{}", leg.journey_public_id),
-        tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+        tag: push_ids::leg_unmatched_tag(&leg.journey_leg_public_id),
         renotify: false,
     };
     enqueue_push(
@@ -1625,7 +1626,7 @@ async fn remind_manual_legs(
             title: "Pick today's train".to_string(),
             body: pick_reminder_body(&route, &leg),
             url: pick_reminder_url(&leg.journey_public_id, leg.has_usual_itinerary),
-            tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
+            tag: push_ids::leg_unmatched_tag(&leg.journey_leg_public_id),
             renotify: false,
         };
         enqueue_push(
@@ -1864,6 +1865,9 @@ mod copy_tests {
         assert_eq!(line_url("tfl-victoria"), "/lines/tfl-victoria");
     }
 
+    /// `train_subscriptions.public_id` of the train tracked as 7.
+    const TRAIN_PID: &str = "t_00000000000000000000000000000007";
+
     fn ctx(total_legs: i64, journey_name: Option<&str>) -> queries::JourneyLegContext {
         queries::JourneyLegContext {
             journey_public_id: "j_00000000000000000000000000000042".to_string(),
@@ -1881,18 +1885,21 @@ mod copy_tests {
 
     #[test]
     fn a_predicted_late_start_is_worded_as_an_expectation() {
-        let payload = build_predicted_start_payload(7, 12, None);
+        let payload = build_predicted_start_payload(TRAIN_PID, 12, None);
         assert_eq!(payload.title, "Your train may start late");
         assert_eq!(
             payload.body,
             "It is expected to start about 12 minutes late: the incoming train is running late."
         );
-        assert_eq!(payload.url, "/track/7");
+        assert_eq!(
+            payload.url,
+            "/train/by-id/t_00000000000000000000000000000007"
+        );
         // The delay push's tag: a later delay or cancellation replaces it.
-        assert_eq!(payload.tag, "train-7");
+        assert_eq!(payload.tag, "train-t_00000000000000000000000000000007");
 
         let context = ctx(3, Some("Weekend in Edinburgh"));
-        let payload = build_predicted_start_payload(7, 12, Some(&context));
+        let payload = build_predicted_start_payload(TRAIN_PID, 12, Some(&context));
         assert_eq!(
             payload.title,
             "Leg 2 of 'Weekend in Edinburgh' may start late"
@@ -1907,11 +1914,15 @@ mod copy_tests {
 
     #[test]
     fn no_journey_context_falls_back_to_todays_exact_copy() {
-        let payload = build_train_notification_payload(7, "en_route", Some(18), None, None, None);
+        let payload =
+            build_train_notification_payload(TRAIN_PID, "en_route", Some(18), None, None, None);
         assert_eq!(payload.title, "Your train is delayed");
         assert_eq!(payload.body, "Now running about 18 minutes late.");
-        assert_eq!(payload.url, "/train/by-id/7");
-        assert_eq!(payload.tag, "train-7");
+        assert_eq!(
+            payload.url,
+            "/train/by-id/t_00000000000000000000000000000007"
+        );
+        assert_eq!(payload.tag, "train-t_00000000000000000000000000000007");
     }
 
     /// An Iarnród Éireann train's delay push names where it was tracked
@@ -1919,7 +1930,7 @@ mod copy_tests {
     #[test]
     fn an_irish_delay_says_where_it_was_tracked_from() {
         let payload = build_train_notification_payload(
-            7,
+            TRAIN_PID,
             "en_route",
             Some(16),
             None,
@@ -1928,37 +1939,61 @@ mod copy_tests {
         );
         assert_eq!(payload.title, "Your train from Dublin Connolly is delayed");
         assert_eq!(payload.body, "Now running about 16 minutes late.");
-        assert_eq!(payload.url, "/train/by-id/7");
+        assert_eq!(
+            payload.url,
+            "/train/by-id/t_00000000000000000000000000000007"
+        );
     }
 
     #[test]
     fn a_one_leg_journey_also_falls_back_to_todays_exact_copy() {
         let context = ctx(1, Some("Weekend in Edinburgh"));
-        let payload =
-            build_train_notification_payload(7, "cancelled", None, Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "cancelled",
+            None,
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(payload.title, "Your train was cancelled");
-        assert_eq!(payload.url, "/train/by-id/7");
+        assert_eq!(
+            payload.url,
+            "/train/by-id/t_00000000000000000000000000000007"
+        );
     }
 
     #[test]
     fn a_multi_leg_journey_names_the_leg_and_journey() {
         let context = ctx(3, Some("Weekend in Edinburgh"));
-        let payload =
-            build_train_notification_payload(7, "en_route", Some(18), Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "en_route",
+            Some(18),
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(payload.title, "Leg 2 of 'Weekend in Edinburgh' is delayed");
         assert_eq!(
             payload.body,
             "Wakefield Westgate to London Kings Cross, now running about 18 minutes late."
         );
         assert_eq!(payload.url, "/journeys/j_00000000000000000000000000000042");
-        assert_eq!(payload.tag, "train-7");
+        assert_eq!(payload.tag, "train-t_00000000000000000000000000000007");
     }
 
     #[test]
     fn an_unnamed_multi_leg_journey_falls_back_to_a_generic_journey_label() {
         let context = ctx(2, None);
-        let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "en_route",
+            Some(5),
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(
             payload.title,
             "Leg 2 of your journey to Brighton is delayed"
@@ -1970,8 +2005,14 @@ mod copy_tests {
         let mut context = ctx(2, None);
         context.journey_destination_crs = None;
         context.journey_destination_name = None;
-        let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "en_route",
+            Some(5),
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(payload.title, "Leg 2 of your journey is delayed");
     }
 
@@ -1979,8 +2020,14 @@ mod copy_tests {
     fn an_unnamed_journey_whose_end_has_no_name_uses_its_code() {
         let mut context = ctx(2, Some("   "));
         context.journey_destination_name = None;
-        let payload =
-            build_train_notification_payload(7, "cancelled", None, Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "cancelled",
+            None,
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(payload.title, "Leg 2 of your journey to BTN was cancelled");
     }
 
@@ -1988,8 +2035,14 @@ mod copy_tests {
     fn a_leg_route_with_one_unresolved_name_uses_codes_on_both_ends() {
         let mut context = ctx(2, None);
         context.destination_name = None;
-        let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "en_route",
+            Some(5),
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(
             payload.body,
             "WAV to KGX, now running about 5 minutes late."
@@ -1999,8 +2052,14 @@ mod copy_tests {
     #[test]
     fn a_multi_leg_cancellation_names_the_route_when_known() {
         let context = ctx(2, Some("Weekend in Edinburgh"));
-        let payload =
-            build_train_notification_payload(7, "cancelled", None, Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "cancelled",
+            None,
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(
             payload.title,
             "Leg 2 of 'Weekend in Edinburgh' was cancelled"
@@ -2016,8 +2075,14 @@ mod copy_tests {
         let mut context = ctx(2, Some("Weekend in Edinburgh"));
         context.origin_crs = None;
         context.destination_crs = None;
-        let payload =
-            build_train_notification_payload(7, "en_route", Some(5), Some(&context), None, None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "en_route",
+            Some(5),
+            Some(&context),
+            None,
+            None,
+        );
         assert_eq!(payload.body, "Now running about 5 minutes late.");
     }
 
@@ -2034,15 +2099,21 @@ mod copy_tests {
             cancel_reason::CancelWhat::TerminatesAt("York".to_string()),
             Some("Signal failure"),
         );
-        let payload =
-            build_train_notification_payload(7, "cancelled", None, None, Some(&terminates), None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "cancelled",
+            None,
+            None,
+            Some(&terminates),
+            None,
+        );
         assert_eq!(payload.title, "Your train terminates at York");
         assert_eq!(payload.body, "Reason: Signal failure.");
-        assert_eq!(payload.tag, "train-7");
+        assert_eq!(payload.tag, "train-t_00000000000000000000000000000007");
 
         let full = copy(cancel_reason::CancelWhat::Cancelled, Some("Driver"));
         let payload =
-            build_train_notification_payload(7, "cancelled", None, None, Some(&full), None);
+            build_train_notification_payload(TRAIN_PID, "cancelled", None, None, Some(&full), None);
         assert_eq!(payload.title, "Your train was cancelled");
         assert_eq!(payload.body, "Reason: Driver.");
 
@@ -2051,8 +2122,14 @@ mod copy_tests {
             cancel_reason::CancelWhat::StartsFrom("Leeds".to_string()),
             None,
         );
-        let payload =
-            build_train_notification_payload(7, "cancelled", None, None, Some(&starts), None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "cancelled",
+            None,
+            None,
+            Some(&starts),
+            None,
+        );
         assert_eq!(payload.title, "Your train now starts from Leeds");
         assert_eq!(payload.body, "Check the latest status.");
     }
@@ -2065,7 +2142,7 @@ mod copy_tests {
             Some("Signal failure"),
         );
         let payload = build_train_notification_payload(
-            7,
+            TRAIN_PID,
             "cancelled",
             None,
             Some(&context),
@@ -2083,7 +2160,7 @@ mod copy_tests {
         );
         let part = copy(cancel_reason::CancelWhat::PartCancelled, None);
         let payload = build_train_notification_payload(
-            7,
+            TRAIN_PID,
             "cancelled",
             None,
             Some(&context),
@@ -2099,8 +2176,14 @@ mod copy_tests {
     #[test]
     fn a_delay_push_ignores_any_cancellation_copy() {
         let full = copy(cancel_reason::CancelWhat::Cancelled, Some("Driver"));
-        let payload =
-            build_train_notification_payload(7, "en_route", Some(18), None, Some(&full), None);
+        let payload = build_train_notification_payload(
+            TRAIN_PID,
+            "en_route",
+            Some(18),
+            None,
+            Some(&full),
+            None,
+        );
         assert_eq!(payload.title, "Your train is delayed");
         assert_eq!(payload.body, "Now running about 18 minutes late.");
     }
@@ -2133,6 +2216,7 @@ mod db_tests {
         let queue = test_queue(&pool);
         let candidates = [queries::TrainCandidate {
             tracked_train_id: -2_700_027,
+            tracked_train_public_id: String::new(),
             // No trains row (so no state row) has a negative id.
             trains_id: -2_700_027,
             user_id: "TEST-DB227-USER".to_string(),
@@ -3092,6 +3176,7 @@ mod sweep_cycle_tests {
     ) -> queries::CommitCheckLeg {
         queries::CommitCheckLeg {
             journey_leg_id: 1,
+            journey_leg_public_id: "l_00000000000000000000000000000001".to_string(),
             journey_public_id: "j_00000000000000000000000000000002".to_string(),
             user_id: "u".to_string(),
             origin_crs: "WOK".to_string(),

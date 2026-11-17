@@ -131,6 +131,7 @@ mod tests {
     fn leg(origin_crs: &str, destination_crs: &str, match_target: &str) -> CommittedLeg {
         CommittedLeg {
             journey_leg_id: -1,
+            journey_leg_public_id: String::new(),
             journey_public_id: String::new(),
             user_id: "TEST-SKIP-CHECK".to_string(),
             origin_crs: origin_crs.to_string(),
