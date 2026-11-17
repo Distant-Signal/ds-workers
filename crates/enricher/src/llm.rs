@@ -679,9 +679,12 @@ pub(crate) enum LlmCallError {
     /// freshly exchanged one. Provider-side (the mapping, the project or
     /// the service account), not the text's fault.
     Unauthorized,
-    /// The request never got an HTTP response, or its body was cut off: a
-    /// refused or reset connection, a DNS failure, a TLS handshake error.
-    /// A provider or proxy outage, not the text's fault.
+    /// The connection was never made: refused, a DNS failure, a TLS
+    /// handshake error. Nothing reached the model (so nothing was billed):
+    /// a provider or proxy outage, not the text's fault. A connection lost
+    /// after the request was sent, or a body cut off mid-read, is
+    /// [`Self::Other`]: like a timeout, a runaway generation on one text
+    /// can end that way, so it keeps feeding the per-text backoff.
     Connect(anyhow::Error),
     Other(anyhow::Error),
 }
@@ -761,14 +764,14 @@ impl LlmCallError {
     }
 
     /// Classifies a `reqwest` error from sending a request or reading its
-    /// body: a client timeout, a transport failure ([`Self::Connect`]:
-    /// connect, DNS, TLS, reset, truncated body), or anything else
-    /// ([`Self::Other`]: a request we built wrong, or a body that isn't
-    /// JSON).
+    /// body: a client timeout, a failure to connect ([`Self::Connect`]:
+    /// refused, DNS, TLS), or anything else ([`Self::Other`]: a connection
+    /// lost after the request was sent, a truncated body, a body that isn't
+    /// JSON, a request we built wrong).
     pub(crate) fn from_reqwest(err: reqwest::Error) -> Self {
         if err.is_timeout() {
             Self::ClientTimeout
-        } else if err.is_connect() || err.is_request() || err.is_body() {
+        } else if err.is_connect() {
             Self::Connect(err.into())
         } else {
             Self::Other(err.into())
@@ -1569,9 +1572,11 @@ impl LlmClient {
     /// - A refusal is the model's answer to this text: not transient.
     /// - A credential failure (no federated token, or a 401 to a fresh one)
     ///   is the deployment's problem: transient.
-    /// - A transport failure (connect, DNS, TLS, reset) is a provider or
-    ///   proxy outage: transient, so an outage doesn't leave every incident
-    ///   it touched backing off for hours after the provider recovers.
+    /// - A failure to connect (refused, DNS, TLS) is a provider or proxy
+    ///   outage and reached no model: transient, so an outage doesn't leave
+    ///   every incident it touched backing off for hours after the provider
+    ///   recovers. A connection lost after the request was sent is not
+    ///   (`Other`): the model may have run, and been billed, on this text.
     #[expect(
         clippy::match_same_arms,
         reason = "separate arms document distinct cases"
@@ -3787,6 +3792,42 @@ mod tests {
             "{err:?}"
         );
         assert!(client.is_provider_transient(&err), "{err:?}");
+    }
+
+    /// A connection closed after the request was sent, before any
+    /// response, is not a connect error: the model may have run (and been
+    /// billed) on this text, so it stays `Other` and feeds the per-text
+    /// backoff rather than being retried every reclaim pass.
+    #[tokio::test]
+    async fn connection_lost_after_sending_is_not_a_connect_error() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Read the request, then hang up without a response.
+            let mut buf = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+        });
+        let client = LlmClient::new(
+            format!("http://{addr}"),
+            None,
+            "m".into(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
+        let err = client
+            .extract_primary("s", "d", reference_date())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmCallError>(),
+                Some(LlmCallError::Other(_))
+            ),
+            "{err:?}"
+        );
+        assert!(!client.is_provider_transient(&err), "{err:?}");
     }
 
     /// A 200 whose body isn't JSON is not a transport failure: it stays

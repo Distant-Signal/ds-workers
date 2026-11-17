@@ -1146,8 +1146,9 @@ async fn finish_adversarial_stage(
             // skipping would delete this paid result with the row and
             // wait for a whole new primary and adversarial cycle, so wait
             // for it briefly. A holder still there after that is a
-            // synchronous extraction (`normal` mode): it wins, and its own
-            // write is fresh.
+            // synchronous extraction (`normal` mode's stream loop, or a
+            // `batch` sweep below `LLM_BATCH_MIN_ITEMS`): it wins, and its
+            // own write is fresh.
             let Some(_claim) = enricher
                 .in_flight
                 .claim_within(&prepared.incident_id, CLAIM_WAIT)
