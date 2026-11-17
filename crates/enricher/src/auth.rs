@@ -468,7 +468,9 @@ struct RefreshState {
 /// Mints, caches and renews federated `OpenAI` access tokens.
 pub(crate) struct FederatedTokenSource {
     config: FederationConfig,
-    /// Its own client: a 10 s per-request timeout, not the LLM's minutes.
+    /// Its own client: a 10 s per-request timeout, not the LLM's minutes,
+    /// and no redirects (a 307/308 would re-POST the credential in the body
+    /// to the `Location` host).
     http: reqwest::Client,
     clock: Clock,
     /// The current `OpenAI` token. A std mutex: never held across an await.
@@ -627,6 +629,7 @@ impl FederatedTokenSource {
     pub(crate) fn with_clock(config: FederationConfig, clock: Clock) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(config.exchange_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let source = Self {
             config,
@@ -1042,6 +1045,17 @@ impl FederatedTokenSource {
             fail(outcome)
         })?;
         let status = response.status();
+        if status.is_redirection() {
+            // Never followed: the body carries the subject token or
+            // assertion. The `Location` is not logged (it may carry one too).
+            tracing::warn!(
+                stage = stage.label(),
+                status = status.as_u16(),
+                outcome = "http_error",
+                "LLM token endpoint answered with a redirect, which is not followed"
+            );
+            return Err(fail("http_error"));
+        }
         if !status.is_success() {
             let body = parse_exchange_error(&response.text().await.unwrap_or_default());
             let outcome = exchange_outcome(stage, status.as_u16(), &body);
@@ -1746,6 +1760,45 @@ pub(crate) mod tests {
             })
         ));
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A redirect from a token endpoint is an error and is not followed: a
+    /// 307/308 would re-POST the credential to the `Location` host.
+    #[tokio::test]
+    async fn a_token_endpoint_redirect_is_not_followed() {
+        let server = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(openai_token("stolen", 3600))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let file = token_file(K8S_TOKEN);
+        for status in [307, 308, 302] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/oauth/token", elsewhere.uri())),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (source, _) = new_source(kubernetes_config(&server, file.path()));
+            assert!(
+                matches!(
+                    source.bearer().await,
+                    Err(LlmCallError::CredentialUnavailable {
+                        stage: "openai",
+                        kind: "http_error"
+                    })
+                ),
+                "{status}"
+            );
+            server.verify().await;
+        }
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
