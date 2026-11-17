@@ -26,7 +26,7 @@ use serde::Deserialize;
 use common::matcher::{Match, MatchScope, lines_affected_by};
 use common::segments::SegmentRegistry;
 
-use crate::no_trains::{StationGazetteer, closed_section};
+use crate::no_trains::{StationGazetteer, TrackNeighbours, closed_section};
 use crate::queries::LoadedIncident;
 
 /// Merges DB-stored custom lines into the static catalogue, converting
@@ -171,6 +171,7 @@ pub(crate) fn aggregate_at(
         .collect();
 
     let match_sets = MatchSets::new(lines);
+    let neighbours = TrackNeighbours::new(lines.values());
     // Layer 1: incidents. Filtered through `keep_reason` first -- a
     // temporally-expired, purely-future, or stale-past-the-rail-day-cutoff
     // incident never reaches the matcher, so its line falls through to
@@ -180,7 +181,7 @@ pub(crate) fn aggregate_at(
             continue;
         };
         for m in match_sets.matches(&loaded.message, registry, station_names) {
-            let status = status_from_incident(&m, loaded, now, station_names, keep);
+            let status = status_from_incident(&m, loaded, now, station_names, &neighbours, keep);
             reports.get_mut(&m.line.id).unwrap().statuses.push(status);
         }
     }
@@ -320,6 +321,7 @@ fn status_from_incident(
     loaded: &LoadedIncident,
     now: DateTime<Utc>,
     station_names: &StationGazetteer,
+    neighbours: &TrackNeighbours,
     keep: Keep,
 ) -> LineStatus {
     let incident = &loaded.message;
@@ -330,7 +332,7 @@ fn status_from_incident(
     let section = if incident.is_planned {
         None
     } else {
-        closed_section(&incident.summary, m.line, station_names)
+        closed_section(&incident.summary, m.line, station_names, neighbours)
     };
     let mut base_severity = severity_from_incident(incident);
     if let Some(section) = &section
@@ -5033,6 +5035,7 @@ mod tests {
             &loaded,
             now,
             &StationGazetteer::default(),
+            &TrackNeighbours::default(),
             Keep::Current,
         );
 
