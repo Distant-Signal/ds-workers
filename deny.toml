@@ -41,6 +41,12 @@ ignore = [
     # expiry: migrate if a plan exists, else re-read the advisory and renew.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
     { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
+    # humantime: informational "unmaintained" advisory (RUSTSEC-2026-0542).
+    # Transitive only, via object_store (the aggregator's S3 archive), which
+    # requires it unconditionally. Upstream fix: apache/arrow-rs-object-store
+    # #908 (humantime to jiff), unmerged. Re-read at the date: bump
+    # object_store once released, else renew.
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained (informational, no patched version); transitive only, via object_store (aggregator S3 archive); upstream fix apache/arrow-rs-object-store#908 (humantime to jiff) unmerged; bump object_store when released" }, # expires 2027-02-17
 ]
 
 [licenses]
