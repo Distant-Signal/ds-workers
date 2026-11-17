@@ -1604,6 +1604,24 @@ struct WebhookRow {
     secret_key_id: Option<String>,
 }
 
+/// Opens a destination's secret for row `id`: a legacy value opens under any
+/// context (and is counted in `distant_signal_secret_box_legacy_opens_total`),
+/// a v2 value only for the row it was sealed for (ds-core's
+/// docs/secret-box-aad.md).
+fn open_webhook_secret(
+    keys: &ds_runtime::secret_box::KeyRing,
+    id: i64,
+    sealed: &ds_runtime::secret_box::Sealed,
+) -> Result<String, ds_runtime::secret_box::OpenError> {
+    keys.open_in(
+        sealed,
+        &ds_runtime::secret_box::Context::new(
+            ds_runtime::secret_box::WEBHOOK_DESTINATION_SECRET,
+            id,
+        ),
+    )
+}
+
 /// The user's enabled webhook destinations (DS-415), their secrets
 /// decrypted with `keys`. A destination whose secret can't be decrypted (a
 /// retired key is missing from the ring, or the value was altered) is left
@@ -1632,7 +1650,7 @@ pub(crate) async fn webhook_destinations_for_user(
                     nonce,
                     key_id,
                 };
-                match keys.open(&sealed) {
+                match open_webhook_secret(keys, row.id, &sealed) {
                     Ok(secret) => Some(secret),
                     Err(err) => {
                         tracing::error!(
@@ -8319,5 +8337,54 @@ mod line_rank_tests {
             ]
         );
         assert_eq!(newest_candidate_per_line(Vec::new()), Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod webhook_secret_tests {
+    use ds_runtime::secret_box::{Context, Format, KeyRing, WEBHOOK_DESTINATION_SECRET};
+
+    use super::open_webhook_secret;
+
+    fn ring() -> KeyRing {
+        KeyRing::parse(&format!("k1:{}=", "A".repeat(43))).unwrap()
+    }
+
+    fn context(id: i64) -> Context {
+        Context::new(WEBHOOK_DESTINATION_SECRET, id)
+    }
+
+    #[test]
+    fn a_secret_sealed_with_its_row_context_round_trips() {
+        let ring = ring();
+        let sealed = ring.seal_in("whsec_x", &context(7)).unwrap();
+        assert_eq!(open_webhook_secret(&ring, 7, &sealed).unwrap(), "whsec_x");
+    }
+
+    #[test]
+    fn a_v2_secret_does_not_open_for_another_row() {
+        let ring = ring();
+        let v2 = ring.seal_as("whsec_x", &context(7), Format::V2).unwrap();
+        assert_eq!(open_webhook_secret(&ring, 7, &v2).unwrap(), "whsec_x");
+        assert!(open_webhook_secret(&ring, 8, &v2).is_err());
+    }
+
+    #[test]
+    fn a_legacy_secret_opens_under_any_row_and_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let ring = ring();
+            let legacy = ring.seal("whsec_x").unwrap();
+            assert_eq!(open_webhook_secret(&ring, 7, &legacy).unwrap(), "whsec_x");
+            assert_eq!(open_webhook_secret(&ring, 8, &legacy).unwrap(), "whsec_x");
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                r#"distant_signal_secret_box_legacy_opens_total{purpose="webhook_destinations.secret_ciphertext"} 2"#
+            ),
+            "{rendered}"
+        );
     }
 }

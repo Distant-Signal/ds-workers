@@ -761,6 +761,44 @@ mod tests {
         );
     }
 
+    /// A destination as the api writes it: the row first, then the secret
+    /// sealed for its id. Returns the id.
+    async fn seed_sealed_destination(
+        pool: &sqlx::PgPool,
+        user: &str,
+        ring: &ds_runtime::secret_box::KeyRing,
+    ) -> i64 {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_destinations (user_id, kind, name, url) \
+             VALUES ($1, 'generic', 'n', 'https://hooks.example/x') RETURNING id",
+        )
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sealed = ring
+            .seal_in(
+                "whsec_stored",
+                &ds_runtime::secret_box::Context::new(
+                    ds_runtime::secret_box::WEBHOOK_DESTINATION_SECRET,
+                    id,
+                ),
+            )
+            .unwrap();
+        sqlx::query(
+            "UPDATE webhook_destinations \
+             SET secret_ciphertext = $1, secret_nonce = $2, secret_key_id = $3 WHERE id = $4",
+        )
+        .bind(&sealed.ciphertext)
+        .bind(&sealed.nonce)
+        .bind(&sealed.key_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
     /// Failures accumulate to the threshold and turn the destination off
     /// with a reason; a success resets the run. Needs `DATABASE_URL`.
     #[tokio::test]
@@ -784,19 +822,7 @@ mod tests {
             .unwrap();
         let ring =
             ds_runtime::secret_box::KeyRing::parse(&format!("k1:{}=", "A".repeat(43))).unwrap();
-        let sealed = ring.seal("whsec_stored").unwrap();
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO webhook_destinations \
-               (user_id, kind, name, url, secret_ciphertext, secret_nonce, secret_key_id) \
-             VALUES ($1, 'generic', 'n', 'https://hooks.example/x', $2, $3, $4) RETURNING id",
-        )
-        .bind(user)
-        .bind(&sealed.ciphertext)
-        .bind(&sealed.nonce)
-        .bind(&sealed.key_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let id = seed_sealed_destination(&pool, user, &ring).await;
         // The stored value is ciphertext, and loads decrypted.
         let stored: Vec<u8> =
             sqlx::query_scalar("SELECT secret_ciphertext FROM webhook_destinations WHERE id = $1")
