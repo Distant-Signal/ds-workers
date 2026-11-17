@@ -591,8 +591,8 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -929,8 +929,8 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "ds-lines"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "anyhow",
  "common",
@@ -938,8 +938,8 @@ dependencies = [
 
 [[package]]
 name = "ds-runtime"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -963,8 +963,8 @@ dependencies = [
 
 [[package]]
 name = "ds-store"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1495,8 +1495,8 @@ dependencies = [
 
 [[package]]
 name = "health-http"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "axum",
  "ds-runtime",
@@ -3213,8 +3213,8 @@ dependencies = [
 
 [[package]]
 name = "schedule-query"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "chrono",
  "compact_str",
@@ -4214,8 +4214,8 @@ dependencies = [
 
 [[package]]
 name = "trust-schema"
-version = "0.16.0"
-source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.16.0#2d55162a40f88603ae80abe64427fd8644174a51"
+version = "0.17.1"
+source = "git+https://github.com/Distant-Signal/ds-core?tag=v0.17.1#9b8a4ce74ad7a9d9150f8ae8a07e99332e8d671e"
 dependencies = [
  "anyhow",
  "chrono",
