@@ -73,6 +73,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "object_store",
+ "scope-text",
  "serde",
  "serde_json",
  "sqlx",
@@ -1080,6 +1081,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "scope-text",
  "serde",
  "serde_json",
  "sqlx",
@@ -3218,6 +3220,13 @@ dependencies = [
  "compact_str",
  "serde",
  "tracing",
+]
+
+[[package]]
+name = "scope-text"
+version = "0.1.0"
+dependencies = [
+ "regex",
 ]
 
 [[package]]
