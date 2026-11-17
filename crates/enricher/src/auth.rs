@@ -54,8 +54,10 @@ pub(crate) const FALLBACK_METRIC: &str = "enricher_llm_token_refresh_fallback_to
 /// alert's `increase()` sees the first failure. `authentication_failed` is
 /// the Claude API's single, deliberately opaque denial (401
 /// `authentication_error`); its reason is only on the Console's
-/// authentication history page.
-pub(crate) const EXCHANGE_OUTCOMES: [&str; 9] = [
+/// authentication history page. `short_lifetime` is a token that would
+/// expire within [`MIN_REMAINING`] (e.g. `expires_in: 0`), refused rather
+/// than cached.
+pub(crate) const EXCHANGE_OUTCOMES: [&str; 10] = [
     "success",
     "token_file_error",
     "invalid_grant",
@@ -64,6 +66,7 @@ pub(crate) const EXCHANGE_OUTCOMES: [&str; 9] = [
     "authentication_failed",
     "http_error",
     "timeout",
+    "short_lifetime",
     "error",
 ];
 
@@ -465,7 +468,9 @@ struct RefreshState {
 /// Mints, caches and renews federated `OpenAI` access tokens.
 pub(crate) struct FederatedTokenSource {
     config: FederationConfig,
-    /// Its own client: a 10 s per-request timeout, not the LLM's minutes.
+    /// Its own client: a 10 s per-request timeout, not the LLM's minutes,
+    /// and no redirects (a 307/308 would re-POST the credential in the body
+    /// to the `Location` host).
     http: reqwest::Client,
     clock: Clock,
     /// The current `OpenAI` token. A std mutex: never held across an await.
@@ -541,14 +546,18 @@ fn exchange_outcome(stage: Stage, status: u16, body: &ExchangeErrorBody) -> &'st
 /// counts from issuance, so measuring it from `t0` is conservative), and
 /// the margin is the larger of `skew` and half the lifetime: refreshing
 /// at half-life leaves the other half for an outage of the token endpoints
-/// to clear while the cached token is still served.
+/// to clear while the cached token is still served. The margin is capped so
+/// the token is fresh for at least a quarter of its lifetime and at least
+/// [`MIN_REMAINING`]: a lifetime at or below `skew` would otherwise be due
+/// for refresh on arrival, and every call would exchange again. A lifetime
+/// under [`MIN_REMAINING`] is `None`: such a token is not usable.
 fn deadlines(
     t0: Instant,
     unix_now: u64,
     expires_in: Option<u64>,
     expires_at: Option<u64>,
     skew: Duration,
-) -> (Instant, Instant) {
+) -> Option<(Instant, Instant)> {
     let until_expires_at = expires_at.map(|at| at.saturating_sub(unix_now));
     let lifetime = match (expires_in, until_expires_at) {
         (Some(a), Some(b)) => Duration::from_secs(a.min(b)),
@@ -556,9 +565,15 @@ fn deadlines(
         (None, None) => FALLBACK_LIFETIME,
     }
     .min(MAX_LIFETIME);
-    let margin = skew.max(lifetime / 2);
+    if lifetime < MIN_REMAINING {
+        return None;
+    }
+    let min_fresh = (lifetime / 4).max(MIN_REMAINING);
+    let margin = skew
+        .max(lifetime / 2)
+        .min(lifetime.saturating_sub(min_fresh));
     let refresh_at = t0 + lifetime.saturating_sub(margin);
-    (refresh_at, t0 + lifetime)
+    Some((refresh_at, t0 + lifetime))
 }
 
 /// How long to serve the cached token after the `failures`th consecutive
@@ -614,6 +629,7 @@ impl FederatedTokenSource {
     pub(crate) fn with_clock(config: FederationConfig, clock: Clock) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(config.exchange_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let source = Self {
             config,
@@ -851,7 +867,7 @@ impl FederatedTokenSource {
             return self.anthropic_exchange(&assertion?).await;
         }
         let subject = match &self.config.authentik {
-            None => self.read_identity_token(Stage::Openai)?,
+            None => self.read_identity_token(Stage::Openai).await?,
             Some(authentik) => self.authentik_token(authentik, state).await?,
         };
         let result = self.openai_exchange(&subject).await;
@@ -865,8 +881,9 @@ impl FederatedTokenSource {
     }
 
     /// The projected service-account token, re-read every time (the kubelet
-    /// rotates it). `stage` is the endpoint it is about to be sent to.
-    fn read_identity_token(&self, stage: Stage) -> Result<Secret, ExchangeFailure> {
+    /// rotates it). `stage` is the endpoint it is about to be sent to. Read
+    /// on the blocking pool, off the async worker threads.
+    async fn read_identity_token(&self, stage: Stage) -> Result<Secret, ExchangeFailure> {
         let failure = |reason: &str| {
             tracing::warn!(
                 stage = stage.label(),
@@ -880,10 +897,12 @@ impl FederatedTokenSource {
                 outcome: "token_file_error",
             }
         };
-        match std::fs::read_to_string(&self.config.identity_token_file) {
-            Ok(raw) if !raw.trim().is_empty() => Ok(Secret::new(raw.trim())),
-            Ok(_) => Err(failure("the file is empty")),
-            Err(err) => Err(failure(&err.to_string())),
+        let path = self.config.identity_token_file.clone();
+        match tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await {
+            Ok(Ok(raw)) if !raw.trim().is_empty() => Ok(Secret::new(raw.trim())),
+            Ok(Ok(_)) => Err(failure("the file is empty")),
+            Ok(Err(err)) => Err(failure(&err.to_string())),
+            Err(err) => Err(failure(&format!("the read task failed: {err}"))),
         }
     }
 
@@ -898,7 +917,7 @@ impl FederatedTokenSource {
             return Ok(cached.token.clone());
         }
         state.authentik = None;
-        let assertion = self.read_identity_token(Stage::Authentik)?;
+        let assertion = self.read_identity_token(Stage::Authentik).await?;
         let mut form = vec![
             ("grant_type", "client_credentials"),
             ("client_id", authentik.client_id.as_str()),
@@ -1029,6 +1048,17 @@ impl FederatedTokenSource {
             fail(outcome)
         })?;
         let status = response.status();
+        if status.is_redirection() {
+            // Never followed: the body carries the subject token or
+            // assertion. The `Location` is not logged (it may carry one too).
+            tracing::warn!(
+                stage = stage.label(),
+                status = status.as_u16(),
+                outcome = "http_error",
+                "LLM token endpoint answered with a redirect, which is not followed"
+            );
+            return Err(fail("http_error"));
+        }
         if !status.is_success() {
             let body = parse_exchange_error(&response.text().await.unwrap_or_default());
             let outcome = exchange_outcome(stage, status.as_u16(), &body);
@@ -1073,13 +1103,22 @@ impl FederatedTokenSource {
             );
             return Err(fail("error"));
         }
-        let (refresh_at, expires_at) = deadlines(
+        let Some((refresh_at, expires_at)) = deadlines(
             t0,
             self.clock.unix_now(),
             parsed.expires_in,
             parsed.expires_at,
             self.config.refresh_skew,
-        );
+        ) else {
+            tracing::warn!(
+                stage = stage.label(),
+                expires_in = parsed.expires_in,
+                expires_at = parsed.expires_at,
+                min_lifetime_secs = MIN_REMAINING.as_secs(),
+                "LLM token response's token expires too soon to use"
+            );
+            return Err(fail("short_lifetime"));
+        };
         record_exchange(stage, "success");
         tracing::info!(
             stage = stage.label(),
@@ -1363,7 +1402,13 @@ pub(crate) mod tests {
         Mock::given(method("POST"))
             .and(path("/oauth/token"))
             .and(body_json(exchange_body("authentik.issued.jwt-2")))
-            .respond_with(openai_token("oai-3", 120))
+            // No `expires_at`: `openai_token`'s is from the real clock, which
+            // the test clock is 900 s past by then (an expired token).
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "oai-3",
+                "token_type": "Bearer",
+                "expires_in": 120,
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -1720,6 +1765,45 @@ pub(crate) mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    /// A redirect from a token endpoint is an error and is not followed: a
+    /// 307/308 would re-POST the credential to the `Location` host.
+    #[tokio::test]
+    async fn a_token_endpoint_redirect_is_not_followed() {
+        let server = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(openai_token("stolen", 3600))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let file = token_file(K8S_TOKEN);
+        for status in [307, 308, 302] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/oauth/token", elsewhere.uri())),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (source, _) = new_source(kubernetes_config(&server, file.path()));
+            assert!(
+                matches!(
+                    source.bearer().await,
+                    Err(LlmCallError::CredentialUnavailable {
+                        stage: "openai",
+                        kind: "http_error"
+                    })
+                ),
+                "{status}"
+            );
+            server.verify().await;
+        }
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_slow_token_endpoint_times_out() {
         let server = MockServer::start().await;
@@ -1848,27 +1932,99 @@ pub(crate) mod tests {
     fn deadlines_use_the_shorter_lifetime_and_the_larger_margin() {
         let t0 = Instant::now();
         let skew = Duration::from_secs(60);
+        let at = |expires_in, expires_at, unix_now| {
+            deadlines(t0, unix_now, expires_in, expires_at, skew).unwrap()
+        };
         // expires_at sooner than expires_in (a subject token about to expire).
-        let (refresh, expires) = deadlines(t0, 1_000, Some(3600), Some(1_000 + 600), skew);
+        let (refresh, expires) = at(Some(3600), Some(1_000 + 600), 1_000);
         assert_eq!(expires - t0, Duration::from_secs(600));
         assert_eq!(refresh - t0, Duration::from_secs(300));
         // Half an hour beats the 60 s skew: refresh at half-life.
-        let (refresh, _) = deadlines(t0, 0, Some(3600), None, skew);
+        let (refresh, _) = at(Some(3600), None, 0);
         assert_eq!(refresh - t0, Duration::from_secs(1800));
         // A skew above half the lifetime wins.
-        let (refresh, _) = deadlines(t0, 0, Some(100), None, skew);
+        let (refresh, _) = at(Some(100), None, 0);
         assert_eq!(refresh - t0, Duration::from_secs(40));
-        // A lifetime shorter than the margin refreshes at once.
-        let (refresh, _) = deadlines(t0, 0, Some(30), None, skew);
-        assert_eq!(refresh, t0);
-        // expires_at in the past.
-        let (refresh, expires) = deadlines(t0, 2_000, None, Some(1_000), skew);
-        assert_eq!((refresh, expires), (t0, t0));
         // Nothing stated; absurd values are capped.
-        let (_, expires) = deadlines(t0, 0, None, None, skew);
+        let (_, expires) = at(None, None, 0);
         assert_eq!(expires - t0, FALLBACK_LIFETIME);
-        let (_, expires) = deadlines(t0, 0, Some(u64::MAX), None, skew);
+        let (_, expires) = at(Some(u64::MAX), None, 0);
         assert_eq!(expires - t0, MAX_LIFETIME);
+    }
+
+    /// A lifetime at or below the skew is still fresh for a quarter of it
+    /// (at least `MIN_REMAINING`), never due for refresh on arrival; one
+    /// under `MIN_REMAINING` is refused.
+    #[test]
+    fn deadlines_cap_the_margin_below_the_lifetime() {
+        let t0 = Instant::now();
+        let skew = Duration::from_secs(60);
+        for (lifetime, fresh_ms) in [
+            (61, 15_250),
+            (60, 15_000),
+            (30, 7_500),
+            (20, 5_000),
+            (5, 5_000),
+        ] {
+            let (refresh, expires) = deadlines(t0, 0, Some(lifetime), None, skew).unwrap();
+            assert_eq!(expires - t0, Duration::from_secs(lifetime), "{lifetime}");
+            assert_eq!(refresh - t0, Duration::from_millis(fresh_ms), "{lifetime}");
+        }
+        // 80 s is where half the lifetime plus the skew stops reaching the
+        // cap: unchanged from before.
+        let (refresh, _) = deadlines(t0, 0, Some(80), None, skew).unwrap();
+        assert_eq!(refresh - t0, Duration::from_secs(20));
+        // A skew as long as the lifetime (LLM_TOKEN_REFRESH_SKEW_SECS=3600).
+        let (refresh, _) = deadlines(t0, 0, Some(3600), None, Duration::from_secs(3600)).unwrap();
+        assert_eq!(refresh - t0, Duration::from_secs(900));
+        // Too short to use: zero, under MIN_REMAINING, expires_at past.
+        assert!(deadlines(t0, 0, Some(0), None, skew).is_none());
+        assert!(deadlines(t0, 0, Some(4), None, skew).is_none());
+        assert!(deadlines(t0, 2_000, None, Some(1_000), skew).is_none());
+    }
+
+    /// A token endpoint answering `expires_in: 0` is a `short_lifetime`
+    /// failure, not a token cached already due for refresh (which made
+    /// every call a full exchange, with no backoff).
+    #[tokio::test]
+    async fn a_token_that_expires_at_once_is_refused() {
+        let server = MockServer::start().await;
+        let file = token_file(K8S_TOKEN);
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "oai-0",
+                "token_type": "Bearer",
+                "expires_in": 0,
+            })))
+            .mount(&server)
+            .await;
+        let (source, _) = new_source(kubernetes_config(&server, file.path()));
+        assert!(matches!(
+            source.bearer().await,
+            Err(LlmCallError::CredentialUnavailable {
+                stage: "openai",
+                kind: "short_lifetime"
+            })
+        ));
+    }
+
+    /// A token lasting no longer than the skew is cached and reused, not
+    /// re-exchanged on every call.
+    #[tokio::test]
+    async fn a_token_no_longer_than_the_skew_is_reused() {
+        let server = MockServer::start().await;
+        let file = token_file(K8S_TOKEN);
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(openai_token("oai-short", 30))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (source, _) = new_source(kubernetes_config(&server, file.path()));
+        for _ in 0..5 {
+            assert_eq!(source.bearer().await.unwrap().expose(), "oai-short");
+        }
     }
 
     /// No token, from any stage, in `Debug` output or in the logs of a
