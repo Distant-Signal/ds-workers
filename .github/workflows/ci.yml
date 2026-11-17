@@ -102,3 +102,10 @@ jobs:
 
       - name: Image version labels
         run: python3 .ds-ci/scripts/release-order.py labels
+
+      # The notifier's DB tests run with --observe (table-wide grants), so
+      # they cannot catch a missing grant: this reads the SQL instead and
+      # checks the pinned ds-core's db-grants.yaml grants the notifier role
+      # every relation the SQL names (DS-534).
+      - name: Notifier SQL names only relations its role is granted
+        run: python3 scripts/check-notifier-grants.py
