@@ -646,6 +646,9 @@ pub(crate) async fn poll_line_candidates_with_max_age(
 
 pub(crate) struct TrainCandidate {
     pub tracked_train_id: i64,
+    /// `train_subscriptions.public_id`: the id the push's URL and tag use
+    /// (DS-534). The numeric id above stays the key of every state row.
+    pub tracked_train_public_id: String,
     pub trains_id: i64,
     pub user_id: String,
     pub new_rank: u8,
@@ -663,6 +666,7 @@ pub(crate) struct TrainCandidate {
 #[derive(sqlx::FromRow)]
 struct Subscriber {
     id: i64,
+    public_id: String,
     user_id: String,
     stop_crs: Option<String>,
     /// The subscriber's `notification_preferences` (DS-153): their delay
@@ -788,7 +792,7 @@ pub(crate) async fn candidates_for_trains_id(
     // journey too (`TrackedTrainListItem::journey_ids`); then the oldest,
     // so the choice, and the cooldown state it reads, stays put.
     let subscribers: Vec<Subscriber> = sqlx::query_as(
-        "SELECT DISTINCT ON (ts.user_id) ts.id, ts.user_id, \
+        "SELECT DISTINCT ON (ts.user_id) ts.id, ts.public_id, ts.user_id, \
                 COALESCE((SELECT jl.destination_crs FROM journey_legs jl \
                           WHERE jl.train_subscription_id = ts.id \
                           ORDER BY jl.id LIMIT 1), \
@@ -818,6 +822,7 @@ pub(crate) async fn candidates_for_trains_id(
     let mut candidates = Vec::new();
     for (subscriber, delay_minutes) in subscribers.into_iter().zip(delays) {
         let tracked_train_id = subscriber.id;
+        let tracked_train_public_id = subscriber.public_id;
         let user_id = subscriber.user_id;
         let delay_threshold_minutes =
             user_delay_threshold(subscriber.delay_threshold_minutes, delay_threshold_minutes);
@@ -852,6 +857,7 @@ pub(crate) async fn candidates_for_trains_id(
         {
             candidates.push(TrainCandidate {
                 tracked_train_id,
+                tracked_train_public_id,
                 trains_id,
                 user_id,
                 new_rank,
@@ -867,6 +873,8 @@ pub(crate) async fn candidates_for_trains_id(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PredictedStartCandidate {
     pub tracked_train_id: i64,
+    /// `train_subscriptions.public_id` (DS-534), for the push's URL and tag.
+    pub tracked_train_public_id: String,
     pub trains_id: i64,
     pub user_id: String,
     pub previous_rank: u8,
@@ -877,6 +885,7 @@ pub(crate) struct PredictedStartCandidate {
 #[derive(sqlx::FromRow)]
 struct PredictedStartSubscriber {
     id: i64,
+    public_id: String,
     user_id: String,
     trains_id: i64,
     train_uid: String,
@@ -908,7 +917,7 @@ pub(crate) async fn predicted_start_candidates(
     use ds_store::trains::predicted_start::{self, Confidence};
 
     let subscribers: Vec<PredictedStartSubscriber> = sqlx::query_as(
-        "SELECT DISTINCT ON (ts.user_id, ts.trains_id) ts.id, ts.user_id, ts.trains_id, \
+        "SELECT DISTINCT ON (ts.user_id, ts.trains_id) ts.id, ts.public_id, ts.user_id, ts.trains_id, \
                 tr.train_uid, tr.service_date, \
                 ns.last_notified_status, ns.last_notified_delay_minutes, \
                 np.delay_threshold_minutes \
@@ -981,6 +990,7 @@ pub(crate) async fn predicted_start_candidates(
         {
             candidates.push(PredictedStartCandidate {
                 tracked_train_id: subscriber.id,
+                tracked_train_public_id: subscriber.public_id,
                 trains_id: subscriber.trains_id,
                 user_id: subscriber.user_id,
                 previous_rank,
@@ -1774,6 +1784,8 @@ pub(crate) async fn station_sample_for_crs(
 
 pub(crate) struct CommittedLeg {
     pub journey_leg_id: i64,
+    /// `journey_legs.public_id`: what the skipped-stop push's tag uses (DS-534).
+    pub journey_leg_public_id: String,
     /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
     pub journey_public_id: String,
     pub user_id: String,
@@ -1819,7 +1831,8 @@ static COMMITTED_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     format!(
-        "SELECT jl.id AS journey_leg_id, j.public_id AS journey_public_id, \
+        "SELECT jl.id AS journey_leg_id, jl.public_id AS journey_leg_public_id, \
+                j.public_id AS journey_public_id, \
                 j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
@@ -1861,6 +1874,7 @@ pub(crate) async fn list_committed_legs_for_today(
         .map(|row| {
             Ok(CommittedLeg {
                 journey_leg_id: row.try_get("journey_leg_id")?,
+                journey_leg_public_id: row.try_get("journey_leg_public_id")?,
                 journey_public_id: row.try_get("journey_public_id")?,
                 user_id: row.try_get("user_id")?,
                 origin_crs: row.try_get("origin_crs")?,
@@ -2245,6 +2259,8 @@ pub(crate) async fn due_templates_for(
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct CommitCheckLeg {
     pub journey_leg_id: i64,
+    /// `journey_legs.public_id`: what the push's tag uses (DS-534).
+    pub journey_leg_public_id: String,
     /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
     pub journey_public_id: String,
     pub user_id: String,
@@ -2314,7 +2330,8 @@ fn commit_check_legs_sql(filter: &str) -> String {
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     format!(
-        "SELECT jl.id AS journey_leg_id, j.public_id AS journey_public_id, \
+        "SELECT jl.id AS journey_leg_id, jl.public_id AS journey_leg_public_id, \
+                j.public_id AS journey_public_id, \
                 j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
@@ -3101,10 +3118,17 @@ mod tests {
             .expect("candidates");
         let ours_only: Vec<&PredictedStartCandidate> =
             candidates.iter().filter(|c| c.trains_id == ours).collect();
+        let subscription_public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM train_subscriptions WHERE id = $1")
+                .bind(subscription)
+                .fetch_one(&fixtures)
+                .await
+                .expect("read train_subscriptions.public_id");
         assert_eq!(
             ours_only,
             [&PredictedStartCandidate {
                 tracked_train_id: subscription,
+                tracked_train_public_id: subscription_public_id,
                 trains_id: ours,
                 user_id: user.to_string(),
                 previous_rank: 0,
@@ -4706,6 +4730,19 @@ mod tests {
             .await
             .expect("read journeys.public_id");
         assert_eq!(found.journey_public_id, public_id);
+        let leg_public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM journey_legs WHERE id = $1")
+                .bind(journey_leg_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read journey_legs.public_id");
+        assert_eq!(found.journey_leg_public_id, leg_public_id);
+        assert!(
+            found.journey_leg_public_id.starts_with("l_")
+                && found.journey_leg_public_id.len() == 34,
+            "the opaque id is l_ and 32 hex digits, got {}",
+            found.journey_leg_public_id
+        );
         assert!(
             found.journey_public_id.starts_with("j_") && found.journey_public_id.len() == 34,
             "the opaque id is j_ and 32 hex digits, got {}",
@@ -5284,6 +5321,12 @@ mod tests {
         let candidates = candidates_for_trains_id(&pool, trains_id, 15)
             .await
             .expect("candidates_for_trains_id");
+        let journey_leg_subscription_public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM train_subscriptions WHERE id = $1")
+                .bind(journey_leg_subscription)
+                .fetch_one(&pool)
+                .await
+                .expect("read train_subscriptions.public_id");
 
         sqlx::query("DELETE FROM journeys WHERE user_id = $1")
             .bind(user_id)
@@ -5313,6 +5356,16 @@ mod tests {
 
         assert_eq!(candidates.len(), 1, "one push per user per train");
         assert_eq!(candidates[0].tracked_train_id, journey_leg_subscription);
+        assert_eq!(
+            candidates[0].tracked_train_public_id,
+            journey_leg_subscription_public_id
+        );
+        assert!(
+            candidates[0].tracked_train_public_id.starts_with("t_")
+                && candidates[0].tracked_train_public_id.len() == 34,
+            "the opaque id is t_ and 32 hex digits, got {}",
+            candidates[0].tracked_train_public_id
+        );
     }
 
     #[tokio::test]
@@ -7396,6 +7449,17 @@ mod sweep_tests {
             leg_ids.contains(&auto_leg_id),
             "the auto-template's leg must be a commit-check candidate"
         );
+        let auto_leg_public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM journey_legs WHERE id = $1")
+                .bind(auto_leg_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read journey_legs.public_id");
+        let found = legs
+            .iter()
+            .find(|l| l.journey_leg_id == auto_leg_id)
+            .expect("the auto leg");
+        assert_eq!(found.journey_leg_public_id, auto_leg_public_id);
         assert!(
             !leg_ids.contains(&manual_leg_id),
             "the manual-template's leg must be excluded"

@@ -95,6 +95,8 @@ pub(crate) struct LeaveRow {
     pub departure: DateTime<Utc>,
     pub basis: String,
     pub leg_id: i64,
+    /// `journey_legs.public_id` of `leg_id`: what the reminder's tag uses (DS-534).
+    pub leg_public_id: String,
     pub lead_minutes: i16,
     pub delay_threshold_minutes: Option<i16>,
     pub leave_by_sent: Option<DateTime<Utc>>,
@@ -125,7 +127,7 @@ pub(crate) async fn journeys_to_check(
     usual_train: bool,
 ) -> anyhow::Result<Vec<LeaveRow>> {
     Ok(sqlx::query_as(&format!(
-        "SELECT j.id AS journey_id, j.public_id AS journey_public_id, j.user_id, lb.leave_by_at, lb.departure, lb.basis, lb.leg_id, \
+        "SELECT j.id AS journey_id, j.public_id AS journey_public_id, j.user_id, lb.leave_by_at, lb.departure, lb.basis, lb.leg_id, lbl.public_id AS leg_public_id, \
                 COALESCE(p.leave_by_lead_minutes, 0::SMALLINT) AS lead_minutes, \
                 p.delay_threshold_minutes, ps.leave_by_sent, \
                 COALESCE(ps.pushes, 0)::BIGINT \
@@ -142,6 +144,7 @@ pub(crate) async fn journeys_to_check(
                 sd.name AS destination_name \
          FROM journeys j \
          JOIN LATERAL ({leave_by}) lb ON TRUE \
+         JOIN journey_legs lbl ON lbl.id = lb.leg_id \
          LEFT JOIN notification_preferences p ON p.user_id = j.user_id \
          LEFT JOIN regular_journey_push_state ps ON ps.journey_id = j.id \
          LEFT JOIN LATERAL ( \
@@ -275,7 +278,7 @@ pub(crate) fn build_leave_by_payload(row: &LeaveRow, moved: bool) -> Notificatio
         title,
         body,
         url: format!("/journeys/{}", row.journey_public_id),
-        tag: format!("journey-leg-leave-{}", row.leg_id),
+        tag: crate::push_ids::leg_leave_tag(&row.leg_public_id),
         renotify: moved,
     }
 }
@@ -798,6 +801,7 @@ mod tests {
             departure: at(8, 42),
             basis: "booked".into(),
             leg_id: 11,
+            leg_public_id: "l_0000000000000000000000000000000b".into(),
             lead_minutes: 0,
             delay_threshold_minutes: None,
             leave_by_sent: None,
@@ -836,6 +840,7 @@ mod tests {
             suggestions_muted: false,
             journey_suggestions: true,
             trigger_tracked_train_id: Some(31),
+            trigger_tracked_train_public_id: Some("t_00000000000000000000000000000031".into()),
             trigger_status: Some("en_route".into()),
             trigger_delay_minutes: Some(20),
             trigger_pushes_on: true,
@@ -1015,7 +1020,10 @@ mod tests {
                 "For the 08:42 Woking to London Waterloo. On time.".into()
             )
         );
-        assert_eq!(on_time.tag, "journey-leg-leave-11");
+        assert_eq!(
+            on_time.tag,
+            "journey-leg-leave-l_0000000000000000000000000000000b"
+        );
         assert_eq!(on_time.url, "/journeys/j_00000000000000000000000000000042");
         assert!(!on_time.renotify);
 
@@ -1065,6 +1073,7 @@ mod tests {
 
         let walk_first = LeaveRow {
             leg_id: 10,
+            leg_public_id: "l_0000000000000000000000000000000a".into(),
             departure: at(8, 30),
             leave_by_at: at(8, 25),
             ..row()
@@ -1317,6 +1326,17 @@ mod tests {
         let row = ours(journeys_to_check(&pool, now, date, true).await.unwrap()).expect("found");
         assert_eq!(row.leave_by_at, now);
         assert_eq!(row.leg_id, leg_id);
+        let leg_public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM journey_legs WHERE id = $1")
+                .bind(leg_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read journey_legs.public_id");
+        assert_eq!(row.leg_public_id, leg_public_id);
+        assert_eq!(
+            build_leave_by_payload(&row, false).tag,
+            format!("journey-leg-leave-{leg_public_id}")
+        );
         assert_eq!(
             decide_leave_reminder(&input_for(&row, now)),
             LeaveReminderDecision::Send { moved: false }
@@ -1502,6 +1522,7 @@ mod tests {
             leave_by_at: at(7, 35),
             departure: at(7, 50),
             leg_id: 11,
+            leg_public_id: "l_0000000000000000000000000000000b".into(),
             train_leg_id: Some(11),
             tracked_train_id: None,
             train_status: None,
@@ -1522,7 +1543,10 @@ mod tests {
                 "For your usual 07:50 Woking to London Waterloo. Tap to pick your train.".into()
             )
         );
-        assert_eq!(usual.tag, "journey-leg-leave-11");
+        assert_eq!(
+            usual.tag,
+            "journey-leg-leave-l_0000000000000000000000000000000b"
+        );
         let closest = build_leave_by_payload(&unpicked("closest"), false);
         assert_eq!(
             text(&closest),

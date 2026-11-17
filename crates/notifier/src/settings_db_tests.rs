@@ -1182,8 +1182,14 @@ async fn an_irish_push_says_where_it_was_tracked_from() {
     let context = queries::journey_leg_for_train_subscription(&pool, subscription)
         .await
         .expect("journey context");
+    let public_id: String =
+        sqlx::query_scalar("SELECT public_id FROM train_subscriptions WHERE id = $1")
+            .bind(subscription)
+            .fetch_one(&pool)
+            .await
+            .expect("read train_subscriptions.public_id");
     let payload = crate::build_train_notification_payload(
-        subscription,
+        &public_id,
         "en_route",
         Some(16),
         context.as_ref(),
@@ -1192,5 +1198,6 @@ async fn an_irish_push_says_where_it_was_tracked_from() {
     );
     assert_eq!(payload.title, "Your train from Zesttown Central is delayed");
     assert_eq!(payload.body, "Now running about 16 minutes late.");
-    assert_eq!(payload.url, format!("/train/by-id/{subscription}"));
+    assert_eq!(payload.url, format!("/train/by-id/{public_id}"));
+    assert_eq!(payload.tag, format!("train-{public_id}"));
 }
