@@ -1227,7 +1227,9 @@ pub(crate) struct LeaveReminderInput {
     pub departure: DateTime<Utc>,
     /// The user's lead (0 to 5 minutes early).
     pub lead: Duration,
-    /// An open break on the journey, or one owning its first train.
+    /// A break notice sent, or due and going out now, for the journey or
+    /// a journey on its first train (`leave_reminder::break_notice_owns`).
+    /// An open break whose notice is off, muted or held back owns nothing.
     pub break_owns: bool,
     /// The leave-by the last delivered reminder named, if any.
     pub sent: Option<DateTime<Utc>>,
@@ -1244,7 +1246,7 @@ pub(crate) struct LeaveReminderInput {
 pub(crate) enum LeaveReminderDecision {
     /// Send it; `moved` when it replaces an earlier one.
     Send { moved: bool },
-    /// A break notice is this journey's push.
+    /// A break notice is this journey's push (sent, or due now).
     BreakOwns,
     /// The day already had `max_pushes`.
     Capped,
@@ -1273,7 +1275,9 @@ impl LeaveReminderDecision {
 
 /// The leave-by rule for one regular journey's day (§5.3). Pure.
 ///
-/// 1. An open break on the journey or its first train owns it: nothing.
+/// 1. A break notice sent, or due and going out now, for the journey or
+///    its first train owns it: nothing. A break whose notice the user
+///    turned off, muted or can't get now owns nothing (DS-534).
 /// 2. (A cancelled first train with nothing suggested has no leave-by at
 ///    all, so never gets here.)
 /// 3. At the cap: nothing.

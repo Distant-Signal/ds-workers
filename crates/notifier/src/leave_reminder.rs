@@ -35,6 +35,13 @@
 //!   leave-by and its moves (`regular_journey_push_state.pushes`) and the
 //!   pick-your-train reminders (`journey_leg_notification_state.last_notified_unmatched`).
 //!   Train, skip and break pushes have their own rules and aren't counted.
+//! - **A break notice is the journey's push** (DS-534): one sent, or due
+//!   and going out now, for the journey or for a journey on its first
+//!   train owns the reminder (`break_notice_owns`). An open break whose
+//!   notice the user turned off or muted, or that quiet hours or a snooze
+//!   keep back (`hold::gate`), leaves the reminder to the reminder's own
+//!   rules, so the user is not left with neither push (a snooze stops the
+//!   reminder too, below).
 //! - **Quiet hours** let a reminder through unless the user turned
 //!   `leave_by_quiet_hours` off; a snooze stops it (`hold::gate`).
 //! - **The morning summary** (off by default): one push per user and London
@@ -45,7 +52,9 @@
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use sqlx::PgPool;
 
+use crate::break_notices::{BreakDecision, BreakNoticeRow, decide_break_notice};
 use crate::decision::{LeaveReminderDecision, LeaveReminderInput, decide_leave_reminder};
+use crate::hold::Quiet;
 use crate::push_queue::{Delivered, PgBackend, PushJob, PushQueue, TriggerTrainState};
 use crate::send::NotificationPayload;
 
@@ -373,18 +382,108 @@ fn count_once(key: (i64, i64), result: &'static str) {
     }
 }
 
-/// Whether the reminder for `row` is owned by a break: an open break on
-/// the journey, or one owning its first train's push.
-async fn break_owns(pool: &PgPool, row: &LeaveRow, now: DateTime<Utc>) -> anyhow::Result<bool> {
-    if row.open_break {
-        return Ok(true);
+/// The open breaks that may speak for `row`'s reminder, as the break-notice
+/// cycle reads them ([`BreakNoticeRow`]): the journey's own, and the
+/// user's breaks triggered by its first train (the trigger leg, as
+/// [`crate::break_notices::train_break_state`] reads them). Only breaks with
+/// suggestions planned, and never "I missed this train": like
+/// [`crate::break_notices::break_owns_train`], a break the api could not
+/// plan for yet sends no notice, so it silences nothing.
+async fn breaks_for_reminder(pool: &PgPool, row: &LeaveRow) -> anyhow::Result<Vec<BreakNoticeRow>> {
+    Ok(sqlx::query_as(&format!(
+        "{} AND b.user_id = $1 \
+           AND (b.journey_id = $2 OR jl.train_subscription_id = $3) \
+         ORDER BY b.id",
+        crate::break_notices::BREAK_ROWS_SQL
+    ))
+    .bind(&row.user_id)
+    .bind(row.journey_id)
+    .bind(row.tracked_train_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Whether a break notice is, or will be, the push for a journey whose
+/// open breaks are `breaks` (DS-534), each decided as the break-notice
+/// cycle decides it ([`decide_break_notice`]) and gated as its push would
+/// be at `now` ([`crate::hold::gate`], `quiet` the user's quiet hours or
+/// snooze):
+///
+/// - a notice already sent at the break's severity owns the reminder: it
+///   told the user the journey changed;
+/// - a notice due (sent this cycle, waiting one sweep for its confirmation,
+///   or opened in the app in the last few minutes and sent after) owns it
+///   only if it would go out now: in quiet hours only a cancellation does,
+///   and a snooze stops it;
+/// - a notice the user turned off (`journey_suggestions`), muted for the
+///   journey (`suggestions_muted`) or silenced with its train's own pushes
+///   owns nothing: the reminder goes as if there were no break.
+///
+/// Pure.
+pub(crate) fn break_notice_owns(
+    breaks: &[BreakNoticeRow],
+    now: DateTime<Utc>,
+    quiet: Quiet,
+    default_delay_threshold_minutes: i32,
+) -> bool {
+    breaks
+        .iter()
+        .any(|row| match decide_break_notice(row, now) {
+            BreakDecision::SuppressNotWorse => true,
+            BreakDecision::Send
+            | BreakDecision::SuppressUnconfirmed
+            | BreakDecision::SuppressActed => {
+                let trigger = row.trigger_tracked_train_id.map(|tracked_train_id| {
+                    let threshold = crate::queries::user_delay_threshold(
+                        row.delay_threshold_minutes,
+                        default_delay_threshold_minutes,
+                    );
+                    let (status, delay_minutes) =
+                        crate::break_notices::equivalent_train_state(row, threshold);
+                    TriggerTrainState {
+                        tracked_train_id,
+                        status,
+                        delay_minutes,
+                    }
+                });
+                let notice = Delivered::JourneyBreak {
+                    break_id: row.id,
+                    severity: row.severity,
+                    trigger,
+                };
+                crate::hold::gate(&notice, quiet, true) == crate::hold::Gate::Send
+            }
+            BreakDecision::SuppressOptOut
+            | BreakDecision::SuppressMuted
+            | BreakDecision::SuppressTrainOff
+            | BreakDecision::SuppressInApp => false,
+        })
+}
+
+/// Whether the reminder for `row` is owned by a break: a break notice sent
+/// or due to go now for the journey, or triggered by its first train
+/// ([`break_notice_owns`]). With break notices off
+/// (`JOURNEY_BREAK_NOTICES_ENABLED`) no notice goes, so none owns it.
+async fn break_owns(
+    pool: &PgPool,
+    row: &LeaveRow,
+    now: DateTime<Utc>,
+    default_delay_threshold_minutes: i32,
+) -> anyhow::Result<bool> {
+    if !crate::break_notices::enabled() || (!row.open_break && row.tracked_train_id.is_none()) {
+        return Ok(false);
     }
-    match row.tracked_train_id {
-        Some(train) => {
-            crate::break_notices::break_covers_train(pool, &row.user_id, train, now).await
-        }
-        None => Ok(false),
+    let breaks = breaks_for_reminder(pool, row).await?;
+    if breaks.is_empty() {
+        return Ok(false);
     }
+    let (hours, _) = crate::hold::quiet_hours_for(pool, &row.user_id).await?;
+    Ok(break_notice_owns(
+        &breaks,
+        now,
+        crate::hold::quiet_at(&hours, now),
+        default_delay_threshold_minutes,
+    ))
 }
 
 /// One tick: decide every near journey's reminder and dispatch the ones
@@ -402,7 +501,8 @@ pub(crate) async fn run_leave_reminder_cycle(
             leave_by: row.leave_by_at,
             departure: row.departure,
             lead: Duration::minutes(i64::from(row.lead_minutes)),
-            break_owns: break_owns(pool, &row, now).await?,
+            break_owns: break_owns(pool, &row, now, settings.default_delay_threshold_minutes)
+                .await?,
             sent: row.leave_by_sent,
             pushes: row.pushes,
             max_pushes: settings.max_pushes,
@@ -714,6 +814,168 @@ mod tests {
 
     fn text(payload: &NotificationPayload) -> (String, String) {
         (payload.title.clone(), payload.body.clone())
+    }
+
+    /// An open break on journey 7 with suggestions planned, confirmed,
+    /// never notified, its notice on: one the break-notice cycle sends.
+    fn open_break(cause: &str) -> BreakNoticeRow {
+        BreakNoticeRow {
+            id: 5,
+            journey_id: 7,
+            user_id: "u".into(),
+            cause: cause.into(),
+            severity: 1,
+            notified_severity: None,
+            opened_at: None,
+            confirmations: 2,
+            suggestions: Some(serde_json::json!({ "suggestions": [] })),
+            suggestions_muted: false,
+            journey_suggestions: true,
+            trigger_tracked_train_id: Some(31),
+            trigger_status: Some("en_route".into()),
+            trigger_delay_minutes: Some(20),
+            trigger_pushes_on: true,
+            trigger_trains_id: Some(41),
+            cancel_reason: None,
+            delay_threshold_minutes: None,
+        }
+    }
+
+    /// DS-534: whether the leave-by reminder (rule 1) goes, with this
+    /// journey's open breaks `breaks`, at `quiet`.
+    fn reminder(breaks: &[BreakNoticeRow], quiet: Quiet) -> LeaveReminderDecision {
+        let now = at(8, 20);
+        decide_leave_reminder(&LeaveReminderInput {
+            now,
+            leave_by: at(8, 20),
+            departure: at(8, 42),
+            lead: Duration::zero(),
+            break_owns: break_notice_owns(breaks, now, quiet, 15),
+            sent: None,
+            pushes: 0,
+            max_pushes: 3,
+            move_threshold: Duration::minutes(5),
+        })
+    }
+
+    const SENT: LeaveReminderDecision = LeaveReminderDecision::Send { moved: false };
+
+    #[test]
+    fn without_a_break_the_reminder_goes() {
+        assert_eq!(reminder(&[], Quiet::No), SENT);
+        assert_eq!(reminder(&[], Quiet::Hours), SENT);
+    }
+
+    #[test]
+    fn a_break_notice_due_owns_the_reminder() {
+        for cause in ["connection_missed", "cancelled", "part_cancelled"] {
+            assert_eq!(
+                reminder(&[open_break(cause)], Quiet::No),
+                LeaveReminderDecision::BreakOwns,
+                "{cause}"
+            );
+        }
+        // Waiting one sweep for its confirmation: the notice goes next.
+        let unconfirmed = BreakNoticeRow {
+            confirmations: 1,
+            ..open_break("connection_missed")
+        };
+        assert_eq!(
+            reminder(&[unconfirmed], Quiet::No),
+            LeaveReminderDecision::BreakOwns
+        );
+        // Opened in the app a moment ago: sent once the user leaves it.
+        let opened = BreakNoticeRow {
+            opened_at: Some(at(8, 18)),
+            ..open_break("connection_missed")
+        };
+        assert_eq!(
+            reminder(&[opened], Quiet::No),
+            LeaveReminderDecision::BreakOwns
+        );
+    }
+
+    /// The notice was sent at the break's severity (`notified_severity`):
+    /// it told the user the journey changed, so the reminder stays quiet,
+    /// as it did before DS-534, whatever the switches say now.
+    #[test]
+    fn a_break_notice_already_sent_owns_the_reminder() {
+        let notified = BreakNoticeRow {
+            notified_severity: Some(1),
+            ..open_break("connection_missed")
+        };
+        assert_eq!(
+            reminder(std::slice::from_ref(&notified), Quiet::No),
+            LeaveReminderDecision::BreakOwns
+        );
+        assert_eq!(
+            reminder(
+                &[BreakNoticeRow {
+                    suggestions_muted: true,
+                    ..notified
+                }],
+                Quiet::Hours
+            ),
+            LeaveReminderDecision::BreakOwns
+        );
+    }
+
+    /// DS-534: a break whose notice the user turned off or muted sends no
+    /// notice, so the reminder still goes.
+    #[test]
+    fn a_break_notice_turned_off_or_muted_leaves_the_reminder() {
+        for silent in [
+            BreakNoticeRow {
+                journey_suggestions: false,
+                ..open_break("cancelled")
+            },
+            BreakNoticeRow {
+                suggestions_muted: true,
+                ..open_break("cancelled")
+            },
+            BreakNoticeRow {
+                trigger_pushes_on: false,
+                ..open_break("cancelled")
+            },
+        ] {
+            assert_eq!(
+                reminder(std::slice::from_ref(&silent), Quiet::No),
+                SENT,
+                "{silent:?}"
+            );
+        }
+        // One silent break and one whose notice is due: the due one owns it.
+        let muted = BreakNoticeRow {
+            suggestions_muted: true,
+            ..open_break("cancelled")
+        };
+        assert_eq!(
+            reminder(&[muted, open_break("connection_missed")], Quiet::No),
+            LeaveReminderDecision::BreakOwns
+        );
+    }
+
+    /// DS-534: a notice that quiet hours or a snooze keep back is not sent
+    /// now, so it owns nothing. In quiet hours a cancellation's notice
+    /// still goes (`hold::gate`) and owns the reminder; a snooze stops it
+    /// too (and the reminder, at dispatch).
+    #[test]
+    fn a_break_notice_held_back_leaves_the_reminder() {
+        assert_eq!(
+            reminder(&[open_break("connection_missed")], Quiet::Hours),
+            SENT
+        );
+        assert_eq!(
+            reminder(&[open_break("cancelled")], Quiet::Hours),
+            LeaveReminderDecision::BreakOwns
+        );
+        for cause in ["connection_missed", "cancelled"] {
+            assert_eq!(
+                reminder(&[open_break(cause)], Quiet::Snoozed),
+                SENT,
+                "{cause}"
+            );
+        }
     }
 
     #[test]
@@ -1126,6 +1388,28 @@ mod tests {
             decide_leave_reminder(&input_for(&row, now)),
             LeaveReminderDecision::BreakOwns
         );
+        // DS-534: the break's notice decides. With nothing planned yet it
+        // sends none and owns nothing; planned, its notice owns the
+        // reminder; muted for the journey, the reminder goes again.
+        assert!(breaks_for_reminder(&pool, &row).await.unwrap().is_empty());
+        exec(
+            &pool,
+            &format!(
+                "UPDATE journey_breaks SET suggestions = '{{}}'::jsonb, confirmations = 2 \
+                 WHERE journey_id = {journey_id} AND user_id = $1"
+            ),
+        )
+        .await;
+        let breaks = breaks_for_reminder(&pool, &row).await.unwrap();
+        assert_eq!(breaks.len(), 1);
+        assert!(break_notice_owns(&breaks, now, Quiet::No, 15));
+        exec(
+            &pool,
+            &format!("UPDATE journeys SET suggestions_muted = TRUE WHERE id = {journey_id} AND user_id = $1"),
+        )
+        .await;
+        let breaks = breaks_for_reminder(&pool, &row).await.unwrap();
+        assert!(!break_notice_owns(&breaks, now, Quiet::No, 15));
 
         exec(
             &pool,
