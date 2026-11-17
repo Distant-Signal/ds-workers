@@ -109,9 +109,10 @@ pub(crate) async fn breaks_to_notify(pool: &PgPool) -> anyhow::Result<Vec<BreakN
 pub(crate) enum TrainBreak {
     /// No break speaks for the train: its own pushes go out.
     None,
-    /// A break the train triggered has a notice due (decided `Send`, or
-    /// waiting one sweep for its confirmation): the notice will be the
-    /// train's push.
+    /// A break the train triggered has a notice due (decided `Send`,
+    /// waiting one sweep for its confirmation, or opened by the user in the
+    /// last [`OPENED_QUIET`], after which it is sent): the notice will be
+    /// the train's push.
     Due,
     /// A break the train triggered was notified at its severity. Its
     /// delivery wrote the train's state at the equivalent rank, so a plain
@@ -121,14 +122,18 @@ pub(crate) enum TrainBreak {
 
 /// [`TrainBreak`] for a user's open breaks triggered by one train (`rows`),
 /// each decided by [`decide_break_notice`] at `now`. Pure. A break whose
-/// notice is suppressed for any other reason (opt-out, mute, the train's
-/// own pushes off, opened in the app) owns nothing, so a break that will
-/// not push never silences the train (review finding N4).
+/// notice is suppressed for good (opt-out, mute, the train's own pushes
+/// off) owns nothing, so a break that will not push never silences the
+/// train (review finding N4). One the user opened in the app is only
+/// quiet for [`OPENED_QUIET`] and then sent, so it is due: a plain push in
+/// that window would be followed by the notice, two pushes for one train.
 pub(crate) fn classify_train_break(rows: &[BreakNoticeRow], now: DateTime<Utc>) -> TrainBreak {
     let mut state = TrainBreak::None;
     for row in rows {
         match decide_break_notice(row, now) {
-            BreakDecision::Send | BreakDecision::SuppressUnconfirmed => return TrainBreak::Due,
+            BreakDecision::Send
+            | BreakDecision::SuppressUnconfirmed
+            | BreakDecision::SuppressActed => return TrainBreak::Due,
             BreakDecision::SuppressNotWorse => {
                 state = TrainBreak::Notified {
                     cause: row.cause.clone(),
@@ -137,7 +142,6 @@ pub(crate) fn classify_train_break(rows: &[BreakNoticeRow], now: DateTime<Utc>) 
             BreakDecision::SuppressOptOut
             | BreakDecision::SuppressMuted
             | BreakDecision::SuppressTrainOff
-            | BreakDecision::SuppressActed
             | BreakDecision::SuppressInApp => {}
         }
     }
@@ -180,9 +184,8 @@ pub(crate) async fn break_owns_train(
 }
 
 /// Whether a break speaks for the train at all: its notice is due or was
-/// sent. For pushes that only add to what the train's own push said (a
-/// cancellation's reason follow-up, a leave-by naming the train), which
-/// the break notice replaces.
+/// sent. For a push that only adds to what the train's own push said (a
+/// leave-by naming the train), which the break notice replaces.
 pub(crate) async fn break_covers_train(
     pool: &PgPool,
     user_id: &str,
@@ -192,20 +195,36 @@ pub(crate) async fn break_covers_train(
     Ok(train_break_state(pool, user_id, tracked_train_id, now).await? != TrainBreak::None)
 }
 
-/// Whether a break already says the train no longer stops where planned:
-/// its notice is due, or was sent for a cancellation, a part-cancellation
-/// or a skipped stop. The skipped-stop push then adds nothing (review
-/// finding N3).
-pub(crate) fn break_covers_skipped_stop(state: &TrainBreak) -> bool {
+/// What a break means for a leg's skipped-stop push (review finding N3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkippedStopBreak {
+    /// No break says it: the skip push goes out.
+    None,
+    /// The break's notice is due and will be the train's push: decide the
+    /// skip again next cycle, without recording it (a notice that never
+    /// goes leaves the skip push to go).
+    Wait,
+    /// A notice for a cancellation, a part-cancellation or a skipped stop
+    /// was sent: it was this push. The skip is recorded as told, so the
+    /// break closing (dismissed, or kept) does not send it a second time.
+    Told,
+}
+
+/// [`SkippedStopBreak`] for the train's [`TrainBreak`]. Pure.
+pub(crate) fn skipped_stop_break(state: &TrainBreak) -> SkippedStopBreak {
     match state {
-        TrainBreak::None => false,
-        TrainBreak::Due => true,
-        TrainBreak::Notified { cause } => {
-            matches!(
+        TrainBreak::Due => SkippedStopBreak::Wait,
+        TrainBreak::Notified { cause }
+            if matches!(
                 cause.as_str(),
                 "cancelled" | "part_cancelled" | "skipped_stop"
-            )
+            ) =>
+        {
+            SkippedStopBreak::Told
         }
+        // No break, or a missed connection's notice, which said nothing
+        // about the stop.
+        TrainBreak::None | TrainBreak::Notified { .. } => SkippedStopBreak::None,
     }
 }
 
@@ -799,6 +818,17 @@ mod tests {
             ..row("connection_missed")
         };
         assert_eq!(classify_train_break(&[unconfirmed], now), TrainBreak::Due);
+        // Opened in the app a moment ago: quiet for OPENED_QUIET, then
+        // sent, so it still owns the train meanwhile.
+        let opened = BreakNoticeRow {
+            opened_at: Some(now - Duration::minutes(2)),
+            ..row("connection_missed")
+        };
+        assert_eq!(
+            decide_break_notice(&opened, now),
+            BreakDecision::SuppressActed
+        );
+        assert_eq!(classify_train_break(&[opened], now), TrainBreak::Due);
         // Already notified at its severity: the notice carried the train
         // up to its equivalent rank, so a plain push past it goes out.
         let notified = BreakNoticeRow {
@@ -825,10 +855,6 @@ mod tests {
                 trigger_pushes_on: false,
                 ..row("cancelled")
             },
-            BreakNoticeRow {
-                opened_at: Some(now - Duration::minutes(2)),
-                ..row("connection_missed")
-            },
         ] {
             assert_eq!(
                 classify_train_break(std::slice::from_ref(&silent), now),
@@ -847,17 +873,27 @@ mod tests {
     /// says the train no longer stops where planned.
     #[test]
     fn a_skipped_stop_defers_to_a_break_that_already_says_so() {
-        assert!(!break_covers_skipped_stop(&TrainBreak::None));
-        assert!(break_covers_skipped_stop(&TrainBreak::Due));
+        assert_eq!(
+            skipped_stop_break(&TrainBreak::None),
+            SkippedStopBreak::None
+        );
+        assert_eq!(skipped_stop_break(&TrainBreak::Due), SkippedStopBreak::Wait);
         for cause in ["skipped_stop", "part_cancelled", "cancelled"] {
-            assert!(break_covers_skipped_stop(&TrainBreak::Notified {
-                cause: cause.into()
-            }));
+            assert_eq!(
+                skipped_stop_break(&TrainBreak::Notified {
+                    cause: cause.into()
+                }),
+                SkippedStopBreak::Told,
+                "{cause}"
+            );
         }
         // A missed connection's notice said nothing about the stop.
-        assert!(!break_covers_skipped_stop(&TrainBreak::Notified {
-            cause: "connection_missed".into()
-        }));
+        assert_eq!(
+            skipped_stop_break(&TrainBreak::Notified {
+                cause: "connection_missed".into()
+            }),
+            SkippedStopBreak::None
+        );
     }
 
     #[test]
