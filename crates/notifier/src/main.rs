@@ -1874,7 +1874,6 @@ mod copy_tests {
 
     fn ctx(total_legs: i64, journey_name: Option<&str>) -> queries::JourneyLegContext {
         queries::JourneyLegContext {
-            journey_id: 42,
             journey_public_id: "j_00000000000000000000000000000042".to_string(),
             journey_name: journey_name.map(str::to_string),
             leg_position: 2,
@@ -3103,7 +3102,6 @@ mod sweep_cycle_tests {
     ) -> queries::CommitCheckLeg {
         queries::CommitCheckLeg {
             journey_leg_id: 1,
-            journey_id: 2,
             journey_public_id: "j_00000000000000000000000000000002".to_string(),
             user_id: "u".to_string(),
             origin_crs: "WOK".to_string(),

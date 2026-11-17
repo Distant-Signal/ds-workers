@@ -1355,7 +1355,6 @@ pub(crate) async fn upsert_train_notification_state(
 
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct JourneyLegContext {
-    pub journey_id: i64,
     /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
     pub journey_public_id: String,
     pub journey_name: Option<String>,
@@ -1405,7 +1404,7 @@ static JOURNEY_LEG_CONTEXT_SQL: std::sync::LazyLock<String> = std::sync::LazyLoc
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     let last_destination = leg_crs_sql(LegEnd::Destination, "jl3", "ts3", "tr3");
     format!(
-        "SELECT j.id AS journey_id, j.public_id AS journey_public_id, \
+        "SELECT j.public_id AS journey_public_id, \
                 j.custom_name AS journey_name, \
                 (SELECT COUNT(*) FROM journey_legs jl2 \
                  WHERE jl2.journey_id = jl.journey_id AND jl2.leg_order <= jl.leg_order) AS leg_position, \
@@ -1757,7 +1756,6 @@ pub(crate) async fn station_sample_for_crs(
 
 pub(crate) struct CommittedLeg {
     pub journey_leg_id: i64,
-    pub journey_id: i64,
     /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
     pub journey_public_id: String,
     pub user_id: String,
@@ -1803,7 +1801,7 @@ static COMMITTED_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     format!(
-        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.public_id AS journey_public_id, \
+        "SELECT jl.id AS journey_leg_id, j.public_id AS journey_public_id, \
                 j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
@@ -1845,7 +1843,6 @@ pub(crate) async fn list_committed_legs_for_today(
         .map(|row| {
             Ok(CommittedLeg {
                 journey_leg_id: row.try_get("journey_leg_id")?,
-                journey_id: row.try_get("journey_id")?,
                 journey_public_id: row.try_get("journey_public_id")?,
                 user_id: row.try_get("user_id")?,
                 origin_crs: row.try_get("origin_crs")?,
@@ -2230,7 +2227,6 @@ pub(crate) async fn due_templates_for(
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct CommitCheckLeg {
     pub journey_leg_id: i64,
-    pub journey_id: i64,
     /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
     pub journey_public_id: String,
     pub user_id: String,
@@ -2300,7 +2296,7 @@ fn commit_check_legs_sql(filter: &str) -> String {
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     format!(
-        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.public_id AS journey_public_id, \
+        "SELECT jl.id AS journey_leg_id, j.public_id AS journey_public_id, \
                 j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
@@ -4963,7 +4959,6 @@ mod tests {
             .await
             .expect("query")
             .expect("a journey leg");
-        assert_eq!(context.journey_id, journey_id);
         let public_id: String = sqlx::query_scalar("SELECT public_id FROM journeys WHERE id = $1")
             .bind(journey_id)
             .fetch_one(&pool)
