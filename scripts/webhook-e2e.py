@@ -206,7 +206,8 @@ def verify_ntfy(topic_url: str, token: str) -> None:
     check(message["priority"] == 4, "an urgent notification is priority 4 (high)")
     check(message["tags"] == ["train"], "the tag is train")
     check(
-        message["click"] == f"{SITE_URL}/train/by-id/t_00000000000000000000000000000042",
+        message["click"]
+        == f"{SITE_URL}/train/by-id/t_00000000000000000000000000000042",
         "the click link is the absolute page",
     )
     anonymous, _ = http("GET", f"{topic_url}/json?poll=1")
@@ -233,7 +234,10 @@ def verify_gotify(base: str, client_token: str) -> None:
     )
     check(message["priority"] == 5, "a normal notification is priority 5")
     click = message["extras"]["client::notification"]["click"]["url"]
-    check(click == f"{SITE_URL}/train/by-id/t_00000000000000000000000000000042", "the click extra is the absolute page")
+    check(
+        click == f"{SITE_URL}/train/by-id/t_00000000000000000000000000000042",
+        "the click extra is the absolute page",
+    )
 
 
 def verify_generic(capture: Path) -> None:

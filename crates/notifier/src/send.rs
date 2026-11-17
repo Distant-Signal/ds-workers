@@ -1220,7 +1220,7 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
 
     /// DS-534: a topic is exactly 32 characters of the URL-safe base64
     /// alphabet for any tag, the same for the same tag, different for
-    /// different ones, and never the tag (so never an id).
+    /// different ones, and never the tag or the id in it.
     #[test]
     fn a_topic_is_32_url_safe_characters_deterministic_and_distinct_per_tag() {
         let tags = [
@@ -1246,7 +1246,8 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 "{tag}: {topic}"
             );
             assert_eq!(topic_for(tag).as_deref(), Some(topic.as_str()), "{tag}");
-            assert!(!tag.contains(&topic) && !topic.contains(tag), "{tag}");
+            assert_ne!(topic, tag, "{tag}");
+            assert!(!topic.contains("0123456789"), "{tag}: {topic}");
             assert!(seen.insert(topic), "{tag} collides");
         }
         assert_eq!(topic_for(""), None);
