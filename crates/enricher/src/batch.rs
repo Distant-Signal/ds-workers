@@ -1002,26 +1002,57 @@ async fn finish_primary_stage(
     let of = items.len();
     let mut plan = plan_primary(items, results);
     let next = plan.next.len();
+    let mut submitted = Vec::new();
+    if let Err(err) = submit_and_swap(enricher, row, &mut plan, max_items, &mut submitted).await {
+        // Nothing recorded the batches already created (or the swap
+        // failed): cancel them so they are neither billed in full nor
+        // submitted again next tick on top of the orphans (best effort).
+        for (batch, _) in &submitted {
+            discard_quietly(enricher, batch).await;
+        }
+        return Err(err);
+    }
+    for _ in &submitted {
+        record_batch_event(provider, Stage::Adversarial, "submitted");
+    }
+    apply_records(enricher, &plan);
+    tracing::info!(
+        batch_id = row.batch_id,
+        next,
+        of,
+        "primary batch done; adversarial batch submitted"
+    );
+    Ok(())
+}
+
+/// The body of [`finish_primary_stage`] that can fail after a batch was
+/// created: creates the adversarial batches (pushing each onto
+/// `submitted` as it is created) and swaps the rows. On `Err` the caller
+/// discards everything in `submitted`.
+async fn submit_and_swap(
+    enricher: &Enricher,
+    row: &BatchRow,
+    plan: &mut StagePlan,
+    max_items: usize,
+    submitted: &mut Vec<(CreatedBatch, Vec<BatchItem>)>,
+) -> anyhow::Result<()> {
+    let provider = enricher.llm.provider_label();
     let meta = BatchMeta {
         stage: Stage::Adversarial.as_str(),
         model_version: &row.model_version,
     };
-    let mut submitted = Vec::new();
     for chunk in into_chunks(std::mem::take(&mut plan.next), max_items) {
         let requests = adversarial_requests(enricher, &chunk)?;
         match enricher.llm.create_batch(&requests, meta).await {
             Ok(batch) => submitted.push((batch, chunk)),
             Err(err) => {
                 record_batch_event(provider, Stage::Adversarial, "submit_failed");
-                for (batch, _) in &submitted {
-                    discard_quietly(enricher, batch).await;
-                }
                 return Err(err.into());
             }
         }
     }
     let mut tx = enricher.pool.begin().await?;
-    for (batch, items) in &submitted {
+    for (batch, items) in submitted.iter() {
         insert_batch(
             &mut *tx,
             &batch.id,
@@ -1034,16 +1065,6 @@ async fn finish_primary_stage(
     }
     delete_batch(&mut *tx, &row.batch_id).await?;
     tx.commit().await?;
-    for _ in &submitted {
-        record_batch_event(provider, Stage::Adversarial, "submitted");
-    }
-    apply_records(enricher, &plan);
-    tracing::info!(
-        batch_id = row.batch_id,
-        next,
-        of,
-        "primary batch done; adversarial batch submitted"
-    );
     Ok(())
 }
 
@@ -1093,6 +1114,10 @@ fn adversarial_requests(
     Ok(requests)
 }
 
+/// How long [`finish_adversarial_stage`] waits for another loop's claim on
+/// an incident before leaving it to that loop.
+const CLAIM_WAIT: Duration = Duration::from_secs(10);
+
 /// How many incidents of an adversarial batch are combined and written at
 /// a time: their parsed outputs are all that is held besides the
 /// remaining results.
@@ -1116,8 +1141,19 @@ async fn finish_adversarial_stage(
         let plan = plan_adversarial(chunk, &mut results);
         for ready in plan.ready {
             let prepared = ready.item.prepared();
-            // Another loop extracting it right now wins; its own write is fresh.
-            let Some(_claim) = enricher.in_flight.try_claim(&prepared.incident_id) else {
+            // In batch modes the holder is a preflight (a sweep's or the
+            // stream loop's), which only reads the DB and never extracts:
+            // skipping would delete this paid result with the row and
+            // wait for a whole new primary and adversarial cycle, so wait
+            // for it briefly. A holder still there after that is a
+            // synchronous extraction (`normal` mode's stream loop, or a
+            // `batch` sweep below `LLM_BATCH_MIN_ITEMS`): it wins, and its
+            // own write is fresh.
+            let Some(_claim) = enricher
+                .in_flight
+                .claim_within(&prepared.incident_id, CLAIM_WAIT)
+                .await
+            else {
                 crate::record_in_flight_skip("batch", &prepared.incident_id);
                 continue;
             };
@@ -1558,6 +1594,77 @@ mod tests {
         assert!(only.defers_stream() && only.batch_only());
         assert!(settings(LlmMode::Batch).defers_stream());
         assert!(!settings(LlmMode::Normal).defers_stream());
+    }
+
+    /// A pool whose every acquire fails at once (nothing listens on the
+    /// port), for the paths that must clean up after a database error.
+    fn unreachable_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://ds:ds@127.0.0.1:1/ds")
+            .unwrap()
+    }
+
+    /// The adversarial batches created for an ended primary batch are
+    /// cancelled when the row swap then fails (here, the database is
+    /// down): otherwise they would be billed but never read, and the next
+    /// tick would submit them all again.
+    #[tokio::test]
+    async fn adversarial_batches_are_cancelled_when_the_swap_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msgbatch_orphan", "processing_status": "in_progress",
+                "request_counts": { "processing": 2 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/messages/batches/msgbatch_orphan/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msgbatch_orphan", "processing_status": "canceling"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let enricher = Enricher {
+            pool: unreachable_pool(),
+            llm: llm::LlmClient::new(
+                server.uri(),
+                Some("sk-ant-test".into()),
+                "claude-sonnet-5-5".into(),
+                Duration::from_secs(30),
+            )
+            .with_anthropic(llm::anthropic::AnthropicSettings::default()),
+            model_version: "mv-test".into(),
+            mismatch_tracker: crate::MismatchTracker::default(),
+            retry_backoff: crate::RetryBackoff::default(),
+            in_flight: crate::InFlight::default(),
+            carry_forward_noops: false,
+            sweep_concurrency: 1,
+            batch: None,
+        };
+        let row = BatchRow {
+            batch_id: "msgbatch_primary".into(),
+            provider: "anthropic".into(),
+            stage: Stage::Primary,
+            model_version: "mv-test".into(),
+            submitted_at: Utc::now(),
+        };
+        let line = serde_json::json!({ "custom_id": "p-0", "result": { "type": "succeeded",
+            "message": { "content": [{ "type": "text", "text": primary_json() }],
+                         "stop_reason": "end_turn",
+                         "usage": { "input_tokens": 10, "output_tokens": 5 } } } });
+        let results: BatchResults = parse_results_jsonl(&line.to_string()).into();
+
+        finish_primary_stage(&enricher, 100, &row, vec![item(0, "ORPHAN")], results)
+            .await
+            .unwrap_err();
+        // `expect(1)` on the cancel mock is checked when `server` drops.
     }
 
     /// Restart resume against a real database: a primary `OpenAI` batch row

@@ -450,6 +450,7 @@ Same outcome labels and retry budgets as the `openai` path
 | other 4xx (400 invalid request or spend limit, 401, 403, 404, 413) | `http_error` | no | yes |
 | 200, `stop_reason: "refusal"` | `refused` (`stop_details.category: explanation` in the log) | no | yes |
 | 200, `stop_reason: "max_tokens"`, or no text block | `empty_content` (`finish_reason` = the stop reason) | no | yes |
+| couldn't connect (connection refused, DNS or TLS failure; a connection lost after sending is `error`) | `connect_error` | no | no |
 
 Failures are logged with the response's `request-id`, which Anthropic
 support asks for. Responses also carry `thinking` blocks (adaptive thinking;

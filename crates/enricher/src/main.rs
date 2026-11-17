@@ -588,7 +588,25 @@ impl InFlight {
             incident_id: incident_id.to_string(),
         })
     }
+
+    /// [`Self::try_claim`], retried every [`CLAIM_POLL`] for up to `wait`
+    /// while another loop holds the incident.
+    async fn claim_within(&self, incident_id: &str, wait: Duration) -> Option<InFlightClaim<'_>> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(claim) = self.try_claim(incident_id) {
+                return Some(claim);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(CLAIM_POLL).await;
+        }
+    }
 }
+
+/// How often [`InFlight::claim_within`] retries a held claim.
+const CLAIM_POLL: Duration = Duration::from_millis(50);
 
 /// Releases its incident on drop -- including when the owning future is
 /// dropped mid-extraction.
@@ -691,21 +709,60 @@ fn ticking_interval(interval_secs: u64) -> tokio::time::Interval {
 /// cases apart.
 #[derive(Default)]
 struct MismatchTracker {
-    counts: Mutex<HashMap<String, u32>>,
+    counts: Mutex<HashMap<String, MismatchEntry>>,
 }
 
+/// One incident's consecutive combine failures against one text.
+struct MismatchEntry {
+    text_hash: String,
+    count: u32,
+    last_failure: std::time::Instant,
+}
+
+/// How long after an incident's last combine failure [`MismatchTracker`]
+/// forgets it. A live incident that keeps failing is retried at least once
+/// per `retry_backoff`'s 24 h cap (plus a sweep interval), which refreshes
+/// its entry, so an entry older than this belongs to an incident that ended
+/// or stopped being retried: without the prune it would hold
+/// `enricher_mismatch_incidents` above 0 forever.
+const MISMATCH_FORGET_AFTER: Duration = Duration::from_secs(
+    retry_backoff::MAX_BACKOFF.as_secs() + retry_backoff::PRUNE_GRACE.as_secs(),
+);
+
 impl MismatchTracker {
-    /// Records a combine failure for `incident_id` and returns the new
-    /// consecutive-failure count (1 on the first occurrence).
+    /// Records a combine failure for `incident_id`'s text `text_hash` and
+    /// returns the new consecutive-failure count (1 on the first
+    /// occurrence, or the first since the text changed: a mismatch on the
+    /// old text says nothing about the new one).
+    fn record_failure(&self, incident_id: &str, text_hash: &str) -> u32 {
+        self.record_failure_at(incident_id, text_hash, std::time::Instant::now())
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "a poisoned lock means another thread already panicked"
     )]
-    fn record_failure(&self, incident_id: &str) -> u32 {
+    fn record_failure_at(
+        &self,
+        incident_id: &str,
+        text_hash: &str,
+        now: std::time::Instant,
+    ) -> u32 {
         let mut counts = self.counts.lock().expect("mismatch tracker mutex poisoned");
-        let count = counts.entry(incident_id.to_string()).or_insert(0);
-        *count += 1;
-        *count
+        let entry = counts
+            .entry(incident_id.to_string())
+            .or_insert_with(|| MismatchEntry {
+                text_hash: text_hash.to_string(),
+                count: 0,
+                last_failure: now,
+            });
+        if entry.text_hash != text_hash {
+            entry.text_hash = text_hash.to_string();
+            entry.count = 0;
+        }
+        entry.count += 1;
+        entry.last_failure = now;
+        entry.count
     }
 
     /// Clears any tracked failure count for `incident_id` -- called on any
@@ -719,6 +776,21 @@ impl MismatchTracker {
     fn record_success(&self, incident_id: &str) {
         let mut counts = self.counts.lock().expect("mismatch tracker mutex poisoned");
         counts.remove(incident_id);
+    }
+
+    /// Forgets incidents whose last failure is older than
+    /// [`MISMATCH_FORGET_AFTER`] (see there); run on every reclaim tick.
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
+    fn prune_at(&self, now: std::time::Instant) {
+        self.counts
+            .lock()
+            .expect("mismatch tracker mutex poisoned")
+            .retain(|_, entry| {
+                now.saturating_duration_since(entry.last_failure) < MISMATCH_FORGET_AFTER
+            });
     }
 
     /// Current count of incidents with at least one recorded consecutive
@@ -840,8 +912,8 @@ fn record_llm_call_metrics(call: &'static str, elapsed: Duration, outcome: &'sta
 
 /// `success` plus the typed `llm::LlmCallError` labels (`rate_limited`,
 /// `quota_exhausted`, `gateway_error`, `timeout`, `http_error`,
-/// `empty_content`, `refused`, `auth_error`, `unauthorized`), falling back
-/// to `error` (malformed JSON, connection refused, ...).
+/// `empty_content`, `refused`, `auth_error`, `unauthorized`,
+/// `connect_error`), falling back to `error` (malformed JSON, ...).
 fn llm_outcome<T>(result: &anyhow::Result<T>) -> &'static str {
     match result {
         Ok(_) => "success",
@@ -1554,7 +1626,7 @@ fn combine_or_record(
             Some(periods)
         }
         Err(err) => {
-            let consecutive = mismatch_tracker.record_failure(incident_id);
+            let consecutive = mismatch_tracker.record_failure(incident_id, text_hash);
             retry_backoff.record_failure(incident_id, text_hash);
             if consecutive > 1 {
                 // Distinguishable from the generic error path below on
@@ -1634,6 +1706,11 @@ async fn reclaim_loop(
             Ok(None) => {}
             Err(err) => tracing::warn!(error = ?err, "failed to sample stream consumer-group lag"),
         }
+        // Incidents that ended (or stopped being retried) drop out of both,
+        // so the gauge goes back to 0 and neither map grows forever.
+        let now = std::time::Instant::now();
+        enricher.mismatch_tracker.prune_at(now);
+        enricher.retry_backoff.prune_at(now);
         metrics::gauge!(ds_runtime::metrics::metric_name(
             "enricher_mismatch_incidents"
         ))
@@ -2090,6 +2167,29 @@ mod tests {
     }
 
     #[test]
+    fn mismatch_tracker_counts_per_text_and_forgets_ended_incidents() {
+        let tracker = MismatchTracker::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(tracker.record_failure_at("A", "h1", t0), 1);
+        assert_eq!(tracker.record_failure_at("A", "h1", t0), 2);
+        // A new text starts the count again.
+        assert_eq!(tracker.record_failure_at("A", "h2", t0), 1);
+        let t1 = t0 + Duration::from_secs(3600);
+        assert_eq!(tracker.record_failure_at("B", "h1", t1), 1);
+        assert_eq!(tracker.len(), 2);
+
+        // Still within the window: kept.
+        tracker.prune_at(t0 + MISMATCH_FORGET_AFTER.saturating_sub(Duration::from_secs(1)));
+        assert_eq!(tracker.len(), 2);
+        // A's last failure has aged out; B's (an hour later) hasn't.
+        tracker.prune_at(t0 + MISMATCH_FORGET_AFTER);
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.record_failure_at("B", "h1", t1), 2);
+        tracker.prune_at(t1 + MISMATCH_FORGET_AFTER);
+        assert_eq!(tracker.len(), 0, "the gauge goes back to 0");
+    }
+
+    #[test]
     fn in_flight_claim_is_exclusive_and_released_on_drop() {
         let in_flight = InFlight::default();
         let claim = in_flight.try_claim("A").expect("first claim");
@@ -2099,6 +2199,43 @@ mod tests {
         assert!(in_flight.try_claim("A").is_some(), "released on drop");
         drop(other);
         assert!(in_flight.ids.lock().unwrap().is_empty());
+    }
+
+    /// `claim_within` gets a claim released while it waits, and gives up
+    /// once `wait` has passed.
+    #[tokio::test]
+    async fn claim_within_waits_for_a_short_holder() {
+        let in_flight = Arc::new(InFlight::default());
+        let held = Arc::new(tokio::sync::Notify::new());
+        let holder = {
+            let in_flight = Arc::clone(&in_flight);
+            let held = Arc::clone(&held);
+            tokio::spawn(async move {
+                let _claim = in_flight.try_claim("A").unwrap();
+                held.notify_one();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            })
+        };
+        held.notified().await;
+        assert!(in_flight.try_claim("A").is_none());
+        assert!(
+            in_flight
+                .claim_within("A", Duration::from_secs(10))
+                .await
+                .is_some(),
+            "claimed once the holder let go"
+        );
+        holder.await.unwrap();
+
+        let _claim = in_flight.try_claim("B").unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(
+            in_flight
+                .claim_within("B", Duration::from_millis(150))
+                .await
+                .is_none()
+        );
+        assert!(start.elapsed() >= Duration::from_millis(150));
     }
 
     #[tokio::test]

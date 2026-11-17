@@ -56,7 +56,14 @@ const BASE_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// failing deterministically for days still gets re-attempted once a day
 /// (in case a prompt/model change fixed it), rather than being backed off
 /// into effective silence.
-const MAX_BACKOFF: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long past its `retry_not_before` an entry is kept for an incident
+/// that hasn't been attempted again. A live incident is retried within a
+/// sweep interval (1 h by default) of becoming eligible, which refreshes
+/// its entry; one that ended never is, and [`RetryBackoff::prune_at`]
+/// drops it after this. Pruning a live one early only resets its count.
+pub(crate) const PRUNE_GRACE: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// How many further consecutive failures it takes to grow from
 /// `BASE_BACKOFF` to `MAX_BACKOFF` at a doubling-per-failure rate (2^9 * 30m
@@ -168,6 +175,20 @@ impl RetryBackoff {
             .expect("retry backoff mutex poisoned")
             .remove(incident_id);
     }
+
+    /// Drops entries more than [`PRUNE_GRACE`] past their
+    /// `retry_not_before`: incidents that ended or stopped being retried.
+    /// Run on every reclaim tick so the map doesn't grow forever.
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means another thread already panicked"
+    )]
+    pub(crate) fn prune_at(&self, now: Instant) {
+        self.entries
+            .lock()
+            .expect("retry backoff mutex poisoned")
+            .retain(|_, entry| now.saturating_duration_since(entry.retry_not_before) < PRUNE_GRACE);
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +279,28 @@ mod tests {
             !backoff.should_skip_at("INC-1", "hash-a", now),
             "a success must clear the backoff so a later new failure starts counting from zero"
         );
+    }
+
+    #[test]
+    fn prune_drops_only_entries_long_past_their_backoff() {
+        let backoff = RetryBackoff::default();
+        let len = || backoff.entries.lock().unwrap().len();
+        let now = Instant::now();
+        // A: one failure, eligible again at once. B: backed off 30 min.
+        backoff.record_failure_at("A", "h", now);
+        backoff.record_failure_at("B", "h", now);
+        backoff.record_failure_at("B", "h", now);
+
+        backoff.prune_at(now + PRUNE_GRACE.saturating_sub(Duration::from_secs(1)));
+        assert_eq!(len(), 2);
+        backoff.prune_at(now + PRUNE_GRACE);
+        assert_eq!(len(), 1, "A aged out");
+        assert!(
+            backoff.should_skip_at("B", "h", now),
+            "B's backoff is intact"
+        );
+        backoff.prune_at(now + BASE_BACKOFF + PRUNE_GRACE);
+        assert_eq!(len(), 0);
     }
 
     #[test]

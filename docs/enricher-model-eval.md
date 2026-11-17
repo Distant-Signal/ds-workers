@@ -697,7 +697,7 @@ Other sections:
 - **Calls**: per pass and overall, giving the final outcome counts (the
   service's `enricher_llm_call_total` labels: `success`, `timeout`,
   `gateway_error`, `rate_limited`, `quota_exhausted`, `http_error`,
-  `empty_content`, `refused`, `auth_error`, `unauthorized`, `error`), timeout and error rates, in-call retries, timed-out attempts
+  `empty_content`, `refused`, `auth_error`, `unauthorized`, `connect_error`, `error`), timeout and error rates, in-call retries, timed-out attempts
   (including timeouts a gateway retry recovered) and three kinds of
   latency. Percentiles use the nearest-rank method.
   - End-to-end call latency (p50 to "Max incl. failures"): successful

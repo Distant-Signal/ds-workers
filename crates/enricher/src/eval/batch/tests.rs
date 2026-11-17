@@ -948,6 +948,120 @@ async fn failed_batch_records_can_be_retried_synchronously() {
     assert_eq!(requests_to(&server, "POST", "/messages").await.len(), 3);
 }
 
+/// A record re-run whole by `retry_failed_sync` gets the service's single
+/// echo retry inside `run_pipeline`, and not a second one after it.
+#[tokio::test]
+async fn a_record_rerun_in_sync_is_echo_retried_once() {
+    struct SyncMessages;
+    impl Respond for SyncMessages {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let system = body["system"][0]["text"].as_str().unwrap_or_default();
+            let [primary, adversarial, _] = llm::builtin_prompts();
+            let text = if system == primary {
+                primary_text()
+            } else if system == adversarial {
+                // Never echoes period 0: a mismatch every time.
+                json!({"periods": [{"period_index": 1, "scope_description": null,
+                                    "resolution_status": "ongoing"}]})
+                .to_string()
+            } else {
+                severity_text()
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }))
+        }
+    }
+    let server = MockServer::start().await;
+    mount_claude_create(&server).await;
+    mount_claude_batch(
+        &server,
+        "msgbatch_p0",
+        0,
+        &[claude_result("p-0", "expired")],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(SyncMessages)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = BatchOptions {
+        retry_failed_sync: true,
+        ..opts(dir.path())
+    };
+    let run = run_batch(
+        &anthropic_client(&server),
+        &label("claude-haiku-5-5"),
+        &cases(&["a"]),
+        1,
+        &opts,
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.meta.retried_in_sync, 1);
+    assert_eq!(run.records[0].echo_retries(), 1, "{:?}", run.records[0]);
+    // Three passes plus one echo retry.
+    assert_eq!(requests_to(&server, "POST", "/messages").await.len(), 4);
+}
+
+/// A poll failure between successful polls doesn't count towards
+/// `max_poll_failures`, which is a limit on consecutive failures.
+#[tokio::test]
+async fn poll_failures_only_count_in_a_row() {
+    struct Flaky(std::sync::atomic::AtomicU32);
+    impl Respond for Flaky {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            // fail, pending, fail, pending, ...; mounted for 6 polls,
+            // after which the batch has ended.
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n.is_multiple_of(2) {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msgbatch_p0", "processing_status": "in_progress",
+                    "request_counts": {"processing": 1}
+                }))
+            }
+        }
+    }
+    let server = MockServer::start().await;
+    mount_claude_create(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/messages/batches/msgbatch_p0"))
+        .respond_with(Flaky(0.into()))
+        .up_to_n_times(6)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_claude_batch(
+        &server,
+        "msgbatch_p0",
+        0,
+        &[claude_result("p-0", "expired")],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let opts = BatchOptions {
+        max_poll_failures: 2,
+        ..opts(dir.path())
+    };
+    // Three failures in all, never two in a row: the run completes.
+    let run = run_batch(
+        &anthropic_client(&server),
+        &label("claude-haiku-5-5"),
+        &cases(&["a"]),
+        1,
+        &opts,
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.records.len(), 1);
+}
+
 /// No batch API (404) or no batch permission (403): a clear error naming
 /// the sync opt-in, never a silent fallback.
 #[tokio::test]

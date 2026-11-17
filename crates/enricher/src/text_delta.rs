@@ -11,7 +11,11 @@
 //! For each of summary and description independently (moving text between
 //! the two is NOT a no-op):
 //!
-//! 1. Replace every HTML tag (`<...>`) with a space.
+//! 1. Replace every HTML tag with a space. A `<` starts a tag only when
+//!    it is followed by a known HTML element name (optionally after `/`),
+//!    or by `!` (a comment or doctype), and closed by a `>` before any
+//!    other `<`; any other `<` is text, so "Delays of <15 minutes" keeps
+//!    its words (and a changed time after it is not a no-op).
 //! 2. Decode numeric character references (`&#233;`, `&#xE9;`); replace any
 //!    other `&name;` entity with a space (so `&nbsp;`/`&amp;` act as
 //!    separators -- `&` is punctuation anyway).
@@ -40,24 +44,33 @@ pub(crate) struct Word {
 pub(crate) fn words(text: &str) -> Vec<Word> {
     let mut plain = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
+    // Byte offset of `chars`' next character in `text`.
+    let mut offset = 0;
     while let Some(c) = chars.next() {
-        match c {
-            '<' => {
-                // Skip to the closing '>'; an unterminated '<' swallows the
-                // rest, which is fine for both sides of a comparison.
-                for c in chars.by_ref() {
-                    if c == '>' {
-                        break;
-                    }
-                }
-                plain.push(' ');
+        offset += c.len_utf8();
+        let tag = if c == '<' {
+            tag_len(&text[offset..])
+        } else {
+            None
+        };
+        if let Some(len) = tag {
+            // Skip the tag's body and its closing '>'.
+            let end = offset + len;
+            while offset < end {
+                let Some(c) = chars.next() else { break };
+                offset += c.len_utf8();
             }
+            plain.push(' ');
+            continue;
+        }
+        match c {
             '&' => {
                 let mut entity = String::new();
                 let mut terminated = false;
                 while let Some(&next) = chars.peek() {
                     if next == ';' {
                         chars.next();
+                        offset += 1;
                         terminated = true;
                         break;
                     }
@@ -66,6 +79,7 @@ pub(crate) fn words(text: &str) -> Vec<Word> {
                     }
                     entity.push(next);
                     chars.next();
+                    offset += 1;
                 }
                 if !terminated {
                     plain.push('&');
@@ -100,6 +114,105 @@ pub(crate) fn words(text: &str) -> Vec<Word> {
             })
         })
         .collect()
+}
+
+/// HTML element names that start a tag in [`words`] (lowercase). Any other
+/// `<word` is text: an unrecognised tag then counts as a change, which only
+/// costs an extraction, while a `<` read wrongly as a tag would hide one.
+const HTML_ELEMENTS: &[&str] = &[
+    "a",
+    "abbr",
+    "article",
+    "b",
+    "big",
+    "blockquote",
+    "body",
+    "br",
+    "caption",
+    "center",
+    "cite",
+    "code",
+    "col",
+    "colgroup",
+    "dd",
+    "del",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "font",
+    "footer",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "i",
+    "img",
+    "ins",
+    "label",
+    "li",
+    "link",
+    "main",
+    "mark",
+    "meta",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "q",
+    "s",
+    "section",
+    "small",
+    "span",
+    "strike",
+    "strong",
+    "style",
+    "sub",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "time",
+    "title",
+    "tr",
+    "tt",
+    "u",
+    "ul",
+    "wbr",
+];
+
+/// The byte length of an HTML tag's body plus its closing `>`, given the
+/// text right after a `<`; `None` when that `<` is text (see the module
+/// doc, step 1).
+fn tag_len(after: &str) -> Option<usize> {
+    let close = after.find('>')?;
+    if after[..close].contains('<') {
+        return None;
+    }
+    if !after.starts_with('!') {
+        let name_part = after.strip_prefix('/').unwrap_or(after);
+        let name_len = name_part
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(name_part.len());
+        let name = name_part[..name_len].to_ascii_lowercase();
+        if !HTML_ELEMENTS.contains(&name.as_str()) {
+            return None;
+        }
+        let next = name_part[name_len..].chars().next()?;
+        if !(next == '>' || next == '/' || next.is_whitespace()) {
+            return None;
+        }
+    }
+    Some(close + 1)
 }
 
 fn keys(text: &str) -> Vec<String> {
@@ -283,6 +396,52 @@ mod tests {
                 "<h4>Trains may be delayed</h4>\n<p></p>",
             ),
             EditClass::SemanticNoop
+        );
+    }
+
+    /// A `<` that isn't a tag is text: the words after it still count, so
+    /// a changed end time after "<15 minutes" is not a no-op.
+    #[test]
+    fn a_less_than_sign_is_not_a_tag() {
+        assert_eq!(
+            classify(
+                "Signal failure",
+                "Delays of <15 minutes. Expected until 14:00",
+                "Signal failure",
+                "Delays of <15 minutes. Expected until 18:00",
+            ),
+            EditClass::NumericOnly
+        );
+        let keys = |t: &str| keys(t);
+        assert_eq!(
+            keys("Delays of <15 minutes"),
+            ["delays", "of", "15", "minutes"]
+        );
+        assert_eq!(keys("a < b and c<d"), ["a", "b", "and", "cd"]);
+        // Unknown names and unclosed tags are text too.
+        assert_eq!(keys("<five minutes> late"), ["five", "minutes", "late"]);
+        assert_eq!(keys("x <p until 18:00"), ["x", "p", "until", "1800"]);
+        // A `>` past another `<` doesn't close the first one.
+        assert_eq!(keys("<15 <b>late</b>"), ["15", "late"]);
+    }
+
+    /// Real tags (with attributes, self-closing, closing, comments, any
+    /// case) are still stripped.
+    #[test]
+    fn html_tags_are_stripped() {
+        assert_eq!(
+            keys(
+                "<P class=\"x\">Trains<BR/>may<br />be <a href=\"https://e.x/a?b=1\">late</a>\
+                 <!-- note --></p>"
+            ),
+            ["trains", "may", "be", "late"]
+        );
+        assert_eq!(keys("<h4>Title</h4>"), ["title"]);
+        // Multi-byte text and entities before a tag keep its offsets right.
+        assert_eq!(keys("café<br>naïve"), ["café", "naïve"]);
+        assert_eq!(
+            keys("a&amp;b <15 &#233;t&eacute;<br>x"),
+            ["a", "b", "15", "ét", "x"]
         );
     }
 

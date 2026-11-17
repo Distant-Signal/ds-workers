@@ -303,13 +303,7 @@ impl LlmClient {
             if let Some(credential) = &credential {
                 request = credential.apply(request);
             }
-            let response = request.send().await.map_err(|err| {
-                if err.is_timeout() {
-                    LlmCallError::ClientTimeout
-                } else {
-                    LlmCallError::Other(err.into())
-                }
-            })?;
+            let response = request.send().await.map_err(LlmCallError::from_reqwest)?;
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED && self.auth.is_federated() {
                 if let Some(credential) = &credential {
