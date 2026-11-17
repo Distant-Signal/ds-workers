@@ -45,6 +45,8 @@ pub(crate) const OPENED_QUIET: Duration = Duration::minutes(10);
 pub(crate) struct BreakNoticeRow {
     pub id: i64,
     pub journey_id: i64,
+    /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
+    pub journey_public_id: String,
     pub user_id: String,
     pub cause: String,
     pub severity: i16,
@@ -75,7 +77,7 @@ pub(crate) struct BreakNoticeRow {
 /// The [`BreakNoticeRow`] columns and joins over open breaks with
 /// suggestions ready (`b`), shared by [`breaks_to_notify`] and
 /// [`train_break_state`] so both decide on the same row.
-pub(crate) const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, b.user_id, b.cause, b.severity, b.notified_severity, \
+pub(crate) const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, j.public_id AS journey_public_id, b.user_id, b.cause, b.severity, b.notified_severity, \
                 b.opened_at, b.confirmations, b.suggestions, j.suggestions_muted, \
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
@@ -431,7 +433,7 @@ pub(crate) fn build_break_payload(row: &BreakNoticeRow) -> NotificationPayload {
         body,
         url: format!(
             "/journeys/{}?break={}&src=push#break",
-            row.journey_id, row.id
+            row.journey_public_id, row.id
         ),
         tag: match row.trigger_tracked_train_id {
             Some(tracked_train_id) => format!("train-{tracked_train_id}"),
@@ -608,6 +610,7 @@ mod tests {
         BreakNoticeRow {
             id: 7,
             journey_id: 42,
+            journey_public_id: "j_00000000000000000000000000000042".to_string(),
             user_id: "u".to_string(),
             cause: cause.to_string(),
             severity: 1,
@@ -648,7 +651,10 @@ mod tests {
             payload.body,
             "You'll miss the 10:16 to Charing Cross. Next: 10:31, arrive 10:52. Tap to switch."
         );
-        assert_eq!(payload.url, "/journeys/42?break=7&src=push#break");
+        assert_eq!(
+            payload.url,
+            "/journeys/j_00000000000000000000000000000042?break=7&src=push#break"
+        );
         assert_eq!(payload.tag, "train-118");
     }
 

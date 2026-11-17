@@ -108,7 +108,7 @@ pub(crate) struct WebhookEvent {
     pub event: &'static str,
     pub title: String,
     pub body: String,
-    /// The path the push opens (`/journeys/1`).
+    /// The path the push opens (`/journeys/j_` and 32 hex digits).
     pub path: String,
     pub tag: String,
     pub urgent: bool,

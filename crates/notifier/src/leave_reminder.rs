@@ -88,6 +88,8 @@ fn is_unpicked_basis(basis: &str) -> bool {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct LeaveRow {
     pub journey_id: i64,
+    /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
+    pub journey_public_id: String,
     pub user_id: String,
     pub leave_by_at: DateTime<Utc>,
     pub departure: DateTime<Utc>,
@@ -123,7 +125,7 @@ pub(crate) async fn journeys_to_check(
     usual_train: bool,
 ) -> anyhow::Result<Vec<LeaveRow>> {
     Ok(sqlx::query_as(&format!(
-        "SELECT j.id AS journey_id, j.user_id, lb.leave_by_at, lb.departure, lb.basis, lb.leg_id, \
+        "SELECT j.id AS journey_id, j.public_id AS journey_public_id, j.user_id, lb.leave_by_at, lb.departure, lb.basis, lb.leg_id, \
                 COALESCE(p.leave_by_lead_minutes, 0::SMALLINT) AS lead_minutes, \
                 p.delay_threshold_minutes, ps.leave_by_sent, \
                 COALESCE(ps.pushes, 0)::BIGINT \
@@ -274,7 +276,7 @@ pub(crate) fn build_leave_by_payload(row: &LeaveRow, moved: bool) -> Notificatio
     NotificationPayload {
         title,
         body,
-        url: format!("/journeys/{}", row.journey_id),
+        url: format!("/journeys/{}", row.journey_public_id),
         tag: format!("journey-leg-leave-{}", row.leg_id),
         renotify: moved,
     }
@@ -792,6 +794,7 @@ mod tests {
     fn row() -> LeaveRow {
         LeaveRow {
             journey_id: 7,
+            journey_public_id: "j_00000000000000000000000000000042".into(),
             user_id: "u".into(),
             leave_by_at: at(8, 20),
             departure: at(8, 42),
@@ -824,6 +827,7 @@ mod tests {
         BreakNoticeRow {
             id: 5,
             journey_id: 7,
+            journey_public_id: "j_00000000000000000000000000000042".into(),
             user_id: "u".into(),
             cause: cause.into(),
             severity: 1,
@@ -1014,7 +1018,7 @@ mod tests {
             )
         );
         assert_eq!(on_time.tag, "journey-leg-leave-11");
-        assert_eq!(on_time.url, "/journeys/7");
+        assert_eq!(on_time.url, "/journeys/j_00000000000000000000000000000042");
         assert!(!on_time.renotify);
 
         let late = LeaveRow {

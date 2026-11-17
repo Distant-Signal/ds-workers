@@ -132,6 +132,7 @@ mod tests {
         CommittedLeg {
             journey_leg_id: -1,
             journey_id: -1,
+            journey_public_id: String::new(),
             user_id: "TEST-SKIP-CHECK".to_string(),
             origin_crs: origin_crs.to_string(),
             destination_crs: destination_crs.to_string(),
