@@ -1646,6 +1646,7 @@ mod tests {
             in_flight: crate::InFlight::default(),
             carry_forward_noops: false,
             sweep_concurrency: 1,
+            group_cursor: crate::stream::SharedCursor::default(),
             batch: None,
         };
         let row = BatchRow {
@@ -1751,6 +1752,7 @@ mod tests {
             in_flight: crate::InFlight::default(),
             carry_forward_noops: false,
             sweep_concurrency: 1,
+            group_cursor: crate::stream::SharedCursor::default(),
             batch: None,
         };
         poll_once(&enricher, 100).await;
@@ -1883,6 +1885,7 @@ mod tests {
             in_flight: crate::InFlight::default(),
             carry_forward_noops: false,
             sweep_concurrency: 1,
+            group_cursor: crate::stream::SharedCursor::default(),
             batch: None,
         };
         submit_primary(&enricher, &[item(0, "TEST-SPLIT-BATCH").prepared()])
@@ -2026,6 +2029,7 @@ mod tests {
             in_flight: crate::InFlight::default(),
             carry_forward_noops: false,
             sweep_concurrency: 1,
+            group_cursor: crate::stream::SharedCursor::default(),
             batch: None,
         };
         poll_once(&enricher, 100).await;

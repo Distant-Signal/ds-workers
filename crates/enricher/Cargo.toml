@@ -39,6 +39,9 @@ toml = { version = "1.1.2", features = ["serde"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
+# `redis_group::fake::FakeConn`, a scripted Redis for the group-cursor tests
+# (`src/stream.rs`).
+ds-runtime = { workspace = true, features = ["redis-test-util"] }
 wiremock = "0.6"
 # Workload identity tests (`src/auth.rs`, `src/config.rs`): the projected
 # token file, the token-exchange metrics and the "no token in the logs" check.
