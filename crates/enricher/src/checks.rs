@@ -32,8 +32,7 @@
 
 use std::sync::LazyLock;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use chrono_tz::Europe::London;
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 use regex::Regex;
 use serde::Serialize;
 
@@ -287,7 +286,7 @@ enum Day {
 /// `reference` in Europe/London.
 pub(crate) fn stated_end_times(text: &str, reference: DateTime<Utc>) -> StatedTimes {
     let text = plain_text(text);
-    let reference_local = reference.with_timezone(&London).naive_local();
+    let reference_local = common::zone::london_naive(reference);
     let mut stated = StatedTimes::default();
     let mut eta_spans = Vec::new();
     for pattern in [&PATTERNS.expected_until, &PATTERNS.until_approximately] {
@@ -416,15 +415,7 @@ const WEEKDAYS: [&str; 7] = [
 /// A Europe/London wall-clock time as UTC: the earlier instant in the
 /// autumn's repeated hour, the instant an hour on in the spring's gap.
 fn london_to_utc(local: NaiveDateTime) -> Option<DateTime<Utc>> {
-    London
-        .from_local_datetime(&local)
-        .earliest()
-        .or_else(|| {
-            London
-                .from_local_datetime(&(local + Duration::hours(1)))
-                .earliest()
-        })
-        .map(|at| at.with_timezone(&Utc))
+    common::zone::london_to_utc_gap_shifted(local)
 }
 
 /// Whether a period reads as "this disruption, until its ETA": an end and

@@ -4757,9 +4757,7 @@ mod tests {
             .expect("pre-clean trains");
         cleanup_user_skip(&pool, user_id).await;
         seed_user(&pool, user_id).await;
-        let today: chrono::NaiveDate = Utc::now()
-            .with_timezone(&chrono_tz::Europe::London)
-            .date_naive();
+        let today: chrono::NaiveDate = common::zone::london_date(Utc::now());
         let far = today + chrono::Duration::days(20);
 
         let trains_id: i64 = sqlx::query_scalar(

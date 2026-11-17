@@ -49,6 +49,7 @@
 //! release the queue refuses keeps its hold for the next cycle.
 
 use chrono::{DateTime, Duration, NaiveTime, Utc};
+use common::zone::Zone;
 use sqlx::PgPool;
 
 use crate::decision::{NotifyDecision, decide_train_notification, train_severity_rank};
@@ -124,12 +125,12 @@ pub(crate) fn quiet_at(quiet: &QuietHours, now: DateTime<Utc>) -> Quiet {
     let (Some(start), Some(end)) = (quiet.start, quiet.end) else {
         return Quiet::No;
     };
-    let zone: chrono_tz::Tz = quiet
+    let zone = quiet
         .timezone
         .as_deref()
-        .and_then(|name| name.parse().ok())
-        .unwrap_or(chrono_tz::Europe::London);
-    let local = now.with_timezone(&zone).time();
+        .and_then(Zone::parse)
+        .unwrap_or(Zone::LONDON);
+    let local = zone.time(now);
     let inside = match start.cmp(&end) {
         std::cmp::Ordering::Less => start <= local && local < end,
         std::cmp::Ordering::Greater => local >= start || local < end,

@@ -28,7 +28,7 @@ compile_error!("the insecure-test-egress feature is for debug test builds only")
 
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use config::Config;
 use push_queue::{Delivered, PgBackend, PushJob, PushQueue};
@@ -1137,7 +1137,7 @@ async fn run_skip_check_cycle(
     // every skip-check for that hour, exactly the same recurring
     // UTC-vs-London-date bug class already fixed for
     // `routes::trains`'s own `london_now` split.
-    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
+    let today = common::zone::london_date(now);
     let legs = queries::list_committed_legs_for_today(pool, today).await?;
 
     for leg in &legs {
@@ -1340,7 +1340,7 @@ async fn run_template_sweep_cycle(
             continue;
         }
 
-        let now_local = now.with_timezone(&chrono_tz::Europe::London).time();
+        let now_local = common::zone::london_time(now);
         // `(day_offset, scheduled)` per candidate, not bare `scheduled` --
         // `now_local` is always day_offset 0 here (this leg's
         // `service_date` is `today`, by the `unmatched_auto_legs_for_commit_check`
@@ -1662,11 +1662,7 @@ fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
     let Some(departure) = suggested else {
         return format!("Your {route} journey is coming up. Tap to pick your train.");
     };
-    let clock = |at: DateTime<Utc>| {
-        at.with_timezone(&chrono_tz::Europe::London)
-            .format("%H:%M")
-            .to_string()
-    };
+    let clock = |at: DateTime<Utc>| common::zone::london_local(at).format("%H:%M").to_string();
     match leg.plan_reason.as_deref() {
         Some("best") => format!(
             "Pick your train for {route}. We couldn't find your usual train today, so the {} \
@@ -1710,11 +1706,7 @@ fn pick_reminder_url(journey_public_id: &str, has_usual_itinerary: bool) -> Stri
 /// crate's crate-boundary constraint; that one is `pub(crate)` and
 /// unreachable from here anyway).
 fn london_to_utc(naive: chrono::NaiveDateTime) -> Option<DateTime<Utc>> {
-    match chrono_tz::Europe::London.from_local_datetime(&naive) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
-        chrono::LocalResult::Ambiguous(earliest, _) => Some(earliest.with_timezone(&Utc)),
-        chrono::LocalResult::None => None,
-    }
+    common::zone::london_to_utc_earliest(naive)
 }
 
 /// `None` when the train has no current-state row (any more).
@@ -2846,9 +2838,7 @@ mod sweep_cycle_tests {
     /// leg's/schedule row's `service_date` actually line up with what the
     /// cycle looks for as "today" when these tests run for real.
     fn today_london() -> chrono::NaiveDate {
-        Utc::now()
-            .with_timezone(&chrono_tz::Europe::London)
-            .date_naive()
+        common::zone::london_date(Utc::now())
     }
 
     /// End-to-end: seeds one `'auto'`-mode template + one template leg + a
@@ -4213,7 +4203,7 @@ mod sweep_cycle_tests {
             "sanity check: this `now` is still 2026-07-15 in bare UTC"
         );
         assert_eq!(
-            now.with_timezone(&chrono_tz::Europe::London).date_naive(),
+            common::zone::london_date(now),
             london_service_date,
             "sanity check: this `now` is already 2026-07-16 in Europe/London (BST, UTC+1)"
         );
