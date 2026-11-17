@@ -227,8 +227,10 @@ async fn run() -> anyhow::Result<()> {
         },
     )
     .await;
-    // The group's position, kept for `stream::recreate_group`.
-    let mut last_delivered = stream::group_last_delivered_id(&mut redis).await;
+    // How far the loops have got, for `stream::recreate_group`: starts at
+    // the group's position, then tracks every entry handed out and acked.
+    let group_cursor =
+        stream::SharedCursor::seeded(stream::group_last_delivered_id(&mut redis).await.as_deref());
     metrics::counter!(ds_runtime::metrics::metric_name(
         stream::GROUP_RESTORED_METRIC
     ))
@@ -295,6 +297,7 @@ async fn run() -> anyhow::Result<()> {
         carry_forward_noops: config.carry_forward_semantic_noops,
         batch: batch_settings,
         sweep_concurrency: sweep_concurrency(config.provider.llm_max_in_flight),
+        group_cursor,
     });
     if enricher.carry_forward_noops {
         tracing::info!(
@@ -343,11 +346,14 @@ async fn run() -> anyhow::Result<()> {
         // incident's extraction -- up to three LLM calls, each bounded by
         // llm_request_timeout_secs. PROGRESS_STALL_SECS must exceed that.
         progress.beat();
-        match stream::read_one(&mut redis).await {
+        match stream::read_one(&mut redis, &enricher.group_cursor).await {
             Ok(Some((entry_id, incident_id))) => {
-                last_delivered = Some(entry_id.clone());
+                // `read_one` recorded the entry as delivered; it stays
+                // outstanding until the ack below succeeds, so an entry left
+                // pending for reclaim holds the group's restore target below it.
                 if process_stream_entry(&enricher, &entry_id, &incident_id).await
-                    && let Err(err) = stream::ack(&mut redis, &entry_id).await
+                    && let Err(err) =
+                        stream::ack(&mut redis, &enricher.group_cursor, &entry_id).await
                 {
                     tracing::error!(error = ?err, entry_id, "failed to ack stream entry");
                 }
@@ -360,14 +366,15 @@ async fn run() -> anyhow::Result<()> {
                 // every subsequent read fails NOGROUP. Recreating the group
                 // here (a no-op BUSYGROUP while it exists) makes that
                 // self-heal within seconds instead of needing a manual
-                // enricher restart. It is recreated after the last entry
-                // read, not at the tail, so entries `api` published in
-                // between are not skipped (see `stream::recreate_group`). The sleep is what stops the same
+                // enricher restart. It is recreated just below the oldest
+                // entry not yet finished, not at the tail, so entries `api`
+                // published in between are not skipped, nor are ones read
+                // but not finished (see `stream::recreate_group`). The sleep is what stops the same
                 // error from becoming a tight CPU-burning retry loop in the
                 // meantime; `read_one` only blocks when it gets far enough to
                 // block at all, which a NOGROUP read never does.
                 tracing::error!(error = ?err, "error reading from incident-text-changed stream; recreating consumer group and backing off");
-                if let Err(err) = stream::recreate_group(&mut redis, &mut last_delivered).await {
+                if let Err(err) = stream::recreate_group(&mut redis, &enricher.group_cursor).await {
                     tracing::error!(error = ?err, "failed to recreate the consumer group");
                 }
                 tokio::time::sleep(STREAM_ERROR_BACKOFF).await;
@@ -413,6 +420,9 @@ struct Enricher {
     /// How many incidents the synchronous sweep extracts at once
     /// ([`sweep_concurrency`]).
     sweep_concurrency: usize,
+    /// The stream entries handed out and not yet acked, shared by the stream
+    /// loop and the reclaim loop (`stream::SharedCursor`).
+    group_cursor: stream::SharedCursor,
 }
 
 /// The synchronous sweep's concurrency: `LLM_MAX_IN_FLIGHT` (3 in prod), or
@@ -1717,7 +1727,7 @@ async fn reclaim_loop(
         ))
         .set(enricher.mismatch_tracker.len() as f64);
 
-        match stream::claim_stale(&mut redis, min_idle).await {
+        match stream::claim_stale(&mut redis, &enricher.group_cursor, min_idle).await {
             Ok(entries) => {
                 if !entries.is_empty() {
                     tracing::info!(
@@ -1726,12 +1736,26 @@ async fn reclaim_loop(
                     );
                 }
                 for entry_id in process_reclaimed(&enricher, entries).await {
-                    if let Err(err) = stream::ack(&mut redis, &entry_id).await {
+                    if let Err(err) =
+                        stream::ack(&mut redis, &enricher.group_cursor, &entry_id).await
+                    {
                         tracing::error!(error = ?err, entry_id, "failed to ack reclaimed stream entry");
                     }
                 }
             }
             Err(err) => tracing::error!(error = ?err, "failed to check for stale pending entries"),
+        }
+        // An entry unfinished for longer than any retry waits no longer
+        // holds the group's restore target down (`SharedCursor::release_abandoned`).
+        let abandoned = enricher
+            .group_cursor
+            .release_abandoned(stream::abandon_cutoff_ms());
+        if abandoned > 0 {
+            tracing::warn!(
+                abandoned,
+                "stream entries unfinished past the longest retry backoff no longer hold the \
+                 consumer group's restore position; the sweep owns them"
+            );
         }
     }
 }
@@ -1838,6 +1862,7 @@ mod tests {
             carry_forward_noops,
             batch: None,
             sweep_concurrency: 1,
+            group_cursor: stream::SharedCursor::default(),
         }
     }
 
