@@ -183,18 +183,6 @@ pub(crate) async fn break_owns_train(
     Ok(train_break_state(pool, user_id, tracked_train_id, now).await? == TrainBreak::Due)
 }
 
-/// Whether a break speaks for the train at all: its notice is due or was
-/// sent. For a push that only adds to what the train's own push said (a
-/// leave-by naming the train), which the break notice replaces.
-pub(crate) async fn break_covers_train(
-    pool: &PgPool,
-    user_id: &str,
-    tracked_train_id: i64,
-    now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    Ok(train_break_state(pool, user_id, tracked_train_id, now).await? != TrainBreak::None)
-}
-
 /// What a break means for a leg's skipped-stop push (review finding N3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkippedStopBreak {
@@ -1111,11 +1099,6 @@ mod db_tests {
             !break_owns_train(&pool, USER, tracked_train_id, now)
                 .await
                 .expect("owns")
-        );
-        assert!(
-            break_covers_train(&pool, USER, tracked_train_id, now)
-                .await
-                .expect("covers")
         );
         assert_eq!(
             train_break_state(&pool, USER, tracked_train_id, now)
