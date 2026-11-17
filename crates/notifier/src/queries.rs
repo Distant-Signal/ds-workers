@@ -4686,6 +4686,17 @@ mod tests {
             .iter()
             .find(|leg| leg.journey_leg_id == journey_leg_id)
             .expect("the seeded leg must be returned");
+        let public_id: String = sqlx::query_scalar("SELECT public_id FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read journeys.public_id");
+        assert_eq!(found.journey_public_id, public_id);
+        assert!(
+            found.journey_public_id.starts_with("j_") && found.journey_public_id.len() == 34,
+            "the opaque id is j_ and 32 hex digits, got {}",
+            found.journey_public_id
+        );
         assert_eq!(found.origin_crs, "RDG");
         assert_eq!(found.destination_crs, "WOK");
         assert_eq!(found.trains_id, trains_id);
@@ -4953,6 +4964,12 @@ mod tests {
             .expect("query")
             .expect("a journey leg");
         assert_eq!(context.journey_id, journey_id);
+        let public_id: String = sqlx::query_scalar("SELECT public_id FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read journeys.public_id");
+        assert_eq!(context.journey_public_id, public_id);
         assert_eq!(context.leg_position, 2);
         assert_eq!(context.total_legs, 3);
         assert_eq!(context.origin_name.as_deref(), Some("Test Change"));
