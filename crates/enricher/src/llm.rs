@@ -2356,11 +2356,11 @@ pub(crate) fn live_client_from_env() -> LlmClient {
 #[cfg(test)]
 mod period_validation_tests {
     use super::*;
+
     #[expect(
         clippy::needless_pass_by_value,
         reason = "a test helper called with a fresh json! literal"
     )]
-
     fn content(period: serde_json::Value) -> String {
         serde_json::json!({ "category": "other", "periods": [period] }).to_string()
     }
@@ -2368,7 +2368,6 @@ mod period_validation_tests {
         clippy::needless_pass_by_value,
         reason = "a test helper called with a fresh json! literal"
     )]
-
     fn period(overrides: serde_json::Value) -> serde_json::Value {
         let mut base = serde_json::json!({
             "scope_description": null, "date_range": null, "schedule_window": null,
