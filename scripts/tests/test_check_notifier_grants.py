@@ -103,6 +103,36 @@ class NotifierGrantsTest(unittest.TestCase):
         relations, _ = check.parse_grants(NARROWED)
         self.assertNotIn("line_status", used(SQL, relations))
 
+    def test_qualified_quoted_only_and_lateral_forms_are_uses(self) -> None:
+        """Schema-qualified, quoted, ONLY and JOIN LATERAL forms count."""
+        relations, _ = check.parse_grants(NARROWED)
+        for sql in (
+            "FROM public.stations s",
+            'FROM "public"."stations"',
+            'JOIN "stations" s ON true',
+            "FROM ONLY stations",
+            "JOIN LATERAL (SELECT 1 FROM stations) x ON true",
+            "SELECT 1\n  FROM\n  stations",
+            "FROM \\\n stations",
+            "DELETE FROM stations",
+            "INSERT INTO stations (id)",
+            "UPDATE stations SET a = 1",
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(sorted(used(sql, relations)), ["stations"])
+
+    def test_sql_comments_and_prose_are_not_uses(self) -> None:
+        """A `--` comment, a column and lower-case prose are not uses."""
+        relations, _ = check.parse_grants(NARROWED)
+        for sql in (
+            "SELECT 1 -- FROM stations\n",
+            "-- JOIN stations\nSELECT 1",
+            "SELECT stations FROM x",
+            'tracing::warn!("read from stations failed")',
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(used(sql, relations), {})
+
     def test_table_level_select_detection(self) -> None:
         """Table-level SELECT is told from a column-limited grant."""
         self.assertTrue(check.has_table_select("S"))

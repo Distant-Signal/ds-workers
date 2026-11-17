@@ -16,8 +16,13 @@ not in that group (ds-core DS-534).
 
 Limits: it sees only SQL written in this crate (not the ds-core functions it
 calls: ds_store::trains, journeys, recurrence, ...), and a relation name
-only counts after one of those keywords. Test code (`#[cfg(test)]` items at
-column 0, whole-file test modules) and comments are skipped.
+only counts after one of those upper-case keywords (an optional ONLY, a
+`public.` prefix and double quotes are allowed; a second relation in a
+comma-separated FROM list, a lower-case keyword and a `format!` table name
+are not seen: write JOIN, and keep table names literal). A table name that
+is only a column, a CTE name or in a comment is not a use. Test code
+(`#[cfg(test)]` items at column 0, whole-file test modules), `//` and SQL
+`--` comments are skipped.
 
 Stdlib only.
 """
@@ -42,7 +47,14 @@ TEST_FILES = frozenset({"settings_db_tests.rs", "webhook_e2e_tests.rs"})
 # The classes the read_shared group can SELECT (ds-core's gen-db-grants.py).
 GROUP_CLASSES = frozenset({"shared-train", "ingest", "derived", "reference"})
 TABLE_LINE = re.compile(r"^  ([a-z_0-9]+): \{class: ([\w-]+)(.*)\}\s*$")
-RELATION_USE = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE)(?:\s|\\)+([a-z_][a-z0-9_]*)")
+# The keywords are upper case, as this crate writes its SQL (lower case
+# would match prose such as "from users"). After one: an optional ONLY, an
+# optional `public.` and optional double quotes round the name.
+RELATION_USE = re.compile(
+    r'\b(?:FROM|JOIN|INTO|UPDATE)(?:\s|\\)+(?:ONLY(?:\s|\\)+)?(?:"?public"?\.)?"?([a-z_][a-z0-9_]*)'
+)
+# A SQL line comment: `--` then a space (not a `--flag` in a message).
+SQL_COMMENT = re.compile(r"(?:^|(?<=\s))--(?=\s)[^\n]*")
 
 
 @dataclass(frozen=True)
@@ -119,7 +131,11 @@ def parse_grants(text: str) -> tuple[dict[str, Relation], bool]:
 
 def strip_test_code(text: str) -> str:
     """Drop comments and column-0 `#[cfg(test)]` items from Rust source."""
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith("//")]
+    lines = [
+        SQL_COMMENT.sub("", line)
+        for line in text.splitlines()
+        if not line.lstrip().startswith("//")
+    ]
     kept: list[str] = []
     i = 0
     while i < len(lines):
