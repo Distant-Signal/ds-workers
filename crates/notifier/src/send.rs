@@ -19,7 +19,9 @@
 
 use std::time::Duration;
 
+use base64::Engine as _;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 pub(crate) use web_push::Urgency;
 use web_push::{ContentEncoding, SubscriptionInfo, WebPushMessage, WebPushMessageBuilder};
 
@@ -66,7 +68,7 @@ pub(crate) const DEFAULT_PUSH_TTL_SECS: u32 = 3600;
 /// §5.2), `Urgency` (§5.3) and, whenever the payload's `tag` can be one
 /// ([`topic_for`]), `Topic` (§5.4).
 ///
-/// Every class sends its tag as its `Topic` (DS-386): a push service holding
+/// Every class sends a hash of its tag as its `Topic` (DS-386, DS-534): a push service holding
 /// a push for an offline device replaces it with a newer one of the same
 /// topic rather than queueing both. On the device, pushes already replace
 /// each other by `NotificationPayload::tag` (the service worker's
@@ -76,8 +78,8 @@ pub(crate) const DEFAULT_PUSH_TTL_SECS: u32 = 3600;
 /// [`SendOutcome::Unknown`] or [`SendOutcome::TimedOut`] is re-decided and
 /// sent again with the same tag, and whether the first copy is still held
 /// by the push service or already shown, the second replaces it instead of
-/// appearing beside it. Tags are per target (`train-<id>`, `line-<id>`,
-/// `journey-leg-leave-<id>`, ...), so the leave-by's topic, the first class
+/// appearing beside it. Tags are per target (`train-<public id>`, `line-<id>`,
+/// `journey-leg-leave-<public id>`, ...), so the leave-by's topic, the first class
 /// to send one, collides with no other class's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeliveryOptions {
@@ -85,16 +87,26 @@ pub(crate) struct DeliveryOptions {
     pub urgency: Urgency,
 }
 
-/// A `Topic` header's value, if `tag` can be one: at most 32 characters
-/// of the URL-safe base64 alphabet (RFC 8030 §5.4). Anything else is sent
-/// without a topic rather than refused by the push service.
+/// The length of a `Topic` header's value: at most 32 characters of the
+/// URL-safe base64 alphabet (RFC 8030 §5.4).
+const TOPIC_LEN: usize = 32;
+
+/// A `Topic` header's value for `tag`: the first 32 characters of the
+/// URL-safe, unpadded base64 of the SHA-256 of the tag (DS-534). A tag now
+/// carries a public id (`train-t_` and 32 hex digits is 40 characters), so
+/// it can no longer be sent as it is, and the push service sees the topic in
+/// the clear: hashing keeps every id out of it. The same tag always gives
+/// the same topic, so a push service still replaces a held push with a newer
+/// one for the same target; 192 bits of the digest keep distinct tags
+/// distinct. `None` only for an empty tag.
 pub(crate) fn topic_for(tag: &str) -> Option<String> {
-    (!tag.is_empty()
-        && tag.len() <= 32
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-    .then(|| tag.to_string())
+    if tag.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(tag.as_bytes());
+    let mut topic = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    topic.truncate(TOPIC_LEN);
+    Some(topic)
 }
 
 /// A push's `TTL`: the configured one (`PUSH_TTL_SECS`) or a fixed one for
@@ -1146,21 +1158,23 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
         }
     }
 
-    /// Every push's `Topic` is its tag, so a push service holding one for
-    /// an offline phone replaces it with a newer one (a moved leave-by, a
-    /// resend after an unknown outcome); a tag that can't be a topic is sent
-    /// without one.
+    /// Every push's `Topic` is the hash of its tag ([`topic_for`]), so a push
+    /// service holding one for an offline phone replaces it with a newer one
+    /// (a moved leave-by, a resend after an unknown outcome), whatever the
+    /// tag's length or characters.
     #[tokio::test]
-    async fn every_push_sends_its_tag_as_its_topic() {
+    async fn every_push_sends_the_hash_of_its_tag_as_its_topic() {
         for (tag, topic) in [
-            ("journey-leg-leave-11", Some("journey-leg-leave-11")),
-            ("train-42", Some("train-42")),
             (
-                "regular-summary-2026-11-09",
-                Some("regular-summary-2026-11-09"),
+                "journey-leg-leave-l_0123456789abcdef0123456789abcdef",
+                Some("SZJFQZL9q-sowY8RQBWt0kWxgeAqWmPe"),
             ),
-            ("has a space", None),
-            ("a-tag-that-is-much-longer-than-thirty-two", None),
+            (
+                "train-t_0123456789abcdef0123456789abcdef",
+                Some("rtQk5a5fLp5Vv-O59pif9H3jc9KIMQKO"),
+            ),
+            ("line-victoria", Some("OYxAVAiQ0Q7rUDE9TZ5TBVKHXUbwkod2")),
+            ("", None),
         ] {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1202,6 +1216,52 @@ MyG+KKTT16anfp8nwB3M0QVuDOSRKYCrdw==
                 .map(|value| value.to_str().unwrap().to_string());
             assert_eq!(sent.as_deref(), topic, "{tag}");
         }
+    }
+
+    /// DS-534: a topic is exactly 32 characters of the URL-safe base64
+    /// alphabet for any tag, the same for the same tag, different for
+    /// different ones, and never the tag (so never an id).
+    #[test]
+    fn a_topic_is_32_url_safe_characters_deterministic_and_distinct_per_tag() {
+        let tags = [
+            "train-t_0123456789abcdef0123456789abcdef",
+            "train-t_0123456789abcdef0123456789abcdee",
+            "journey-leg-skip-l_0123456789abcdef0123456789abcdef",
+            "journey-leg-unmatched-l_0123456789abcdef0123456789abcdef",
+            "journey-leg-leave-l_0123456789abcdef0123456789abcdef",
+            "journey-break-j_0123456789abcdef0123456789abcdef",
+            "line-victoria",
+            "regular-summary-2026-11-09",
+            "a",
+            "has a space and \u{e9}",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            let topic = topic_for(tag).expect("a topic");
+            assert_eq!(topic.len(), 32, "{tag}");
+            assert!(
+                topic
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{tag}: {topic}"
+            );
+            assert_eq!(topic_for(tag).as_deref(), Some(topic.as_str()), "{tag}");
+            assert!(!tag.contains(&topic) && !topic.contains(tag), "{tag}");
+            assert!(seen.insert(topic), "{tag} collides");
+        }
+        assert_eq!(topic_for(""), None);
+    }
+
+    #[test]
+    fn a_topic_is_the_prefix_of_the_unpadded_url_safe_sha256() {
+        assert_eq!(
+            topic_for("train-t_0123456789abcdef0123456789abcdef").as_deref(),
+            Some("rtQk5a5fLp5Vv-O59pif9H3jc9KIMQKO")
+        );
+        assert_eq!(
+            topic_for("line-victoria").as_deref(),
+            Some("OYxAVAiQ0Q7rUDE9TZ5TBVKHXUbwkod2")
+        );
     }
 
     #[test]
