@@ -648,7 +648,7 @@ fn next_window_start(loaded: &LoadedIncident, now: DateTime<Utc>) -> Option<Date
 )]
 fn window_start_after(window: &ScheduleWindow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let start = NaiveTime::parse_from_str(&window.start_time, "%H:%M").ok()?;
-    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
+    let today = common::zone::london_date(now);
     (0..=8)
         .map(|offset| today + Duration::days(offset))
         .filter(|date| {
@@ -966,7 +966,7 @@ fn period_bounds(range: &DateRange) -> Result<PeriodBounds, ()> {
     if let (Some(from), Some(to)) = (from, to)
         && to <= from
     {
-        let day = from.with_timezone(&chrono_tz::Europe::London).date_naive();
+        let day = common::zone::london_date(from);
         return Ok((
             Some(london_midnight(day)),
             Some(london_midnight(day + Duration::days(1))),
@@ -1088,7 +1088,7 @@ fn elapsed_annotation(period: &ExtractionPeriod) -> String {
             |dt| {
                 format!(
                     "expected to end by {}",
-                    dt.with_timezone(&chrono_tz::Europe::London).format("%H:%M")
+                    common::zone::london_local(dt.with_timezone(&Utc)).format("%H:%M")
                 )
             },
         );
@@ -1117,14 +1117,13 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
     if window.days_of_week.is_empty() {
         return true;
     }
-    let local = now.with_timezone(&chrono_tz::Europe::London);
     let Ok(start) = NaiveTime::parse_from_str(&window.start_time, "%H:%M") else {
         return true;
     };
     let Ok(end) = NaiveTime::parse_from_str(&window.end_time, "%H:%M") else {
         return true;
     };
-    let now_time = local.time();
+    let now_time = common::zone::london_time(now);
 
     // Which calendar day did the window instance covering `now` START on?
     // For a same-day window (start <= end) that is always today. For an
@@ -1135,9 +1134,9 @@ fn now_within_window(window: &ScheduleWindow, now: DateTime<Utc>) -> bool {
     // weekday there would report "outside the window" and manufacture a
     // demotion for a disruption that is genuinely still active.
     let window_start_date = if start > end && now_time < end {
-        local.date_naive() - Duration::days(1)
+        common::zone::london_date(now) - Duration::days(1)
     } else {
-        local.date_naive()
+        common::zone::london_date(now)
     };
     let weekday = window_start_date.weekday().number_from_monday() as u8; // 1=Monday..7=Sunday
     if !window.days_of_week.contains(&weekday) {
@@ -5666,8 +5665,7 @@ mod tests {
         );
         // Schedule window that excludes now: an all-day window on every
         // weekday except today's (Europe/London).
-        let today = now
-            .with_timezone(&chrono_tz::Europe::London)
+        let today = common::zone::london_date(now)
             .weekday()
             .number_from_monday() as u8;
         let other_days: Vec<u8> = (1..=7).filter(|d| *d != today).collect();

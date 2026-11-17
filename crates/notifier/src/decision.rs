@@ -483,9 +483,8 @@ pub(crate) fn template_mint_dates(
     evening_hour: u32,
 ) -> (chrono::NaiveDate, Option<chrono::NaiveDate>) {
     use chrono::Timelike as _;
-    let london = now.with_timezone(&chrono_tz::Europe::London);
-    let today = london.date_naive();
-    let tomorrow = (london.hour() >= evening_hour)
+    let today = common::zone::london_date(now);
+    let tomorrow = (common::zone::london_time(now).hour() >= evening_hour)
         .then(|| today.succ_opt())
         .flatten();
     (today, tomorrow)

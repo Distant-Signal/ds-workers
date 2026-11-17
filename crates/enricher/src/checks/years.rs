@@ -26,7 +26,6 @@
 //! [`LOOKAHEAD_DAYS`] ahead, are only reported (`flagged`).
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc, Weekday};
-use chrono_tz::Europe::London;
 use serde::Serialize;
 
 use super::{CheckText, MONTHS, PATTERNS, WEEKDAYS, london_to_utc, plain_text};
@@ -151,7 +150,7 @@ pub(crate) fn check_years(text: &CheckText<'_>, periods: &mut [ExtractionPeriod]
     let states_a_year = stated.iter().any(|s| s.year.is_some())
         || PATTERNS.any_year.is_match(&plain_text(text.summary))
         || PATTERNS.any_year.is_match(&plain_text(text.description));
-    let reference_day = text.reference_date.with_timezone(&London).date_naive();
+    let reference_day = common::zone::london_date(text.reference_date);
     let resolved: Vec<NaiveDate> = stated
         .iter()
         .filter_map(|s| resolve(*s, reference_day))
@@ -217,7 +216,7 @@ pub(crate) fn check_years(text: &CheckText<'_>, periods: &mut [ExtractionPeriod]
 /// of the day before. When several resolved dates share the day and month,
 /// any year among them is accepted.
 fn year_shift(at: DateTime<Utc>, is_end: bool, resolved: &[NaiveDate]) -> Option<i32> {
-    let local = at.with_timezone(&London).naive_local();
+    let local = common::zone::london_naive(at);
     let mut days = vec![local.date()];
     if is_end && local.hour() == 0 && local.minute() == 0 {
         days.extend(local.date().pred_opt());
@@ -243,7 +242,7 @@ fn year_shift(at: DateTime<Utc>, is_end: bool, resolved: &[NaiveDate]) -> Option
 /// time of day (so a BST midnight in October stays a midnight in GMT
 /// January). `None` for 29 February into a non-leap year.
 fn shift_years(at: DateTime<Utc>, years: i32) -> Option<DateTime<Utc>> {
-    let local = at.with_timezone(&London).naive_local();
+    let local = common::zone::london_naive(at);
     let day = NaiveDate::from_ymd_opt(local.year() + years, local.month(), local.day())?;
     london_to_utc(day.and_time(local.time()))
 }

@@ -13,7 +13,6 @@ anyhow = "1.0.102"
 # public-key check. Same version `api` already uses, so no new crate.
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
-chrono-tz = "0.10"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 common = { workspace = true, features = ["default", "postgres"] }
 ds-runtime = { workspace = true, features = ["default", "postgres"] }

@@ -179,9 +179,7 @@ pub(crate) async fn journeys_to_check(
 }
 
 fn london_clock(at: DateTime<Utc>) -> String {
-    at.with_timezone(&chrono_tz::Europe::London)
-        .format("%H:%M")
-        .to_string()
+    common::zone::london_local(at).format("%H:%M").to_string()
 }
 
 /// "the 08:42 Woking to London Waterloo", or "the 08:42" without a route.
@@ -498,7 +496,7 @@ pub(crate) async fn run_leave_reminder_cycle(
     now: DateTime<Utc>,
     settings: LeaveReminderSettings,
 ) -> anyhow::Result<()> {
-    let today = now.with_timezone(&chrono_tz::Europe::London).date_naive();
+    let today = common::zone::london_date(now);
     for row in journeys_to_check(pool, now, today, settings.usual_train).await? {
         let input = LeaveReminderInput {
             now,

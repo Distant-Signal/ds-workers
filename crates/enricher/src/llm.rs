@@ -2014,9 +2014,7 @@ pub(crate) fn primary_spec(
              date in the text below relative to that reference date.\nSummary: {summary}\n\
              Description: {description}",
             reference_date.to_rfc3339(),
-            reference_date
-                .with_timezone(&chrono_tz::Europe::London)
-                .format("%A %-d %B %Y")
+            common::zone::london_local(reference_date).format("%A %-d %B %Y")
         ),
         schema_name: PRIMARY_SCHEMA_NAME,
         schema: primary_schema(),

@@ -1413,9 +1413,7 @@ pub(crate) async fn trains_prune_due(
 /// docs/superpowers/specs/2026-08-31-line-history-graphics-design.md, Open
 /// question 5, for why these two conventions coexist.
 pub(crate) fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
-    instant
-        .with_timezone(&chrono_tz::Europe::London)
-        .date_naive()
+    common::zone::london_date(instant)
 }
 
 /// The plain UTC 30-minute bucket `instant` falls in, truncated to the
@@ -1423,7 +1421,7 @@ pub(crate) fn london_calendar_day(instant: DateTime<Utc>) -> NaiveDate {
 /// Originally `utc_hour_start` (1-hour buckets); renamed and narrowed to
 /// 30-minute buckets when the trend chart's granularity was doubled --
 /// see this crate's git history for the hourly-era version. Deliberately
-/// NOT routed through `chrono_tz::Europe::London` the way
+/// NOT routed through the London zone the way
 /// `london_calendar_day` is -- Decision 4 of
 /// docs/superpowers/specs/2026-09-02-trend-chart-granularity-design.md
 /// explains why (still applies unchanged at the new granularity):

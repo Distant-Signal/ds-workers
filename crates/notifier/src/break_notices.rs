@@ -306,9 +306,7 @@ pub(crate) fn decide_break_notice(row: &BreakNoticeRow, now: DateTime<Utc>) -> B
 }
 
 fn london_clock(at: DateTime<Utc>) -> String {
-    at.with_timezone(&chrono_tz::Europe::London)
-        .format("%H:%M")
-        .to_string()
+    common::zone::london_local(at).format("%H:%M").to_string()
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
