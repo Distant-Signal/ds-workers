@@ -37,6 +37,7 @@ mod sweep;
 #[cfg(test)]
 mod test_db;
 mod text_delta;
+mod validate;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

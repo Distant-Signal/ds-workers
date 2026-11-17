@@ -417,7 +417,16 @@ impl WebhookSender {
             && let Err(reason) =
                 ds_runtime::outbound_endpoint_guard::validate_outbound_url(&dest.url).await
         {
-            return WebhookOutcome::Failed(reason);
+            // The guard's reason tells "does not resolve" from "resolves to
+            // a disallowed address", which would let a user probe internal
+            // DNS through `last_error`. It stays in the log only; the user
+            // gets the same sentence the connect-time refusal gives.
+            tracing::warn!(
+                destination_id = dest.id,
+                reason = %reason,
+                "webhook destination failed the outbound address check"
+            );
+            return WebhookOutcome::Failed(UNREACHABLE_REASON.into());
         }
         let mut last = WebhookOutcome::Failed("The message couldn't be sent.".into());
         for attempt in 0..MAX_ATTEMPTS {
@@ -464,9 +473,7 @@ impl WebhookSender {
                     last = WebhookOutcome::Failed("The destination didn't answer in time.".into());
                 }
                 Err(err) if err.is_connect() => {
-                    last = WebhookOutcome::Failed(
-                        "Couldn't connect. The address may not be a public one.".into(),
-                    );
+                    last = WebhookOutcome::Failed(UNREACHABLE_REASON.into());
                 }
                 Err(_) => {
                     last = WebhookOutcome::Failed("The message couldn't be sent.".into());
@@ -476,6 +483,12 @@ impl WebhookSender {
         last
     }
 }
+
+/// The one reason shown for every address the sender will not, or cannot,
+/// reach: an unparseable or non-https URL, a name that does not resolve, an
+/// address that is not public, or a refused connection. Telling them apart
+/// would be a DNS and network-position oracle.
+const UNREACHABLE_REASON: &str = "Couldn't connect. The address may not be a public one.";
 
 #[cfg(test)]
 mod tests {
@@ -721,6 +734,31 @@ mod tests {
                 .await;
             assert!(matches!(outcome, WebhookOutcome::Failed(_)), "{url}");
         }
+    }
+
+    /// A name that does not resolve and an address that is not public get
+    /// the same stored reason.
+    #[tokio::test]
+    async fn guard_refusals_share_one_user_facing_reason() {
+        let sender = WebhookSender::new(None).unwrap();
+        let mut reasons = Vec::new();
+        for url in [
+            "https://127.0.0.1/x",
+            "https://nonexistent-host.invalid/x",
+            "http://example.com/x",
+        ] {
+            let outcome = sender
+                .send(&dest("generic", url, Some("s")), &event(false))
+                .await;
+            let WebhookOutcome::Failed(reason) = outcome else {
+                panic!("{url} was not refused");
+            };
+            reasons.push(reason);
+        }
+        assert!(
+            reasons.iter().all(|r| r == UNREACHABLE_REASON),
+            "{reasons:?}"
+        );
     }
 
     /// Failures accumulate to the threshold and turn the destination off
