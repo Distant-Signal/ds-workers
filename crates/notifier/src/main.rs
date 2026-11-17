@@ -813,7 +813,7 @@ fn build_train_notification_payload(
     NotificationPayload {
         title,
         body,
-        url: format!("/journeys/{}", ctx.journey_id),
+        url: format!("/journeys/{}", ctx.journey_public_id),
         tag: format!("train-{tracked_train_id}"), // unchanged -- still the same underlying tracked-train row
         renotify: false,
     }
@@ -937,7 +937,7 @@ fn build_predicted_start_payload(
             Some(route) => format!("The {route} service is {body_tail}"),
             None => format!("It is {body_tail}"),
         },
-        url: format!("/journeys/{}", ctx.journey_id),
+        url: format!("/journeys/{}", ctx.journey_public_id),
         tag,
         renotify: false,
     }
@@ -1200,7 +1200,7 @@ async fn run_skip_check_cycle(
                 push_station(&leg.origin_crs, leg.origin_name.as_deref()),
                 push_station(&leg.destination_crs, leg.destination_name.as_deref())
             ),
-            url: format!("/journeys/{}", leg.journey_id),
+            url: format!("/journeys/{}", leg.journey_public_id),
             tag: format!("journey-leg-skip-{}", leg.journey_leg_id),
             renotify: false,
         };
@@ -1454,7 +1454,7 @@ async fn enqueue_needs_attention(
             )
             .unwrap_or_default()
         ),
-        url: format!("/journeys/{}", leg.journey_id),
+        url: format!("/journeys/{}", leg.journey_public_id),
         tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
         renotify: false,
     };
@@ -1624,7 +1624,7 @@ async fn remind_manual_legs(
         let payload = NotificationPayload {
             title: "Pick today's train".to_string(),
             body: pick_reminder_body(&route, &leg),
-            url: pick_reminder_url(leg.journey_id, leg.has_usual_itinerary),
+            url: pick_reminder_url(&leg.journey_public_id, leg.has_usual_itinerary),
             tag: format!("journey-leg-unmatched-{}", leg.journey_leg_id),
             renotify: false,
         };
@@ -1696,11 +1696,11 @@ fn pick_reminder_body(route: &str, leg: &queries::CommitCheckLeg) -> String {
 /// The pick reminder's link: the journey, with `?pick=usual` when its
 /// template has a usual itinerary, so the page puts the usual train first
 /// (regular journeys design §4.3).
-fn pick_reminder_url(journey_id: i64, has_usual_itinerary: bool) -> String {
+fn pick_reminder_url(journey_public_id: &str, has_usual_itinerary: bool) -> String {
     if has_usual_itinerary {
-        format!("/journeys/{journey_id}?pick=usual")
+        format!("/journeys/{journey_public_id}?pick=usual")
     } else {
-        format!("/journeys/{journey_id}")
+        format!("/journeys/{journey_public_id}")
     }
 }
 
@@ -1874,7 +1874,7 @@ mod copy_tests {
 
     fn ctx(total_legs: i64, journey_name: Option<&str>) -> queries::JourneyLegContext {
         queries::JourneyLegContext {
-            journey_id: 42,
+            journey_public_id: "j_00000000000000000000000000000042".to_string(),
             journey_name: journey_name.map(str::to_string),
             leg_position: 2,
             total_legs,
@@ -1910,7 +1910,7 @@ mod copy_tests {
             "The Wakefield Westgate to London Kings Cross service is expected to start about 12 \
              minutes late: the incoming train is running late."
         );
-        assert_eq!(payload.url, "/journeys/42");
+        assert_eq!(payload.url, "/journeys/j_00000000000000000000000000000042");
     }
 
     #[test]
@@ -1958,7 +1958,7 @@ mod copy_tests {
             payload.body,
             "Wakefield Westgate to London Kings Cross, now running about 18 minutes late."
         );
-        assert_eq!(payload.url, "/journeys/42");
+        assert_eq!(payload.url, "/journeys/j_00000000000000000000000000000042");
         assert_eq!(payload.tag, "train-7");
     }
 
@@ -3102,7 +3102,7 @@ mod sweep_cycle_tests {
     ) -> queries::CommitCheckLeg {
         queries::CommitCheckLeg {
             journey_leg_id: 1,
-            journey_id: 2,
+            journey_public_id: "j_00000000000000000000000000000002".to_string(),
             user_id: "u".to_string(),
             origin_crs: "WOK".to_string(),
             destination_crs: "WAT".to_string(),
@@ -3271,8 +3271,14 @@ mod sweep_cycle_tests {
 
     #[test]
     fn the_pick_reminder_links_to_the_usual_train_when_there_is_one() {
-        assert_eq!(pick_reminder_url(42, false), "/journeys/42");
-        assert_eq!(pick_reminder_url(42, true), "/journeys/42?pick=usual");
+        assert_eq!(
+            pick_reminder_url("j_00000000000000000000000000000042", false),
+            "/journeys/j_00000000000000000000000000000042"
+        );
+        assert_eq!(
+            pick_reminder_url("j_00000000000000000000000000000042", true),
+            "/journeys/j_00000000000000000000000000000042?pick=usual"
+        );
     }
 
     /// The service dates of a template's minted occurrences, in order.

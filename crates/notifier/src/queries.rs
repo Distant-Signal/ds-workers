@@ -1355,7 +1355,8 @@ pub(crate) async fn upsert_train_notification_state(
 
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct JourneyLegContext {
-    pub journey_id: i64,
+    /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
+    pub journey_public_id: String,
     pub journey_name: Option<String>,
     /// The leg's 1-based position among the journey's legs. Not
     /// `leg_order`, which is never renumbered after a leg is deleted, so a
@@ -1403,7 +1404,8 @@ static JOURNEY_LEG_CONTEXT_SQL: std::sync::LazyLock<String> = std::sync::LazyLoc
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     let last_destination = leg_crs_sql(LegEnd::Destination, "jl3", "ts3", "tr3");
     format!(
-        "SELECT j.id AS journey_id, j.custom_name AS journey_name, \
+        "SELECT j.public_id AS journey_public_id, \
+                j.custom_name AS journey_name, \
                 (SELECT COUNT(*) FROM journey_legs jl2 \
                  WHERE jl2.journey_id = jl.journey_id AND jl2.leg_order <= jl.leg_order) AS leg_position, \
                 (SELECT COUNT(*) FROM journey_legs jl2 WHERE jl2.journey_id = jl.journey_id) AS total_legs, \
@@ -1754,7 +1756,8 @@ pub(crate) async fn station_sample_for_crs(
 
 pub(crate) struct CommittedLeg {
     pub journey_leg_id: i64,
-    pub journey_id: i64,
+    /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
+    pub journey_public_id: String,
     pub user_id: String,
     pub origin_crs: String,
     pub destination_crs: String,
@@ -1798,7 +1801,8 @@ static COMMITTED_LEGS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     format!(
-        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
+        "SELECT jl.id AS journey_leg_id, j.public_id AS journey_public_id, \
+                j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
                 ts.trains_id, jl.train_subscription_id AS tracked_train_id, \
@@ -1839,7 +1843,7 @@ pub(crate) async fn list_committed_legs_for_today(
         .map(|row| {
             Ok(CommittedLeg {
                 journey_leg_id: row.try_get("journey_leg_id")?,
-                journey_id: row.try_get("journey_id")?,
+                journey_public_id: row.try_get("journey_public_id")?,
                 user_id: row.try_get("user_id")?,
                 origin_crs: row.try_get("origin_crs")?,
                 destination_crs: row.try_get("destination_crs")?,
@@ -2223,7 +2227,8 @@ pub(crate) async fn due_templates_for(
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct CommitCheckLeg {
     pub journey_leg_id: i64,
-    pub journey_id: i64,
+    /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
+    pub journey_public_id: String,
     pub user_id: String,
     pub origin_crs: String,
     pub destination_crs: String,
@@ -2291,7 +2296,8 @@ fn commit_check_legs_sql(filter: &str) -> String {
     let origin = leg_crs_sql(LegEnd::Origin, "jl", "ts", "tr");
     let destination = leg_crs_sql(LegEnd::Destination, "jl", "ts", "tr");
     format!(
-        "SELECT jl.id AS journey_leg_id, jl.journey_id, j.user_id, \
+        "SELECT jl.id AS journey_leg_id, j.public_id AS journey_public_id, \
+                j.user_id, \
                 {origin} AS origin_crs, {destination} AS destination_crs, \
                 so.name AS origin_name, sd.name AS destination_name, \
                 jl.service_date, jl.depart_after, jl.depart_before, jl.arrive_after, jl.arrive_before, \
@@ -4676,6 +4682,17 @@ mod tests {
             .iter()
             .find(|leg| leg.journey_leg_id == journey_leg_id)
             .expect("the seeded leg must be returned");
+        let public_id: String = sqlx::query_scalar("SELECT public_id FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read journeys.public_id");
+        assert_eq!(found.journey_public_id, public_id);
+        assert!(
+            found.journey_public_id.starts_with("j_") && found.journey_public_id.len() == 34,
+            "the opaque id is j_ and 32 hex digits, got {}",
+            found.journey_public_id
+        );
         assert_eq!(found.origin_crs, "RDG");
         assert_eq!(found.destination_crs, "WOK");
         assert_eq!(found.trains_id, trains_id);
@@ -4942,7 +4959,12 @@ mod tests {
             .await
             .expect("query")
             .expect("a journey leg");
-        assert_eq!(context.journey_id, journey_id);
+        let public_id: String = sqlx::query_scalar("SELECT public_id FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read journeys.public_id");
+        assert_eq!(context.journey_public_id, public_id);
         assert_eq!(context.leg_position, 2);
         assert_eq!(context.total_legs, 3);
         assert_eq!(context.origin_name.as_deref(), Some("Test Change"));

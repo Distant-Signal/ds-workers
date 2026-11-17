@@ -120,7 +120,7 @@ mod tests {
     /// A `CommittedLeg` built directly in Rust -- `leg_is_skipped` takes
     /// `&CommittedLeg`, not a `journey_leg_id`, so there's no need to seed
     /// `journeys`/`journey_legs`/`train_subscriptions` rows at all just to
-    /// exercise this function. `journey_leg_id`/`journey_id`/`trains_id`
+    /// exercise this function. `journey_leg_id`/`trains_id`
     /// are never read by `leg_is_skipped` (only the CRS/match-target fields
     /// are), so `-1` sentinels are fine here. `train_origin_crs: None` keeps
     /// this fixture on the `destination_skipped` branch only -- the
@@ -131,7 +131,7 @@ mod tests {
     fn leg(origin_crs: &str, destination_crs: &str, match_target: &str) -> CommittedLeg {
         CommittedLeg {
             journey_leg_id: -1,
-            journey_id: -1,
+            journey_public_id: String::new(),
             user_id: "TEST-SKIP-CHECK".to_string(),
             origin_crs: origin_crs.to_string(),
             destination_crs: destination_crs.to_string(),
