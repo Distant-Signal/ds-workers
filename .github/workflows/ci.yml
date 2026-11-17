@@ -27,7 +27,7 @@ jobs:
   # git source allowed is Distant-Signal/ds-core), rustfmt, and cargo build
   # and test (the tests that need no database).
   rust:
-    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@4ffee4c03a4f18c5b45d065a04e389353e9d186a # main
+    uses: Distant-Signal/ci/.github/workflows/rust-ci.yml@0473da68a2af3101d91a7843b6df0e0742765d0f # main
     with:
       # renovate: datasource=rust-version depName=rust
       toolchain: 1.99.0
