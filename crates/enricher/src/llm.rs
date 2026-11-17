@@ -5721,3 +5721,159 @@ mod tests {
         );
     }
 }
+
+/// Pins the London date and weekday the primary pass's request states for a
+/// reference instant, around both clock changes of 2025 and 2026 and at the
+/// UTC/London date boundary. Expected values come from an independent
+/// implementation of the IANA rules.
+#[cfg(test)]
+mod reference_date_pinning_tests {
+    use super::*;
+
+    /// `(reference instant, "%A %-d %B %Y" in London)`.
+    #[rustfmt::skip]
+    const CASES: &[(&str, &str)] = &[
+        ("2025-03-29T22:00:00Z", "Saturday 29 March 2025"),
+        ("2025-03-29T23:00:00Z", "Saturday 29 March 2025"),
+        ("2025-03-29T23:30:00Z", "Saturday 29 March 2025"),
+        ("2025-03-30T00:00:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T00:30:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T00:59:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T01:00:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T01:01:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T01:30:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T01:59:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T02:00:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T02:30:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T03:00:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T12:00:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T22:59:00Z", "Sunday 30 March 2025"),
+        ("2025-03-30T23:00:00Z", "Monday 31 March 2025"),
+        ("2025-03-30T23:30:00Z", "Monday 31 March 2025"),
+        ("2025-03-31T00:30:00Z", "Monday 31 March 2025"),
+        ("2025-10-25T22:00:00Z", "Saturday 25 October 2025"),
+        ("2025-10-25T23:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-25T23:30:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T00:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T00:30:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T00:59:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T01:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T01:01:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T01:30:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T01:59:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T02:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T02:30:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T03:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T12:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T22:59:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T23:00:00Z", "Sunday 26 October 2025"),
+        ("2025-10-26T23:30:00Z", "Sunday 26 October 2025"),
+        ("2025-10-27T00:30:00Z", "Monday 27 October 2025"),
+        ("2025-12-31T22:00:00Z", "Wednesday 31 December 2025"),
+        ("2025-12-31T22:59:00Z", "Wednesday 31 December 2025"),
+        ("2025-12-31T23:00:00Z", "Wednesday 31 December 2025"),
+        ("2025-12-31T23:30:00Z", "Wednesday 31 December 2025"),
+        ("2025-12-31T23:59:00Z", "Wednesday 31 December 2025"),
+        ("2026-01-01T00:00:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T00:30:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T00:59:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T01:00:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T01:30:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T01:59:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T02:00:00Z", "Thursday 1 January 2026"),
+        ("2026-01-01T02:30:00Z", "Thursday 1 January 2026"),
+        ("2026-01-15T22:00:00Z", "Thursday 15 January 2026"),
+        ("2026-01-15T22:59:00Z", "Thursday 15 January 2026"),
+        ("2026-01-15T23:00:00Z", "Thursday 15 January 2026"),
+        ("2026-01-15T23:30:00Z", "Thursday 15 January 2026"),
+        ("2026-01-15T23:59:00Z", "Thursday 15 January 2026"),
+        ("2026-01-16T00:00:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T00:30:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T00:59:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T01:00:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T01:30:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T01:59:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T02:00:00Z", "Friday 16 January 2026"),
+        ("2026-01-16T02:30:00Z", "Friday 16 January 2026"),
+        ("2026-03-28T22:00:00Z", "Saturday 28 March 2026"),
+        ("2026-03-28T23:00:00Z", "Saturday 28 March 2026"),
+        ("2026-03-28T23:30:00Z", "Saturday 28 March 2026"),
+        ("2026-03-29T00:00:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T00:30:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T00:59:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T01:00:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T01:01:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T01:30:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T01:59:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T02:00:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T02:30:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T03:00:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T12:00:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T22:59:00Z", "Sunday 29 March 2026"),
+        ("2026-03-29T23:00:00Z", "Monday 30 March 2026"),
+        ("2026-03-29T23:30:00Z", "Monday 30 March 2026"),
+        ("2026-03-30T00:30:00Z", "Monday 30 March 2026"),
+        ("2026-06-30T22:00:00Z", "Tuesday 30 June 2026"),
+        ("2026-06-30T22:59:00Z", "Tuesday 30 June 2026"),
+        ("2026-06-30T23:00:00Z", "Wednesday 1 July 2026"),
+        ("2026-06-30T23:30:00Z", "Wednesday 1 July 2026"),
+        ("2026-06-30T23:59:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T00:00:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T00:30:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T00:59:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T01:00:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T01:30:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T01:59:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T02:00:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-01T02:30:00Z", "Wednesday 1 July 2026"),
+        ("2026-07-15T22:00:00Z", "Wednesday 15 July 2026"),
+        ("2026-07-15T22:59:00Z", "Wednesday 15 July 2026"),
+        ("2026-07-15T23:00:00Z", "Thursday 16 July 2026"),
+        ("2026-07-15T23:30:00Z", "Thursday 16 July 2026"),
+        ("2026-07-15T23:59:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T00:00:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T00:30:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T00:59:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T01:00:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T01:30:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T01:59:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T02:00:00Z", "Thursday 16 July 2026"),
+        ("2026-07-16T02:30:00Z", "Thursday 16 July 2026"),
+        ("2026-10-24T22:00:00Z", "Saturday 24 October 2026"),
+        ("2026-10-24T23:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-24T23:30:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T00:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T00:30:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T00:59:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T01:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T01:01:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T01:30:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T01:59:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T02:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T02:30:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T03:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T12:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T22:59:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T23:00:00Z", "Sunday 25 October 2026"),
+        ("2026-10-25T23:30:00Z", "Sunday 25 October 2026"),
+        ("2026-10-26T00:30:00Z", "Monday 26 October 2026"),
+    ];
+
+    #[test]
+    fn the_primary_request_names_the_london_date() {
+        let prompts = crate::profile::PromptSet::default();
+        for &(at, expected) in CASES {
+            let spec = primary_spec(&prompts, "summary", "description", at.parse().unwrap());
+            let stated = format!("({expected} in Europe/London)");
+            assert!(
+                spec.user_content.contains(&stated),
+                "at {at}: {} lacks {stated}",
+                spec.user_content
+            );
+            assert!(
+                spec.user_content.contains(&at.replace('Z', "+00:00")),
+                "at {at}: the RFC 3339 instant is missing"
+            );
+        }
+    }
+}
