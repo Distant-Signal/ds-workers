@@ -32,15 +32,14 @@ ignore = [
     # p256 0.13, with no newer web-push. The full reasoning, and the
     # 2027-02-05 review date, are in osv-scanner.toml (DS-337).
     { id = "RUSTSEC-2026-0387", reason = "only via web-push's VAPID signing; no web-push release on crypto-bigint 0.7; see osv-scanner.toml" }, # expires 2027-02-05
-    # chrono and chrono-tz: informational "unmaintained" advisories
-    # (RUSTSEC-2026-0543, RUSTSEC-2026-0555), not vulnerabilities. All
+    # chrono: informational "unmaintained" advisory
+    # (RUSTSEC-2026-0543), not a vulnerability. All
     # versions are affected and no patched release exists. chrono is a
     # direct dependency across the Distant-Signal Rust repositories, plus
     # the sqlx, schemars and ts-rs integrations; the advisory suggests
     # jiff or time, but a move is a cross-repo effort. Revisit before the
     # expiry: migrate if a plan exists, else re-read the advisory and renew.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (informational, no patched version); a move to jiff or time is a cross-repo effort" }, # expires 2027-02-17
     # humantime: informational "unmaintained" advisory (RUSTSEC-2026-0542).
     # Transitive only, via object_store (the aggregator's S3 archive), which
     # requires it unconditionally. Upstream fix: apache/arrow-rs-object-store
