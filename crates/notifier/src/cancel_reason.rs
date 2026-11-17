@@ -141,6 +141,8 @@ pub(crate) async fn summary_for_train(
 struct FollowupRow {
     user_id: String,
     tracked_train_id: i64,
+    /// `train_subscriptions.public_id`: the id the push's URL and tag use (DS-534).
+    tracked_train_public_id: String,
     trains_id: i64,
     last_notified_delay_minutes: Option<i32>,
 }
@@ -153,7 +155,8 @@ pub(crate) async fn run_reason_followup_cycle(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let rows: Vec<FollowupRow> = sqlx::query_as(
-        "SELECT ns.user_id, ns.tracked_train_id, ts.trains_id, ns.last_notified_delay_minutes \
+        "SELECT ns.user_id, ns.tracked_train_id, ts.public_id AS tracked_train_public_id, \
+                ts.trains_id, ns.last_notified_delay_minutes \
          FROM train_notification_state ns \
          JOIN train_subscriptions ts ON ts.id = ns.tracked_train_id \
          JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
@@ -187,7 +190,7 @@ pub(crate) async fn run_reason_followup_cycle(
         let journey_context =
             crate::queries::journey_leg_for_train_subscription(pool, row.tracked_train_id).await?;
         let payload = crate::build_train_notification_payload(
-            row.tracked_train_id,
+            &row.tracked_train_public_id,
             "cancelled",
             None,
             journey_context.as_ref(),
