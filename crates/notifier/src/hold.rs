@@ -33,7 +33,9 @@
 //! user's quiet hours are over it checks the hold again, against what has
 //! been sent since and the current state, and enqueues it only when it is
 //! still news ([`decide_release`]): the user still wants that kind of push,
-//! a line push's rank is not the one they were last sent, a train push
+//! the line's current rank (not the held one: the line may have moved on
+//! while the push waited) is not the one they were last sent, and that
+//! current rank is what is sent, a train push
 //! still escalates past what they were last sent (a cancellation that went
 //! through in the meantime outranks a held delay), the train has not
 //! finished (or, for a predicted late start, not started), no open journey
@@ -246,8 +248,10 @@ async fn quiet_hours_for(pool: &PgPool, user_id: &str) -> anyhow::Result<(QuietH
 }
 
 /// Hands one decided push on: to the queue, to `notification_holds`, or
-/// nowhere while the user's quiet hours last ([`gate`]). A push that goes
-/// to the queue deletes its target's hold: it is newer.
+/// nowhere while the user's quiet hours last ([`gate`]). A push the queue
+/// accepts deletes its target's hold: it is newer. One the queue refuses
+/// leaves the hold alone, so the older push still has its chance at release
+/// (review finding N6).
 pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyhow::Result<()> {
     let (quiet, leave_by_quiet_hours) = if is_account_security_notice(&job.delivered) {
         (Quiet::No, true)
@@ -264,14 +268,18 @@ pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyh
                     "cancellation_through"
                 });
             }
-            if let Some(target) = hold_target(&job.delivered) {
+            let user_id = job.user_id.clone();
+            let target = hold_target(&job.delivered);
+            let outcome = queue.enqueue(job);
+            if let Some(target) = target
+                && replaces_hold(outcome)
+            {
                 sqlx::query("DELETE FROM notification_holds WHERE user_id = $1 AND target = $2")
-                    .bind(&job.user_id)
+                    .bind(&user_id)
                     .bind(&target)
                     .execute(pool)
                     .await?;
             }
-            queue.enqueue(job);
         }
         Gate::Hold => {
             store_hold(pool, &job).await?;
@@ -287,6 +295,12 @@ pub(crate) async fn dispatch(pool: &PgPool, queue: &Queue, job: PushJob) -> anyh
         }
     }
     Ok(())
+}
+
+/// Whether a push the queue took (or refused) replaces its target's hold:
+/// only one it accepted.
+fn replaces_hold(outcome: EnqueueOutcome) -> bool {
+    !matches!(outcome, EnqueueOutcome::Dropped(_))
 }
 
 async fn store_hold(pool: &PgPool, job: &PushJob) -> anyhow::Result<()> {
@@ -375,6 +389,14 @@ pub(crate) struct HoldRow {
     pub still_wanted: bool,
     /// The rank of the last line push delivered for this line.
     pub line_last_rank: Option<i16>,
+    /// The line's newest `line_status_history` statuses, for
+    /// [`HoldRow::line_current_rank`].
+    pub line_current_statuses: Option<serde_json::Value>,
+    /// The line's rank now ([`crate::queries::rank_of_statuses_json`] of
+    /// `line_current_statuses`), filled in after the query; `None` when it
+    /// is unknown, and then the held rank stands.
+    #[sqlx(skip)]
+    pub line_current_rank: Option<u8>,
     /// The last train push delivered for this subscription.
     pub last_notified_status: Option<String>,
     pub last_notified_delay_minutes: Option<i32>,
@@ -415,11 +437,19 @@ pub(crate) fn decide_release(
     if !hold.still_wanted {
         return Release::Drop("opted_out");
     }
-    if let Some(rank) = hold.line_rank {
-        return if hold.line_last_rank == Some(rank) {
-            Release::Drop("already_sent")
-        } else {
-            Release::Send
+    if hold.line_rank.is_some() {
+        // The line's rank now, not the held one: a line that went 0 to 4
+        // and back to 0 in quiet hours is not news to a user last told 0
+        // (review finding N1).
+        let Some(rank) = line_rank_to_send(hold) else {
+            return Release::Drop("unknown");
+        };
+        return match hold.line_last_rank {
+            Some(last) if last == i16::from(rank) => Release::Drop("already_sent"),
+            // Never told anything about this line and it is healthy now:
+            // nothing to say.
+            None if rank == 0 => Release::Drop("already_sent"),
+            _ => Release::Send,
         };
     }
     let Some(status) = hold.train_status.as_deref() else {
@@ -443,8 +473,20 @@ pub(crate) fn decide_release(
     }
 }
 
+/// The rank a released line hold names: the line's current rank, else the
+/// held one.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a stored line rank is a severity rank, 0..=4"
+)]
+fn line_rank_to_send(hold: &HoldRow) -> Option<u8> {
+    hold.line_current_rank
+        .or_else(|| hold.line_rank.map(|rank| rank as u8))
+}
+
 async fn held_rows(pool: &PgPool) -> anyhow::Result<Vec<HoldRow>> {
-    Ok(sqlx::query_as(
+    let mut rows: Vec<HoldRow> = sqlx::query_as(
         "SELECT h.user_id, h.target, h.line_id, h.line_rank, h.tracked_train_id, \
                 h.train_status, h.train_delay_minutes, h.title, h.body, h.url, h.tag, \
                 h.decided_at, h.expires_at, \
@@ -463,7 +505,8 @@ async fn held_rows(pool: &PgPool) -> anyhow::Result<Vec<HoldRow>> {
                 END AS still_wanted, \
                 lns.last_notified_severity_rank AS line_last_rank, \
                 tns.last_notified_status, tns.last_notified_delay_minutes, \
-                cs.status AS current_train_status, p.delay_threshold_minutes \
+                cs.status AS current_train_status, p.delay_threshold_minutes, \
+                lh.statuses AS line_current_statuses \
          FROM notification_holds h \
          LEFT JOIN notification_preferences p ON p.user_id = h.user_id \
          LEFT JOIN line_notification_state lns \
@@ -472,11 +515,21 @@ async fn held_rows(pool: &PgPool) -> anyhow::Result<Vec<HoldRow>> {
          LEFT JOIN train_notification_state tns \
            ON tns.user_id = h.user_id AND tns.tracked_train_id = h.tracked_train_id \
          LEFT JOIN train_current_state cs ON cs.trains_id = ts.trains_id \
+         LEFT JOIN LATERAL ( \
+             SELECT statuses FROM line_status_history \
+             WHERE line_id = h.line_id ORDER BY id DESC LIMIT 1 \
+         ) lh ON h.line_id IS NOT NULL \
          ORDER BY h.decided_at, h.user_id, h.target \
          LIMIT 1000",
     )
     .fetch_all(pool)
-    .await?)
+    .await?;
+    for row in &mut rows {
+        if let (Some(line_id), Some(statuses)) = (&row.line_id, row.line_current_statuses.take()) {
+            row.line_current_rank = crate::queries::rank_of_statuses_json(line_id, statuses);
+        }
+    }
+    Ok(rows)
 }
 
 /// Deletes the hold, unless a newer decision replaced it meanwhile.
@@ -506,7 +559,8 @@ pub(crate) async fn run_release_cycle(
         if release == Release::Send
             && let Some(tracked_train_id) = hold.tracked_train_id
             && crate::break_notices::enabled()
-            && crate::break_notices::break_owns_train(pool, &hold.user_id, tracked_train_id).await?
+            && crate::break_notices::break_owns_train(pool, &hold.user_id, tracked_train_id, now)
+                .await?
         {
             release = Release::Drop("break_owns_train");
         }
@@ -546,16 +600,11 @@ pub(crate) async fn run_release_cycle(
     Ok(())
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "a stored line rank is a severity rank, 0..=3"
-)]
 fn delivered_of(hold: &HoldRow) -> Option<Delivered> {
-    if let (Some(line_id), Some(rank)) = (&hold.line_id, hold.line_rank) {
+    if let Some(line_id) = &hold.line_id {
         return Some(Delivered::Line {
             line_id: line_id.clone(),
-            rank: rank as u8,
+            rank: line_rank_to_send(hold)?,
         });
     }
     Some(Delivered::Train {
@@ -607,6 +656,23 @@ mod tests {
     #[test]
     fn no_quiet_hours_never_holds() {
         assert!(!in_quiet_hours(&QuietHours::default(), utc(3, 0)));
+    }
+
+    /// Review finding N6: a push the queue refuses must not take the
+    /// target's hold with it.
+    #[test]
+    fn only_an_accepted_push_replaces_its_hold() {
+        use crate::push_queue::DropReason;
+        assert!(replaces_hold(EnqueueOutcome::Queued));
+        assert!(replaces_hold(EnqueueOutcome::Superseded));
+        assert!(replaces_hold(EnqueueOutcome::Duplicate));
+        for reason in [
+            DropReason::QueueFull,
+            DropReason::UserQueueFull,
+            DropReason::ShuttingDown,
+        ] {
+            assert!(!replaces_hold(EnqueueOutcome::Dropped(reason)));
+        }
     }
 
     #[test]
@@ -758,6 +824,8 @@ mod tests {
             snoozed_until: None,
             still_wanted: true,
             line_last_rank: None,
+            line_current_statuses: None,
+            line_current_rank: None,
             last_notified_status: None,
             last_notified_delay_minutes: None,
             current_train_status: Some("en_route".into()),
@@ -824,5 +892,206 @@ mod tests {
             decide_release(&hold, utc(7, 0), 15),
             Release::Drop("already_sent")
         );
+    }
+
+    fn line_hold(held: i16, last: Option<i16>, current: Option<u8>) -> HoldRow {
+        HoldRow {
+            target: "line:victoria".into(),
+            line_id: Some("victoria".into()),
+            line_rank: Some(held),
+            tracked_train_id: None,
+            train_status: None,
+            line_last_rank: last,
+            line_current_rank: current,
+            ..train_hold("en_route", None)
+        }
+    }
+
+    /// Review finding N1: the user was last told 0, the line went 0 to 4
+    /// (held) and back to 0 in quiet hours. The hold is not news.
+    #[test]
+    fn a_line_hold_is_dropped_when_the_line_is_back_where_the_user_was_told() {
+        let hold = line_hold(4, Some(0), Some(0));
+        assert_eq!(
+            decide_release(&hold, utc(7, 0), 15),
+            Release::Drop("already_sent")
+        );
+        // Never told anything, and the line is healthy again.
+        let hold = line_hold(4, None, Some(0));
+        assert_eq!(
+            decide_release(&hold, utc(7, 0), 15),
+            Release::Drop("already_sent")
+        );
+    }
+
+    /// A line that moved on while its push was held sends where it is now.
+    #[test]
+    fn a_released_line_hold_names_the_lines_current_rank() {
+        let hold = line_hold(4, Some(0), Some(2));
+        assert_eq!(decide_release(&hold, utc(7, 0), 15), Release::Send);
+        assert_eq!(
+            delivered_of(&hold),
+            Some(Delivered::Line {
+                line_id: "victoria".into(),
+                rank: 2
+            })
+        );
+        // Without a current rank the held one stands.
+        let hold = line_hold(4, Some(0), None);
+        assert_eq!(decide_release(&hold, utc(7, 0), 15), Release::Send);
+        assert_eq!(
+            delivered_of(&hold),
+            Some(Delivered::Line {
+                line_id: "victoria".into(),
+                rank: 4
+            })
+        );
+        // Still at the held rank, which the user was already told.
+        let hold = line_hold(4, Some(4), Some(4));
+        assert_eq!(
+            decide_release(&hold, utc(7, 0), 15),
+            Release::Drop("already_sent")
+        );
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    const USER: &str = "TEST-HOLD-LINE-USER";
+    const LINE: &str = "TEST-HOLD-LINE";
+
+    async fn connect() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        sqlx::postgres::PgPoolOptions::new()
+            .connect(&database_url)
+            .await
+            .expect("connect to postgres")
+    }
+
+    async fn cleanup(pool: &PgPool) {
+        for sql in [
+            "DELETE FROM notification_holds WHERE user_id = $1",
+            "DELETE FROM line_notification_state WHERE user_id = $1",
+            "DELETE FROM pinned_lines WHERE user_id = $1",
+            "DELETE FROM users WHERE id = $1",
+        ] {
+            sqlx::query(sql).bind(USER).execute(pool).await.expect(sql);
+        }
+        sqlx::query("DELETE FROM line_status_history WHERE line_id = $1")
+            .bind(LINE)
+            .execute(pool)
+            .await
+            .expect("history");
+    }
+
+    fn statuses(severity: common::Severity) -> serde_json::Value {
+        serde_json::to_value(vec![common::LineStatus {
+            severity,
+            reason: String::new(),
+            validity: common::ValidityPeriod {
+                from_date: Utc::now(),
+                to_date: None,
+                is_now: true,
+            },
+            disruption: None,
+            data_quality: common::DataQuality::default(),
+            sample_stats: None,
+            sample_availability: common::SampleAvailability::NoCoverage,
+            full_coverage_stats: None,
+            full_coverage_availability: common::FullCoverageAvailability::NotEnabled,
+        }])
+        .expect("statuses")
+    }
+
+    async fn add_history(pool: &PgPool, severity: common::Severity) {
+        sqlx::query(
+            "INSERT INTO line_status_history (line_id, statuses, computed_at) VALUES ($1, $2, now())",
+        )
+        .bind(LINE)
+        .bind(statuses(severity))
+        .execute(pool)
+        .await
+        .expect("history");
+    }
+
+    /// Review finding N1: told 0, the line went 0 to severe (held) and back
+    /// to good in quiet hours. The hold reads the line's current rank and is
+    /// dropped; while the line is still bad it is released.
+    #[tokio::test]
+    #[ignore = "requires a live database: DATABASE_URL"]
+    async fn a_line_hold_is_decided_on_the_lines_current_rank() {
+        let pool = connect().await;
+        cleanup(&pool).await;
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1)")
+            .bind(USER)
+            .execute(&pool)
+            .await
+            .expect("user");
+        sqlx::query(
+            "INSERT INTO pinned_lines (user_id, line_id, pinned_at) VALUES ($1, $2, now())",
+        )
+        .bind(USER)
+        .bind(LINE)
+        .execute(&pool)
+        .await
+        .expect("pin");
+        sqlx::query(
+            "INSERT INTO line_notification_state (user_id, line_id, last_notified_severity_rank, \
+                                                  last_notified_at) \
+             VALUES ($1, $2, 0, now() - INTERVAL '1 day')",
+        )
+        .bind(USER)
+        .bind(LINE)
+        .execute(&pool)
+        .await
+        .expect("state");
+        let severe = common::severity_rank(common::Severity::SevereDelays);
+        let now = Utc::now();
+        store_hold(
+            &pool,
+            &PushJob {
+                user_id: USER.into(),
+                payload: NotificationPayload {
+                    title: "t".into(),
+                    body: "b".into(),
+                    url: "/u".into(),
+                    tag: "line".into(),
+                    renotify: false,
+                },
+                delivered: Delivered::Line {
+                    line_id: LINE.into(),
+                    rank: severe,
+                },
+                decided_at: now,
+            },
+        )
+        .await
+        .expect("hold");
+        let ours = |rows: Vec<HoldRow>| {
+            rows.into_iter()
+                .find(|row| row.user_id == USER)
+                .expect("our hold")
+        };
+
+        add_history(&pool, common::Severity::GoodService).await;
+        add_history(&pool, common::Severity::SevereDelays).await;
+        let hold = ours(held_rows(&pool).await.expect("rows"));
+        assert_eq!(hold.line_current_rank, Some(severe));
+        assert_eq!(decide_release(&hold, now, 15), Release::Send);
+
+        add_history(&pool, common::Severity::GoodService).await;
+        let hold = ours(held_rows(&pool).await.expect("rows"));
+        assert_eq!(
+            hold.line_current_rank,
+            Some(common::severity_rank(common::Severity::GoodService))
+        );
+        assert_eq!(
+            decide_release(&hold, now, 15),
+            Release::Drop("already_sent")
+        );
+        cleanup(&pool).await;
     }
 }

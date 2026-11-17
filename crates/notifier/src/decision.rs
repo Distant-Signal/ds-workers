@@ -38,6 +38,15 @@ pub(crate) fn is_severity_transition(previous_rank: Option<u8>, new_rank: u8) ->
 /// objective transition (shared across every user pinning this line);
 /// `last_notified_rank`/`last_notified_at` are this specific user's own
 /// notification history for this line.
+///
+/// Whether the change is an escalation is judged against what the user was
+/// last told when there is a record of it, else against the line's previous
+/// rank: a user told rank 4 whose line went 4 to 0 (held by the cooldown)
+/// and then 0 to 2 sees a de-escalation from 4 to 2, which waits for the
+/// cooldown (and `line_recheck`); a user told 0 whose line went 0 to 4 to 2
+/// within one poll (only the newest row notifies,
+/// `queries::newest_candidate_per_line`) sees an escalation from 0 to 2,
+/// which goes at once.
 pub(crate) fn decide_user_notification(
     previous_rank: u8,
     new_rank: u8,
@@ -52,7 +61,7 @@ pub(crate) fn decide_user_notification(
         // position -- do not re-notify.
         return NotifyDecision::Skip;
     }
-    let escalated = new_rank > previous_rank;
+    let escalated = new_rank > last_notified_rank.unwrap_or(previous_rank);
     if escalated {
         return NotifyDecision::NotifyNow;
     }
@@ -559,6 +568,33 @@ mod tests {
         assert_eq!(
             decide_deferred_deescalation(minor, closed, old, now, cooldown),
             NotifyDecision::Skip
+        );
+    }
+
+    /// Review finding N2: escalation is judged against what the user was
+    /// last told, so collapsing a poll to each line's newest row neither
+    /// loses an escalation nor skips the cooldown.
+    #[test]
+    fn escalation_is_judged_against_what_the_user_was_last_told() {
+        let now = Utc::now();
+        let cooldown = Duration::minutes(20);
+        let recent = Some(now - Duration::minutes(5));
+        // Told 0 five minutes ago; the line went 0 to 4 to 2 in one poll and
+        // only the 4 to 2 row is decided: still an escalation for this user.
+        assert_eq!(
+            decide_user_notification(4, 2, Some(0), recent, now, cooldown),
+            NotifyDecision::NotifyNow
+        );
+        // Told 4 five minutes ago; the line went 4 to 0 then 0 to 2: a
+        // de-escalation for this user, held by the cooldown.
+        assert_eq!(
+            decide_user_notification(0, 2, Some(4), recent, now, cooldown),
+            NotifyDecision::Skip
+        );
+        // Never told: the line's own transition decides.
+        assert_eq!(
+            decide_user_notification(4, 2, None, None, now, cooldown),
+            NotifyDecision::NotifyNow
         );
     }
 

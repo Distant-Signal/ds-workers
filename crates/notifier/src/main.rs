@@ -486,6 +486,8 @@ async fn run_cycle(
         line_history_max_age,
     )
     .await?;
+    // Only a line's newest transition may notify (`newest_candidate_per_line`).
+    let line_candidates = queries::newest_candidate_per_line(line_candidates);
 
     for candidate in &line_candidates {
         // Mirrors `notify_train_candidates`'s own per-candidate log, and is
@@ -617,8 +619,13 @@ async fn notify_train_candidates(
         // One push per user per train (mid-journey changes spec §6.3): an
         // open break on a journey using this train owns its push.
         if break_notices::enabled()
-            && break_notices::break_owns_train(pool, &candidate.user_id, candidate.tracked_train_id)
-                .await?
+            && break_notices::break_owns_train(
+                pool,
+                &candidate.user_id,
+                candidate.tracked_train_id,
+                now,
+            )
+            .await?
         {
             tracing::info!(
                 tracked_train_id = candidate.tracked_train_id,
@@ -876,8 +883,13 @@ async fn predicted_start_pushes(
     }
     let mut pushes = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        if break_notices::break_owns_train(pool, &candidate.user_id, candidate.tracked_train_id)
-            .await?
+        if break_notices::break_owns_train(
+            pool,
+            &candidate.user_id,
+            candidate.tracked_train_id,
+            now,
+        )
+        .await?
         {
             tracing::info!(
                 tracked_train_id = candidate.tracked_train_id,
@@ -1152,6 +1164,33 @@ async fn run_skip_check_cycle(
             != decision::NotifyDecision::NotifyNow
         {
             continue;
+        }
+        // One push per user per train (mid-journey changes spec §6.3): a
+        // break the train triggered that already says it no longer stops
+        // where planned is this push (review finding N3,
+        // `break_notices::skipped_stop_break`).
+        if break_notices::enabled() {
+            let state =
+                break_notices::train_break_state(pool, &leg.user_id, leg.tracked_train_id, now)
+                    .await?;
+            let deferral = break_notices::skipped_stop_break(&state);
+            if deferral != break_notices::SkippedStopBreak::None {
+                if deferral == break_notices::SkippedStopBreak::Told {
+                    queries::upsert_skip_notification_state(
+                        pool,
+                        &leg.user_id,
+                        leg.journey_leg_id,
+                        true,
+                        now,
+                    )
+                    .await?;
+                }
+                tracing::info!(
+                    journey_leg_id = leg.journey_leg_id,
+                    "skipped-stop push deferred to the journey's break notice"
+                );
+                continue;
+            }
         }
 
         let payload = NotificationPayload {

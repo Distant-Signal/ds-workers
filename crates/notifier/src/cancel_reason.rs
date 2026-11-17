@@ -168,8 +168,13 @@ pub(crate) async fn run_reason_followup_cycle(
     .fetch_all(pool)
     .await?;
     for row in rows {
+        // Only a break whose notice is due owns the follow-up: that notice
+        // carries the reason and its delivery clears the window. A window
+        // still open after a notice went out belongs to a plain
+        // cancellation push sent past the notice (a connection-missed
+        // notice, then the train cancelled), whose reason is news.
         if crate::break_notices::enabled()
-            && crate::break_notices::break_owns_train(pool, &row.user_id, row.tracked_train_id)
+            && crate::break_notices::break_owns_train(pool, &row.user_id, row.tracked_train_id, now)
                 .await?
         {
             continue;

@@ -375,12 +375,14 @@ fn count_once(key: (i64, i64), result: &'static str) {
 
 /// Whether the reminder for `row` is owned by a break: an open break on
 /// the journey, or one owning its first train's push.
-async fn break_owns(pool: &PgPool, row: &LeaveRow) -> anyhow::Result<bool> {
+async fn break_owns(pool: &PgPool, row: &LeaveRow, now: DateTime<Utc>) -> anyhow::Result<bool> {
     if row.open_break {
         return Ok(true);
     }
     match row.tracked_train_id {
-        Some(train) => crate::break_notices::break_owns_train(pool, &row.user_id, train).await,
+        Some(train) => {
+            crate::break_notices::break_covers_train(pool, &row.user_id, train, now).await
+        }
         None => Ok(false),
     }
 }
@@ -400,7 +402,7 @@ pub(crate) async fn run_leave_reminder_cycle(
             leave_by: row.leave_by_at,
             departure: row.departure,
             lead: Duration::minutes(i64::from(row.lead_minutes)),
-            break_owns: break_owns(pool, &row).await?,
+            break_owns: break_owns(pool, &row, now).await?,
             sent: row.leave_by_sent,
             pushes: row.pushes,
             max_pushes: settings.max_pushes,
@@ -611,6 +613,22 @@ pub(crate) fn summary_due(first_leave_by: DateTime<Utc>, now: DateTime<Utc>) -> 
     now >= first_leave_by - SUMMARY_LEAD && now < first_leave_by
 }
 
+/// The first half of a morning summary's [`count_once`] key: the user, so
+/// two users whose days start at the same leave-by are each counted (it was
+/// `0` for every user, and the second summary went uncounted). Negative, so
+/// it never meets a journey id.
+fn summary_count_key(user_id: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    user_id.hash(&mut hasher);
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "only the bits matter: it is a hash, folded to a negative key"
+    )]
+    let key = (hasher.finish() >> 1) as i64;
+    -key - 1
+}
+
 async fn run_morning_summaries(
     pool: &PgPool,
     queue: &PushQueue<PgBackend>,
@@ -627,7 +645,10 @@ async fn run_morning_summaries(
             continue;
         }
         let user_id = user_rows[0].user_id.clone();
-        count_once((0, first_leave_by.timestamp()), "summary_sent");
+        count_once(
+            (summary_count_key(&user_id), first_leave_by.timestamp()),
+            "summary_sent",
+        );
         crate::hold::dispatch(
             pool,
             queue,
@@ -654,6 +675,16 @@ mod tests {
 
     fn at(h: u32, m: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 9, h, m, 0).unwrap()
+    }
+
+    /// Two users whose days start at the same leave-by each get their own
+    /// summary count, and the key never meets a journey id.
+    #[test]
+    fn a_summary_is_counted_per_user() {
+        let (a, b) = (summary_count_key("user-a"), summary_count_key("user-b"));
+        assert_ne!(a, b);
+        assert!(a < 0 && b < 0);
+        assert_eq!(a, summary_count_key("user-a"));
     }
 
     fn row() -> LeaveRow {

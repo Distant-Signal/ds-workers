@@ -138,6 +138,7 @@ mod tests {
             origin_name: None,
             destination_name: None,
             trains_id: -1,
+            tracked_train_id: -1,
             pin_destination_crs: Some(match_target.to_string()),
             next_calling_point: None,
             train_origin_crs: None,
