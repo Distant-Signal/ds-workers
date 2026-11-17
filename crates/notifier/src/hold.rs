@@ -222,7 +222,10 @@ type QuietHoursRow = (
 
 /// The user's quiet hours and snooze, and their leave-by "During quiet
 /// hours" switch (on without a row).
-async fn quiet_hours_for(pool: &PgPool, user_id: &str) -> anyhow::Result<(QuietHours, bool)> {
+pub(crate) async fn quiet_hours_for(
+    pool: &PgPool,
+    user_id: &str,
+) -> anyhow::Result<(QuietHours, bool)> {
     let row: Option<QuietHoursRow> = sqlx::query_as(
         "SELECT quiet_hours_start, quiet_hours_end, quiet_hours_timezone, snoozed_until, \
                 leave_by_quiet_hours \

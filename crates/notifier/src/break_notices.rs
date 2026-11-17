@@ -75,7 +75,7 @@ pub(crate) struct BreakNoticeRow {
 /// The [`BreakNoticeRow`] columns and joins over open breaks with
 /// suggestions ready (`b`), shared by [`breaks_to_notify`] and
 /// [`train_break_state`] so both decide on the same row.
-const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, b.user_id, b.cause, b.severity, b.notified_severity, \
+pub(crate) const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, b.user_id, b.cause, b.severity, b.notified_severity, \
                 b.opened_at, b.confirmations, b.suggestions, j.suggestions_muted, \
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
@@ -181,18 +181,6 @@ pub(crate) async fn break_owns_train(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     Ok(train_break_state(pool, user_id, tracked_train_id, now).await? == TrainBreak::Due)
-}
-
-/// Whether a break speaks for the train at all: its notice is due or was
-/// sent. For a push that only adds to what the train's own push said (a
-/// leave-by naming the train), which the break notice replaces.
-pub(crate) async fn break_covers_train(
-    pool: &PgPool,
-    user_id: &str,
-    tracked_train_id: i64,
-    now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    Ok(train_break_state(pool, user_id, tracked_train_id, now).await? != TrainBreak::None)
 }
 
 /// What a break means for a leg's skipped-stop push (review finding N3).
@@ -1111,11 +1099,6 @@ mod db_tests {
             !break_owns_train(&pool, USER, tracked_train_id, now)
                 .await
                 .expect("owns")
-        );
-        assert!(
-            break_covers_train(&pool, USER, tracked_train_id, now)
-                .await
-                .expect("covers")
         );
         assert_eq!(
             train_break_state(&pool, USER, tracked_train_id, now)
