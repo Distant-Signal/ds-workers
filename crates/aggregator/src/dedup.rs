@@ -194,6 +194,16 @@ impl SeenServiceLedger {
         self.seen.retain(|(_, period), _| *period >= retain_from);
     }
 
+    /// The per-cycle prune for a cycle on London day `today`: drops every
+    /// period before YESTERDAY, never yesterday itself. `mark_seen`'s
+    /// day-rollover guard looks a train up in yesterday's bucket, so
+    /// pruning to `today` would empty that bucket on the first cycle after
+    /// midnight: a train seen at 23:58 that is missing from that one cycle
+    /// (a gap in the samples) and back on the next would count twice.
+    pub(crate) fn prune_for_day(&mut self, today: NaiveDate) {
+        self.prune_before(today.pred_opt().unwrap_or(today));
+    }
+
     #[cfg(test)]
     fn tracked_period_count(&self) -> usize {
         self.seen.len()
@@ -641,5 +651,53 @@ mod tests {
         // Pruned period's memory is gone, so the same service_id on that
         // now-forgotten day would count as new again if it recurred -- an
         // accepted tradeoff of bounding memory, not exercised further here.
+    }
+
+    /// The review's case: a train seen at 23:58, missing from the first
+    /// cycle after midnight (whose prune runs), and back on the next cycle
+    /// is the same train, not a new one.
+    #[test]
+    fn prune_for_day_keeps_yesterday_for_the_rollover_guard() {
+        let l = line("alton", &["AHT"]);
+        let defaults = Defaults::default();
+        let mut ledger = SeenServiceLedger::new();
+        let with_train = samples_with("AHT", vec![departure("svc-1", 0, false)]);
+        let without = samples_with("AHT", vec![]);
+
+        let seen = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 30),
+            &l,
+            &with_train,
+            &defaults,
+        );
+        assert_eq!(seen.map(|s| s.total), Some(1));
+        ledger.prune_for_day(day(2026, 8, 30));
+
+        // First cycle of the next day: the train is not in the samples.
+        dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &without,
+            &defaults,
+        );
+        ledger.prune_for_day(day(2026, 8, 31));
+
+        let again = dedup_new_sample_stats(
+            &mut ledger,
+            "alton",
+            day(2026, 8, 31),
+            &l,
+            &with_train,
+            &defaults,
+        );
+        assert!(again.is_none(), "the 23:58 train is not counted twice");
+
+        // Two days on, the old period is dropped.
+        ledger.prune_for_day(day(2026, 9, 2));
+        assert_eq!(ledger.tracked_period_count(), 0);
     }
 }

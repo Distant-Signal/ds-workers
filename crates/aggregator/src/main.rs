@@ -437,8 +437,10 @@ async fn run_cycle(
     window_settings: &full_coverage_window::WindowSettings,
 ) -> anyhow::Result<()> {
     // Every custom line loaded here is merged into the global catalogue and
-    // then fully re-evaluated below -- matcher pass against every active
-    // incident, segment rebuild, `line_status`/stats writes -- on every
+    // then fully re-evaluated below -- its own matcher pass against every
+    // active incident beside the catalogue (`aggregation::MatchSets`: it
+    // never changes the catalogue's or another custom line's matches),
+    // segment rebuild, `line_status`/stats writes -- on every
     // cycle, for as long as it exists. That per-cycle cost is what
     // `crates/api`'s `custom_lines::MAX_CUSTOM_LINES_PER_USER` bounds at the
     // creation end; there is deliberately no cap enforced here, since
@@ -648,7 +650,7 @@ async fn run_cycle(
         }
         tx.commit().await?;
     }
-    dedup_ledger.prune_before(today);
+    dedup_ledger.prune_for_day(today);
 
     // The full-coverage sibling of the dedup/daily-stats pass above. Unlike
     // that pass, this one is fed each status's raw `full_coverage_stats`
