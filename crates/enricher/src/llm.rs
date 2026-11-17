@@ -1386,8 +1386,18 @@ impl LlmClient {
         model: String,
         request_timeout: std::time::Duration,
     ) -> Self {
+        // No redirects: every request carries the provider credential
+        // (`x-api-key` or a bearer token), and reqwest re-sends custom
+        // headers to the redirect target, so a hostile or compromised
+        // endpoint could bounce it to a host of its choosing. A 3xx is just
+        // a non-success status (`LlmCallError::Status`), logged by status
+        // code only, never its `Location`. An `https://` base URL also pins
+        // the client to https, so nothing can downgrade it.
+        let https_only = base_url.starts_with("https://");
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(https_only)
             .build()
             // Only fails if the TLS backend can't initialize, which would
             // break every request anyway -- there is no useful degraded mode.
@@ -3738,6 +3748,50 @@ mod tests {
                 });
         let err = error_for_status(&retrying_client, &server, 504).await;
         assert!(retrying_client.is_provider_transient(&err), "{err:?}");
+    }
+
+    /// A redirect from the provider endpoint is an error and is not
+    /// followed: the credential header must never reach the `Location`.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_credential_goes_nowhere_else() {
+        let target = MockServer::start().await;
+        let origin = MockServer::start().await;
+        for (provider_path, anthropic) in [("/chat/completions", false), ("/messages", true)] {
+            origin.reset().await;
+            target.reset().await;
+            Mock::given(method("POST"))
+                .and(path(provider_path))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("location", format!("{}/steal", target.uri())),
+                )
+                .mount(&origin)
+                .await;
+            let mut client = LlmClient::new(
+                origin.uri(),
+                Some("sk-test-key".into()),
+                "m".into(),
+                DEFAULT_REQUEST_TIMEOUT,
+            );
+            if anthropic {
+                client = client.with_anthropic(anthropic::AnthropicSettings::default());
+            }
+            let err = client
+                .extract_primary("s", "d", reference_date())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<LlmCallError>(),
+                    Some(LlmCallError::Status { status: 307 })
+                ),
+                "{err:?}"
+            );
+            assert!(
+                target.received_requests().await.unwrap().is_empty(),
+                "the redirect target must receive nothing"
+            );
+        }
     }
 
     /// A refused connection (the provider or a proxy down) is typed as
