@@ -4,7 +4,10 @@
   // The Distant Signal preset (Distant-Signal/ci): grouping, schedules,
   // pinning, and the MSRV and image rules every repository shares. Only
   // ds-workers's own rules are here.
-  "extends": ["github>Distant-Signal/ci//renovate/default.json5"],
+  // Pinned to a Distant-Signal/ci commit: a preset change reaches this
+  // repository only through a PR that moves the sha. Bump it as
+  // Distant-Signal/ci's README ("Renovate preset") describes.
+  "extends": ["github>Distant-Signal/ci//renovate/default.json5#3315550e579c716eaf23501c06f76f90bb12c36b"],
 
   // The builder's rust image and cargo-chef in docker/services.toml, which
   // Distant-Signal/ci's gen-rust-dockerfiles.py renders into every
