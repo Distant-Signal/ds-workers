@@ -828,6 +828,7 @@ mod tests {
     fn open_break(cause: &str) -> BreakNoticeRow {
         BreakNoticeRow {
             id: 5,
+            break_public_id: Some("b_00000000000000000000000000000005".into()),
             journey_id: 7,
             journey_public_id: "j_00000000000000000000000000000042".into(),
             user_id: "u".into(),

@@ -872,6 +872,19 @@ mod tests {
         assert_eq!(hold_target(&current), hold_target(&delivered));
     }
 
+    /// DS-534: a break notice is never held (a quiet-hours cancellation
+    /// goes now, anything else waits for its next cycle), so no
+    /// `notification_holds` row carries a break URL, old numeric or new.
+    #[test]
+    fn a_break_notice_has_no_hold_key() {
+        let delivered = Delivered::JourneyBreak {
+            break_id: 7,
+            severity: 3,
+            trigger: None,
+        };
+        assert_eq!(hold_target(&delivered), None);
+    }
+
     #[test]
     fn a_hold_waits_out_quiet_hours_then_goes_if_still_news() {
         let hold = train_hold("en_route", Some(20));

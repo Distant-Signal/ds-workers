@@ -44,6 +44,11 @@ pub(crate) const OPENED_QUIET: Duration = Duration::minutes(10);
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct BreakNoticeRow {
     pub id: i64,
+    /// `journey_breaks.public_id` (`b_` plus 32 hex, DS-534): the id the
+    /// notice's URL carries. The column is nullable in the schema (a
+    /// validated CHECK and a DEFAULT keep it set), so a NULL falls back to
+    /// the numeric id, which the website still accepts.
+    pub break_public_id: Option<String>,
     pub journey_id: i64,
     /// `journeys.public_id`: the id the website's journey URLs use (DS-534).
     pub journey_public_id: String,
@@ -80,7 +85,7 @@ pub(crate) struct BreakNoticeRow {
 /// The [`BreakNoticeRow`] columns and joins over open breaks with
 /// suggestions ready (`b`), shared by [`breaks_to_notify`] and
 /// [`train_break_state`] so both decide on the same row.
-pub(crate) const BREAK_ROWS_SQL: &str = "SELECT b.id, b.journey_id, j.public_id AS journey_public_id, b.user_id, b.cause, b.severity, b.notified_severity, \
+pub(crate) const BREAK_ROWS_SQL: &str = "SELECT b.id, b.public_id AS break_public_id, b.journey_id, j.public_id AS journey_public_id, b.user_id, b.cause, b.severity, b.notified_severity, \
                 b.opened_at, b.confirmations, b.suggestions, j.suggestions_muted, \
                 COALESCE(p.journey_suggestions, TRUE) AS journey_suggestions, \
                 jl.train_subscription_id AS trigger_tracked_train_id, \
@@ -433,16 +438,27 @@ pub(crate) fn build_break_payload(row: &BreakNoticeRow) -> NotificationPayload {
     NotificationPayload {
         title,
         body,
-        url: format!(
-            "/journeys/{}?break={}&src=push#break",
-            row.journey_public_id, row.id
-        ),
+        url: break_url(row),
         tag: match &row.trigger_tracked_train_public_id {
             Some(train_public_id) => crate::push_ids::train_tag(train_public_id),
             None => crate::push_ids::journey_break_tag(&row.journey_public_id),
         },
         renotify: false,
     }
+}
+
+/// The notice's link: the journey's public id and the break's, so no
+/// numeric id leaves the service (DS-534). A break with no public id (not
+/// expected) links its numeric id, which the website still accepts.
+fn break_url(row: &BreakNoticeRow) -> String {
+    let break_ref = match row.break_public_id.as_deref() {
+        Some(public_id) if !public_id.is_empty() => public_id.to_string(),
+        _ => row.id.to_string(),
+    };
+    format!(
+        "/journeys/{}?break={break_ref}&src=push#break",
+        row.journey_public_id
+    )
 }
 
 /// The train state a delivered notice writes for its trigger train, so the
@@ -611,6 +627,7 @@ mod tests {
     fn row(cause: &str) -> BreakNoticeRow {
         BreakNoticeRow {
             id: 7,
+            break_public_id: Some("b_00000000000000000000000000000007".to_string()),
             journey_id: 42,
             journey_public_id: "j_00000000000000000000000000000042".to_string(),
             user_id: "u".to_string(),
@@ -656,9 +673,38 @@ mod tests {
         );
         assert_eq!(
             payload.url,
-            "/journeys/j_00000000000000000000000000000042?break=7&src=push#break"
+            "/journeys/j_00000000000000000000000000000042?break=b_00000000000000000000000000000007&src=push#break"
         );
         assert_eq!(payload.tag, "train-t_00000000000000000000000000000118");
+    }
+
+    /// DS-534: the link carries the break's public id, never its number.
+    #[test]
+    fn the_url_carries_the_public_break_id_and_no_numeric_one() {
+        let url = break_url(&row("cancelled"));
+        assert_eq!(
+            url,
+            "/journeys/j_00000000000000000000000000000042?break=b_00000000000000000000000000000007&src=push#break"
+        );
+        assert!(!url.contains("break=7"), "{url}");
+    }
+
+    /// A row whose `public_id` is NULL (the column allows it, the DEFAULT
+    /// and CHECK keep it from happening) links its numeric id rather than
+    /// a bare `b_`.
+    #[test]
+    fn a_break_without_a_public_id_falls_back_to_its_numeric_id() {
+        for missing in [None, Some(String::new())] {
+            let r = BreakNoticeRow {
+                break_public_id: missing,
+                ..row("cancelled")
+            };
+            assert_eq!(
+                break_url(&r),
+                "/journeys/j_00000000000000000000000000000042?break=7&src=push#break"
+            );
+            assert_eq!(build_break_payload(&r).url, break_url(&r));
+        }
     }
 
     #[test]
@@ -1032,6 +1078,27 @@ mod db_tests {
         assert!(
             public_id.starts_with("t_") && public_id.len() == 34,
             "{public_id}"
+        );
+        // DS-534: the query reads the break's own public id, and the
+        // notice's link carries it.
+        let break_public_id: String =
+            sqlx::query_scalar("SELECT public_id FROM journey_breaks WHERE id = $1")
+                .bind(break_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read journey_breaks.public_id");
+        assert!(
+            break_public_id.starts_with("b_") && break_public_id.len() == 34,
+            "{break_public_id}"
+        );
+        assert_eq!(
+            row.break_public_id.as_deref(),
+            Some(break_public_id.as_str())
+        );
+        assert!(
+            build_break_payload(row)
+                .url
+                .ends_with(&format!("?break={break_public_id}&src=push#break"))
         );
         assert_eq!(row.trigger_status.as_deref(), Some("cancelled"));
         assert!(row.journey_suggestions && !row.suggestions_muted);

@@ -756,6 +756,61 @@ mod tests {
         assert_eq!(err.unwrap_err(), BuildError::UnknownKind);
     }
 
+    /// DS-534: a break notice's webhook carries the push's URL, with the
+    /// break's public id and no numeric one; the schema version stays 1 and
+    /// the delivery id (a hash of the destination, tag and decision time)
+    /// does not depend on the URL.
+    #[test]
+    fn a_break_webhook_carries_the_public_id_url_and_keeps_its_delivery_id() {
+        let journey = "j_00000000000000000000000000000042";
+        let break_ref = "b_00000000000000000000000000000007";
+        let payload = |url: String| NotificationPayload {
+            title: "t".into(),
+            body: "b".into(),
+            url,
+            tag: crate::push_ids::journey_break_tag(journey),
+            renotify: false,
+        };
+        let delivered = Delivered::JourneyBreak {
+            break_id: 7,
+            severity: 1,
+            trigger: None,
+        };
+        let decided_at = Utc::now();
+        let new = WebhookEvent::from_job(
+            &delivered,
+            &payload(format!(
+                "/journeys/{journey}?break={break_ref}&src=push#break"
+            )),
+            decided_at,
+        )
+        .expect("an event");
+        let old = WebhookEvent::from_job(
+            &delivered,
+            &payload(format!("/journeys/{journey}?break=7&src=push#break")),
+            decided_at,
+        )
+        .expect("an event");
+        assert_eq!(new.event, "journey_break");
+        assert_eq!(delivery_id(1, &new), delivery_id(1, &old));
+
+        let request = build_request(
+            &dest("generic", "https://hooks.example/x", Some("s3cret")),
+            &new,
+            Some("https://ds.example"),
+            decided_at,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body["url"],
+            format!("https://ds.example/journeys/{journey}?break={break_ref}&src=push#break")
+        );
+        assert_eq!(body["schema_version"], 1);
+        let text = String::from_utf8(request.body).unwrap();
+        assert!(!text.contains("break=7"), "{text}");
+    }
+
     #[test]
     fn security_notices_are_never_sent() {
         assert_eq!(event_name(&Delivered::GrantCreated { grant_id: 1 }), None);
