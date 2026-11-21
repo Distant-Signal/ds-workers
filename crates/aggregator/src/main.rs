@@ -315,7 +315,7 @@ async fn report_trains_snapshot_guard(
         metrics::counter!(ds_runtime::metrics::metric_name(
             "aggregator_trains_snapshot_guard_forced_total"
         ))
-        .increment(counts.forced as u64);
+        .increment(counts.forced.unsigned_abs());
         tracing::warn!(
             forced = counts.forced,
             guard_max_days = trains_snapshot_guard_max_days,

@@ -6154,7 +6154,7 @@ mod tests {
             "prune_trust_event_backlog must stop after its MIN probe"
         );
 
-        let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 100_000)).await;
+        let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 100_000, 180)).await;
         assert_eq!(pruned.expect("prune_trains"), 0);
         assert_eq!(queries, 1, "prune_trains must stop after its MIN probe");
     }
