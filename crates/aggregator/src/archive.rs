@@ -620,6 +620,7 @@ pub(crate) async fn archive_and_prune_trains(
     archiver: &Archiver,
     retention_days: i64,
     untracked_retention_days: i64,
+    snapshot_guard_max_days: i64,
     batch_size: i64,
 ) -> Result<TrainsArchiveOutcome> {
     let mut outcome = TrainsArchiveOutcome::default();
@@ -638,8 +639,9 @@ pub(crate) async fn archive_and_prune_trains(
         // retried batch re-selects the same rows and overwrites the same
         // keys. Not locked: step 3 locks and re-checks.
         let candidates: Vec<(i64, NaiveDate)> = sqlx::query_as(&format!(
-            "SELECT t.id, t.service_date FROM trains t WHERE {TRAINS_ELIGIBLE} \
-             ORDER BY t.service_date, t.id LIMIT $3"
+            "SELECT t.id, t.service_date FROM trains t WHERE {} \
+             ORDER BY t.service_date, t.id LIMIT $3",
+            trains_eligible()
         ))
         .bind(untracked_retention_days.to_string())
         .bind(retention_days.to_string())
@@ -647,6 +649,7 @@ pub(crate) async fn archive_and_prune_trains(
         // The later of the two cutoffs, as a plain range the planner can
         // serve from `trains_service_date` (the OR alone cannot be).
         .bind(retention_days.min(untracked_retention_days).to_string())
+        .bind(snapshot_guard_max_days.to_string())
         .fetch_all(pool)
         .await?;
 
@@ -720,6 +723,7 @@ pub(crate) async fn archive_and_prune_trains(
             exported_fingerprints.as_deref(),
             retention_days,
             untracked_retention_days,
+            snapshot_guard_max_days,
         )
         .await?
         else {
@@ -750,12 +754,21 @@ pub(crate) async fn archive_and_prune_trains(
 
 /// The two-tier retention predicate over `trains t`. Binds: `$1` untracked
 /// days, `$2` tracked days, `$4` the smaller of the two (a plain range on
-/// `service_date` the planner can use; the OR alone cannot be).
-const TRAINS_ELIGIBLE: &str = "t.service_date < CURRENT_DATE - ($4 || ' days')::interval \
-     AND ((t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
-           AND NOT EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id)) \
-       OR (t.service_date < CURRENT_DATE - ($2 || ' days')::interval \
-           AND EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id)))";
+/// `service_date` the planner can use; the OR alone cannot be), `$5` the
+/// snapshot guard's hard bound in days. The tracked branch also requires the
+/// snapshot guard (`queries::trains_snapshot_guard`): a row with an
+/// unsnapshotted journey leg stays until that bound.
+fn trains_eligible() -> String {
+    format!(
+        "t.service_date < CURRENT_DATE - ($4 || ' days')::interval \
+         AND ((t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
+               AND NOT EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id)) \
+           OR (t.service_date < CURRENT_DATE - ($2 || ' days')::interval \
+               AND EXISTS (SELECT 1 FROM train_subscriptions s WHERE s.trains_id = t.id) \
+               AND {}))",
+        crate::queries::trains_snapshot_guard(5)
+    )
+}
 
 /// One table's rows for a batch, as seen by one snapshot: `(row count, sum
 /// of each row's 64-bit text hash)`. Equal fingerprints before and after
@@ -848,6 +861,7 @@ async fn delete_batch(
     exported: Option<&[Fingerprint]>,
     retention_days: i64,
     untracked_retention_days: i64,
+    snapshot_guard_max_days: i64,
 ) -> Result<Option<u64>> {
     let mut tx = pool.begin().await?;
     ds_runtime::pg::set_local_statement_timeout(&mut tx, ARCHIVE_BATCH_STATEMENT_TIMEOUT).await?;
@@ -855,13 +869,15 @@ async fn delete_batch(
     // movement-event insert referencing these rows (their FK takes a KEY
     // SHARE lock) until we commit or roll back.
     let still_eligible: Vec<i64> = sqlx::query_scalar(&format!(
-        "SELECT t.id FROM trains t WHERE t.id = ANY($3) AND {TRAINS_ELIGIBLE} \
-         ORDER BY t.id FOR UPDATE OF t"
+        "SELECT t.id FROM trains t WHERE t.id = ANY($3) AND {} \
+         ORDER BY t.id FOR UPDATE OF t",
+        trains_eligible()
     ))
     .bind(untracked_retention_days.to_string())
     .bind(retention_days.to_string())
     .bind(ids)
     .bind(retention_days.min(untracked_retention_days).to_string())
+    .bind(snapshot_guard_max_days.to_string())
     .fetch_all(&mut *tx)
     .await?;
 
@@ -1312,6 +1328,101 @@ mod tests {
         paths
     }
 
+    /// The snapshot guard holds an archivable train back, archiving nothing,
+    /// until its leg has a snapshot; then it is archived and deleted.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
+    async fn holds_a_train_whose_leg_has_no_snapshot_then_archives_it() {
+        let pool = pool().await;
+        let owner = fixtures(&pool).await;
+        let date = chrono::Utc::now().date_naive() - chrono::Duration::days(40);
+        let ids = seed(&pool, "TEST-ARCHIVE-GUARD-", date, 1).await;
+        let user_id = "TEST-ARCHIVE-GUARD-USER";
+        sqlx::query("DELETE FROM journeys WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&owner)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&owner)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING")
+            .bind(user_id)
+            .execute(&owner)
+            .await
+            .unwrap();
+        let sub_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions \
+                 (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure) \
+             VALUES ($1, $2, $3, 'EUS', NOW()) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(ids[0])
+        .bind(date)
+        .fetch_one(&owner)
+        .await
+        .unwrap();
+        let journey_id: i64 =
+            sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+                .bind(user_id)
+                .fetch_one(&owner)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO journey_legs (journey_id, leg_order, origin_crs, destination_crs, \
+                 service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'EUS', 'MAN', $2, $3, 'manual')",
+        )
+        .bind(journey_id)
+        .bind(date)
+        .bind(sub_id)
+        .execute(&owner)
+        .await
+        .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FlakyStore::default());
+        let a = archiver(store.clone(), FailurePolicy::Retain);
+
+        let held = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
+            .await
+            .unwrap();
+        assert!(!held.upload_failed);
+        assert_eq!(remaining(&pool, &ids).await.0, 1, "held back, not deleted");
+        assert!(objects_under(store.as_ref(), "cold").await.is_empty());
+
+        sqlx::query(
+            "UPDATE journey_legs SET final_snapshot = '{}'::jsonb, final_snapshot_at = NOW() \
+             WHERE journey_id = $1",
+        )
+        .bind(journey_id)
+        .execute(&owner)
+        .await
+        .unwrap();
+        let released = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
+            .await
+            .unwrap();
+        assert!(released.pruned >= 1);
+        assert_eq!(remaining(&pool, &ids).await, (0, 0, 0));
+        assert!(!objects_under(store.as_ref(), "cold").await.is_empty());
+
+        sqlx::query("DELETE FROM journeys WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&owner)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&owner)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&owner)
+            .await
+            .ok();
+    }
+
     #[tokio::test]
     #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
     async fn archives_every_row_to_expected_keys_then_deletes() {
@@ -1322,7 +1433,7 @@ mod tests {
         let a = archiver(store.clone(), FailurePolicy::Retain);
 
         // Batch of 2 -> parts starting at ids[0], ids[2], ids[4].
-        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 2)
+        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 180, 2)
             .await
             .unwrap();
         assert!(!outcome.upload_failed);
@@ -1405,7 +1516,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let a = archiver(flaky.clone(), FailurePolicy::Retain);
 
-        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(outcome.upload_failed);
@@ -1436,7 +1547,7 @@ mod tests {
             .fail_head
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let a = archiver(flaky.clone(), FailurePolicy::Retain);
-        let first = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let first = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(first.upload_failed);
@@ -1445,7 +1556,7 @@ mod tests {
         flaky
             .fail_head
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let second = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let second = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(!second.upload_failed);
@@ -1474,7 +1585,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let a = archiver(flaky.clone(), FailurePolicy::Delete);
 
-        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(outcome.upload_failed);
@@ -1510,7 +1621,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(FlakyStore::default());
         let a = archiver(store.clone(), FailurePolicy::Retain);
-        archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
 
@@ -1557,7 +1668,7 @@ mod tests {
         *flaky.probe_locks.lock().unwrap() = Some((pool.clone(), ids.clone()));
         let a = archiver(flaky.clone(), FailurePolicy::Retain);
 
-        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let outcome = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(!outcome.upload_failed);
@@ -1583,7 +1694,7 @@ mod tests {
         *flaky.mutate_on_put.lock().unwrap() = Some((fixtures(&pool).await, ids[0]));
         let a = archiver(flaky.clone(), FailurePolicy::Retain);
 
-        let first = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let first = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(!first.upload_failed);
@@ -1593,7 +1704,7 @@ mod tests {
             "a changed batch is not deleted"
         );
 
-        let second = archive_and_prune_trains(&pool, &a, 30, 14, 1000)
+        let second = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
             .await
             .unwrap();
         assert!(second.pruned >= 2);

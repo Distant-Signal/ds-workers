@@ -1326,58 +1326,131 @@ const PRUNE_TRAINS_BATCH: i64 = 1000;
 /// of `trains_service_date`: without it, a stale row estimate plus `LIMIT`
 /// made the planner pick a whole-table seq scan it expected to stop early
 /// (DB review part 2, DB2-6).
+///
+/// The tracked tier also keeps a row whose journey leg has no snapshot yet,
+/// up to `snapshot_guard_max_days` old ([`trains_snapshot_guard`]).
 pub(crate) async fn prune_trains(
     pool: &PgPool,
     retention_days: i64,
     untracked_retention_days: i64,
+    snapshot_guard_max_days: i64,
 ) -> Result<u64> {
     let (untracked_due, tracked_due) =
         trains_prune_due(pool, retention_days, untracked_retention_days).await?;
     let mut pruned = 0u64;
     if untracked_due {
-        pruned += prune_trains_tier(pool, untracked_retention_days, "NOT EXISTS").await?;
+        pruned += prune_trains_tier(pool, untracked_retention_days, "NOT EXISTS", None).await?;
     }
     if tracked_due {
-        pruned += prune_trains_tier(pool, retention_days, "EXISTS").await?;
+        pruned += prune_trains_tier(
+            pool,
+            retention_days,
+            "EXISTS",
+            Some(snapshot_guard_max_days),
+        )
+        .await?;
     }
     Ok(pruned)
 }
 
 /// One `prune_trains` tier: batches of the oldest eligible rows until a
 /// batch comes back short. `subscription_test` is `EXISTS` (tracked) or
-/// `NOT EXISTS` (untracked).
+/// `NOT EXISTS` (untracked). `snapshot_guard_max_days` is the tracked
+/// tier's snapshot guard (see [`trains_snapshot_guard`]); the untracked tier
+/// has no subscription, so no leg, and takes none.
 async fn prune_trains_tier(
     pool: &PgPool,
     retention_days: i64,
     subscription_test: &'static str,
+    snapshot_guard_max_days: Option<i64>,
 ) -> Result<u64> {
+    let guard = if snapshot_guard_max_days.is_some() {
+        format!("AND {}", trains_snapshot_guard(3))
+    } else {
+        String::new()
+    };
     let sql = format!(
         "DELETE FROM trains WHERE id IN ( \
-            SELECT id FROM trains \
-            WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval \
+            SELECT t.id FROM trains t \
+            WHERE t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
               AND {subscription_test} ( \
                   SELECT 1 FROM train_subscriptions \
-                  WHERE train_subscriptions.trains_id = trains.id \
+                  WHERE train_subscriptions.trains_id = t.id \
               ) \
-            ORDER BY service_date \
+              {guard} \
+            ORDER BY t.service_date \
             LIMIT $2 \
          )"
     );
     let mut pruned = 0u64;
     loop {
-        let rows_affected = execute_retention_delete(
-            pool,
-            sqlx::query(&sql)
-                .bind(retention_days.to_string())
-                .bind(PRUNE_TRAINS_BATCH),
-        )
-        .await?
-        .rows_affected();
+        let mut query = sqlx::query(&sql)
+            .bind(retention_days.to_string())
+            .bind(PRUNE_TRAINS_BATCH);
+        if let Some(days) = snapshot_guard_max_days {
+            query = query.bind(days.to_string());
+        }
+        let rows_affected = execute_retention_delete(pool, query).await?.rows_affected();
         pruned += rows_affected;
         if rows_affected < PRUNE_TRAINS_BATCH as u64 {
             return Ok(pruned);
         }
     }
+}
+
+/// `EXISTS` over a leg bound to a subscription on `trains t` that has never
+/// been snapshotted (`journey_legs.final_snapshot_at IS NULL`).
+const TRAINS_UNSNAPSHOTTED_LEG: &str = "EXISTS ( \
+         SELECT 1 FROM train_subscriptions gs \
+         JOIN journey_legs gl ON gl.train_subscription_id = gs.id \
+         WHERE gs.trains_id = t.id AND gl.final_snapshot_at IS NULL)";
+
+/// The snapshot guard over `trains t`, true when the row may be deleted.
+/// Deleting a `trains` row sets `train_subscriptions.trains_id` NULL, after
+/// which a journey leg loses its timetable; the api's sweep copies it into
+/// `journey_legs.final_snapshot` first. A row is therefore held back while
+/// a leg on it has no snapshot (`final_snapshot_at IS NULL`), but only
+/// until it is `$param` days old (`TRAINS_SNAPSHOT_GUARD_MAX_DAYS`): past
+/// that a stuck sweep must not grow `trains` without bound, so the row goes
+/// anyway. `param` is the bind's number; its value is text (days).
+pub(crate) fn trains_snapshot_guard(param: u8) -> String {
+    format!(
+        "NOT (t.service_date >= CURRENT_DATE - (${param} || ' days')::interval \
+              AND {TRAINS_UNSNAPSHOTTED_LEG})"
+    )
+}
+
+/// Rows the snapshot guard is acting on, from [`trains_snapshot_guard_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TrainsSnapshotGuardCounts {
+    /// Past the tracked retention window but held back: a leg has no
+    /// snapshot and the row is younger than the hard bound.
+    pub held: i64,
+    /// Past the hard bound with a leg still unsnapshotted: pruned anyway,
+    /// so that snapshot is lost.
+    pub forced: i64,
+}
+
+/// Counts what [`trains_snapshot_guard`] holds back and what the hard bound
+/// is about to prune regardless, for the retention run's WARN and metrics.
+/// Both are rows past `retention_days`; they differ by the bound.
+pub(crate) async fn trains_snapshot_guard_counts(
+    pool: &PgPool,
+    retention_days: i64,
+    snapshot_guard_max_days: i64,
+) -> Result<TrainsSnapshotGuardCounts> {
+    let (held, forced): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FILTER (WHERE t.service_date >= CURRENT_DATE - ($2 || ' days')::interval), \
+                COUNT(*) FILTER (WHERE t.service_date <  CURRENT_DATE - ($2 || ' days')::interval) \
+         FROM trains t \
+         WHERE t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
+           AND {TRAINS_UNSNAPSHOTTED_LEG}"
+    ))
+    .bind(retention_days.to_string())
+    .bind(snapshot_guard_max_days.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(TrainsSnapshotGuardCounts { held, forced })
 }
 
 /// Whether either `trains` retention tier can have anything to delete,
@@ -5372,7 +5445,9 @@ mod tests {
         .await
         .expect("seed a recent trains row");
 
-        let pruned = prune_trains(&pool, 30, 30).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 30, 180)
+            .await
+            .expect("prune_trains");
         assert!(pruned >= 1);
 
         let old_still_exists: bool =
@@ -5461,7 +5536,9 @@ mod tests {
             "should have 1 current state row before prune"
         );
 
-        let pruned = prune_trains(&pool, 30, 30).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 30, 180)
+            .await
+            .expect("prune_trains");
         assert!(pruned >= 1, "should have pruned at least one train");
 
         let train_still_exists: bool =
@@ -5574,7 +5651,9 @@ mod tests {
         let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subscriber = tracing_subscriber::registry().with(SqlxQueryCounter(query_count.clone()));
         let guard = tracing::subscriber::set_default(subscriber);
-        let pruned = prune_trains(&pool, 30, 30).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 30, 180)
+            .await
+            .expect("prune_trains");
         drop(guard);
 
         assert!(
@@ -5647,7 +5726,9 @@ mod tests {
         .await
         .expect("seed an untracked trains row");
 
-        let pruned = prune_trains(&pool, 30, 14).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 14, 180)
+            .await
+            .expect("prune_trains");
         assert!(pruned >= 1);
 
         let still_exists: bool =
@@ -5711,7 +5792,9 @@ mod tests {
         .await
         .expect("seed a subscription referencing the trains row");
 
-        prune_trains(&pool, 30, 14).await.expect("prune_trains");
+        prune_trains(&pool, 30, 14, 180)
+            .await
+            .expect("prune_trains");
 
         let still_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
@@ -5785,7 +5868,9 @@ mod tests {
         .await
         .expect("seed a subscription referencing the trains row");
 
-        let pruned = prune_trains(&pool, 30, 14).await.expect("prune_trains");
+        let pruned = prune_trains(&pool, 30, 14, 180)
+            .await
+            .expect("prune_trains");
         assert!(pruned >= 1);
 
         let still_exists: bool =
@@ -5814,6 +5899,200 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    /// A tracked train with a journey leg bound to it, `age_days` old, plus
+    /// the leg's snapshot state. Cleans up any earlier run's rows first.
+    /// Returns `(trains_id, subscription_id, journey_id)`.
+    async fn seed_leg_on_train(pool: &PgPool, tag: &str, age_days: i64) -> (i64, i64, i64) {
+        let user_id = format!("TEST-SNAPSHOT-GUARD-USER-{tag}");
+        let uid = format!("TEST-SNAPSHOT-GUARD-{tag}");
+        sqlx::query("DELETE FROM journeys WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM trains WHERE train_uid = $1")
+            .bind(&uid)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let date: NaiveDate = Utc::now().date_naive() - chrono::Duration::days(age_days);
+        let trains_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(&uid)
+        .bind(date)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sub_id: i64 = sqlx::query_scalar(
+            "INSERT INTO train_subscriptions \
+                 (user_id, trains_id, service_date, pin_origin_crs, pin_scheduled_departure) \
+             VALUES ($1, $2, $3, 'EUS', NOW()) RETURNING id",
+        )
+        .bind(&user_id)
+        .bind(trains_id)
+        .bind(date)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let journey_id: i64 =
+            sqlx::query_scalar("INSERT INTO journeys (user_id) VALUES ($1) RETURNING id")
+                .bind(&user_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO journey_legs (journey_id, leg_order, origin_crs, destination_crs, \
+                 service_date, train_subscription_id, match_mode) \
+             VALUES ($1, 1, 'EUS', 'MAN', $2, $3, 'manual')",
+        )
+        .bind(journey_id)
+        .bind(date)
+        .bind(sub_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (trains_id, sub_id, journey_id)
+    }
+
+    async fn cleanup_leg_on_train(pool: &PgPool, tag: &str) {
+        let user_id = format!("TEST-SNAPSHOT-GUARD-USER-{tag}");
+        sqlx::query("DELETE FROM journeys WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM train_subscriptions WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM trains WHERE train_uid = $1")
+            .bind(format!("TEST-SNAPSHOT-GUARD-{tag}"))
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// The snapshot guard: a train past the tracked window whose leg has no
+    /// snapshot is kept, with its subscription still pointing at it; once
+    /// the leg is snapshotted the next prune removes it.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_keeps_a_train_whose_leg_has_no_snapshot \
+                -- --ignored --test-threads=1`"]
+    async fn prune_trains_keeps_a_train_whose_leg_has_no_snapshot() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let (trains_id, sub_id, journey_id) = seed_leg_on_train(&pool, "HOLD", 40).await;
+
+        prune_trains(&pool, 30, 14, 180)
+            .await
+            .expect("prune_trains");
+        let (exists, linked): (bool, Option<i64>) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1), \
+                    (SELECT trains_id FROM train_subscriptions WHERE id = $2)",
+        )
+        .bind(trains_id)
+        .bind(sub_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            exists,
+            "a 40-day-old train with an unsnapshotted leg must be kept"
+        );
+        assert_eq!(
+            linked,
+            Some(trains_id),
+            "the subscription must keep its train"
+        );
+
+        let counts = trains_snapshot_guard_counts(&pool, 30, 180).await.unwrap();
+        assert!(
+            counts.held >= 1,
+            "the held train must be counted: {counts:?}"
+        );
+
+        sqlx::query(
+            "UPDATE journey_legs SET final_snapshot = '{}'::jsonb, final_snapshot_at = NOW() \
+             WHERE journey_id = $1",
+        )
+        .bind(journey_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        prune_trains(&pool, 30, 14, 180)
+            .await
+            .expect("prune_trains");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+            .bind(trains_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "once the leg has a snapshot the train is pruned");
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT trains_id FROM train_subscriptions WHERE id = $1")
+                .bind(sub_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, None, "ON DELETE SET NULL on the subscription");
+
+        cleanup_leg_on_train(&pool, "HOLD").await;
+    }
+
+    /// Past the hard bound the unsnapshotted train is pruned anyway, and
+    /// `trains_snapshot_guard_counts` reports it as forced (what the
+    /// retention run's WARN prints) just before.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_trains_prunes_an_unsnapshotted_train_past_the_hard_bound \
+                -- --ignored --test-threads=1`"]
+    async fn prune_trains_prunes_an_unsnapshotted_train_past_the_hard_bound() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let (trains_id, _, _) = seed_leg_on_train(&pool, "BOUND", 200).await;
+
+        let counts = trains_snapshot_guard_counts(&pool, 30, 180).await.unwrap();
+        assert!(
+            counts.forced >= 1,
+            "the bound-forced train must be counted: {counts:?}"
+        );
+
+        prune_trains(&pool, 30, 14, 180)
+            .await
+            .expect("prune_trains");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
+            .bind(trains_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !exists,
+            "a 200-day-old train is pruned past the 180-day bound"
+        );
+
+        cleanup_leg_on_train(&pool, "BOUND").await;
     }
 
     // ---- Retention prunes: skip-when-nothing-due, short-batch stop, and
@@ -5905,7 +6184,7 @@ mod tests {
         // one, then stop. Tracked tier 100000 days: nothing due, no DELETE.
         // Probe + 2 DELETEs (the old loop needed 3 DELETEs), each DELETE
         // in its own `execute_retention_delete` transaction.
-        let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 30)).await;
+        let (pruned, queries) = count_queries(prune_trains(&pool, 100_000, 30, 180)).await;
         let pruned = pruned.expect("prune_trains");
         let remaining: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM trains WHERE train_uid LIKE 'TEST-PRUNE-SHORT-%'",

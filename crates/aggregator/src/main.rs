@@ -213,6 +213,7 @@ struct RetentionSettings {
     trust_event_backlog_retention_days: i64,
     trains_retention_days: i64,
     untracked_trains_retention_days: i64,
+    trains_snapshot_guard_max_days: i64,
     schedule_destination_departures_retention_days: i64,
     schedule_derived_products_retention_days: i64,
     schedule_line_population_retention_days: i64,
@@ -229,6 +230,7 @@ impl RetentionSettings {
             trust_event_backlog_retention_days: config.trust_event_backlog_retention_days,
             trains_retention_days: config.trains_retention_days,
             untracked_trains_retention_days: config.untracked_trains_retention_days,
+            trains_snapshot_guard_max_days: config.trains_snapshot_guard_max_days,
             schedule_destination_departures_retention_days: config
                 .schedule_destination_departures_retention_days,
             schedule_derived_products_retention_days: config
@@ -274,6 +276,55 @@ async fn retention_loop(
     }
 }
 
+/// Logs and counts what the trains snapshot guard holds back (journey legs
+/// not yet snapshotted) and what its hard bound is about to prune anyway.
+/// Runs before the trains prune so `forced` is what that prune will take.
+/// A failure here is logged and leaves the prune to run (and fail the same
+/// way if the grant is missing).
+async fn report_trains_snapshot_guard(
+    pool: &sqlx::PgPool,
+    trains_retention_days: i64,
+    trains_snapshot_guard_max_days: i64,
+) {
+    let counts = match queries::trains_snapshot_guard_counts(
+        pool,
+        trains_retention_days,
+        trains_snapshot_guard_max_days,
+    )
+    .await
+    {
+        Ok(counts) => counts,
+        Err(err) => {
+            tracing::error!(error = ?err, "counting trains held by the snapshot guard failed");
+            return;
+        }
+    };
+    metrics::gauge!(ds_runtime::metrics::metric_name(
+        "aggregator_trains_snapshot_guard_held"
+    ))
+    .set(f64::from(i32::try_from(counts.held).unwrap_or(i32::MAX)));
+    if counts.held > 0 {
+        tracing::warn!(
+            held = counts.held,
+            guard_max_days = trains_snapshot_guard_max_days,
+            retention_days = trains_retention_days,
+            "trains past retention kept because a journey leg has no snapshot yet"
+        );
+    }
+    if counts.forced > 0 {
+        metrics::counter!(ds_runtime::metrics::metric_name(
+            "aggregator_trains_snapshot_guard_forced_total"
+        ))
+        .increment(counts.forced as u64);
+        tracing::warn!(
+            forced = counts.forced,
+            guard_max_days = trains_snapshot_guard_max_days,
+            "trains past TRAINS_SNAPSHOT_GUARD_MAX_DAYS are being pruned with a journey leg \
+             still unsnapshotted (the leg loses its timetable); is the snapshot sweep stuck?"
+        );
+    }
+}
+
 /// One retention run: every prune, each in its own error scope
 /// (`retention_step`), so one failing prune never skips another; each
 /// failure is logged, counted and left for the next run.
@@ -290,6 +341,7 @@ async fn run_retention_pass(
         settings.trust_event_backlog_retention_days,
         settings.trains_retention_days,
         settings.untracked_trains_retention_days,
+        settings.trains_snapshot_guard_max_days,
         settings.schedule_destination_departures_retention_days,
         settings.schedule_derived_products_retention_days,
         settings.schedule_line_population_retention_days,
@@ -776,6 +828,7 @@ async fn run_retention(
     trust_event_backlog_retention_days: i64,
     trains_retention_days: i64,
     untracked_trains_retention_days: i64,
+    trains_snapshot_guard_max_days: i64,
     schedule_destination_departures_retention_days: i64,
     schedule_derived_products_retention_days: i64,
     schedule_line_population_retention_days: i64,
@@ -830,6 +883,7 @@ async fn run_retention(
     // and counted rather than returned. Like every step here it has its own
     // error scope: a database error in it skips no other prune, and no
     // other prune's error skips it.
+    report_trains_snapshot_guard(pool, trains_retention_days, trains_snapshot_guard_max_days).await;
     let trains_pruned = match archiver.filter(|a| a.archives("trains")) {
         Some(archiver) => {
             retention_step("trains", async {
@@ -838,6 +892,7 @@ async fn run_retention(
                     archiver,
                     trains_retention_days,
                     untracked_trains_retention_days,
+                    trains_snapshot_guard_max_days,
                     archive::ARCHIVE_TRAINS_BATCH,
                 )
                 .await;
@@ -865,7 +920,12 @@ async fn run_retention(
         None => {
             retention_step(
                 "trains",
-                queries::prune_trains(pool, trains_retention_days, untracked_trains_retention_days),
+                queries::prune_trains(
+                    pool,
+                    trains_retention_days,
+                    untracked_trains_retention_days,
+                    trains_snapshot_guard_max_days,
+                ),
             )
             .await
         }
