@@ -1389,7 +1389,10 @@ mod tests {
             .unwrap();
         assert!(!held.upload_failed);
         assert_eq!(remaining(&pool, &ids).await.0, 1, "held back, not deleted");
-        assert!(objects_under(store.as_ref(), "cold").await.is_empty());
+        assert_eq!(
+            objects_under(store.as_ref(), "cold").await,
+            Vec::<Path>::new()
+        );
 
         sqlx::query(
             "UPDATE journey_legs SET final_snapshot = '{}'::jsonb, final_snapshot_at = NOW() \
@@ -1404,7 +1407,10 @@ mod tests {
             .unwrap();
         assert!(released.pruned >= 1);
         assert_eq!(remaining(&pool, &ids).await, (0, 0, 0));
-        assert!(!objects_under(store.as_ref(), "cold").await.is_empty());
+        assert_ne!(
+            objects_under(store.as_ref(), "cold").await,
+            Vec::<Path>::new()
+        );
 
         sqlx::query("DELETE FROM journeys WHERE user_id = $1")
             .bind(user_id)
