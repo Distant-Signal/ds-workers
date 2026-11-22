@@ -64,6 +64,57 @@ chart value for `TRAINS_SNAPSHOT_GUARD_MAX_DAYS` is optional. The hold keeps
 the retention windows' other rule: `trainsRetentionDays` still decides when
 an unbound tracked train goes.
 
+**Pinned schedule, Darwin and board rows.** Tracking a train pins the rest of
+what the train page and leg detail read about it, not only the `trains` row.
+The retention run keeps, for each train a journey leg is bound to (the same
+test and the same hard bound as the journey hold above), only the rows keyed
+to that train and service date, past their own windows:
+
+| Table | Key to the train | Own window | What it gives the page | Estimated size per train |
+| --- | --- | --- | --- | --- |
+| `schedule_services` | `(service_date, uid)` | `trainsRetentionDays` (min 8 days) | service mode (bus, ferry), operator code, headcode | 1 row, about 100 bytes |
+| `schedule_destination_departures` | `(service_date, train_uid)` | 8 days | operator, headcode, "known scheduled train" | one row per departure, about 10 to 40 rows, a few KB |
+| `schedule_calling_points_full` | `(service_date, uid)` | 8 days | booked stops and platforms, when `trains.calling_points` is empty | about 20 to 60 rows, a few KB |
+| `schedule_turnarounds` | `(service_date, uid)` | 8 days | the previous working's platform and times | 1 row |
+| `schedule_associations` | the main or the associated `(service_date, uid)` | 8 days | joins and divides | 0 to 4 rows |
+| `darwin_services`, `darwin_calls`, `darwin_associations` | RID, from `darwin_services (uid, ssd)` | 2 days past the start date | forecast times, platform changes and their confirmed flags, cancellations | 1 service, about 20 to 80 calls (about 200 bytes each), under 20 KB |
+| `tracked_stop_boards`, `tracked_stop_arrival_boards` | `(train_uid, service_date)` | 24 hours from the last poll | the station board last polled for each of the train's stops | one row per stop with a JSON board, about 2 to 20 KB each, so up to a few hundred KB |
+
+Every one of these is a single anti-join against the set of bound trains
+(`PINNED_TRAINS_CTE`, evaluated once per statement from the legs, never from
+a scan of `trains`), so a prune costs what it did plus one hash probe per row
+it would have deleted; no row is deleted and re-inserted, and the first run
+after this ships deletes nothing more than before, so there is no bulk write
+(until the storage migration the node's kubelet eviction threshold is 5%
+free, but the pin only adds the few KB above per bound train, never a whole
+day). The pin keeps what exists: a row that was already pruned, or never
+recorded (a Darwin call for a train bound after its start date plus two days,
+a board for a stop the train had already passed), is not recovered. The pin
+ends with the journey hold: when the journey (so the leg) is deleted or the
+bound passes, the rows go on the next run by the ordinary rule. These tables
+are not archived; `ARCHIVABLE_TABLES` is still `trains` and the archive's
+order (upload, then delete) is untouched.
+
+Not pinned, because no safe per-train key exists or a rule forbids it:
+`trust_event_backlog` (1-day TRUST licensing window; the tracked train's own
+`train_movement_events` hold the same facts), `notifier_forward_queue`
+(transient push signals, gone with the `trains` row), `station_samples`,
+`schedule_line_population`, `schedule_network_departures` and
+`line_train_summaries` (per station or line, not per train),
+`station_full_coverage_samples` and the full-coverage statistics (aggregates).
+The Island of Ireland board history (`island_of_ireland_trains`,
+`island_of_ireland_train_calls`) is pruned by ingest-writer, not here.
+
+**Loss alarm.** Each retention run exports
+`distant_signal_aggregator_pinned_trains_missing_data{kind}` (gauge): bound,
+schedule-matched GB trains from 2026-11-22 on, old enough for the ordinary
+retention to have removed the rows, that have no `schedule_services` row
+(`kind="schedule_services"`), no `schedule_destination_departures` row
+(`schedule_departures`), neither `trains.calling_points` nor a
+`schedule_calling_points_full` row (`calling_points`) or no
+`train_current_state` row (`current_state`). All zero while the pin works;
+the retention run also logs an ERROR per non-zero kind.
+
 Some tables can never be archived. The binary refuses to start, and the
 chart refuses to render, if one of them is listed:
 
