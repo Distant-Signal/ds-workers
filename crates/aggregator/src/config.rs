@@ -232,6 +232,10 @@ pub(crate) struct Config {
     /// `service_date` partitioning with a partition swap is the right
     /// mitigation before a longer unpartitioned window.
     ///
+    /// Rows of a train a journey leg is bound to are kept past this window
+    /// (`TRAINS_SNAPSHOT_GUARD_MAX_DAYS`; docs/cold-archive.md, "Pinned
+    /// schedule, Darwin and board rows"), so it bounds the unpinned rows only.
+    ///
     /// Like `schedule_destination_departures_retention_days`, and unlike
     /// `trust_event_backlog_retention_days`, nothing legal is at stake in
     /// raising this -- only disk -- so no warning is emitted.

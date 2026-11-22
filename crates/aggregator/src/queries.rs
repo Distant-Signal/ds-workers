@@ -998,6 +998,83 @@ pub(crate) async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64
     Ok(pruned)
 }
 
+/// The `(train_uid, service_date)` of every train a journey leg is bound to
+/// and that is within the journey hold's hard bound (`$2` days from its
+/// service date, as text; see [`trains_snapshot_guard`]), as a CTE for the
+/// schedule and ingest prunes below. This is "tracking pins the train's
+/// data": a row keyed to one of these pairs is kept past its retention, a
+/// row of any other train goes as before. It is materialised once per
+/// statement and is as small as the legs' trains (it starts from
+/// `journey_legs_train_subscription_id`, never from `trains`), so each
+/// prune stays one anti-join, never a per-row loop. Reads
+/// `journey_legs (train_subscription_id)`, `train_subscriptions (id,
+/// trains_id)` and `trains`, which the aggregator role has from ds-core v0.17.6.
+const PINNED_TRAINS_CTE: &str = "pinned AS MATERIALIZED ( \
+         SELECT DISTINCT t.train_uid, t.service_date \
+         FROM journey_legs gl \
+         JOIN train_subscriptions gs ON gs.id = gl.train_subscription_id \
+         JOIN trains t ON t.id = gs.trains_id \
+         WHERE t.service_date >= CURRENT_DATE - ($2 || ' days')::interval)";
+
+/// The Darwin RIDs of the pinned trains (`darwin_services (uid, ssd)` is
+/// indexed), for the three Darwin tables that are keyed by RID. Needs the
+/// `pinned` CTE ([`PINNED_TRAINS_CTE`]) before it.
+const PINNED_DARWIN_RIDS_CTE: &str = "pinned_rids AS MATERIALIZED ( \
+         SELECT s.rid FROM pinned p \
+         JOIN darwin_services s ON s.uid = p.train_uid AND s.ssd = p.service_date)";
+
+/// One schedule prune: rows of `table` for service dates older than
+/// `retention_days`, except those of a pinned train (`uid_col`, with
+/// `service_date`). Strictly `<`, as the other schedule prunes.
+async fn prune_schedule_unpinned(
+    pool: &PgPool,
+    table: &'static str,
+    uid_col: &'static str,
+    retention_days: i64,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    let sql = format!(
+        "WITH {PINNED_TRAINS_CTE} \
+         DELETE FROM {table} x \
+         WHERE x.service_date < CURRENT_DATE - ($1 || ' days')::interval \
+           AND NOT EXISTS (SELECT 1 FROM pinned p \
+                           WHERE p.train_uid = x.{uid_col} AND p.service_date = x.service_date)"
+    );
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(&sql)
+            .bind(retention_days.to_string())
+            .bind(pin_guard_max_days.to_string()),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// One tracked-stop-board prune: rows of `table` last polled more than
+/// [`TRACKED_STOP_BOARDS_RETENTION_HOURS`] ago, except those of a pinned
+/// train (`train_uid`, `service_date`).
+async fn prune_boards_unpinned(
+    pool: &PgPool,
+    table: &'static str,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    let sql = format!(
+        "WITH {PINNED_TRAINS_CTE} \
+         DELETE FROM {table} b \
+         WHERE b.polled_at < now() - make_interval(hours => $1::int) \
+           AND NOT EXISTS (SELECT 1 FROM pinned p \
+                           WHERE p.train_uid = b.train_uid AND p.service_date = b.service_date)"
+    );
+    let result = execute_retention_delete(
+        pool,
+        sqlx::query(&sql)
+            .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS)
+            .bind(pin_guard_max_days.to_string()),
+    )
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Prunes `schedule_destination_departures` rows for service dates older
 /// than `retention_days`.
 ///
@@ -1034,17 +1111,16 @@ pub(crate) async fn prune_trust_event_backlog(pool: &PgPool, retention_days: i64
 pub(crate) async fn prune_schedule_destination_departures(
     pool: &PgPool,
     retention_days: i64,
+    pin_guard_max_days: i64,
 ) -> Result<u64> {
-    let result = execute_retention_delete(
+    prune_schedule_unpinned(
         pool,
-        sqlx::query(
-            "DELETE FROM schedule_destination_departures \
-         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
-        )
-        .bind(retention_days.to_string()),
+        "schedule_destination_departures",
+        "train_uid",
+        retention_days,
+        pin_guard_max_days,
     )
-    .await?;
-    Ok(result.rows_affected())
+    .await
 }
 
 /// Prunes `schedule_calling_points_full` rows for service dates older than
@@ -1068,47 +1144,60 @@ pub(crate) async fn prune_schedule_destination_departures(
 pub(crate) async fn prune_schedule_calling_points_full(
     pool: &PgPool,
     retention_days: i64,
+    pin_guard_max_days: i64,
 ) -> Result<u64> {
-    let result = execute_retention_delete(
+    prune_schedule_unpinned(
         pool,
-        sqlx::query(
-            "DELETE FROM schedule_calling_points_full \
-         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
-        )
-        .bind(retention_days.to_string()),
+        "schedule_calling_points_full",
+        "uid",
+        retention_days,
+        pin_guard_max_days,
     )
-    .await?;
-    Ok(result.rows_affected())
+    .await
 }
 
 /// Prunes `schedule_turnarounds` (each train's previous working, DS-127)
 /// for service dates older than `retention_days`: schedule-reference
 /// replaces one date at a time, so old dates would otherwise stay forever.
 /// The same strictly-`<` comparison as the other schedule prunes.
-pub(crate) async fn prune_schedule_turnarounds(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = execute_retention_delete(
+pub(crate) async fn prune_schedule_turnarounds(
+    pool: &PgPool,
+    retention_days: i64,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    prune_schedule_unpinned(
         pool,
-        sqlx::query(
-            "DELETE FROM schedule_turnarounds \
-         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
-        )
-        .bind(retention_days.to_string()),
+        "schedule_turnarounds",
+        "uid",
+        retention_days,
+        pin_guard_max_days,
     )
-    .await?;
-    Ok(result.rows_affected())
+    .await
 }
 
 /// Prunes `schedule_associations` (the CIF joins and divides in force per
 /// date, DS-152) for service dates older than `retention_days`, like the
 /// other schedule products: schedule-reference replaces one date at a time.
-pub(crate) async fn prune_schedule_associations(pool: &PgPool, retention_days: i64) -> Result<u64> {
+pub(crate) async fn prune_schedule_associations(
+    pool: &PgPool,
+    retention_days: i64,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    let sql = format!(
+        "WITH {PINNED_TRAINS_CTE} \
+         DELETE FROM schedule_associations x \
+         WHERE x.service_date < CURRENT_DATE - ($1 || ' days')::interval \
+           AND NOT EXISTS (SELECT 1 FROM pinned p \
+                           WHERE p.train_uid = x.main_uid AND p.service_date = x.service_date) \
+           AND NOT EXISTS (SELECT 1 FROM pinned p \
+                           WHERE p.train_uid = x.assoc_uid \
+                             AND p.service_date = x.assoc_service_date)"
+    );
     let result = execute_retention_delete(
         pool,
-        sqlx::query(
-            "DELETE FROM schedule_associations \
-         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
-        )
-        .bind(retention_days.to_string()),
+        sqlx::query(&sql)
+            .bind(retention_days.to_string())
+            .bind(pin_guard_max_days.to_string()),
     )
     .await?;
     Ok(result.rows_affected())
@@ -1123,22 +1212,36 @@ pub(crate) const DARWIN_RETENTION_DAYS: i32 = 2;
 /// Prunes `darwin_calls` (DS-152) past [`DARWIN_RETENTION_DAYS`] after the
 /// service's scheduled start date. ingest-writer only upserts the Darwin
 /// tables, so nothing else deletes them.
-pub(crate) async fn prune_darwin_calls(pool: &PgPool) -> Result<u64> {
+pub(crate) async fn prune_darwin_calls(pool: &PgPool, pin_guard_max_days: i64) -> Result<u64> {
+    let sql = format!(
+        "WITH {PINNED_TRAINS_CTE}, {PINNED_DARWIN_RIDS_CTE} \
+         DELETE FROM darwin_calls c \
+         WHERE c.ssd < CURRENT_DATE - $1::int \
+           AND NOT EXISTS (SELECT 1 FROM pinned_rids r WHERE r.rid = c.rid)"
+    );
     let result = execute_retention_delete(
         pool,
-        sqlx::query("DELETE FROM darwin_calls WHERE ssd < CURRENT_DATE - $1::int")
-            .bind(DARWIN_RETENTION_DAYS),
+        sqlx::query(&sql)
+            .bind(DARWIN_RETENTION_DAYS)
+            .bind(pin_guard_max_days.to_string()),
     )
     .await?;
     Ok(result.rows_affected())
 }
 
 /// Prunes `darwin_services` (DS-152), as [`prune_darwin_calls`].
-pub(crate) async fn prune_darwin_services(pool: &PgPool) -> Result<u64> {
+pub(crate) async fn prune_darwin_services(pool: &PgPool, pin_guard_max_days: i64) -> Result<u64> {
+    let sql = format!(
+        "WITH {PINNED_TRAINS_CTE}, {PINNED_DARWIN_RIDS_CTE} \
+         DELETE FROM darwin_services s \
+         WHERE s.ssd < CURRENT_DATE - $1::int \
+           AND NOT EXISTS (SELECT 1 FROM pinned_rids r WHERE r.rid = s.rid)"
+    );
     let result = execute_retention_delete(
         pool,
-        sqlx::query("DELETE FROM darwin_services WHERE ssd < CURRENT_DATE - $1::int")
-            .bind(DARWIN_RETENTION_DAYS),
+        sqlx::query(&sql)
+            .bind(DARWIN_RETENTION_DAYS)
+            .bind(pin_guard_max_days.to_string()),
     )
     .await?;
     Ok(result.rows_affected())
@@ -1146,14 +1249,22 @@ pub(crate) async fn prune_darwin_services(pool: &PgPool) -> Result<u64> {
 
 /// Prunes `darwin_associations` (DS-152) by the main service's scheduled
 /// start date, or, when its RID gave none, by when it was last written.
-pub(crate) async fn prune_darwin_associations(pool: &PgPool) -> Result<u64> {
+pub(crate) async fn prune_darwin_associations(
+    pool: &PgPool,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    let sql = format!(
+        "WITH {PINNED_TRAINS_CTE}, {PINNED_DARWIN_RIDS_CTE} \
+         DELETE FROM darwin_associations a \
+         WHERE COALESCE(a.main_ssd, a.updated_at::date) < CURRENT_DATE - $1::int \
+           AND NOT EXISTS (SELECT 1 FROM pinned_rids r WHERE r.rid = a.main_rid) \
+           AND NOT EXISTS (SELECT 1 FROM pinned_rids r WHERE r.rid = a.assoc_rid)"
+    );
     let result = execute_retention_delete(
         pool,
-        sqlx::query(
-            "DELETE FROM darwin_associations \
-             WHERE COALESCE(main_ssd, updated_at::date) < CURRENT_DATE - $1::int",
-        )
-        .bind(DARWIN_RETENTION_DAYS),
+        sqlx::query(&sql)
+            .bind(DARWIN_RETENTION_DAYS)
+            .bind(pin_guard_max_days.to_string()),
     )
     .await?;
     Ok(result.rows_affected())
@@ -1167,33 +1278,21 @@ pub(crate) const TRACKED_STOP_BOARDS_RETENTION_HOURS: i32 = 24;
 /// Prunes `tracked_stop_boards` rows last polled more than
 /// [`TRACKED_STOP_BOARDS_RETENTION_HOURS`] ago: the poller stops polling a
 /// stop once its train has left, and nothing else deletes the row.
-pub(crate) async fn prune_tracked_stop_boards(pool: &PgPool) -> Result<u64> {
-    let result = execute_retention_delete(
-        pool,
-        sqlx::query(
-            "DELETE FROM tracked_stop_boards \
-         WHERE polled_at < now() - make_interval(hours => $1::int)",
-        )
-        .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS),
-    )
-    .await?;
-    Ok(result.rows_affected())
+pub(crate) async fn prune_tracked_stop_boards(
+    pool: &PgPool,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    prune_boards_unpinned(pool, "tracked_stop_boards", pin_guard_max_days).await
 }
 
 /// Prunes `tracked_stop_arrival_boards` rows (DS-152) last polled more than
 /// [`TRACKED_STOP_BOARDS_RETENTION_HOURS`] ago, for the same reason as
 /// [`prune_tracked_stop_boards`].
-pub(crate) async fn prune_tracked_stop_arrival_boards(pool: &PgPool) -> Result<u64> {
-    let result = execute_retention_delete(
-        pool,
-        sqlx::query(
-            "DELETE FROM tracked_stop_arrival_boards \
-         WHERE polled_at < now() - make_interval(hours => $1::int)",
-        )
-        .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS),
-    )
-    .await?;
-    Ok(result.rows_affected())
+pub(crate) async fn prune_tracked_stop_arrival_boards(
+    pool: &PgPool,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    prune_boards_unpinned(pool, "tracked_stop_arrival_boards", pin_guard_max_days).await
 }
 
 /// Prunes `schedule_services` rows (one per schedule per service date, the
@@ -1202,17 +1301,19 @@ pub(crate) async fn prune_tracked_stop_arrival_boards(pool: &PgPool) -> Result<u
 /// less than the other schedule products'), so a tracked bus's page keeps
 /// saying it is a bus for as long as the page exists. Same strictly-`<`
 /// comparison as the other schedule prunes.
-pub(crate) async fn prune_schedule_services(pool: &PgPool, retention_days: i64) -> Result<u64> {
-    let result = execute_retention_delete(
+pub(crate) async fn prune_schedule_services(
+    pool: &PgPool,
+    retention_days: i64,
+    pin_guard_max_days: i64,
+) -> Result<u64> {
+    prune_schedule_unpinned(
         pool,
-        sqlx::query(
-            "DELETE FROM schedule_services \
-         WHERE service_date < CURRENT_DATE - ($1 || ' days')::interval",
-        )
-        .bind(retention_days.to_string()),
+        "schedule_services",
+        "uid",
+        retention_days,
+        pin_guard_max_days,
     )
-    .await?;
-    Ok(result.rows_affected())
+    .await
 }
 
 /// Prunes `schedule_network_departures` rows for service dates older than
@@ -1463,6 +1564,95 @@ pub(crate) async fn trains_snapshot_guard_counts(
     .fetch_one(pool)
     .await?;
     Ok(TrainsSnapshotGuardCounts { held, forced })
+}
+
+/// The service date the pin of a train's schedule rows shipped (ds-workers
+/// DS-638 follow-up, 2026-11-22). A bound train from before it had its
+/// schedule rows pruned already, so only later ones are expected to have them.
+const PIN_SHIPPED_DATE: (i32, u32, u32) = (2026, 11, 22);
+
+/// [`PIN_SHIPPED_DATE`] as a date.
+pub(crate) fn pin_shipped_date() -> NaiveDate {
+    let (y, m, d) = PIN_SHIPPED_DATE;
+    NaiveDate::from_ymd_opt(y, m, d).unwrap_or(NaiveDate::MIN)
+}
+
+/// Pinned trains missing data they should have kept, per kind, from
+/// [`pinned_train_gaps`]. All zero while the pin works.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PinnedTrainGaps {
+    /// No `schedule_services` row (service mode, operator, headcode).
+    pub schedule_services: i64,
+    /// No `schedule_destination_departures` row (operator, headcode, "is a
+    /// known scheduled train").
+    pub schedule_departures: i64,
+    /// No `schedule_calling_points_full` row and no `trains.calling_points`.
+    pub calling_points: i64,
+    /// No `train_current_state` row.
+    pub current_state: i64,
+}
+
+/// Counts trains a journey leg is bound to, on a service date from
+/// `since` (the pin's ship date, [`pin_shipped_date`]) and old enough that its ordinary retention would
+/// already have removed the rows (`services_retention_days` for
+/// `schedule_services`, `derived_retention_days` for the departures and
+/// calling points, `trains_retention_days` for the live state), that lack
+/// the data the pin keeps. A schedule-matched GB train only (`destination_crs`
+/// set, not an `ie:` train): a live-only train has no timetable rows to
+/// lose. It is a loss alarm, not a repair. One scan of the legs' trains
+/// (the `pinned` set) with an index probe per train and kind.
+pub(crate) async fn pinned_train_gaps(
+    pool: &PgPool,
+    services_retention_days: i64,
+    derived_retention_days: i64,
+    trains_retention_days: i64,
+    pin_guard_max_days: i64,
+    since: NaiveDate,
+) -> Result<PinnedTrainGaps> {
+    let (schedule_services, schedule_departures, calling_points, current_state): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "WITH pinned AS MATERIALIZED ( \
+             SELECT DISTINCT t.id, t.train_uid, t.service_date, \
+                    t.calling_points IS NOT NULL AS has_calling_points \
+             FROM journey_legs gl \
+             JOIN train_subscriptions gs ON gs.id = gl.train_subscription_id \
+             JOIN trains t ON t.id = gs.trains_id \
+             WHERE t.service_date >= CURRENT_DATE - ($4 || ' days')::interval \
+               AND t.service_date >= $5 \
+               AND t.destination_crs IS NOT NULL \
+               AND t.train_uid NOT LIKE 'ie:%') \
+         SELECT \
+           COUNT(*) FILTER (WHERE p.service_date < CURRENT_DATE - ($1 || ' days')::interval \
+              AND NOT EXISTS (SELECT 1 FROM schedule_services s \
+                              WHERE s.service_date = p.service_date AND s.uid = p.train_uid)), \
+           COUNT(*) FILTER (WHERE p.service_date < CURRENT_DATE - ($2 || ' days')::interval \
+              AND NOT EXISTS (SELECT 1 FROM schedule_destination_departures d \
+                              WHERE d.service_date = p.service_date AND d.train_uid = p.train_uid)), \
+           COUNT(*) FILTER (WHERE p.service_date < CURRENT_DATE - ($2 || ' days')::interval \
+              AND NOT p.has_calling_points \
+              AND NOT EXISTS (SELECT 1 FROM schedule_calling_points_full c \
+                              WHERE c.service_date = p.service_date AND c.uid = p.train_uid)), \
+           COUNT(*) FILTER (WHERE p.service_date < CURRENT_DATE - ($3 || ' days')::interval \
+              AND NOT EXISTS (SELECT 1 FROM train_current_state cs WHERE cs.trains_id = p.id)) \
+         FROM pinned p",
+    )
+    .bind(services_retention_days.to_string())
+    .bind(derived_retention_days.to_string())
+    .bind(trains_retention_days.to_string())
+    .bind(pin_guard_max_days.to_string())
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
+    Ok(PinnedTrainGaps {
+        schedule_services,
+        schedule_departures,
+        calling_points,
+        current_state,
+    })
 }
 
 /// Whether either `trains` retention tier can have anything to delete,
@@ -2013,10 +2203,15 @@ mod tests {
             .expect("association");
         }
 
-        assert!(prune_darwin_calls(&pool).await.expect("prune calls") >= 1);
-        assert!(prune_darwin_services(&pool).await.expect("prune services") >= 1);
+        assert!(prune_darwin_calls(&pool, 600).await.expect("prune calls") >= 1);
         assert!(
-            prune_darwin_associations(&pool)
+            prune_darwin_services(&pool, 600)
+                .await
+                .expect("prune services")
+                >= 1
+        );
+        assert!(
+            prune_darwin_associations(&pool, 600)
                 .await
                 .expect("prune associations")
                 >= 1
@@ -5074,7 +5269,7 @@ mod tests {
             .expect("seed fixture rows");
         }
 
-        let pruned = prune_schedule_destination_departures(&pool, 2)
+        let pruned = prune_schedule_destination_departures(&pool, 2, 600)
             .await
             .expect("prune");
         assert_eq!(
@@ -5143,9 +5338,11 @@ mod tests {
             .expect("seed fixture rows");
         }
 
-        let pruned = prune_schedule_services(&pool, 2).await.expect("prune");
+        let pruned = prune_schedule_services(&pool, 2, 600).await.expect("prune");
         assert_eq!(pruned, 1, "only the 5-day-old row is pruned at 2 days");
-        prune_schedule_services(&pool, 0).await.expect("prune at 0");
+        prune_schedule_services(&pool, 0, 600)
+            .await
+            .expect("prune at 0");
         let remaining: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM schedule_services WHERE uid = 'TPSS-TODAY'")
                 .fetch_one(&pool)
@@ -5188,7 +5385,7 @@ mod tests {
             .expect("seed fixture rows");
         }
 
-        let pruned = prune_schedule_calling_points_full(&pool, 2)
+        let pruned = prune_schedule_calling_points_full(&pool, 2, 600)
             .await
             .expect("prune");
         assert_eq!(
@@ -5197,7 +5394,7 @@ mod tests {
         );
 
         // Even at the most aggressive value, today survives.
-        prune_schedule_calling_points_full(&pool, 0)
+        prune_schedule_calling_points_full(&pool, 0, 600)
             .await
             .expect("prune at 0");
         let remaining: (i64,) = sqlx::query_as(
@@ -5407,7 +5604,7 @@ mod tests {
         .expect("seed today's fixture row");
 
         // Even at the most aggressive value this config field allows.
-        prune_schedule_destination_departures(&pool, 0)
+        prune_schedule_destination_departures(&pool, 0, 600)
             .await
             .expect("prune");
 
@@ -6174,6 +6371,316 @@ mod tests {
         );
 
         cleanup_leg_on_train(&pool, "BOUND").await;
+    }
+
+    /// Every schedule, Darwin and board row a train's page reads, keyed to
+    /// `uid` on `date` (Darwin by `rid`). Clears an earlier run's rows first.
+    async fn seed_pinnable_rows(pool: &PgPool, uid: &str, date: NaiveDate, rid: &str) {
+        clear_pinnable_rows(pool, uid, rid).await;
+        let statements: [(&str, u8); 10] = [
+            (
+                "INSERT INTO schedule_services (service_date, uid, mode, stp, operator_atoc, headcode) \
+                 VALUES ($1, $2, 'bus', 'P', 'XX', '1A23')",
+                0,
+            ),
+            (
+                "INSERT INTO schedule_destination_departures \
+                     (service_date, destination_crs, scheduled, train_uid, origin_crs, operator_atoc, headcode) \
+                 VALUES ($1, 'ZRB', '08:00:00', $2, 'EUS', 'XX', '1A23')",
+                0,
+            ),
+            (
+                "INSERT INTO schedule_calling_points_full \
+                     (service_date, uid, seq, tiploc, kind, booked_departure, day_offset, platform) \
+                 VALUES ($1, $2, 0, 'EUSTON', 'origin', '08:00:00', 0, '4')",
+                0,
+            ),
+            (
+                "INSERT INTO schedule_turnarounds \
+                     (service_date, uid, prev_service_date, prev_uid, booked_turnaround_minutes, \
+                      link, origin_tiploc, platform, departs_at) \
+                 VALUES ($1, $2, $1, 'TEST-PIN-PREV', 10, 'inferred', 'EUSTON', '4', now())",
+                0,
+            ),
+            (
+                "INSERT INTO schedule_associations \
+                     (service_date, main_uid, assoc_uid, assoc_service_date, category, tiploc) \
+                 VALUES ($1, $2, 'TEST-PIN-ASSOC', $1, 'JJ', 'EUSTON')",
+                0,
+            ),
+            (
+                "INSERT INTO darwin_services (rid, uid, ssd, message_ts) \
+                 VALUES ($3, $2, $1, now())",
+                1,
+            ),
+            (
+                "INSERT INTO darwin_calls (rid, tiploc, wtd, ssd, platform, departure_at) \
+                 VALUES ($2, 'EUSTON', '08:00', $1, '4', '08:03')",
+                2,
+            ),
+            (
+                "INSERT INTO darwin_associations \
+                     (main_rid, assoc_rid, tiploc, category, main_ssd, message_ts) \
+                 VALUES ($2, 'TESTPINOTHER', 'EUSTON', 'NP', $1, now())",
+                2,
+            ),
+            (
+                "INSERT INTO tracked_stop_boards (train_uid, service_date, crs, polled_at, departures) \
+                 VALUES ($2, $1, 'EUS', now() - interval '3 days', '[]'::jsonb)",
+                0,
+            ),
+            (
+                "INSERT INTO tracked_stop_arrival_boards (train_uid, service_date, crs, polled_at, arrivals) \
+                 VALUES ($2, $1, 'MAN', now() - interval '3 days', '[]'::jsonb)",
+                0,
+            ),
+        ];
+        // 0 binds (date, uid), 1 (date, uid, rid), 2 (date, rid): Postgres
+        // refuses a bind it has no placeholder for.
+        for (sql, binds) in statements {
+            let query = sqlx::query(sql).bind(date);
+            let query = match binds {
+                0 => query.bind(uid),
+                1 => query.bind(uid).bind(rid),
+                _ => query.bind(rid),
+            };
+            query
+                .execute(pool)
+                .await
+                .unwrap_or_else(|err| panic!("seed {sql}: {err}"));
+        }
+    }
+
+    async fn clear_pinnable_rows(pool: &PgPool, uid: &str, rid: &str) {
+        for sql in [
+            "DELETE FROM schedule_services WHERE uid = $1",
+            "DELETE FROM schedule_destination_departures WHERE train_uid = $1",
+            "DELETE FROM schedule_calling_points_full WHERE uid = $1",
+            "DELETE FROM schedule_turnarounds WHERE uid = $1",
+            "DELETE FROM schedule_associations WHERE main_uid = $1",
+            "DELETE FROM tracked_stop_boards WHERE train_uid = $1",
+            "DELETE FROM tracked_stop_arrival_boards WHERE train_uid = $1",
+        ] {
+            sqlx::query(sql).bind(uid).execute(pool).await.unwrap();
+        }
+        for sql in [
+            "DELETE FROM darwin_calls WHERE rid = $1",
+            "DELETE FROM darwin_associations WHERE main_rid = $1",
+            "DELETE FROM darwin_services WHERE rid = $1",
+        ] {
+            sqlx::query(sql).bind(rid).execute(pool).await.unwrap();
+        }
+    }
+
+    /// Rows left per table for one train, in a fixed order.
+    async fn pinnable_counts(pool: &PgPool, uid: &str, rid: &str) -> Vec<(&'static str, i64)> {
+        let mut out = Vec::new();
+        for (table, sql) in [
+            (
+                "schedule_services",
+                "SELECT COUNT(*) FROM schedule_services WHERE uid = $1",
+            ),
+            (
+                "schedule_destination_departures",
+                "SELECT COUNT(*) FROM schedule_destination_departures WHERE train_uid = $1",
+            ),
+            (
+                "schedule_calling_points_full",
+                "SELECT COUNT(*) FROM schedule_calling_points_full WHERE uid = $1",
+            ),
+            (
+                "schedule_turnarounds",
+                "SELECT COUNT(*) FROM schedule_turnarounds WHERE uid = $1",
+            ),
+            (
+                "schedule_associations",
+                "SELECT COUNT(*) FROM schedule_associations WHERE main_uid = $1",
+            ),
+            (
+                "tracked_stop_boards",
+                "SELECT COUNT(*) FROM tracked_stop_boards WHERE train_uid = $1",
+            ),
+            (
+                "tracked_stop_arrival_boards",
+                "SELECT COUNT(*) FROM tracked_stop_arrival_boards WHERE train_uid = $1",
+            ),
+        ] {
+            let n: i64 = sqlx::query_scalar(sql)
+                .bind(uid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            out.push((table, n));
+        }
+        for (table, sql) in [
+            (
+                "darwin_services",
+                "SELECT COUNT(*) FROM darwin_services WHERE rid = $1",
+            ),
+            (
+                "darwin_calls",
+                "SELECT COUNT(*) FROM darwin_calls WHERE rid = $1",
+            ),
+            (
+                "darwin_associations",
+                "SELECT COUNT(*) FROM darwin_associations WHERE main_rid = $1",
+            ),
+        ] {
+            let n: i64 = sqlx::query_scalar(sql)
+                .bind(rid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            out.push((table, n));
+        }
+        out
+    }
+
+    /// The schedule, Darwin and board prunes as the retention run makes
+    /// them: the production schedule window (8 days) and the journey hold's
+    /// bound (600).
+    async fn run_pin_aware_prunes(pool: &PgPool) {
+        prune_schedule_destination_departures(pool, 8, 600)
+            .await
+            .unwrap();
+        prune_schedule_calling_points_full(pool, 8, 600)
+            .await
+            .unwrap();
+        prune_schedule_services(pool, 90, 600).await.unwrap();
+        prune_schedule_turnarounds(pool, 8, 600).await.unwrap();
+        prune_schedule_associations(pool, 8, 600).await.unwrap();
+        prune_darwin_calls(pool, 600).await.unwrap();
+        prune_darwin_services(pool, 600).await.unwrap();
+        prune_darwin_associations(pool, 600).await.unwrap();
+        prune_tracked_stop_boards(pool, 600).await.unwrap();
+        prune_tracked_stop_arrival_boards(pool, 600).await.unwrap();
+    }
+
+    /// Tracking pins the train's schedule, Darwin and board rows: a train a
+    /// journey leg is bound to keeps every row keyed to it far past the 8-day
+    /// schedule window, the 2-day Darwin window and the 24-hour board window;
+    /// an unbound train of the same age loses them; and once the journey is
+    /// deleted the rows go on the next run. Only that train's rows are held
+    /// (a neighbouring train of the same service date is pruned).
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_keeps_the_schedule_rows_of_a_pinned_train -- --ignored --test-threads=1`"]
+    async fn prune_keeps_the_schedule_rows_of_a_pinned_train() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let date = Utc::now().date_naive() - chrono::Duration::days(400);
+        let (_, _, journey_id) = seed_leg_on_train(&pool, "PINROWS", 400).await;
+        let pinned_uid = "TEST-SNAPSHOT-GUARD-PINROWS";
+        let (unbound_uid, pinned_rid, unbound_rid) =
+            ("TEST-PIN-UNBOUND", "TESTPINBOUND", "TESTPINUNB");
+        seed_pinnable_rows(&pool, pinned_uid, date, pinned_rid).await;
+        seed_pinnable_rows(&pool, unbound_uid, date, unbound_rid).await;
+
+        run_pin_aware_prunes(&pool).await;
+        for (table, n) in pinnable_counts(&pool, pinned_uid, pinned_rid).await {
+            assert_eq!(n, 1, "{table}: a pinned train's row survives its window");
+        }
+        for (table, n) in pinnable_counts(&pool, unbound_uid, unbound_rid).await {
+            assert_eq!(n, 0, "{table}: an unbound train's row is pruned");
+        }
+
+        // The journey goes: the leg, so the pin, goes with it.
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_pin_aware_prunes(&pool).await;
+        for (table, n) in pinnable_counts(&pool, pinned_uid, pinned_rid).await {
+            assert_eq!(n, 0, "{table}: released with the journey");
+        }
+
+        clear_pinnable_rows(&pool, pinned_uid, pinned_rid).await;
+        cleanup_leg_on_train(&pool, "PINROWS").await;
+    }
+
+    /// Past the hard bound the schedule rows are not held either.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_does_not_hold_schedule_rows_past_the_hard_bound \
+                -- --ignored --test-threads=1`"]
+    async fn prune_does_not_hold_schedule_rows_past_the_hard_bound() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let date = Utc::now().date_naive() - chrono::Duration::days(700);
+        seed_leg_on_train(&pool, "PINBOUND", 700).await;
+        let uid = "TEST-SNAPSHOT-GUARD-PINBOUND";
+        seed_pinnable_rows(&pool, uid, date, "TESTPINBND").await;
+
+        run_pin_aware_prunes(&pool).await;
+        for (table, n) in pinnable_counts(&pool, uid, "TESTPINBND").await {
+            assert_eq!(
+                n, 0,
+                "{table}: a 700-day-old train is past the 600-day bound"
+            );
+        }
+
+        clear_pinnable_rows(&pool, uid, "TESTPINBND").await;
+        cleanup_leg_on_train(&pool, "PINBOUND").await;
+    }
+
+    /// The loss gauge counts a bound, schedule-matched train whose schedule
+    /// or live rows are gone, and nothing once the pin has kept them.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                pinned_train_gaps_counts_a_bound_train_that_lost_its_rows \
+                -- --ignored --test-threads=1`"]
+    async fn pinned_train_gaps_counts_a_bound_train_that_lost_its_rows() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let date = Utc::now().date_naive() - chrono::Duration::days(400);
+        let (trains_id, _, _) = seed_leg_on_train(&pool, "GAPS", 400).await;
+        let uid = "TEST-SNAPSHOT-GUARD-GAPS";
+        sqlx::query("UPDATE trains SET destination_crs = 'MAN' WHERE id = $1")
+            .bind(trains_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        clear_pinnable_rows(&pool, uid, "TESTPINGAPS").await;
+        let since = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        let count = async |pool: &PgPool| {
+            pinned_train_gaps(pool, 90, 8, 90, 600, since)
+                .await
+                .unwrap()
+        };
+
+        let gaps = count(&pool).await;
+        assert!(
+            gaps.schedule_services >= 1
+                && gaps.schedule_departures >= 1
+                && gaps.calling_points >= 1
+                && gaps.current_state >= 1,
+            "a bound train with nothing kept is a gap on every kind: {gaps:?}"
+        );
+
+        seed_pinnable_rows(&pool, uid, date, "TESTPINGAPS").await;
+        seed_train_data(&pool, trains_id, "GAPS").await;
+        let before = gaps;
+        let gaps = count(&pool).await;
+        assert_eq!(gaps.schedule_services, before.schedule_services - 1);
+        assert_eq!(gaps.schedule_departures, before.schedule_departures - 1);
+        assert_eq!(gaps.calling_points, before.calling_points - 1);
+        assert_eq!(gaps.current_state, before.current_state - 1);
+
+        let since_future = NaiveDate::from_ymd_opt(2999, 1, 1).unwrap();
+        assert_eq!(
+            pinned_train_gaps(&pool, 90, 8, 90, 600, since_future)
+                .await
+                .unwrap(),
+            PinnedTrainGaps::default(),
+            "a train from before the pin shipped is never counted"
+        );
+
+        clear_pinnable_rows(&pool, uid, "TESTPINGAPS").await;
+        cleanup_leg_on_train(&pool, "GAPS").await;
     }
 
     // ---- Retention prunes: skip-when-nothing-due, short-batch stop, and

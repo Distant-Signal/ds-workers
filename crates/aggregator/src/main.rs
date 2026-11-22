@@ -325,6 +325,54 @@ async fn report_trains_snapshot_guard(
     }
 }
 
+/// Exports `distant_signal_aggregator_pinned_trains_missing_data{kind}`: the
+/// trains a journey leg is bound to that lost data the pin keeps
+/// (`queries::pinned_train_gaps`). Runs before the prunes, so it sees what
+/// the previous run left. A failure is logged and leaves the gauge as it was.
+async fn report_pinned_train_gaps(
+    pool: &sqlx::PgPool,
+    services_retention_days: i64,
+    derived_retention_days: i64,
+    trains_retention_days: i64,
+    trains_snapshot_guard_max_days: i64,
+) {
+    let gaps = match queries::pinned_train_gaps(
+        pool,
+        services_retention_days,
+        derived_retention_days,
+        trains_retention_days,
+        trains_snapshot_guard_max_days,
+        queries::pin_shipped_date(),
+    )
+    .await
+    {
+        Ok(gaps) => gaps,
+        Err(err) => {
+            tracing::error!(error = ?err, "counting pinned trains missing data failed");
+            return;
+        }
+    };
+    for (kind, count) in [
+        ("schedule_services", gaps.schedule_services),
+        ("schedule_departures", gaps.schedule_departures),
+        ("calling_points", gaps.calling_points),
+        ("current_state", gaps.current_state),
+    ] {
+        metrics::gauge!(
+            ds_runtime::metrics::metric_name("aggregator_pinned_trains_missing_data"),
+            "kind" => kind
+        )
+        .set(f64::from(i32::try_from(count).unwrap_or(i32::MAX)));
+        if count > 0 {
+            tracing::error!(
+                kind,
+                count,
+                "trains a journey leg is bound to are missing data the pin should have kept"
+            );
+        }
+    }
+}
+
 /// One retention run: every prune, each in its own error scope
 /// (`retention_step`), so one failing prune never skips another; each
 /// failure is logged, counted and left for the next run.
@@ -884,6 +932,14 @@ async fn run_retention(
     // error scope: a database error in it skips no other prune, and no
     // other prune's error skips it.
     report_trains_snapshot_guard(pool, trains_retention_days, trains_snapshot_guard_max_days).await;
+    report_pinned_train_gaps(
+        pool,
+        trains_retention_days.max(schedule_derived_products_retention_days),
+        schedule_derived_products_retention_days,
+        trains_retention_days,
+        trains_snapshot_guard_max_days,
+    )
+    .await;
     let trains_pruned = match archiver.filter(|a| a.archives("trains")) {
         Some(archiver) => {
             retention_step("trains", async {
@@ -945,6 +1001,7 @@ async fn run_retention(
         queries::prune_schedule_destination_departures(
             pool,
             schedule_destination_departures_retention_days,
+            trains_snapshot_guard_max_days,
         ),
     )
     .await;
@@ -964,7 +1021,11 @@ async fn run_retention(
     // function's own doc comment.
     let schedule_calling_points_full_pruned = retention_step(
         "schedule_calling_points_full",
-        queries::prune_schedule_calling_points_full(pool, schedule_derived_products_retention_days),
+        queries::prune_schedule_calling_points_full(
+            pool,
+            schedule_derived_products_retention_days,
+            trains_snapshot_guard_max_days,
+        ),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(
@@ -980,6 +1041,7 @@ async fn run_retention(
         queries::prune_schedule_services(
             pool,
             trains_retention_days.max(schedule_derived_products_retention_days),
+            trains_snapshot_guard_max_days,
         ),
     )
     .await;
@@ -990,7 +1052,11 @@ async fn run_retention(
 
     let schedule_turnarounds_pruned = retention_step(
         "schedule_turnarounds",
-        queries::prune_schedule_turnarounds(pool, schedule_derived_products_retention_days),
+        queries::prune_schedule_turnarounds(
+            pool,
+            schedule_derived_products_retention_days,
+            trains_snapshot_guard_max_days,
+        ),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(
@@ -1000,7 +1066,11 @@ async fn run_retention(
 
     let schedule_associations_pruned = retention_step(
         "schedule_associations",
-        queries::prune_schedule_associations(pool, schedule_derived_products_retention_days),
+        queries::prune_schedule_associations(
+            pool,
+            schedule_derived_products_retention_days,
+            trains_snapshot_guard_max_days,
+        ),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(
@@ -1013,17 +1083,25 @@ async fn run_retention(
     for (task, pruned) in [
         (
             "darwin_calls",
-            retention_step("darwin_calls", queries::prune_darwin_calls(pool)).await,
+            retention_step(
+                "darwin_calls",
+                queries::prune_darwin_calls(pool, trains_snapshot_guard_max_days),
+            )
+            .await,
         ),
         (
             "darwin_services",
-            retention_step("darwin_services", queries::prune_darwin_services(pool)).await,
+            retention_step(
+                "darwin_services",
+                queries::prune_darwin_services(pool, trains_snapshot_guard_max_days),
+            )
+            .await,
         ),
         (
             "darwin_associations",
             retention_step(
                 "darwin_associations",
-                queries::prune_darwin_associations(pool),
+                queries::prune_darwin_associations(pool, trains_snapshot_guard_max_days),
             )
             .await,
         ),
@@ -1037,7 +1115,7 @@ async fn run_retention(
 
     let tracked_stop_boards_pruned = retention_step(
         "tracked_stop_boards",
-        queries::prune_tracked_stop_boards(pool),
+        queries::prune_tracked_stop_boards(pool, trains_snapshot_guard_max_days),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(
@@ -1047,7 +1125,7 @@ async fn run_retention(
 
     let tracked_stop_arrival_boards_pruned = retention_step(
         "tracked_stop_arrival_boards",
-        queries::prune_tracked_stop_arrival_boards(pool),
+        queries::prune_tracked_stop_arrival_boards(pool, trains_snapshot_guard_max_days),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(
