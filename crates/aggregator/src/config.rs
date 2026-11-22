@@ -293,19 +293,19 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 14, value_parser = non_negative_retention)]
     pub untracked_trains_retention_days: i64,
 
-    /// Hard upper bound, in days since `service_date`, on the snapshot
-    /// guard. A `trains` row older than `trains_retention_days` is normally
-    /// deleted, which sets `train_subscriptions.trains_id` NULL and costs a
-    /// journey leg its timetable; the api's sweep first copies it into
-    /// `journey_legs.final_snapshot`. Until that has happened
-    /// (`final_snapshot_at IS NULL`) the aggregator keeps the row, but only
-    /// until it is this many days old: past it the row is pruned anyway, so
-    /// a stuck sweep cannot grow `trains` without bound (a WARN counts those
-    /// rows). Set it above `trains_retention_days` (otherwise the guard never
-    /// holds anything) and well above the sweep's worst-case lag; 0 turns the
-    /// guard off. Needs the aggregator role's SELECT on `journey_legs`
-    /// (ds-core v0.17.6).
-    #[arg(long, env, default_value_t = 180, value_parser = non_negative_retention)]
+    /// Hard upper bound, in days since `service_date`, on the journey hold
+    /// (the variable keeps its first name, `TRAINS_SNAPSHOT_GUARD_MAX_DAYS`,
+    /// which the chart already lists). A `trains` row a journey leg is bound
+    /// to (through `train_subscriptions.trains_id`) is kept, with its
+    /// movement events, current state and reasons, for as long as that leg
+    /// exists, whatever `trains_retention_days` says: the api deletes the
+    /// leg's subscription when it passes the journey retention (548 days),
+    /// which releases the train. Past this bound the row is pruned anyway, so
+    /// a journey retention that stopped running cannot grow `trains` without
+    /// bound (a WARN counts those rows). Keep it above the journey retention;
+    /// 0 turns the hold off. Needs the aggregator role's SELECT on
+    /// `journey_legs (train_subscription_id)` (ds-core v0.17.6).
+    #[arg(long, env, default_value_t = 600, value_parser = non_negative_retention)]
     pub trains_snapshot_guard_max_days: i64,
 
     /// Port for the aggregator's Prometheus `/metrics` endpoint. The
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(config.schedule_derived_products_retention_days, 8);
         assert_eq!(config.schedule_line_population_retention_days, 3);
         assert_eq!(config.untracked_trains_retention_days, 14);
-        assert_eq!(config.trains_snapshot_guard_max_days, 180);
+        assert_eq!(config.trains_snapshot_guard_max_days, 600);
         assert!(
             !config.archive.archive_enabled,
             "archiving must be off unless explicitly enabled"

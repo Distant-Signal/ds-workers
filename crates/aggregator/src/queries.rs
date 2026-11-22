@@ -1327,8 +1327,8 @@ const PRUNE_TRAINS_BATCH: i64 = 1000;
 /// made the planner pick a whole-table seq scan it expected to stop early
 /// (DB review part 2, DB2-6).
 ///
-/// The tracked tier also keeps a row whose journey leg has no snapshot yet,
-/// up to `snapshot_guard_max_days` old ([`trains_snapshot_guard`]).
+/// The tracked tier also keeps a row a journey leg is bound to, up to
+/// `snapshot_guard_max_days` old ([`trains_snapshot_guard`]).
 pub(crate) async fn prune_trains(
     pool: &PgPool,
     retention_days: i64,
@@ -1356,7 +1356,7 @@ pub(crate) async fn prune_trains(
 /// One `prune_trains` tier: batches of the oldest eligible rows until a
 /// batch comes back short. `subscription_test` is `EXISTS` (tracked) or
 /// `NOT EXISTS` (untracked). `snapshot_guard_max_days` is the tracked
-/// tier's snapshot guard (see [`trains_snapshot_guard`]); the untracked tier
+/// tier's journey hold (see [`trains_snapshot_guard`]); the untracked tier
 /// has no subscription, so no leg, and takes none.
 async fn prune_trains_tier(
     pool: &PgPool,
@@ -1398,36 +1398,48 @@ async fn prune_trains_tier(
     }
 }
 
-/// `EXISTS` over a leg bound to a subscription on `trains t` that has never
-/// been snapshotted (`journey_legs.final_snapshot_at IS NULL`).
-const TRAINS_UNSNAPSHOTTED_LEG: &str = "EXISTS ( \
+/// `EXISTS` over a journey leg bound to a subscription on `trains t`. A leg
+/// belongs to exactly one journey (`journey_legs.journey_id` is `NOT NULL`
+/// and cascades), so a leg that exists is a leg of an existing journey, and
+/// tracking a train is a one-leg journey: this is "someone's journey still
+/// uses this train". It reads only `train_subscriptions (id, trains_id)` and
+/// `journey_legs (train_subscription_id)`, which the aggregator role has.
+/// Both joins are index lookups (`journey_legs_train_subscription_id`,
+/// `train_subscriptions.trains_id`), never a scan of either table.
+const TRAINS_JOURNEY_LEG: &str = "EXISTS ( \
          SELECT 1 FROM train_subscriptions gs \
          JOIN journey_legs gl ON gl.train_subscription_id = gs.id \
-         WHERE gs.trains_id = t.id AND gl.final_snapshot_at IS NULL)";
+         WHERE gs.trains_id = t.id)";
 
-/// The snapshot guard over `trains t`, true when the row may be deleted.
-/// Deleting a `trains` row sets `train_subscriptions.trains_id` NULL, after
-/// which a journey leg loses its timetable; the api's sweep copies it into
-/// `journey_legs.final_snapshot` first. A row is therefore held back while
-/// a leg on it has no snapshot (`final_snapshot_at IS NULL`), but only
-/// until it is `$param` days old (`TRAINS_SNAPSHOT_GUARD_MAX_DAYS`): past
-/// that a stuck sweep must not grow `trains` without bound, so the row goes
-/// anyway. `param` is the bind's number; its value is text (days).
+/// The journey hold over `trains t`, true when the row may be deleted.
+/// A train a journey leg is bound to keeps its whole scheduled and tracked
+/// data (movement events, current state, reasons, service labels), and
+/// stays found by its uid, for as long as the leg exists: the api deletes
+/// the leg's `train_subscriptions` row (and the journey) when it passes the
+/// journey retention (`PAST_TRAVEL_RETENTION_DAYS`, 548 days from the leg's
+/// service date), which unbinds the leg and makes the train prunable by the
+/// ordinary rule. Whether the leg has a final snapshot no longer matters.
+///
+/// The hold has a hard bound, `$param` days from the train's
+/// `service_date` (`TRAINS_SNAPSHOT_GUARD_MAX_DAYS`, default 600: above the
+/// journey retention): past it the row goes anyway, so a journey retention
+/// that stopped running cannot grow `trains` without bound. `param` is the
+/// bind's number; its value is text (days).
 pub(crate) fn trains_snapshot_guard(param: u8) -> String {
     format!(
         "NOT (t.service_date >= CURRENT_DATE - (${param} || ' days')::interval \
-              AND {TRAINS_UNSNAPSHOTTED_LEG})"
+              AND {TRAINS_JOURNEY_LEG})"
     )
 }
 
-/// Rows the snapshot guard is acting on, from [`trains_snapshot_guard_counts`].
+/// Rows the journey hold is acting on, from [`trains_snapshot_guard_counts`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TrainsSnapshotGuardCounts {
-    /// Past the tracked retention window but held back: a leg has no
-    /// snapshot and the row is younger than the hard bound.
+    /// Past the tracked retention window but held back: a journey leg is
+    /// bound to it and the row is younger than the hard bound.
     pub held: i64,
-    /// Past the hard bound with a leg still unsnapshotted: pruned anyway,
-    /// so that snapshot is lost.
+    /// Past the hard bound with a journey leg still bound: pruned anyway,
+    /// so that leg loses its train.
     pub forced: i64,
 }
 
@@ -1444,7 +1456,7 @@ pub(crate) async fn trains_snapshot_guard_counts(
                 COUNT(*) FILTER (WHERE t.service_date <  CURRENT_DATE - ($2 || ' days')::interval) \
          FROM trains t \
          WHERE t.service_date < CURRENT_DATE - ($1 || ' days')::interval \
-           AND {TRAINS_UNSNAPSHOTTED_LEG}"
+           AND {TRAINS_JOURNEY_LEG}"
     ))
     .bind(retention_days.to_string())
     .bind(snapshot_guard_max_days.to_string())
@@ -5901,8 +5913,7 @@ mod tests {
             .ok();
     }
 
-    /// A tracked train with a journey leg bound to it, `age_days` old, plus
-    /// the leg's snapshot state. Cleans up any earlier run's rows first.
+    /// A tracked train with a journey leg bound to it, `age_days` old. Cleans up any earlier run's rows first.
     /// Returns `(trains_id, subscription_id, journey_id)`.
     async fn seed_leg_on_train(pool: &PgPool, tag: &str, age_days: i64) -> (i64, i64, i64) {
         let user_id = format!("TEST-SNAPSHOT-GUARD-USER-{tag}");
@@ -5991,47 +6002,106 @@ mod tests {
             .ok();
     }
 
-    /// The snapshot guard: a train past the tracked window whose leg has no
-    /// snapshot is kept, with its subscription still pointing at it; once
-    /// the leg is snapshotted the next prune removes it.
+    /// One movement event, current state, reason and service label on a
+    /// train: the per-train data the journey hold must keep whole.
+    async fn seed_train_data(pool: &PgPool, trains_id: i64, tag: &str) {
+        sqlx::query(
+            "INSERT INTO train_movement_events \
+                 (trains_id, event_type, msg_type, dedup_key, raw_body, actual_timestamp) \
+             VALUES ($1, 'departure', '0003', $2, '{}'::jsonb, NOW())",
+        )
+        .bind(trains_id)
+        .bind(format!("TEST-SNAPSHOT-GUARD-{tag}-{trains_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO train_current_state (trains_id, status) VALUES ($1, 'completed')")
+            .bind(trains_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO train_reasons (trains_id, msg_type, reason_code, canx_type) \
+             VALUES ($1, '0002', 'TG', 'EN ROUTE')",
+        )
+        .bind(trains_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// `(trains, movement events, current state, reasons)` for one train.
+    async fn train_data_counts(pool: &PgPool, trains_id: i64) -> (i64, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM trains WHERE id = $1), \
+                    (SELECT COUNT(*) FROM train_movement_events WHERE trains_id = $1), \
+                    (SELECT COUNT(*) FROM train_current_state WHERE trains_id = $1), \
+                    (SELECT COUNT(*) FROM train_reasons WHERE trains_id = $1)",
+        )
+        .bind(trains_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The journey hold: a train a journey leg is bound to is kept far past
+    /// the tracked window with its whole data and its subscription link,
+    /// whether or not the leg has a final snapshot; an untracked train of the
+    /// same age goes; and once the journey (so the leg) is deleted the train
+    /// becomes prunable by the ordinary rule.
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_trains_keeps_a_train_whose_leg_has_no_snapshot \
+                prune_trains_keeps_a_train_a_journey_leg_is_bound_to \
                 -- --ignored --test-threads=1`"]
-    async fn prune_trains_keeps_a_train_whose_leg_has_no_snapshot() {
+    async fn prune_trains_keeps_a_train_a_journey_leg_is_bound_to() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let (trains_id, sub_id, journey_id) = seed_leg_on_train(&pool, "HOLD", 40).await;
+        // 400 days old: far past the 90-day production window, inside the bound.
+        let (trains_id, sub_id, journey_id) = seed_leg_on_train(&pool, "HOLD", 400).await;
+        seed_train_data(&pool, trains_id, "HOLD").await;
 
-        prune_trains(&pool, 30, 14, 180)
+        // An untracked train of the same age, with data.
+        sqlx::query("DELETE FROM trains WHERE train_uid = 'TEST-SNAPSHOT-GUARD-UNTRACKED'")
+            .execute(&pool)
             .await
-            .expect("prune_trains");
-        let (exists, linked): (bool, Option<i64>) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1), \
-                    (SELECT trains_id FROM train_subscriptions WHERE id = $2)",
+            .unwrap();
+        let untracked_id: i64 = sqlx::query_scalar(
+            "INSERT INTO trains (train_uid, service_date) \
+             VALUES ('TEST-SNAPSHOT-GUARD-UNTRACKED', CURRENT_DATE - 400) RETURNING id",
         )
-        .bind(trains_id)
-        .bind(sub_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(
-            exists,
-            "a 40-day-old train with an unsnapshotted leg must be kept"
+        seed_train_data(&pool, untracked_id, "UNTRACKED").await;
+
+        prune_trains(&pool, 90, 14, 600)
+            .await
+            .expect("prune_trains");
+        assert_eq!(
+            train_data_counts(&pool, trains_id).await,
+            (1, 1, 1, 1),
+            "a tracked train keeps its events, state and reasons"
         );
         assert_eq!(
-            linked,
-            Some(trains_id),
-            "the subscription must keep its train"
+            train_data_counts(&pool, untracked_id).await,
+            (0, 0, 0, 0),
+            "an untracked train of the same age is pruned"
         );
-
-        let counts = trains_snapshot_guard_counts(&pool, 30, 180).await.unwrap();
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT trains_id FROM train_subscriptions WHERE id = $1")
+                .bind(sub_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, Some(trains_id), "the subscription keeps its train");
+        let counts = trains_snapshot_guard_counts(&pool, 90, 600).await.unwrap();
         assert!(
-            counts.held >= 1,
-            "the held train must be counted: {counts:?}"
+            counts.held >= 1 && counts.forced == 0,
+            "the held train is counted held: {counts:?}"
         );
 
+        // Regression: a final snapshot no longer releases the train.
         sqlx::query(
             "UPDATE journey_legs SET final_snapshot = '{}'::jsonb, final_snapshot_at = NOW() \
              WHERE journey_id = $1",
@@ -6040,15 +6110,29 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        prune_trains(&pool, 30, 14, 180)
+        prune_trains(&pool, 90, 14, 600)
             .await
             .expect("prune_trains");
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
-            .bind(trains_id)
-            .fetch_one(&pool)
+        assert_eq!(
+            train_data_counts(&pool, trains_id).await,
+            (1, 1, 1, 1),
+            "an already-snapshotted leg still holds its train"
+        );
+
+        // The journey goes (its legs cascade): the train is ordinary again.
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&pool)
             .await
             .unwrap();
-        assert!(!exists, "once the leg has a snapshot the train is pruned");
+        prune_trains(&pool, 90, 14, 600)
+            .await
+            .expect("prune_trains");
+        assert_eq!(
+            train_data_counts(&pool, trains_id).await,
+            (0, 0, 0, 0),
+            "without a leg the train is pruned past the tracked window"
+        );
         let linked: Option<i64> =
             sqlx::query_scalar("SELECT trains_id FROM train_subscriptions WHERE id = $1")
                 .bind(sub_id)
@@ -6060,36 +6144,33 @@ mod tests {
         cleanup_leg_on_train(&pool, "HOLD").await;
     }
 
-    /// Past the hard bound the unsnapshotted train is pruned anyway, and
+    /// Past the hard bound the held train is pruned anyway, and
     /// `trains_snapshot_guard_counts` reports it as forced (what the
     /// retention run's WARN prints) just before.
     #[tokio::test]
     #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
-                prune_trains_prunes_an_unsnapshotted_train_past_the_hard_bound \
+                prune_trains_prunes_a_held_train_past_the_hard_bound \
                 -- --ignored --test-threads=1`"]
-    async fn prune_trains_prunes_an_unsnapshotted_train_past_the_hard_bound() {
+    async fn prune_trains_prunes_a_held_train_past_the_hard_bound() {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
-        let (trains_id, _, _) = seed_leg_on_train(&pool, "BOUND", 200).await;
+        let (trains_id, _, _) = seed_leg_on_train(&pool, "BOUND", 700).await;
+        seed_train_data(&pool, trains_id, "BOUND").await;
 
-        let counts = trains_snapshot_guard_counts(&pool, 30, 180).await.unwrap();
+        let counts = trains_snapshot_guard_counts(&pool, 90, 600).await.unwrap();
         assert!(
             counts.forced >= 1,
             "the bound-forced train must be counted: {counts:?}"
         );
 
-        prune_trains(&pool, 30, 14, 180)
+        prune_trains(&pool, 90, 14, 600)
             .await
             .expect("prune_trains");
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM trains WHERE id = $1)")
-            .bind(trains_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(
-            !exists,
-            "a 200-day-old train is pruned past the 180-day bound"
+        assert_eq!(
+            train_data_counts(&pool, trains_id).await,
+            (0, 0, 0, 0),
+            "a 700-day-old train is pruned past the 600-day bound"
         );
 
         cleanup_leg_on_train(&pool, "BOUND").await;
