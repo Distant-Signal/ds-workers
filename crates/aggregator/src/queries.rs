@@ -1052,24 +1052,32 @@ async fn prune_schedule_unpinned(
 
 /// One tracked-stop-board prune: rows of `table` last polled more than
 /// [`TRACKED_STOP_BOARDS_RETENTION_HOURS`] ago, except those of a pinned
-/// train (`train_uid`, `service_date`).
+/// train (`train_uid`, `service_date`) that were last polled no more than
+/// `board_pin_max_days` days ago. The boards are LDBWS-derived, so RDM's
+/// 300-day ceiling applies to every copy: the hold counts from the row's own
+/// `polled_at` and ends there even while the train is pinned. 0 holds
+/// nothing (the ordinary 24-hour rule).
 async fn prune_boards_unpinned(
     pool: &PgPool,
     table: &'static str,
     pin_guard_max_days: i64,
+    board_pin_max_days: i64,
 ) -> Result<u64> {
     let sql = format!(
         "WITH {PINNED_TRAINS_CTE} \
          DELETE FROM {table} b \
          WHERE b.polled_at < now() - make_interval(hours => $1::int) \
-           AND NOT EXISTS (SELECT 1 FROM pinned p \
-                           WHERE p.train_uid = b.train_uid AND p.service_date = b.service_date)"
+           AND (b.polled_at < now() - make_interval(days => $3::int) \
+                OR NOT EXISTS (SELECT 1 FROM pinned p \
+                               WHERE p.train_uid = b.train_uid \
+                                 AND p.service_date = b.service_date))"
     );
     let result = execute_retention_delete(
         pool,
         sqlx::query(&sql)
             .bind(TRACKED_STOP_BOARDS_RETENTION_HOURS)
-            .bind(pin_guard_max_days.to_string()),
+            .bind(pin_guard_max_days.to_string())
+            .bind(i32::try_from(board_pin_max_days).unwrap_or(i32::MAX)),
     )
     .await?;
     Ok(result.rows_affected())
@@ -1281,8 +1289,15 @@ pub(crate) const TRACKED_STOP_BOARDS_RETENTION_HOURS: i32 = 24;
 pub(crate) async fn prune_tracked_stop_boards(
     pool: &PgPool,
     pin_guard_max_days: i64,
+    board_pin_max_days: i64,
 ) -> Result<u64> {
-    prune_boards_unpinned(pool, "tracked_stop_boards", pin_guard_max_days).await
+    prune_boards_unpinned(
+        pool,
+        "tracked_stop_boards",
+        pin_guard_max_days,
+        board_pin_max_days,
+    )
+    .await
 }
 
 /// Prunes `tracked_stop_arrival_boards` rows (DS-152) last polled more than
@@ -1291,8 +1306,15 @@ pub(crate) async fn prune_tracked_stop_boards(
 pub(crate) async fn prune_tracked_stop_arrival_boards(
     pool: &PgPool,
     pin_guard_max_days: i64,
+    board_pin_max_days: i64,
 ) -> Result<u64> {
-    prune_boards_unpinned(pool, "tracked_stop_arrival_boards", pin_guard_max_days).await
+    prune_boards_unpinned(
+        pool,
+        "tracked_stop_arrival_boards",
+        pin_guard_max_days,
+        board_pin_max_days,
+    )
+    .await
 }
 
 /// Prunes `schedule_services` rows (one per schedule per service date, the
@@ -6552,8 +6574,10 @@ mod tests {
         prune_darwin_calls(pool, 600).await.unwrap();
         prune_darwin_services(pool, 600).await.unwrap();
         prune_darwin_associations(pool, 600).await.unwrap();
-        prune_tracked_stop_boards(pool, 600).await.unwrap();
-        prune_tracked_stop_arrival_boards(pool, 600).await.unwrap();
+        prune_tracked_stop_boards(pool, 600, 300).await.unwrap();
+        prune_tracked_stop_arrival_boards(pool, 600, 300)
+            .await
+            .unwrap();
     }
 
     /// Tracking pins the train's schedule, Darwin and board rows: a train a
@@ -6598,6 +6622,85 @@ mod tests {
 
         clear_pinnable_rows(&pool, pinned_uid, pinned_rid).await;
         cleanup_leg_on_train(&pool, "PINROWS").await;
+    }
+
+    /// RDM's 300-day ceiling on LDBWS data: a pinned train's board polled
+    /// more than 300 days ago is pruned while its schedule and Darwin rows
+    /// (inside the 600-day bound) stay; a board polled under 300 days ago
+    /// stays; with the board hold at 0 a pinned board goes by the ordinary
+    /// 24-hour rule.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                prune_caps_the_pinned_boards_at_the_ldbws_ceiling \
+                -- --ignored --test-threads=1`"]
+    async fn prune_caps_the_pinned_boards_at_the_ldbws_ceiling() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let date = Utc::now().date_naive() - chrono::Duration::days(400);
+        seed_leg_on_train(&pool, "PINCAP", 400).await;
+        let uid = "TEST-SNAPSHOT-GUARD-PINCAP";
+        let rid = "TESTPINCAP";
+        seed_pinnable_rows(&pool, uid, date, rid).await;
+        for (table, column) in [
+            ("tracked_stop_boards", "departures"),
+            ("tracked_stop_arrival_boards", "arrivals"),
+        ] {
+            for (crs, days) in [("OLD", 301), ("NEW", 299)] {
+                sqlx::query(&format!(
+                    "INSERT INTO {table} (train_uid, service_date, crs, polled_at, {column}) \
+                     VALUES ($1, $2, $3, now() - make_interval(days => $4::int), '[]'::jsonb)"
+                ))
+                .bind(uid)
+                .bind(date)
+                .bind(crs)
+                .bind(days)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        run_pin_aware_prunes(&pool).await;
+        for table in ["tracked_stop_boards", "tracked_stop_arrival_boards"] {
+            let crs: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT crs FROM {table} WHERE train_uid = $1 ORDER BY crs"
+            ))
+            .bind(uid)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let expected: &[&str] = if table == "tracked_stop_boards" {
+                &["EUS", "NEW"]
+            } else {
+                &["MAN", "NEW"]
+            };
+            assert_eq!(
+                crs, expected,
+                "{table}: the 301-day board goes, younger ones stay"
+            );
+        }
+        for (table, n) in pinnable_counts(&pool, uid, rid).await {
+            if !table.starts_with("tracked_stop") {
+                assert_eq!(n, 1, "{table}: schedule and Darwin rows stay to 600 days");
+            }
+        }
+
+        // No board hold: every pinned board older than 24 hours goes.
+        prune_tracked_stop_boards(&pool, 600, 0).await.unwrap();
+        prune_tracked_stop_arrival_boards(&pool, 600, 0)
+            .await
+            .unwrap();
+        for (table, n) in pinnable_counts(&pool, uid, rid).await {
+            if table.starts_with("tracked_stop") {
+                assert_eq!(n, 0, "{table}: a hold of 0 days keeps nothing");
+            } else {
+                assert_eq!(n, 1, "{table}: untouched by the board hold");
+            }
+        }
+
+        clear_pinnable_rows(&pool, uid, rid).await;
+        cleanup_leg_on_train(&pool, "PINCAP").await;
     }
 
     /// Past the hard bound the schedule rows are not held either.
