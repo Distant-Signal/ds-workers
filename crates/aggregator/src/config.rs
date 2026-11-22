@@ -29,6 +29,24 @@ fn non_negative_retention(s: &str) -> anyhow::Result<i64> {
     Ok(value)
 }
 
+/// RDM's ceiling, in days, on every copy of LDBWS-derived data. The pinned
+/// board tables may not be held longer than this
+/// (`Config::ldbws_pinned_boards_max_days`).
+pub(crate) const LDBWS_CEILING_DAYS: i64 = 300;
+
+/// Like [`non_negative_retention`], and refuses a value above
+/// [`LDBWS_CEILING_DAYS`]: that bound is RDM's licence ceiling, not a tuning
+/// knob, so a larger value fails startup rather than being clamped quietly.
+fn ldbws_ceiling_retention(s: &str) -> anyhow::Result<i64> {
+    let value = non_negative_retention(s)?;
+    anyhow::ensure!(
+        value <= LDBWS_CEILING_DAYS,
+        "LDBWS_PINNED_BOARDS_MAX_DAYS must not exceed {LDBWS_CEILING_DAYS}, got {value}: RDM's \
+         {LDBWS_CEILING_DAYS}-day ceiling applies to every copy of LDBWS-derived data"
+    );
+    Ok(value)
+}
+
 /// CLI/env configuration for the `aggregator` service.
 /// `Debug` is safe to log: every credential is a [`ds_runtime::secret::Secret`]
 /// (SVC-12).
@@ -312,6 +330,18 @@ pub(crate) struct Config {
     #[arg(long, env, default_value_t = 600, value_parser = non_negative_retention)]
     pub trains_snapshot_guard_max_days: i64,
 
+    /// How long, in days after the row's own `polled_at`, the journey hold
+    /// keeps the LDBWS-derived `tracked_stop_boards` and
+    /// `tracked_stop_arrival_boards` rows of a pinned train. The rest of the
+    /// hold (`trains_snapshot_guard_max_days`) is unaffected. RDM's
+    /// 300-day ceiling applies to every copy of LDBWS data, so a value above
+    /// 300 is refused at startup. A pinned board polled more than this many
+    /// days ago is deleted by the next retention run; 0 turns the hold off
+    /// for the boards (the ordinary 24-hour rule). Decision of 2026-11-22
+    /// (DS-638); docs/cold-archive.md, "Pinned schedule, Darwin and board rows".
+    #[arg(long, env, default_value_t = 300, value_parser = ldbws_ceiling_retention)]
+    pub ldbws_pinned_boards_max_days: i64,
+
     /// Port for the aggregator's Prometheus `/metrics` endpoint. The
     /// aggregator has no HTTP server of its own, so `ds_runtime::metrics::install`
     /// starts a dedicated listener on this port.
@@ -422,6 +452,23 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_board_hold_is_refused_above_the_rdm_ceiling() {
+        for value in ["301", "600", "-1"] {
+            assert!(
+                Config::try_parse_from(minimal_args(&["--ldbws-pinned-boards-max-days", value]))
+                    .is_err(),
+                "{value} must be refused: RDM's 300-day ceiling is a licence rule"
+            );
+        }
+        for (value, want) in [("300", 300), ("299", 299), ("0", 0)] {
+            let config =
+                Config::try_parse_from(minimal_args(&["--ldbws-pinned-boards-max-days", value]))
+                    .expect("at or under the ceiling is accepted");
+            assert_eq!(config.ldbws_pinned_boards_max_days, want);
+        }
+    }
+
+    #[test]
     fn a_non_negative_retention_days_value_still_parses_normally() {
         let config = Config::try_parse_from(minimal_args(&["--history-retention-days", "0"]))
             .expect("zero is a valid (if aggressive) retention window");
@@ -446,6 +493,7 @@ mod tests {
         assert_eq!(config.schedule_line_population_retention_days, 3);
         assert_eq!(config.untracked_trains_retention_days, 14);
         assert_eq!(config.trains_snapshot_guard_max_days, 600);
+        assert_eq!(config.ldbws_pinned_boards_max_days, 300);
         assert!(
             !config.archive.archive_enabled,
             "archiving must be off unless explicitly enabled"

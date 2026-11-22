@@ -214,6 +214,7 @@ struct RetentionSettings {
     trains_retention_days: i64,
     untracked_trains_retention_days: i64,
     trains_snapshot_guard_max_days: i64,
+    ldbws_pinned_boards_max_days: i64,
     schedule_destination_departures_retention_days: i64,
     schedule_derived_products_retention_days: i64,
     schedule_line_population_retention_days: i64,
@@ -231,6 +232,7 @@ impl RetentionSettings {
             trains_retention_days: config.trains_retention_days,
             untracked_trains_retention_days: config.untracked_trains_retention_days,
             trains_snapshot_guard_max_days: config.trains_snapshot_guard_max_days,
+            ldbws_pinned_boards_max_days: config.ldbws_pinned_boards_max_days,
             schedule_destination_departures_retention_days: config
                 .schedule_destination_departures_retention_days,
             schedule_derived_products_retention_days: config
@@ -390,6 +392,7 @@ async fn run_retention_pass(
         settings.trains_retention_days,
         settings.untracked_trains_retention_days,
         settings.trains_snapshot_guard_max_days,
+        settings.ldbws_pinned_boards_max_days,
         settings.schedule_destination_departures_retention_days,
         settings.schedule_derived_products_retention_days,
         settings.schedule_line_population_retention_days,
@@ -877,6 +880,7 @@ async fn run_retention(
     trains_retention_days: i64,
     untracked_trains_retention_days: i64,
     trains_snapshot_guard_max_days: i64,
+    ldbws_pinned_boards_max_days: i64,
     schedule_destination_departures_retention_days: i64,
     schedule_derived_products_retention_days: i64,
     schedule_line_population_retention_days: i64,
@@ -1115,7 +1119,11 @@ async fn run_retention(
 
     let tracked_stop_boards_pruned = retention_step(
         "tracked_stop_boards",
-        queries::prune_tracked_stop_boards(pool, trains_snapshot_guard_max_days),
+        queries::prune_tracked_stop_boards(
+            pool,
+            trains_snapshot_guard_max_days,
+            ldbws_pinned_boards_max_days,
+        ),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(
@@ -1125,7 +1133,11 @@ async fn run_retention(
 
     let tracked_stop_arrival_boards_pruned = retention_step(
         "tracked_stop_arrival_boards",
-        queries::prune_tracked_stop_arrival_boards(pool, trains_snapshot_guard_max_days),
+        queries::prune_tracked_stop_arrival_boards(
+            pool,
+            trains_snapshot_guard_max_days,
+            ldbws_pinned_boards_max_days,
+        ),
     )
     .await;
     metrics::counter!(ds_runtime::metrics::metric_name(

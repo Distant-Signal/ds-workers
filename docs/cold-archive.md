@@ -78,7 +78,32 @@ to that train and service date, past their own windows:
 | `schedule_turnarounds` | `(service_date, uid)` | 8 days | the previous working's platform and times | 1 row |
 | `schedule_associations` | the main or the associated `(service_date, uid)` | 8 days | joins and divides | 0 to 4 rows |
 | `darwin_services`, `darwin_calls`, `darwin_associations` | RID, from `darwin_services (uid, ssd)` | 2 days past the start date | forecast times, platform changes and their confirmed flags, cancellations | 1 service, about 20 to 80 calls (about 200 bytes each), under 20 KB |
-| `tracked_stop_boards`, `tracked_stop_arrival_boards` | `(train_uid, service_date)` | 24 hours from the last poll | the station board last polled for each of the train's stops | one row per stop with a JSON board, about 2 to 20 KB each, so up to a few hundred KB |
+| `tracked_stop_boards`, `tracked_stop_arrival_boards` | `(train_uid, service_date)` | 24 hours from the last poll; held to at most 300 days from the row's own `polled_at` (licence cap, below) | the station board last polled for each of the train's stops | one row per stop with a JSON board, about 2 to 20 KB each, so up to a few hundred KB |
+
+**Boards are capped at 300 days (decision of 2026-11-22, DS-638).** The two
+board tables are LDBWS-derived (ds-core: `tracked_stop_arrival_boards` is the
+"Latest LDBWS arrival board per tracked train and alighting stop";
+`tracked_stop_boards` is filled by the same poller's departure-board lane),
+and RDM's 300-day ceiling applies to every copy of LDBWS data (see "What can
+be archived", below). So the journey hold does not keep them for the journey's
+life: a board whose own `polled_at` is more than 300 days old is deleted by
+the next retention run even while its train is bound to a journey leg. A board
+polled 300 days ago or less is held under the pin's usual rules. The cap runs
+from `polled_at`, the capture time of the board (not the service date, which
+can be earlier than the last poll), and is a separate bound,
+`LDBWS_PINNED_BOARDS_MAX_DAYS` (default 300, so no chart value is needed). A
+larger value is refused at startup, because the ceiling is a licence rule, not
+a tuning knob; 0 holds no board past the ordinary 24-hour rule. Every other
+pinned table keeps the 600-day bound above: `schedule_*` is the CIF timetable
+and `darwin_*` is the Darwin Push Port feed, and neither is LDBWS data. This
+repository states no licence ceiling for either feed.
+
+**Raw TRUST messages stay on pinned live rows (decision of 2026-11-22).** The
+journey hold keeps a pinned train's `train_movement_events` whole, including
+`raw_body`, for the journey's lifetime; nothing scrubs it while the row is
+held. The archive still strips `raw_body` from every archived movement event
+(triage decision DQ14, below), and `trust_event_backlog` keeps its 1-day
+window; neither changes.
 
 Every one of these is a single anti-join against the set of bound trains
 (`PINNED_TRAINS_CTE`, evaluated once per statement from the legs, never from
@@ -307,6 +332,16 @@ example in docker-compose: `ARCHIVE_ENABLED`, `ARCHIVE_TABLES`
 `ARCHIVE_EXPIRY_INTERVAL_SECS` (default `86400`),
 `ARCHIVE_EXPIRY_MAX_DELETES_PER_RUN` (default `20000`) and
 `ARCHIVE_PROTECTED_PREFIXES` (comma-separated).
+
+The journey hold's two bounds are aggregator variables with defaults, not
+chart-driven: `TRAINS_SNAPSHOT_GUARD_MAX_DAYS` (default 600; the hold on
+`trains`, schedule and Darwin rows, counted from the service date) and
+`LDBWS_PINNED_BOARDS_MAX_DAYS` (default 300; the hold on the two LDBWS board
+tables, counted from each row's `polled_at`; values above 300 are refused at
+startup, 0 turns the board hold off). ds-deploy needs no chart value for the
+new variable while the default stands. Its `check-config-defaults-chart.py`
+should list `LDBWS_PINNED_BOARDS_MAX_DAYS` as unwired, on the same footing as
+`TRAINS_SNAPSHOT_GUARD_MAX_DAYS`, if it fails on an env the chart does not set.
 
 ### Network access
 
