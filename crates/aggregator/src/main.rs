@@ -276,8 +276,8 @@ async fn retention_loop(
     }
 }
 
-/// Logs and counts what the trains snapshot guard holds back (journey legs
-/// not yet snapshotted) and what its hard bound is about to prune anyway.
+/// Logs and counts what the trains journey hold keeps (trains a
+/// journey leg is bound to) and what its hard bound is about to prune anyway.
 /// Runs before the trains prune so `forced` is what that prune will take.
 /// A failure here is logged and leaves the prune to run (and fail the same
 /// way if the grant is missing).
@@ -295,7 +295,7 @@ async fn report_trains_snapshot_guard(
     {
         Ok(counts) => counts,
         Err(err) => {
-            tracing::error!(error = ?err, "counting trains held by the snapshot guard failed");
+            tracing::error!(error = ?err, "counting trains held by the journey hold failed");
             return;
         }
     };
@@ -308,7 +308,7 @@ async fn report_trains_snapshot_guard(
             held = counts.held,
             guard_max_days = trains_snapshot_guard_max_days,
             retention_days = trains_retention_days,
-            "trains past retention kept because a journey leg has no snapshot yet"
+            "trains past retention kept because a journey leg is still bound to them"
         );
     }
     if counts.forced > 0 {
@@ -320,7 +320,7 @@ async fn report_trains_snapshot_guard(
             forced = counts.forced,
             guard_max_days = trains_snapshot_guard_max_days,
             "trains past TRAINS_SNAPSHOT_GUARD_MAX_DAYS are being pruned with a journey leg \
-             still unsnapshotted (the leg loses its timetable); is the snapshot sweep stuck?"
+             still bound to them (the leg loses its train); is the api's journey retention stuck?"
         );
     }
 }

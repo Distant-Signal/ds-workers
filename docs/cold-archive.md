@@ -27,27 +27,42 @@ and pruned after `untrackedTrainsRetentionDays` (14 days by default). A
 train with a subscription is archived and pruned after
 `trainsRetentionDays` (30 days by default).
 
-**Snapshot guard (all `trains` prunes, archived or not).** A tracked train
-that a journey leg is bound to is not deleted while that leg has no final
-snapshot (`journey_legs.final_snapshot_at IS NULL`, ds-core v0.17.5): the
-api's sweep copies the train's timetable into the leg first, because
-deleting the `trains` row sets `train_subscriptions.trains_id` NULL and the
-leg would lose its timetable. The archive is not a substitute, as the app
-does not read it. The hold ends at `TRAINS_SNAPSHOT_GUARD_MAX_DAYS`
-(default 180, counted from the train's `service_date`; 0 turns the guard
-off): past it the row is archived and pruned anyway, so a stuck sweep
-cannot grow `trains` without bound. Each retention run logs a WARN with
-`held` (kept past retention) and `forced` (pruned by the bound with a leg
-still unsnapshotted), and exports
+**Journey hold (all `trains` prunes, archived or not).** A train that a
+journey leg is bound to is not deleted for as long as that leg exists,
+however old it is: the journey keeps the train's whole scheduled and tracked
+data (movement events, current state, reasons, service labels) and the train
+stays found by its uid. Tracking a train is a one-leg journey, so this covers
+every tracked train. The test is `train_subscriptions.trains_id = trains.id`
+joined to `journey_legs.train_subscription_id`; whether the leg has a final
+snapshot (`journey_legs.final_snapshot_at`) no longer matters, and the
+snapshot is a fallback, not a reason to delete. The hold ends when the api's
+journey retention deletes the leg's `train_subscriptions` row
+(`PAST_TRAVEL_RETENTION_DAYS`, 548 days from the service date; the journey
+goes with it), after which the train is an ordinary tracked train and goes
+at `trainsRetentionDays`, archived first. A train with a subscription but no
+leg is not held.
+
+The hold has a hard bound, `TRAINS_SNAPSHOT_GUARD_MAX_DAYS` (default 600,
+counted from the train's `service_date`; 0 turns the hold off; the variable
+keeps its first name). It is above the 548-day journey retention on purpose:
+past it the row is archived and pruned anyway, so a journey retention that
+stopped running cannot grow `trains` without bound. Each retention run logs a
+WARN with `held` (kept past retention) and `forced` (pruned by the bound with
+a leg still bound), and exports
 `distant_signal_aggregator_trains_snapshot_guard_held` (gauge) and
 `distant_signal_aggregator_trains_snapshot_guard_forced_total` (counter).
 While rows are held, the cheap "nothing old enough" probe no longer
-short-circuits, so every run does the candidate scan. The guard reads
-`journey_legs` and `train_subscriptions.id`, which the aggregator role has
-from ds-core v0.17.6: the grants setup Job must have run before an
-aggregator with the guard rolls out, or the prune fails with permission
-denied. No chart change is needed (the default applies); a chart value for
-`TRAINS_SNAPSHOT_GUARD_MAX_DAYS` is optional.
+short-circuits, so every run does the candidate scan; the scan walks the
+held rows (one index probe each) before the rows behind them. The hold
+reads `journey_legs (train_subscription_id)` and
+`train_subscriptions (id, trains_id)`, which the aggregator role has from
+ds-core v0.17.6: the grants setup Job must have run before an aggregator
+with the hold rolls out, or the prune fails with permission denied. No chart
+change is needed (the default applies, and ds-deploy's
+`check-config-defaults-chart.py` already lists the variable as unwired); a
+chart value for `TRAINS_SNAPSHOT_GUARD_MAX_DAYS` is optional. The hold keeps
+the retention windows' other rule: `trainsRetentionDays` still decides when
+an unbound tracked train goes.
 
 Some tables can never be archived. The binary refuses to start, and the
 chart refuses to render, if one of them is listed:

@@ -755,9 +755,9 @@ pub(crate) async fn archive_and_prune_trains(
 /// The two-tier retention predicate over `trains t`. Binds: `$1` untracked
 /// days, `$2` tracked days, `$4` the smaller of the two (a plain range on
 /// `service_date` the planner can use; the OR alone cannot be), `$5` the
-/// snapshot guard's hard bound in days. The tracked branch also requires the
-/// snapshot guard (`queries::trains_snapshot_guard`): a row with an
-/// unsnapshotted journey leg stays until that bound.
+/// journey hold's hard bound in days. The tracked branch also requires the
+/// journey hold (`queries::trains_snapshot_guard`): a row with a journey
+/// leg bound to it stays until that bound.
 fn trains_eligible() -> String {
     format!(
         "t.service_date < CURRENT_DATE - ($4 || ' days')::interval \
@@ -1328,15 +1328,21 @@ mod tests {
         paths
     }
 
-    /// The snapshot guard holds an archivable train back, archiving nothing,
-    /// until its leg has a snapshot; then it is archived and deleted.
+    /// The journey hold keeps a train a leg is bound to (archiving nothing,
+    /// snapshot or not) while an untracked train of the same age is archived
+    /// and deleted; once the journey is deleted the held train is archived
+    /// and deleted too.
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear scenario: seed, hold, snapshot, delete the journey, release"
+    )]
     #[ignore = "requires a live database; run with DATABASE_URL=... cargo test -p aggregator -- --ignored --test-threads=1"]
-    async fn holds_a_train_whose_leg_has_no_snapshot_then_archives_it() {
+    async fn holds_a_train_a_leg_is_bound_to_then_archives_it_once_released() {
         let pool = pool().await;
         let owner = fixtures(&pool).await;
         let date = chrono::Utc::now().date_naive() - chrono::Duration::days(40);
-        let ids = seed(&pool, "TEST-ARCHIVE-GUARD-", date, 1).await;
+        let ids = seed(&pool, "TEST-ARCHIVE-GUARD-", date, 2).await;
         let user_id = "TEST-ARCHIVE-GUARD-USER";
         sqlx::query("DELETE FROM journeys WHERE user_id = $1")
             .bind(user_id)
@@ -1384,16 +1390,28 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(FlakyStore::default());
         let a = archiver(store.clone(), FailurePolicy::Retain);
 
-        let held = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
+        // ids[0] has a leg; ids[1] is untracked and the same age.
+        let held = archive_and_prune_trains(&pool, &a, 30, 14, 600, 1000)
             .await
             .unwrap();
         assert!(!held.upload_failed);
-        assert_eq!(remaining(&pool, &ids).await.0, 1, "held back, not deleted");
         assert_eq!(
+            remaining(&pool, &ids[..1]).await,
+            (1, 2, 1),
+            "the tracked train is held with its data"
+        );
+        assert_eq!(
+            remaining(&pool, &ids[1..]).await,
+            (0, 0, 0),
+            "the untracked train is pruned"
+        );
+        assert_ne!(
             objects_under(store.as_ref(), "cold").await,
-            Vec::<Path>::new()
+            Vec::<Path>::new(),
+            "the untracked train was archived before its delete"
         );
 
+        // A final snapshot does not release the train; deleting the journey does.
         sqlx::query(
             "UPDATE journey_legs SET final_snapshot = '{}'::jsonb, final_snapshot_at = NOW() \
              WHERE journey_id = $1",
@@ -1402,15 +1420,20 @@ mod tests {
         .execute(&owner)
         .await
         .unwrap();
-        let released = archive_and_prune_trains(&pool, &a, 30, 14, 180, 1000)
+        archive_and_prune_trains(&pool, &a, 30, 14, 600, 1000)
+            .await
+            .unwrap();
+        assert_eq!(remaining(&pool, &ids[..1]).await, (1, 2, 1));
+        sqlx::query("DELETE FROM journeys WHERE id = $1")
+            .bind(journey_id)
+            .execute(&owner)
+            .await
+            .unwrap();
+        let released = archive_and_prune_trains(&pool, &a, 30, 14, 600, 1000)
             .await
             .unwrap();
         assert!(released.pruned >= 1);
         assert_eq!(remaining(&pool, &ids).await, (0, 0, 0));
-        assert_ne!(
-            objects_under(store.as_ref(), "cold").await,
-            Vec::<Path>::new()
-        );
 
         sqlx::query("DELETE FROM journeys WHERE user_id = $1")
             .bind(user_id)
