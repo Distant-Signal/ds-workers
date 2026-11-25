@@ -1677,6 +1677,59 @@ pub(crate) async fn pinned_train_gaps(
     })
 }
 
+/// Train legs whose subscription is matched but has no train, from
+/// [`bound_legs_without_train`]. Both zero while the pin works.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BoundLegsWithoutTrain {
+    /// `final_snapshot_at IS NULL`: no live train and no snapshot, so the
+    /// leg's train data is gone. The one that alarms.
+    pub unsnapshotted: i64,
+    /// A snapshot exists, but the live train is gone: the leg shows its
+    /// snapshot. Expected for legs from before the snapshots shipped, which
+    /// the date floor leaves out; a leg after it should not stay here for
+    /// long, so a rise is informational.
+    pub snapshotted: i64,
+}
+
+/// Counts the train legs of journeys still kept (a leg is deleted with its
+/// journey, so every leg here is within the journey retention) whose
+/// subscription is matched (`resolution_status` `resolved` or
+/// `schedule_matched`) yet has `trains_id IS NULL` (the `trains` row was
+/// pruned out from under it, `ON DELETE SET NULL`), on a service date from
+/// `since` (the pin's ship date, [`pin_shipped_date`]) and no older than
+/// `guard_max_days` (past the snapshot guard's hard bound the train is
+/// allowed to go). Split by whether the leg was snapshotted
+/// (`journey_legs.final_snapshot_at`). One query per call: the planner
+/// drives from `train_subscriptions_trains_id` (a btree, so `IS NULL` is an
+/// index condition on the few subscriptions without a train), filters the
+/// status and date on the heap rows, and probes `journey_legs` by
+/// `journey_legs_train_subscription_id` once per remaining subscription. No
+/// scan of `trains` or of the legs.
+pub(crate) async fn bound_legs_without_train(
+    pool: &PgPool,
+    guard_max_days: i64,
+    since: NaiveDate,
+) -> Result<BoundLegsWithoutTrain> {
+    let (unsnapshotted, snapshotted): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) FILTER (WHERE jl.final_snapshot_at IS NULL), \
+                COUNT(*) FILTER (WHERE jl.final_snapshot_at IS NOT NULL) \
+         FROM train_subscriptions ts \
+         JOIN journey_legs jl ON jl.train_subscription_id = ts.id \
+         WHERE ts.trains_id IS NULL \
+           AND ts.resolution_status IN ('resolved', 'schedule_matched') \
+           AND ts.service_date >= $1 \
+           AND ts.service_date >= CURRENT_DATE - ($2 || ' days')::interval",
+    )
+    .bind(since)
+    .bind(guard_max_days.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(BoundLegsWithoutTrain {
+        unsnapshotted,
+        snapshotted,
+    })
+}
+
 /// Whether either `trains` retention tier can have anything to delete,
 /// as `(untracked_due, tracked_due)`: `MIN(service_date)` (one descent of
 /// `trains_service_date`) against each tier's cutoff. Lets
@@ -6784,6 +6837,75 @@ mod tests {
 
         clear_pinnable_rows(&pool, uid, "TESTPINGAPS").await;
         cleanup_leg_on_train(&pool, "GAPS").await;
+    }
+
+    /// The bound-legs gauge counts a matched leg whose train is gone by its
+    /// snapshot state, and not a bound, unmatched, too-early or too-old one.
+    #[tokio::test]
+    #[ignore = "requires a live database; run with `DATABASE_URL=... cargo test -p aggregator \
+                bound_legs_without_train_counts_matched_legs_that_lost_their_train \
+                -- --ignored --test-threads=1`"]
+    async fn bound_legs_without_train_counts_matched_legs_that_lost_their_train() {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run this test");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        let since = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        // One leg per tag, 5 days old: (tag, status, bound to a train,
+        // snapshotted).
+        let legs = [
+            ("BLWT-UNSNAP", "resolved", false, false),
+            ("BLWT-UNSNAP2", "schedule_matched", false, false),
+            ("BLWT-SNAP", "resolved", false, true),
+            ("BLWT-BOUND", "resolved", true, false),
+            ("BLWT-UNRES", "unresolved", false, false),
+        ];
+        for (tag, ..) in legs {
+            cleanup_leg_on_train(&pool, tag).await;
+        }
+        let before = bound_legs_without_train(&pool, 600, since).await.unwrap();
+        for (tag, status, bound, snapshotted) in legs {
+            let (_, sub_id, _) = seed_leg_on_train(&pool, tag, 5).await;
+            sqlx::query(
+                "UPDATE train_subscriptions SET resolution_status = $2, \
+                     trains_id = CASE WHEN $3 THEN trains_id END WHERE id = $1",
+            )
+            .bind(sub_id)
+            .bind(status)
+            .bind(bound)
+            .execute(&pool)
+            .await
+            .unwrap();
+            if snapshotted {
+                sqlx::query(
+                    "UPDATE journey_legs SET final_train_uid = 'C1', \
+                         final_snapshot = '{}'::jsonb, final_snapshot_at = NOW() \
+                     WHERE train_subscription_id = $1",
+                )
+                .bind(sub_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let after = bound_legs_without_train(&pool, 600, since).await.unwrap();
+        assert_eq!(after.unsnapshotted - before.unsnapshotted, 2);
+        assert_eq!(after.snapshotted - before.snapshotted, 1);
+
+        // A floor after the legs' date, or a guard bound shorter than their
+        // age, leaves them out.
+        let tomorrow = Utc::now().date_naive() + chrono::Duration::days(1);
+        let floored = bound_legs_without_train(&pool, 600, tomorrow)
+            .await
+            .unwrap();
+        assert_eq!(floored, BoundLegsWithoutTrain::default());
+        let too_old = bound_legs_without_train(&pool, 1, since).await.unwrap();
+        assert!(too_old.unsnapshotted <= before.unsnapshotted);
+        assert!(too_old.snapshotted <= before.snapshotted);
+
+        for (tag, ..) in legs {
+            cleanup_leg_on_train(&pool, tag).await;
+        }
     }
 
     // ---- Retention prunes: skip-when-nothing-due, short-batch stop, and

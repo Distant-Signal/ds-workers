@@ -375,6 +375,47 @@ async fn report_pinned_train_gaps(
     }
 }
 
+/// Exports `distant_signal_aggregator_bound_legs_without_train{state}`: the
+/// train legs of kept journeys whose subscription is matched but whose
+/// `trains` row is gone (`queries::bound_legs_without_train`), from the pin's
+/// ship date on. `unsnapshotted` (no snapshot either: the leg's train data is
+/// lost) logs an ERROR when above zero; `snapshotted` (the leg falls back to
+/// its snapshot) is informational. Runs before the prunes, like
+/// [`report_pinned_train_gaps`]. A failure is logged and leaves the gauges as
+/// they were.
+async fn report_bound_legs_without_train(pool: &sqlx::PgPool, trains_snapshot_guard_max_days: i64) {
+    let legs = match queries::bound_legs_without_train(
+        pool,
+        trains_snapshot_guard_max_days,
+        queries::pin_shipped_date(),
+    )
+    .await
+    {
+        Ok(legs) => legs,
+        Err(err) => {
+            tracing::error!(error = ?err, "counting bound legs without a train failed");
+            return;
+        }
+    };
+    for (state, count) in [
+        ("unsnapshotted", legs.unsnapshotted),
+        ("snapshotted", legs.snapshotted),
+    ] {
+        metrics::gauge!(
+            ds_runtime::metrics::metric_name("aggregator_bound_legs_without_train"),
+            "state" => state
+        )
+        .set(f64::from(i32::try_from(count).unwrap_or(i32::MAX)));
+    }
+    if legs.unsnapshotted > 0 {
+        tracing::error!(
+            count = legs.unsnapshotted,
+            "journey legs bound to a train that no longer exists have no snapshot either: \
+             their train data is lost"
+        );
+    }
+}
+
 /// One retention run: every prune, each in its own error scope
 /// (`retention_step`), so one failing prune never skips another; each
 /// failure is logged, counted and left for the next run.
@@ -944,6 +985,7 @@ async fn run_retention(
         trains_snapshot_guard_max_days,
     )
     .await;
+    report_bound_legs_without_train(pool, trains_snapshot_guard_max_days).await;
     let trains_pruned = match archiver.filter(|a| a.archives("trains")) {
         Some(archiver) => {
             retention_step("trains", async {

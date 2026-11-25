@@ -140,6 +140,25 @@ retention to have removed the rows, that have no `schedule_services` row
 `train_current_state` row (`current_state`). All zero while the pin works;
 the retention run also logs an ERROR per non-zero kind.
 
+`distant_signal_aggregator_bound_legs_without_train{state}` (gauge) counts the
+other way a leg can lose data: the train legs of journeys still kept whose
+subscription is matched (`resolution_status` `resolved` or `schedule_matched`)
+but whose `trains` row is gone (`trains_id IS NULL`), on a service date from
+2026-11-22 on and within `TRAINS_SNAPSHOT_GUARD_MAX_DAYS` (the leg goes with
+its journey, so every leg counted is inside the journey retention).
+`state="unsnapshotted"` is the legs with no `final_snapshot_at`: the train is
+gone and no snapshot replaced it, so the user's leg has lost its timetable and
+outcome for good. It is zero while the guard and the snapshot work, and the
+retention run logs an ERROR when it is not. `state="snapshotted"` is the legs
+that have a snapshot but no live train: the leg shows its snapshot, which is
+how it is meant to look after the train is pruned. The 13 legs recovered from
+before the date are older than the floor, so they are not counted; a rise in
+`snapshotted` is informational only. Each run issues one query, driven from the
+btree on `train_subscriptions.trains_id` (`IS NULL`) with a probe of
+`journey_legs` by `train_subscription_id` per remaining subscription; the
+aggregator reads only `service_date` and `resolution_status` of the
+subscription for it.
+
 Some tables can never be archived. The binary refuses to start, and the
 chart refuses to render, if one of them is listed:
 
